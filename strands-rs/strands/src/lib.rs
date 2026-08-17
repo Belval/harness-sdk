@@ -19,12 +19,14 @@
 
 pub mod agent;
 pub mod errors;
+pub mod hooks;
 pub mod models;
 pub mod tools;
 pub mod types;
 
-pub use agent::{Agent, AgentBuilder, AgentResult};
+pub use agent::{Agent, AgentBuilder, AgentResult, InvocationState};
 pub use errors::StrandsError;
+pub use hooks::{HookCleanup, HookEvent, HookOrder, HookRegistry};
 pub use models::Model;
 pub use tools::{Tool, ToolContext};
 pub use types::messages::{ContentBlock, Message, Role, StopReason};
@@ -44,8 +46,9 @@ pub mod reexport {
 
 /// Convenient re-exports for common imports.
 pub mod prelude {
-    pub use crate::agent::{Agent, AgentBuilder, AgentResult};
+    pub use crate::agent::{Agent, AgentBuilder, AgentResult, InvocationState};
     pub use crate::errors::StrandsError;
+    pub use crate::hooks::{HookOrder, HookRegistry};
     pub use crate::models::Model;
     pub use crate::tools::{Tool, ToolContext};
     pub use crate::types::messages::{ContentBlock, Message, Role};

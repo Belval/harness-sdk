@@ -22,6 +22,11 @@ translatable. It is the Rust counterpart to the construct-mapping guidance the
 | `crypto.randomUUID()` | `uuid::Uuid::new_v4()` | |
 | `Uint8Array` field, base64 in `toJSON` | `Vec<u8>` with `#[serde(with = "base64_bytes")]` | Keeps the base64 wire form identical. |
 | `AbortSignal` cancellation | (not ported in the slice) | The TS loop's cancellation path is out of scope. |
+| `HookRegistry` (`Map<constructor, entries>`) | `HookRegistry` wrapping `Arc<Mutex<HashMap<TypeId, Vec<entry>>>>` | The event *type* is the key (`TypeId` ↔ constructor). `Arc<Mutex<…>>` lets `add_callback` return a real cleanup closure, mirroring the TS one. |
+| `HookableEvent` base class + `_shouldReverseCallbacks` | `trait HookEvent` with `should_reverse_callbacks` default | Each event `impl HookEvent`; `After*` events override the default. |
+| `HookCallback = (event) => void \| Promise<void>` | `Fn(&mut E) -> Result<(), StrandsError>` | Synchronous only in the slice (see deviations); a thrown error ↔ `Err`. |
+| `cancel: boolean \| string` | `Option<HookCancel>` (`Default` / `WithMessage`) | Rust has no truthiness, so the signal is an explicit `Option`; the string carries a reason. `AfterToolsEvent.endTurn` maps the same way to `Option<HookEndTurn>`, where the string is literal content. |
+| `InvocationState` (mutable bag by reference) | `InvocationState` wrapping `Arc<Mutex<HashMap>>` | A cheap-clone handle so every event can carry one and share the same map. |
 
 ## Cross-SDK naming parity
 
@@ -53,6 +58,9 @@ Following the monorepo's cross-SDK rules:
 | `tools/executors/sequential.ts` | `tools/mod.rs` (`execute_tools`) |
 | `agent/agent.ts` (`_stream` core) | `agent/mod.rs` |
 | `types/agent.ts` (`AgentResult`) | `agent/result.rs` |
+| `types/agent.ts` (`InvocationState`) | `agent/invocation.rs` |
+| `hooks/registry.ts`, `hooks/types.ts` | `hooks/mod.rs` |
+| `hooks/events.ts` | `hooks/events.rs` |
 | `tools/tool-factory.ts` (`tool()`) | `strands-macros/src/lib.rs` (`#[tool]`) |
 
 ## Known deviations from a literal port
@@ -64,3 +72,18 @@ Following the monorepo's cross-SDK rules:
   matching the TS ordering.
 - **`MAX_LOOP_ITERATIONS`** in the agent loop is a slice-local substitute for the
   TS hook-driven `InvokeOptions.limits`, which are not ported.
+- **Hook callbacks are synchronous.** The TS SDK awaits sync-or-async callbacks;
+  the Rust slice takes `Fn(&mut E) -> Result<(), StrandsError>`. Async-callback
+  ergonomics (borrowing the event across an `await`) are deferred.
+- **Hook events carry no `agent` back-reference.** The loop holds the agent as
+  `&mut self` while dispatching and cannot also lend it to callbacks, so events
+  expose only their data plus control fields. The agent-callback path is deferred.
+- **Empty-string cancel / end-turn is not falsy.** TS treats `cancel = ""` /
+  `endTurn = ""` as not-triggered (JS truthiness); Rust uses `Option`, so
+  `Some(HookCancel::WithMessage("".into()))` genuinely cancels with an empty
+  message.
+- **Deferred hook events:** `ModelStreamUpdateEvent` / `ToolStreamUpdateEvent`
+  (need the streaming loop and tool-progress streaming) and `InterruptEvent` +
+  the `Interruptible.interrupt()` surface on tool-call events (need the interrupt
+  feature) are not part of the hooks slice. `ContentBlockEvent` fires per
+  aggregated block rather than per streamed block.

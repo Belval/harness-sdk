@@ -58,18 +58,38 @@ pub trait Tool: Send + Sync {
 /// otherwise, matching Bedrock's content rules), and an error becomes an error
 /// result carrying the message.
 pub async fn execute_tool(tool: &dyn Tool, tool_use: ToolUseBlock) -> ToolResultBlock {
+    execute_tool_reporting_error(tool, tool_use).await.0
+}
+
+/// Executes a tool like [`execute_tool`], additionally reporting the error
+/// message when the tool fails.
+///
+/// The tuple's second element is `Some(message)` only when the tool returned
+/// `Err` — the counterpart to the `error` field the TypeScript executor sets on
+/// `AfterToolCallEvent` (distinct from a tool that deliberately returns an
+/// error-status result).
+pub async fn execute_tool_reporting_error(
+    tool: &dyn Tool,
+    tool_use: ToolUseBlock,
+) -> (ToolResultBlock, Option<String>) {
     let tool_use_id = tool_use.tool_use_id.clone();
     match tool.invoke(ToolContext { tool_use }).await {
-        Ok(value) => ToolResultBlock {
-            tool_use_id,
-            status: ToolResultStatus::Success,
-            content: vec![wrap_value(value)],
-        },
-        Err(error) => ToolResultBlock {
-            tool_use_id,
-            status: ToolResultStatus::Error,
-            content: vec![ToolResultContent::Text(format!("Error: {error}"))],
-        },
+        Ok(value) => (
+            ToolResultBlock {
+                tool_use_id,
+                status: ToolResultStatus::Success,
+                content: vec![wrap_value(value)],
+            },
+            None,
+        ),
+        Err(error) => (
+            ToolResultBlock {
+                tool_use_id,
+                status: ToolResultStatus::Error,
+                content: vec![ToolResultContent::Text(format!("Error: {error}"))],
+            },
+            Some(error.to_string()),
+        ),
     }
 }
 

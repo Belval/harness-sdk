@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::agent::Agent;
 use crate::errors::StrandsError;
+use crate::hooks::{HookEvent, HookRegistry, InitializedEvent};
 use crate::models::Model;
 use crate::tools::{Tool, ToolRegistry};
 use crate::types::messages::{Message, SystemPrompt};
@@ -16,6 +17,7 @@ pub struct AgentBuilder {
     system_prompt: Option<SystemPrompt>,
     messages: Vec<Message>,
     tool_registry: ToolRegistry,
+    hooks: HookRegistry,
 }
 
 impl AgentBuilder {
@@ -63,6 +65,26 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Registers a hook callback for event type `E`, fired at the default order.
+    pub fn hook<E, F>(self, callback: F) -> Self
+    where
+        E: HookEvent + 'static,
+        F: Fn(&mut E) -> Result<(), StrandsError> + Send + Sync + 'static,
+    {
+        self.hooks.add_callback(callback);
+        self
+    }
+
+    /// Registers a hook callback for event type `E` with an explicit order.
+    pub fn hook_with_order<E, F>(self, callback: F, order: i32) -> Self
+    where
+        E: HookEvent + 'static,
+        F: Fn(&mut E) -> Result<(), StrandsError> + Send + Sync + 'static,
+    {
+        self.hooks.add_callback_with_order(callback, order);
+        self
+    }
+
     /// Builds the agent.
     ///
     /// # Panics
@@ -73,16 +95,22 @@ impl AgentBuilder {
             .expect("Agent requires a model; call .model(...) before .build()")
     }
 
-    /// Builds the agent, returning an error if no model was set.
+    /// Builds the agent, then fires [`InitializedEvent`] to registered hooks.
+    ///
+    /// Returns an error if no model was set or an initialized-hook callback
+    /// fails.
     pub fn try_build(self) -> Result<Agent, StrandsError> {
         let model = self.model.ok_or_else(|| {
             StrandsError::model("Agent requires a model; call .model(...) before building")
         })?;
-        Ok(Agent::new(
+        let agent = Agent::new(
             model,
             self.system_prompt,
             self.messages,
             self.tool_registry,
-        ))
+            self.hooks,
+        );
+        agent.hooks().invoke_callbacks(&mut InitializedEvent {})?;
+        Ok(agent)
     }
 }
