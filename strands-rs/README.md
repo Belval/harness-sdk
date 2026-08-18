@@ -70,13 +70,18 @@ strands-rs/
 
 **Ported:** core message/content types, `Model` trait + `stream_aggregated`,
 Bedrock provider (Converse Stream API), tool system (`Tool`, `FunctionTool`,
-registry, sequential execution), the `#[tool]` macro, and the agent loop
-(`Agent::invoke`).
+registry, sequential execution), the `#[tool]` macro, the agent loop
+(`Agent::invoke`), and the lifecycle **hook system** (`HookRegistry`, the
+`Before*`/`After*` events with their `cancel` / `retry` / `selected_tool` /
+`resume` / `end_turn` / mutable `tool_use` / `result` control fields, and
+`InvocationState`).
 
-**Not yet ported** (present in the TypeScript SDK): hooks, middleware, interrupts,
+**Not yet ported** (present in the TypeScript SDK): middleware, interrupts,
 checkpointing, telemetry/tracing, sessions, memory, structured output, tool
 progress-streaming, guardrails, prompt caching, citations, the streaming agent
-API, multi-agent orchestration, and providers other than Bedrock.
+API, multi-agent orchestration, and providers other than Bedrock. A few hook
+events tied to those features (streaming-update events, `InterruptEvent`) are
+deferred with them — see [`docs/PORTING.md`](docs/PORTING.md).
 
 See [`docs/PORTING.md`](docs/PORTING.md) for the TypeScript→Rust construct
 mapping and the per-file translation record.
