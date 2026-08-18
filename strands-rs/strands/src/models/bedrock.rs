@@ -1,23 +1,30 @@
 //! AWS Bedrock model provider. Ports `models/bedrock.ts`.
 //!
 //! Uses the Bedrock Converse Stream API via the AWS Rust SDK. This slice ports
-//! the request formatting (messages, system prompt, tools, inference config) and
-//! the streamed-event mapping; guardrails, prompt caching, citations, and native
-//! token counting from the TypeScript provider are out of scope.
+//! the request formatting (messages, system prompt, tools, inference config),
+//! the streamed-event mapping, and prompt caching; guardrails, citations, and
+//! native token counting from the TypeScript provider are out of scope.
 
 use async_stream::stream;
 use aws_sdk_bedrockruntime::types as brt;
 use aws_sdk_bedrockruntime::Client;
 
 use crate::errors::StrandsError;
-use crate::models::{Model, ModelEventStream, StreamOptions};
-use crate::types::messages::{ContentBlock, Message, StopReason, ToolResultContent};
+use crate::models::{CacheStrategy, Model, ModelEventStream, StreamOptions};
+use crate::types::messages::{
+    ContentBlock, Message, StopReason, SystemContentBlock, ToolResultContent,
+};
 use crate::types::streaming::{ContentBlockDelta, Metrics, ModelStreamEvent, ToolUseStart, Usage};
 use crate::types::tools::{ToolChoice, ToolSpec};
 
 /// Default model ID used when none is configured. Mirrors the TypeScript SDK's
 /// Bedrock default.
 const DEFAULT_MODEL_ID: &str = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+
+/// Model-ID substrings that support Anthropic-style prompt caching, used to
+/// auto-detect when `cacheConfig.strategy` is `Auto`. Ports
+/// `MODELS_SUPPORTING_ANTHROPIC_CACHING`.
+const MODELS_SUPPORTING_ANTHROPIC_CACHING: &[&str] = &["anthropic", "claude"];
 
 /// Substrings that identify a Bedrock context-window-overflow error, mapped to
 /// [`StrandsError::ContextWindowOverflow`]. Mirrors `BEDROCK_CONTEXT_WINDOW_OVERFLOW_MESSAGES`.
@@ -27,6 +34,44 @@ const CONTEXT_WINDOW_OVERFLOW_MESSAGES: &[&str] = &[
     "too many total text bytes",
 ];
 
+/// Prompt-caching configuration for the Bedrock provider. Ports
+/// `BedrockCacheConfig`.
+///
+/// TTLs are provider strings (`"5m"`, `"1h"`, or any value Bedrock accepts) and
+/// must be non-increasing across tools → system → messages, per the Converse API.
+#[derive(Debug, Clone)]
+pub struct BedrockCacheConfig {
+    /// Whether to auto-detect caching support or force it on.
+    pub strategy: CacheStrategy,
+    /// TTL for the cache point appended after the tool definitions.
+    pub tools_ttl: Option<String>,
+    /// TTL for the cache point injected into the last user message.
+    pub messages_ttl: Option<String>,
+}
+
+impl BedrockCacheConfig {
+    /// Creates a config with the given strategy and no explicit TTLs.
+    pub fn new(strategy: CacheStrategy) -> Self {
+        BedrockCacheConfig {
+            strategy,
+            tools_ttl: None,
+            messages_ttl: None,
+        }
+    }
+
+    /// Sets the tools cache-point TTL.
+    pub fn with_tools_ttl(mut self, ttl: impl Into<String>) -> Self {
+        self.tools_ttl = Some(ttl.into());
+        self
+    }
+
+    /// Sets the messages cache-point TTL.
+    pub fn with_messages_ttl(mut self, ttl: impl Into<String>) -> Self {
+        self.messages_ttl = Some(ttl.into());
+        self
+    }
+}
+
 /// AWS Bedrock implementation of [`Model`], using the Converse Stream API.
 pub struct BedrockModel {
     client: Client,
@@ -34,6 +79,7 @@ pub struct BedrockModel {
     max_tokens: Option<i32>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    cache_config: Option<BedrockCacheConfig>,
 }
 
 impl BedrockModel {
@@ -47,6 +93,7 @@ impl BedrockModel {
             max_tokens: None,
             temperature: None,
             top_p: None,
+            cache_config: None,
         }
     }
 
@@ -64,6 +111,7 @@ impl BedrockModel {
             max_tokens: None,
             temperature: None,
             top_p: None,
+            cache_config: None,
         }
     }
 
@@ -71,6 +119,32 @@ impl BedrockModel {
     pub fn with_max_tokens(mut self, max_tokens: i32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
+    }
+
+    /// Enables prompt caching with the given configuration. Ports
+    /// `BedrockModelConfig.cacheConfig`.
+    pub fn with_cache_config(mut self, cache_config: BedrockCacheConfig) -> Self {
+        self.cache_config = Some(cache_config);
+        self
+    }
+
+    /// Whether prompt caching should be applied for this request. Ports
+    /// `_shouldEnableCaching`, additionally warning when `Auto` is configured for
+    /// a model that does not support automatic caching.
+    fn should_enable_caching(&self) -> bool {
+        let enabled = caching_enabled(self.cache_config.as_ref(), &self.model_id);
+        if !enabled
+            && matches!(
+                self.cache_config.as_ref().map(|config| config.strategy),
+                Some(CacheStrategy::Auto)
+            )
+        {
+            tracing::warn!(
+                model_id = %self.model_id,
+                "cache config is enabled but this model does not support automatic caching"
+            );
+        }
+        enabled
     }
 
     /// Sets the sampling temperature.
@@ -108,6 +182,15 @@ impl BedrockModel {
             tools.push(brt::Tool::ToolSpec(tool_spec));
         }
 
+        // Cache point after the tool definitions, so the tools prefix is cached.
+        if self.should_enable_caching() {
+            let ttl = self
+                .cache_config
+                .as_ref()
+                .and_then(|config| config.tools_ttl.as_deref());
+            tools.push(brt::Tool::CachePoint(bedrock_cache_point("default", ttl)));
+        }
+
         let mut builder = brt::ToolConfiguration::builder().set_tools(Some(tools));
         if let Some(choice) = tool_choice {
             builder = builder.tool_choice(match choice {
@@ -137,7 +220,22 @@ impl Model for BedrockModel {
         options: &'a StreamOptions,
     ) -> ModelEventStream<'a> {
         Box::pin(stream! {
-            let bedrock_messages = match format_messages(messages) {
+            let mut message_contents = match format_message_contents(messages) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            };
+
+            // Auto mode manages cache points itself: strip any manual ones and
+            // inject after the tools and into the last user message.
+            if self.should_enable_caching() {
+                let ttl = self.cache_config.as_ref().and_then(|config| config.messages_ttl.as_deref());
+                inject_cache_point(&mut message_contents, ttl);
+            }
+
+            let bedrock_messages = match build_messages(message_contents) {
                 Ok(messages) => messages,
                 Err(error) => {
                     yield Err(error);
@@ -151,7 +249,17 @@ impl Model for BedrockModel {
                 .set_messages(Some(bedrock_messages));
 
             if let Some(prompt) = &options.system_prompt {
-                request = request.system(brt::SystemContentBlock::Text(prompt.clone()));
+                let system_blocks: Vec<brt::SystemContentBlock> = prompt
+                    .blocks()
+                    .into_iter()
+                    .map(|block| match block {
+                        SystemContentBlock::Text(text) => brt::SystemContentBlock::Text(text),
+                        SystemContentBlock::CachePoint(cache_point) => brt::SystemContentBlock::CachePoint(
+                            bedrock_cache_point(&cache_point.cache_type, cache_point.ttl.as_deref()),
+                        ),
+                    })
+                    .collect();
+                request = request.set_system(Some(system_blocks));
             }
 
             if let Some(tool_config) = self.build_tool_config(&options.tool_specs, options.tool_choice.as_ref()) {
@@ -334,10 +442,13 @@ fn map_stop_reason(reason: &brt::StopReason) -> StopReason {
     }
 }
 
-/// Formats SDK messages into Bedrock `Message`s. Ports `_formatMessages` /
+/// Formats SDK messages into `(role, content)` pairs. Ports `_formatMessages` /
 /// `_formatContentBlock`. Empty messages are dropped, matching the TypeScript
-/// `content.length > 0` guard.
-fn format_messages(messages: &[Message]) -> Result<Vec<brt::Message>, StrandsError> {
+/// `content.length > 0` guard. Kept separate from [`build_messages`] so cache
+/// points can be injected into the content vecs before the messages are built.
+fn format_message_contents(
+    messages: &[Message],
+) -> Result<Vec<(brt::ConversationRole, Vec<brt::ContentBlock>)>, StrandsError> {
     let mut formatted = Vec::new();
     for message in messages {
         let mut content = Vec::new();
@@ -353,16 +464,92 @@ fn format_messages(messages: &[Message]) -> Result<Vec<brt::Message>, StrandsErr
             crate::types::messages::Role::User => brt::ConversationRole::User,
             crate::types::messages::Role::Assistant => brt::ConversationRole::Assistant,
         };
-        let bedrock_message = brt::Message::builder()
+        formatted.push((role, content));
+    }
+    Ok(formatted)
+}
+
+/// Builds Bedrock `Message`s from `(role, content)` pairs.
+fn build_messages(
+    pairs: Vec<(brt::ConversationRole, Vec<brt::ContentBlock>)>,
+) -> Result<Vec<brt::Message>, StrandsError> {
+    let mut messages = Vec::with_capacity(pairs.len());
+    for (role, content) in pairs {
+        let message = brt::Message::builder()
             .role(role)
             .set_content(Some(content))
             .build()
             .map_err(|error| {
                 StrandsError::model_with_source("failed to build bedrock message", error)
             })?;
-        formatted.push(bedrock_message);
+        messages.push(message);
     }
-    Ok(formatted)
+    Ok(messages)
+}
+
+/// Whether prompt caching should be applied. Ports `_shouldEnableCaching`'s pure
+/// decision: `Anthropic` forces it on; `Auto` enables it only when the model id
+/// is known to support Anthropic-style caching.
+fn caching_enabled(cache_config: Option<&BedrockCacheConfig>, model_id: &str) -> bool {
+    match cache_config {
+        None => false,
+        Some(config) => match config.strategy {
+            CacheStrategy::Anthropic => true,
+            CacheStrategy::Auto => MODELS_SUPPORTING_ANTHROPIC_CACHING
+                .iter()
+                .any(|pattern| model_id.contains(pattern)),
+        },
+    }
+}
+
+/// Builds a Bedrock `CachePointBlock` of type `cache_type` with an optional TTL.
+fn bedrock_cache_point(cache_type: &str, ttl: Option<&str>) -> brt::CachePointBlock {
+    let mut builder = brt::CachePointBlock::builder().r#type(brt::CachePointType::from(cache_type));
+    if let Some(ttl) = ttl {
+        // Bedrock validates TTL values server-side, so any string is accepted.
+        builder = builder.ttl(brt::CacheTtl::from(ttl));
+    }
+    builder.build().expect("cache point type is always set")
+}
+
+/// Strips any existing cache points and injects one into the last user message.
+/// Ports `_injectCachePoint`: auto mode manages cache points itself.
+///
+/// The cache point is placed before the first non-PDF document block (which
+/// Bedrock rejects as the block directly preceding a cache point); if such a
+/// block leads the message there is no cacheable prefix, so injection is skipped.
+fn inject_cache_point(
+    messages: &mut [(brt::ConversationRole, Vec<brt::ContentBlock>)],
+    ttl: Option<&str>,
+) {
+    let mut last_user_idx: Option<usize> = None;
+    for (index, (role, content)) in messages.iter_mut().enumerate() {
+        content.retain(|block| !matches!(block, brt::ContentBlock::CachePoint(_)));
+        if *role == brt::ConversationRole::User {
+            last_user_idx = Some(index);
+        }
+    }
+
+    let Some(index) = last_user_idx else {
+        return;
+    };
+    let content = &mut messages[index].1;
+    let cache_point = brt::ContentBlock::CachePoint(bedrock_cache_point("default", ttl));
+
+    let first_non_pdf_document = content.iter().position(|block| {
+        matches!(block, brt::ContentBlock::Document(document) if *document.format() != brt::DocumentFormat::Pdf)
+    });
+
+    match first_non_pdf_document {
+        None => content.push(cache_point),
+        Some(0) => {
+            tracing::debug!(
+                msg_idx = index,
+                "skipped cache point for leading non-pdf document"
+            );
+        }
+        Some(position) => content.insert(position, cache_point),
+    }
 }
 
 fn format_content_block(block: &ContentBlock) -> Result<Option<brt::ContentBlock>, StrandsError> {
@@ -408,7 +595,11 @@ fn format_content_block(block: &ContentBlock) -> Result<Option<brt::ContentBlock
                 })?;
             Ok(Some(brt::ContentBlock::ToolResult(bedrock_result)))
         }
-        // Reasoning, cache points, and media blocks are not sent back in the slice.
+        // A manually-placed cache point passes through; `type` comes from `cache_type`.
+        ContentBlock::CachePoint(cache_point) => Ok(Some(brt::ContentBlock::CachePoint(
+            bedrock_cache_point(&cache_point.cache_type, cache_point.ttl.as_deref()),
+        ))),
+        // Reasoning and media blocks are not sent back in the slice.
         _ => Ok(None),
     }
 }
@@ -437,5 +628,136 @@ fn json_to_document(value: &serde_json::Value) -> aws_smithy_types::Document {
                 .map(|(key, value)| (key.clone(), json_to_document(value)))
                 .collect(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Ports the Bedrock prompt-caching specs from `models/__tests__/bedrock*`:
+    //! the caching-enabled decision, cache-point wire mapping, and auto-mode
+    //! cache-point injection into the last user message.
+
+    use super::*;
+
+    fn user(content: Vec<brt::ContentBlock>) -> (brt::ConversationRole, Vec<brt::ContentBlock>) {
+        (brt::ConversationRole::User, content)
+    }
+
+    fn assistant(
+        content: Vec<brt::ContentBlock>,
+    ) -> (brt::ConversationRole, Vec<brt::ContentBlock>) {
+        (brt::ConversationRole::Assistant, content)
+    }
+
+    fn is_cache_point(block: &brt::ContentBlock) -> bool {
+        matches!(block, brt::ContentBlock::CachePoint(_))
+    }
+
+    // "_shouldEnableCaching": auto enables only for supported models; anthropic forces on
+    #[test]
+    fn caching_enabled_decision() {
+        assert!(!caching_enabled(None, "anthropic.claude-3"));
+
+        let auto = BedrockCacheConfig::new(CacheStrategy::Auto);
+        assert!(caching_enabled(
+            Some(&auto),
+            "us.anthropic.claude-sonnet-4-5"
+        ));
+        assert!(caching_enabled(Some(&auto), "some-claude-model"));
+        assert!(!caching_enabled(Some(&auto), "amazon.titan-text"));
+
+        // Explicit anthropic strategy forces caching on even for an unrecognized id.
+        let forced = BedrockCacheConfig::new(CacheStrategy::Anthropic);
+        assert!(caching_enabled(Some(&forced), "custom.inference-profile"));
+    }
+
+    // cache point maps cacheType -> type and TTL strings to CacheTtl
+    #[test]
+    fn cache_point_wire_mapping() {
+        let default_point = bedrock_cache_point("default", None);
+        assert_eq!(default_point.r#type(), &brt::CachePointType::Default);
+        assert!(default_point.ttl().is_none());
+
+        assert_eq!(
+            bedrock_cache_point("default", Some("5m"))
+                .ttl()
+                .unwrap()
+                .as_str(),
+            "5m"
+        );
+        assert_eq!(
+            bedrock_cache_point("default", Some("1h"))
+                .ttl()
+                .unwrap()
+                .as_str(),
+            "1h"
+        );
+        // Bedrock validates server-side, so any TTL string is preserved.
+        assert_eq!(
+            bedrock_cache_point("default", Some("2h"))
+                .ttl()
+                .unwrap()
+                .as_str(),
+            "2h"
+        );
+    }
+
+    // "_injectCachePoint": appends a cache point to the last user message
+    #[test]
+    fn injects_cache_point_into_last_user_message() {
+        let mut messages = vec![
+            user(vec![brt::ContentBlock::Text("first".to_string())]),
+            assistant(vec![brt::ContentBlock::Text("reply".to_string())]),
+            user(vec![brt::ContentBlock::Text("second".to_string())]),
+        ];
+        inject_cache_point(&mut messages, None);
+
+        // Only the last user message gains a trailing cache point.
+        assert!(!messages[0].1.iter().any(is_cache_point));
+        assert!(is_cache_point(messages[2].1.last().unwrap()));
+        assert_eq!(messages[2].1.len(), 2);
+    }
+
+    // "_injectCachePoint": strips any manually-placed cache points first (auto mode manages them)
+    #[test]
+    fn strips_existing_cache_points_before_injecting() {
+        let mut messages = vec![user(vec![
+            brt::ContentBlock::Text("hi".to_string()),
+            brt::ContentBlock::CachePoint(bedrock_cache_point("default", None)),
+        ])];
+        inject_cache_point(&mut messages, Some("5m"));
+
+        // Exactly one cache point remains — the freshly injected one, carrying the TTL.
+        let cache_points: Vec<_> = messages[0]
+            .1
+            .iter()
+            .filter(|block| is_cache_point(block))
+            .collect();
+        assert_eq!(cache_points.len(), 1);
+        let brt::ContentBlock::CachePoint(point) = cache_points[0] else {
+            unreachable!();
+        };
+        assert_eq!(point.ttl().unwrap().as_str(), "5m");
+    }
+
+    // "_injectCachePoint": no user message means nothing to cache
+    #[test]
+    fn injects_nothing_without_a_user_message() {
+        let mut messages = vec![assistant(vec![brt::ContentBlock::Text("only".to_string())])];
+        inject_cache_point(&mut messages, None);
+        assert!(!messages[0].1.iter().any(is_cache_point));
+    }
+
+    // manual cache point passes through _formatContentBlock with type from cacheType
+    #[test]
+    fn format_content_block_passes_through_cache_point() {
+        let block =
+            ContentBlock::CachePoint(crate::types::messages::CachePointBlock::with_ttl("1h"));
+        let formatted = format_content_block(&block).unwrap().unwrap();
+        let brt::ContentBlock::CachePoint(point) = formatted else {
+            panic!("expected a cache point block");
+        };
+        assert_eq!(point.r#type(), &brt::CachePointType::Default);
+        assert_eq!(point.ttl().unwrap().as_str(), "1h");
     }
 }
