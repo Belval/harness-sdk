@@ -8,9 +8,12 @@
 //!
 //! # Deviations from the TypeScript port
 //!
-//! - **Callbacks are synchronous** (`Fn(&mut E) -> Result<(), StrandsError>`).
-//!   The TypeScript SDK also accepts async callbacks; the async-callback
-//!   ergonomics in Rust (borrowing the event across an `await`) are deferred.
+//! - **Callbacks may be synchronous or asynchronous.** `add_callback` takes a
+//!   sync `Fn(&mut E) -> Result<(), StrandsError>`; `add_callback_async` takes a
+//!   `for<'a> Fn(&'a mut E) -> HookFuture<'a>` whose future may borrow the event
+//!   across `await` points (callers write `|event| Box::pin(async move { … })`).
+//!   Both share one dispatch path — sync callbacks are stored as ready futures —
+//!   and `invoke_callbacks` is `async`.
 //! - **Events carry an [`crate::agent::AgentHandle`], not the whole agent.** The
 //!   loop owns the agent as `&mut self` while dispatching, so instead of a full
 //!   `&Agent` reference callbacks receive a handle over the agent's shared,
@@ -25,9 +28,14 @@ pub use events::*;
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use crate::errors::StrandsError;
+
+/// The future a hook callback resolves to, borrowing the event for its duration.
+pub type HookFuture<'a> = Pin<Box<dyn Future<Output = Result<(), StrandsError>> + Send + 'a>>;
 
 /// Preset hook execution orders. Lower values run first. Ports `HookOrder`.
 ///
@@ -61,7 +69,7 @@ pub trait HookEvent: Any + Send {
     }
 }
 
-/// A registered hook callback. Ports `HookCallback` (the synchronous form).
+/// A registered synchronous hook callback. Ports `HookCallback`.
 ///
 /// Returning `Err` propagates out of the loop, the Rust counterpart to a
 /// callback throwing in TypeScript.
@@ -73,8 +81,10 @@ pub type HookCallback<E> = dyn Fn(&mut E) -> Result<(), StrandsError> + Send + S
 pub type HookCleanup = Box<dyn Fn() + Send + Sync>;
 
 /// A type-erased callback stored in the registry. Downcasts the event back to
-/// its concrete type before invoking the caller's typed callback.
-type ErasedCallback = Arc<dyn Fn(&mut (dyn Any + Send)) -> Result<(), StrandsError> + Send + Sync>;
+/// its concrete type, then returns the (possibly async) work as a future.
+/// Synchronous callbacks are stored as ready futures, so both forms share one
+/// dispatch path.
+type ErasedCallback = Arc<dyn for<'a> Fn(&'a mut (dyn Any + Send)) -> HookFuture<'a> + Send + Sync>;
 
 struct CallbackEntry {
     id: u64,
@@ -103,7 +113,8 @@ impl HookRegistry {
         Self::default()
     }
 
-    /// Registers `callback` for event type `E` at [`HookOrder::DEFAULT`].
+    /// Registers a synchronous `callback` for event type `E` at
+    /// [`HookOrder::DEFAULT`].
     ///
     /// Returns a [`HookCleanup`] that removes the callback when invoked.
     pub fn add_callback<E, F>(&self, callback: F) -> HookCleanup
@@ -114,7 +125,8 @@ impl HookRegistry {
         self.add_callback_with_order(callback, HookOrder::DEFAULT)
     }
 
-    /// Registers `callback` for event type `E` with an explicit `order`.
+    /// Registers a synchronous `callback` for event type `E` with an explicit
+    /// `order`.
     ///
     /// Lower orders run first; callbacks with the same order run in registration
     /// order (reversed for `After*` events).
@@ -123,14 +135,50 @@ impl HookRegistry {
         E: HookEvent + 'static,
         F: Fn(&mut E) -> Result<(), StrandsError> + Send + Sync + 'static,
     {
-        let type_id = TypeId::of::<E>();
+        // A sync callback runs to completion when the future is created, then
+        // resolves immediately — the shared dispatch path just awaits it.
+        let erased: ErasedCallback = Arc::new(move |event: &mut (dyn Any + Send)| {
+            let event = event
+                .downcast_mut::<E>()
+                .expect("hook callback invoked with mismatched event type");
+            Box::pin(std::future::ready(callback(event))) as HookFuture<'_>
+        });
+        self.register::<E>(order, erased)
+    }
+
+    /// Registers an asynchronous `callback` for event type `E` at
+    /// [`HookOrder::DEFAULT`].
+    ///
+    /// The callback returns a boxed future that may borrow the event across
+    /// `await` points, e.g.
+    /// `registry.add_callback_async::<MyEvent, _>(|event| Box::pin(async move { … }))`.
+    pub fn add_callback_async<E, F>(&self, callback: F) -> HookCleanup
+    where
+        E: HookEvent + 'static,
+        F: for<'a> Fn(&'a mut E) -> HookFuture<'a> + Send + Sync + 'static,
+    {
+        self.add_callback_async_with_order(callback, HookOrder::DEFAULT)
+    }
+
+    /// Registers an asynchronous `callback` for event type `E` with an explicit
+    /// `order`.
+    pub fn add_callback_async_with_order<E, F>(&self, callback: F, order: i32) -> HookCleanup
+    where
+        E: HookEvent + 'static,
+        F: for<'a> Fn(&'a mut E) -> HookFuture<'a> + Send + Sync + 'static,
+    {
         let erased: ErasedCallback = Arc::new(move |event: &mut (dyn Any + Send)| {
             let event = event
                 .downcast_mut::<E>()
                 .expect("hook callback invoked with mismatched event type");
             callback(event)
         });
+        self.register::<E>(order, erased)
+    }
 
+    /// Stores an erased callback for event type `E`, returning its cleanup.
+    fn register<E: 'static>(&self, order: i32, callback: ErasedCallback) -> HookCleanup {
+        let type_id = TypeId::of::<E>();
         let mut inner = self.inner.lock().expect("hook registry mutex poisoned");
         let id = inner.next_id;
         inner.next_id += 1;
@@ -141,7 +189,7 @@ impl HookRegistry {
             .push(CallbackEntry {
                 id,
                 order,
-                callback: erased,
+                callback,
             });
 
         let weak = Arc::downgrade(&self.inner);
@@ -168,13 +216,14 @@ impl HookRegistry {
     /// combined interrupt error is returned after all callbacks run. A duplicate
     /// interrupt name across callbacks is a hard error. Any non-interrupt error
     /// propagates immediately and stops later callbacks. Ports `invokeCallbacks`.
-    pub fn invoke_callbacks<E: HookEvent + 'static>(
+    pub async fn invoke_callbacks<E: HookEvent + 'static>(
         &self,
         event: &mut E,
     ) -> Result<(), StrandsError> {
         // Snapshot the callbacks under the lock, then release it before invoking
         // any of them: a callback may register or remove hooks, which re-enters
-        // the registry and would otherwise deadlock on the same mutex.
+        // the registry and would otherwise deadlock on the same mutex. The lock
+        // is never held across an `await`.
         let ordered = {
             let inner = self.inner.lock().expect("hook registry mutex poisoned");
             let Some(entries) = inner.callbacks.get(&TypeId::of::<E>()) else {
@@ -195,7 +244,7 @@ impl HookRegistry {
 
         let mut collected: Vec<crate::interrupt::Interrupt> = Vec::new();
         for (_, _, callback) in ordered {
-            match callback(event) {
+            match callback(event).await {
                 Ok(()) => {}
                 Err(StrandsError::Interrupt(interrupt_error)) => {
                     collected.extend(interrupt_error.interrupts);
@@ -259,8 +308,8 @@ mod tests {
     }
 
     // "runs callbacks in registration order for same order value"
-    #[test]
-    fn runs_in_registration_order() {
+    #[tokio::test]
+    async fn runs_in_registration_order() {
         let registry = HookRegistry::new();
         registry.add_callback::<ForwardEvent, _>(|event| {
             event.log.push("a");
@@ -271,13 +320,13 @@ mod tests {
             Ok(())
         });
         let mut event = ForwardEvent::default();
-        registry.invoke_callbacks(&mut event).unwrap();
+        registry.invoke_callbacks(&mut event).await.unwrap();
         assert_eq!(event.log, vec!["a", "b"]);
     }
 
     // "lower order runs first regardless of registration order"
-    #[test]
-    fn sorts_by_order() {
+    #[tokio::test]
+    async fn sorts_by_order() {
         let registry = HookRegistry::new();
         registry.add_callback_with_order::<ForwardEvent, _>(
             |event| {
@@ -294,13 +343,13 @@ mod tests {
             HookOrder::SDK_FIRST,
         );
         let mut event = ForwardEvent::default();
-        registry.invoke_callbacks(&mut event).unwrap();
+        registry.invoke_callbacks(&mut event).await.unwrap();
         assert_eq!(event.log, vec!["early", "late"]);
     }
 
     // "After* events run same-order callbacks in reverse registration order"
-    #[test]
-    fn reverses_same_order_for_after_events() {
+    #[tokio::test]
+    async fn reverses_same_order_for_after_events() {
         let registry = HookRegistry::new();
         registry.add_callback::<ReverseEvent, _>(|event| {
             event.log.push("first");
@@ -311,13 +360,13 @@ mod tests {
             Ok(())
         });
         let mut event = ReverseEvent::default();
-        registry.invoke_callbacks(&mut event).unwrap();
+        registry.invoke_callbacks(&mut event).await.unwrap();
         assert_eq!(event.log, vec!["second", "first"]);
     }
 
     // "cleanup removes the callback and is idempotent"
-    #[test]
-    fn cleanup_removes_callback() {
+    #[tokio::test]
+    async fn cleanup_removes_callback() {
         let registry = HookRegistry::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_in = calls.clone();
@@ -328,18 +377,20 @@ mod tests {
 
         registry
             .invoke_callbacks(&mut ForwardEvent::default())
+            .await
             .unwrap();
         cleanup();
         cleanup(); // idempotent
         registry
             .invoke_callbacks(&mut ForwardEvent::default())
+            .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     // "a callback error propagates and stops later callbacks"
-    #[test]
-    fn error_propagates() {
+    #[tokio::test]
+    async fn error_propagates() {
         let registry = HookRegistry::new();
         registry.add_callback::<ForwardEvent, _>(|_| Err(StrandsError::model("boom")));
         registry.add_callback::<ForwardEvent, _>(|event| {
@@ -347,17 +398,44 @@ mod tests {
             Ok(())
         });
         let mut event = ForwardEvent::default();
-        let error = registry.invoke_callbacks(&mut event).unwrap_err();
+        let error = registry.invoke_callbacks(&mut event).await.unwrap_err();
         assert!(matches!(error, StrandsError::Model { .. }));
         assert!(event.log.is_empty());
     }
 
     // "no callbacks registered is a no-op"
-    #[test]
-    fn no_callbacks_is_noop() {
+    #[tokio::test]
+    async fn no_callbacks_is_noop() {
         let registry = HookRegistry::new();
         let mut event = ForwardEvent::default();
-        registry.invoke_callbacks(&mut event).unwrap();
+        registry.invoke_callbacks(&mut event).await.unwrap();
         assert!(event.log.is_empty());
+    }
+
+    // Async callbacks run and interleave in order with sync callbacks, mutating
+    // the event after awaiting.
+    #[tokio::test]
+    async fn async_callback_runs_and_interleaves_with_sync() {
+        let registry = HookRegistry::new();
+        registry.add_callback::<ForwardEvent, _>(|event| {
+            event.log.push("sync-first");
+            Ok(())
+        });
+        registry.add_callback_async::<ForwardEvent, _>(|event| {
+            Box::pin(async move {
+                // Yield to the runtime, then mutate the event after the await.
+                tokio::task::yield_now().await;
+                event.log.push("async-second");
+                Ok(())
+            })
+        });
+        registry.add_callback::<ForwardEvent, _>(|event| {
+            event.log.push("sync-third");
+            Ok(())
+        });
+
+        let mut event = ForwardEvent::default();
+        registry.invoke_callbacks(&mut event).await.unwrap();
+        assert_eq!(event.log, vec!["sync-first", "async-second", "sync-third"]);
     }
 }

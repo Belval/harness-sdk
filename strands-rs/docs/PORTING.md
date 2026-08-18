@@ -87,9 +87,12 @@ Following the monorepo's cross-SDK rules:
   matching the TS ordering.
 - **`MAX_LOOP_ITERATIONS`** in the agent loop is a slice-local substitute for the
   TS hook-driven `InvokeOptions.limits`, which are not ported.
-- **Hook callbacks are synchronous.** The TS SDK awaits sync-or-async callbacks;
-  the Rust slice takes `Fn(&mut E) -> Result<(), StrandsError>`. Async-callback
-  ergonomics (borrowing the event across an `await`) are deferred.
+- **Hook callbacks may be sync or async.** `add_callback` / `builder.hook` /
+  `agent.add_hook` take a sync `Fn(&mut E) -> Result<(), StrandsError>`;
+  `add_callback_async` / `builder.hook_async` / `agent.add_hook_async` take a
+  `for<'a> Fn(&'a mut E) -> HookFuture<'a>` (callers write
+  `|event| Box::pin(async move { … })`). `invoke_callbacks` is `async`; sync
+  callbacks are stored as ready futures so both share one dispatch path.
 - **Hook events carry an `AgentHandle`, not a full `&Agent`.** The loop holds the
   agent as `&mut self` while dispatching, so callbacks receive a handle over the
   agent's shared, interior-mutable surfaces — the persisted `AgentState`, the
@@ -143,9 +146,9 @@ Following the monorepo's cross-SDK rules:
   `Arc<dyn Model>` so a stage terminal can own it, and `ToolExecutionResult`
   carries a separate `error` string in place of TypeScript's
   `ToolResultBlock.error`.
-- **`ConversationManager` reduces reactively; proactive `apply_management` is not
-  yet hook-driven.** The loop calls `reduce_context` (async) on a model
-  `ContextWindowOverflow` and retries (bounded by `MAX_CONTEXT_REDUCTIONS`).
-  `apply_management` is on the trait and the agent exposes the manager, but
-  triggering it from a hook needs async hook callbacks (a later prerequisite),
-  since strands-rs hook callbacks are synchronous.
+- **`ConversationManager` reduces reactively.** The loop calls `reduce_context`
+  (async) on a model `ContextWindowOverflow` and retries (bounded by
+  `MAX_CONTEXT_REDUCTIONS`). Proactive `apply_management` is on the trait and the
+  agent exposes the manager; with async hook callbacks now available, a
+  `BeforeModelCall` hook can call it and await, as the Python `ContextManager`
+  does.
