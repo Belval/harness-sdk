@@ -62,6 +62,14 @@ pub enum StrandsError {
     /// Raised when the model fails to produce structured output.
     #[error("{0}")]
     StructuredOutput(String),
+
+    /// Raised when a tool or hook requests a human-in-the-loop interrupt.
+    ///
+    /// Carries the interrupts to surface. The agent loop catches this variant to
+    /// stop the turn with [`crate::StopReason::Interrupt`] rather than
+    /// propagating it to the caller.
+    #[error("{0}")]
+    Interrupt(#[from] crate::interrupt::InterruptError),
 }
 
 impl StrandsError {

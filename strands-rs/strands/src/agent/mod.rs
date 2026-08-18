@@ -18,6 +18,7 @@ pub use builder::AgentBuilder;
 pub use invocation::InvocationState;
 pub use result::AgentResult;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::errors::StrandsError;
@@ -25,10 +26,13 @@ use crate::hooks::{
     AfterInvocationEvent, AfterModelCallEvent, AfterToolCallEvent, AfterToolsEvent,
     AgentResultEvent, BeforeInvocationEvent, BeforeModelCallEvent, BeforeToolCallEvent,
     BeforeToolsEvent, ContentBlockEvent, HookCleanup, HookEndTurn, HookEvent, HookRegistry,
-    MessageAddedEvent, ModelMessageEvent, ModelStopData, ToolResultEvent, ToolUseData,
+    InterruptEvent, MessageAddedEvent, ModelMessageEvent, ModelStopData, ToolResultEvent,
+    ToolUseData,
 };
+use crate::interrupt::{InterruptError, InterruptState, PendingToolExecution};
 use crate::models::{Model, StreamAggregatedResult, StreamOptions};
 use crate::tools::{Tool, ToolRegistry};
+use crate::types::interrupt::InterruptResponse;
 use crate::types::messages::{
     ContentBlock, Message, Role, StopReason, SystemPrompt, ToolResultBlock, ToolResultContent,
     ToolResultStatus, ToolUseBlock,
@@ -62,6 +66,7 @@ pub struct Agent {
     model: Box<dyn Model>,
     tool_registry: ToolRegistry,
     hooks: HookRegistry,
+    interrupt_state: InterruptState,
 }
 
 impl Agent {
@@ -83,6 +88,7 @@ impl Agent {
             model,
             tool_registry,
             hooks,
+            interrupt_state: InterruptState::new(),
         }
     }
 
@@ -125,8 +131,46 @@ impl Agent {
     }
 
     /// Runs the agent loop starting from a caller-constructed user message.
+    ///
+    /// # Errors
+    /// Returns an error if the agent is waiting on an interrupt — resume with
+    /// [`Agent::resume`] before starting a new turn.
     pub async fn invoke_message(&mut self, message: Message) -> Result<AgentResult, StrandsError> {
+        if self.interrupt_state.is_activated() {
+            return Err(StrandsError::model(
+                "Agent is in an interrupted state. Resume with `Agent::resume` before invoking.",
+            ));
+        }
         self.run(Some(message), InvocationState::new()).await
+    }
+
+    /// Resumes a turn that halted on an interrupt, supplying the human responses.
+    ///
+    /// Applies the responses to the matching interrupts, then re-enters the loop:
+    /// a pending tool execution is replayed without re-invoking the model, and
+    /// the previously interrupted tool/hook `interrupt(...)` calls now return
+    /// their responses. Ports resuming via `invoke` with interrupt-response
+    /// content blocks.
+    ///
+    /// # Errors
+    /// Returns an error if the agent is not in an interrupted state, or if a
+    /// response references an unknown interrupt id.
+    pub async fn resume(
+        &mut self,
+        responses: Vec<InterruptResponse>,
+    ) -> Result<AgentResult, StrandsError> {
+        if !self.interrupt_state.is_activated() {
+            return Err(StrandsError::model(
+                "Agent is not in an interrupted state; call `invoke` to start a new turn.",
+            ));
+        }
+        self.interrupt_state.resume(responses)?;
+        self.run(None, InvocationState::new()).await
+    }
+
+    /// The interrupt state backing this agent, for inspection and serialization.
+    pub fn interrupt_state(&self) -> &InterruptState {
+        &self.interrupt_state
     }
 
     /// The resume loop: brackets each pass with [`BeforeInvocationEvent`] /
@@ -199,27 +243,58 @@ impl Agent {
             }
             iterations += 1;
 
-            if let Some(message) = new_input.take() {
-                self.append_message(message, state)?;
-            }
+            // Resuming from a tool interrupt reuses the stored assistant message
+            // and completed results, skipping the model call. Ports the
+            // `getPendingExecution` short-circuit.
+            let (assistant_message, completed) = match self.interrupt_state.get_pending_execution()
+            {
+                Some(pending) => (
+                    pending.assistant_message,
+                    Some(pending.completed_tool_results),
+                ),
+                None => {
+                    if let Some(message) = new_input.take() {
+                        self.append_message(message, state)?;
+                    }
 
-            let model_result = self.invoke_model(state).await?;
+                    let model_result = self.invoke_model(state).await?;
 
-            if model_result.stop_reason != StopReason::ToolUse {
-                self.append_message(model_result.message.clone(), state)?;
-                return Ok(AgentResult::new(
-                    model_result.stop_reason,
-                    model_result.message,
-                ));
-            }
+                    if model_result.stop_reason != StopReason::ToolUse {
+                        self.append_message(model_result.message.clone(), state)?;
+                        return Ok(AgentResult::new(
+                            model_result.stop_reason,
+                            model_result.message,
+                        ));
+                    }
+                    (model_result.message, None)
+                }
+            };
 
-            let assistant_message = model_result.message;
-            let tools_result = self.execute_tools(&assistant_message, state).await?;
+            let tools_result = match self
+                .execute_tools(&assistant_message, state, completed)
+                .await
+            {
+                Ok(tools_result) => tools_result,
+                Err(StrandsError::Interrupt(interrupt_error)) => {
+                    // execute_tools stored the pending execution before propagating;
+                    // stop the turn to wait for human input.
+                    return self.stop_for_interrupt(interrupt_error, state);
+                }
+                Err(error) => return Err(error),
+            };
 
             // Deferred append: both messages are pushed together after tools run,
             // so history never holds a tool-use without its matching results.
             self.append_message(assistant_message, state)?;
             self.append_message(tools_result.message.clone(), state)?;
+
+            // The pair is in history, so any stored pending execution is stale;
+            // clear it and leave the interrupted state so fresh interrupts can be
+            // raised on the next cycle.
+            self.interrupt_state.clear_pending_tool_execution();
+            if self.interrupt_state.is_activated() {
+                self.interrupt_state.deactivate();
+            }
 
             if let Some(end_turn) = &tools_result.end_turn {
                 let text = end_turn
@@ -230,6 +305,39 @@ impl Agent {
                 return Ok(AgentResult::new(StopReason::EndTurn, message));
             }
         }
+    }
+
+    /// Registers the raised interrupts, activates the interrupted state, fires an
+    /// [`InterruptEvent`] per unanswered interrupt, and returns an interrupt
+    /// result. Ports `_createInterruptResult` plus the interrupt fan-out.
+    fn stop_for_interrupt(
+        &self,
+        error: InterruptError,
+        state: &InvocationState,
+    ) -> Result<AgentResult, StrandsError> {
+        let hooks = self.hooks.clone();
+        for interrupt in &error.interrupts {
+            self.interrupt_state.register_interrupt(interrupt);
+        }
+        self.interrupt_state.activate();
+
+        let unanswered = self.interrupt_state.get_unanswered_interrupts();
+        for interrupt in &unanswered {
+            let mut event = InterruptEvent {
+                interrupt: interrupt.clone(),
+                invocation_state: state.clone(),
+            };
+            hooks.invoke_callbacks(&mut event)?;
+        }
+
+        let last_message = self.messages.last().cloned().unwrap_or_else(|| {
+            Message::new(Role::Assistant, vec![ContentBlock::text("Interrupted")])
+        });
+        Ok(AgentResult::with_interrupts(
+            StopReason::Interrupt,
+            last_message,
+            unanswered,
+        ))
     }
 
     /// Invokes the model, firing [`BeforeModelCallEvent`], per-block
@@ -336,15 +444,29 @@ impl Agent {
         &self,
         assistant_message: &Message,
         state: &InvocationState,
+        completed: Option<HashMap<String, ToolResultBlock>>,
     ) -> Result<ToolsExecutionResult, StrandsError> {
         let hooks = self.hooks.clone();
+        let completed = completed.unwrap_or_default();
 
         let mut before = BeforeToolsEvent {
             message: assistant_message.clone(),
             invocation_state: state.clone(),
             cancel: None,
+            interrupt_state: self.interrupt_state.clone(),
         };
-        hooks.invoke_callbacks(&mut before)?;
+        // A BeforeTools hook interrupt stores pending state with no completed
+        // results before propagating, so the whole batch replays on resume.
+        if let Err(error) = hooks.invoke_callbacks(&mut before) {
+            if matches!(error, StrandsError::Interrupt(_)) {
+                self.interrupt_state
+                    .set_pending_tool_execution(PendingToolExecution {
+                        assistant_message: assistant_message.clone(),
+                        completed_tool_results: completed,
+                    });
+            }
+            return Err(error);
+        }
 
         let tool_uses: Vec<ToolUseBlock> = assistant_message
             .content
@@ -354,6 +476,9 @@ impl Agent {
             .collect();
 
         let mut result_blocks: Vec<ToolResultBlock> = Vec::new();
+        // Accumulates results as they complete, keyed by model-issued id, so an
+        // interrupt mid-batch can store what finished for a clean resume.
+        let mut results_by_id: HashMap<String, ToolResultBlock> = completed.clone();
 
         if let Some(cancel) = &before.cancel {
             let message = cancel.message("Tool cancelled by hook").to_string();
@@ -368,13 +493,34 @@ impl Agent {
             }
         } else {
             for tool_use in &tool_uses {
-                let result = self.execute_single_tool(tool_use, state).await?;
-                let mut event = ToolResultEvent {
-                    result: result.clone(),
-                    invocation_state: state.clone(),
-                };
-                hooks.invoke_callbacks(&mut event)?;
-                result_blocks.push(result);
+                // On resume, a tool that already completed is restored without
+                // replaying its lifecycle events. Ports the sequential executor's
+                // completed-result skip.
+                if let Some(done) = completed.get(&tool_use.tool_use_id) {
+                    result_blocks.push(done.clone());
+                    continue;
+                }
+
+                match self.execute_single_tool(tool_use, state).await {
+                    Ok(result) => {
+                        let mut event = ToolResultEvent {
+                            result: result.clone(),
+                            invocation_state: state.clone(),
+                        };
+                        hooks.invoke_callbacks(&mut event)?;
+                        results_by_id.insert(tool_use.tool_use_id.clone(), result.clone());
+                        result_blocks.push(result);
+                    }
+                    Err(error) if matches!(error, StrandsError::Interrupt(_)) => {
+                        self.interrupt_state
+                            .set_pending_tool_execution(PendingToolExecution {
+                                assistant_message: assistant_message.clone(),
+                                completed_tool_results: results_by_id,
+                            });
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
 
@@ -424,6 +570,7 @@ impl Agent {
                 invocation_state: state.clone(),
                 cancel: None,
                 selected_tool: None,
+                interrupt_state: self.interrupt_state.clone(),
             };
             hooks.invoke_callbacks(&mut before)?;
 
@@ -473,7 +620,14 @@ impl Agent {
                         input: tool_use.input.clone(),
                         reasoning_signature: None,
                     };
-                    crate::tools::execute_tool_reporting_error(tool.as_ref(), block).await
+                    // An interrupt raised inside the tool propagates as `Err`;
+                    // an ordinary failure becomes an error result the model sees.
+                    crate::tools::execute_tool_reporting_error(
+                        tool.as_ref(),
+                        block,
+                        self.interrupt_state.clone(),
+                    )
+                    .await?
                 }
                 None => {
                     let message = format!("Tool '{}' not found", tool_use.name);

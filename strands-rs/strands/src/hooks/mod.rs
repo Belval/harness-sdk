@@ -15,9 +15,8 @@
 //!   `&mut self` while dispatching, so it cannot also hand out a shared reference
 //!   to callbacks. Callbacks operate on the event's data plus any state they
 //!   capture. The agent-callback path is deferred.
-//! - **`InterruptError` collection** in `invoke_callbacks` and the streaming
-//!   update events (`ModelStreamUpdateEvent`, `ToolStreamUpdateEvent`) and
-//!   `InterruptEvent` are deferred with the interrupt and streaming features.
+//! - **The streaming update events** (`ModelStreamUpdateEvent`,
+//!   `ToolStreamUpdateEvent`) are deferred with the streaming feature.
 
 mod events;
 
@@ -162,6 +161,12 @@ impl HookRegistry {
     /// returns `true`), callbacks run reversed then re-sorted by order, so a
     /// lower order still runs first but same-order callbacks run in reverse
     /// registration order.
+    ///
+    /// [`StrandsError::Interrupt`] errors are collected across callbacks rather
+    /// than propagated immediately, so every hook can raise its interrupt; a
+    /// combined interrupt error is returned after all callbacks run. A duplicate
+    /// interrupt name across callbacks is a hard error. Any non-interrupt error
+    /// propagates immediately and stops later callbacks. Ports `invokeCallbacks`.
     pub fn invoke_callbacks<E: HookEvent + 'static>(
         &self,
         event: &mut E,
@@ -187,10 +192,43 @@ impl HookRegistry {
             selected
         };
 
+        let mut collected: Vec<crate::interrupt::Interrupt> = Vec::new();
         for (_, _, callback) in ordered {
-            callback(event)?;
+            match callback(event) {
+                Ok(()) => {}
+                Err(StrandsError::Interrupt(interrupt_error)) => {
+                    collected.extend(interrupt_error.interrupts);
+                }
+                Err(other) => return Err(other),
+            }
         }
-        Ok(())
+
+        if collected.is_empty() {
+            return Ok(());
+        }
+
+        // A name raised by more than one callback is ambiguous on resume.
+        let mut seen: Vec<&str> = Vec::new();
+        let mut duplicates: Vec<&str> = Vec::new();
+        for interrupt in &collected {
+            if seen.contains(&interrupt.name.as_str()) {
+                if !duplicates.contains(&interrupt.name.as_str()) {
+                    duplicates.push(&interrupt.name);
+                }
+            } else {
+                seen.push(&interrupt.name);
+            }
+        }
+        if !duplicates.is_empty() {
+            let names = duplicates.join(", ");
+            return Err(StrandsError::model(format!(
+                "interrupt_names=<{names}> | duplicate interrupt names"
+            )));
+        }
+
+        Err(StrandsError::Interrupt(
+            crate::interrupt::InterruptError::new(collected),
+        ))
     }
 }
 
