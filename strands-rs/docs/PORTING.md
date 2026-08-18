@@ -23,6 +23,8 @@ translatable. It is the Rust counterpart to the construct-mapping guidance the
 | `Uint8Array` field, base64 in `toJSON` | `Vec<u8>` with `#[serde(with = "base64_bytes")]` | Keeps the base64 wire form identical. |
 | `AbortSignal` cancellation | (not ported in the slice) | The TS loop's cancellation path is out of scope. |
 | `Tracer` + OpenTelemetry spans | `Tracer` emitting `tracing` spans | Rust telemetry is `tracing`; a subscriber (e.g. an OTel layer) is the backend. Span *names* are static (`invoke_agent`, `chat`, …) with the dynamic OTel name in a `name` field. |
+| `MiddlewareHandler` async generator (`yield events, return result`) | `Fn(C, next) -> Future<R>` (no events) | The Rust loop is non-streaming, so handlers return the result without yielding events. |
+| one `MiddlewareRegistry` keyed by stage token | one typed `MiddlewareStack<C, R>` per stage | The stage token is the typed stack; no `TypeId` erasure. |
 | `InterruptError` (thrown) | `StrandsError::Interrupt(InterruptError)` (an `Err`) | Rust has no exceptions; `interrupt()` returns `Result` and the loop matches the variant. |
 | `interruptFromAgent(agent, …)` | `interrupt_from_state(&InterruptState, …)` | Events/tool context carry an `Arc`-backed `InterruptState` handle instead of an `agent` back-reference. |
 | resume via `invoke([InterruptResponseContent])` | `Agent::resume(Vec<InterruptResponse>)` | A dedicated resume entry point; `invoke` while activated errors (input gating). |
@@ -71,6 +73,7 @@ Following the monorepo's cross-SDK rules:
 | `SystemPrompt` / `SystemContentBlock` / `CacheConfig` (`types/messages.ts`, `models/model.ts`) | `types/messages.rs` (`SystemPrompt`, `SystemContentBlock`), `models/mod.rs` (`CacheStrategy`) |
 | Bedrock caching (`models/bedrock.ts`) | `models/bedrock.rs` (`BedrockCacheConfig`, injection, wire lowering) |
 | `telemetry/tracer.ts` (span surface) | `telemetry/mod.rs` (`Tracer`, `tracing` spans) |
+| `middleware/{types,registry,stages}.ts` | `middleware/mod.rs` (`MiddlewareStack`, contexts) |
 | `tools/tool-factory.ts` (`tool()`) | `strands-macros/src/lib.rs` (`#[tool]`) |
 
 ## Known deviations from a literal port
@@ -123,3 +126,14 @@ Following the monorepo's cross-SDK rules:
   operation names, span hierarchy, the STABLE/LATEST semconv switch
   (`gen_ai.system` vs `gen_ai.provider.name`), and `OTEL_SERVICE_NAME` are in
   parity.
+- **Middleware is non-streaming and typed per stage.** Handlers are async
+  functions (`Input`: `C -> C`, `Output`: `R -> R`, `Wrap`: `(C, next) -> R`)
+  rather than event-yielding async generators, and each stage is its own
+  `MiddlewareStack<C, R>` (registered via `Agent::invoke_model_middleware()` /
+  `execute_tool_middleware()`) rather than a token-keyed registry. Only the two
+  stable stages (`InvokeModelStage`, `ExecuteToolStage`) are ported; the
+  `AgentStreamStage`, the event-yielding handler form, and the middleware
+  interrupt bridge defer with the streaming API. The model becomes
+  `Arc<dyn Model>` so a stage terminal can own it, and `ToolExecutionResult`
+  carries a separate `error` string in place of TypeScript's
+  `ToolResultBlock.error`.

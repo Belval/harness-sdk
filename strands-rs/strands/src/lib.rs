@@ -21,6 +21,7 @@ pub mod agent;
 pub mod errors;
 pub mod hooks;
 pub mod interrupt;
+pub mod middleware;
 pub mod models;
 pub mod telemetry;
 pub mod tools;
@@ -30,6 +31,10 @@ pub use agent::{Agent, AgentBuilder, AgentResult, InvocationState};
 pub use errors::StrandsError;
 pub use hooks::{HookCleanup, HookEvent, HookOrder, HookRegistry};
 pub use interrupt::{Interrupt, InterruptError, InterruptSource, InterruptState};
+pub use middleware::{
+    ExecuteToolContext, InvokeModelContext, MiddlewareCleanup, MiddlewareNext, MiddlewareStack,
+    ToolExecutionResult,
+};
 pub use models::{CacheStrategy, Model};
 pub use telemetry::Tracer;
 pub use tools::{Tool, ToolContext};

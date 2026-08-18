@@ -5,12 +5,13 @@
 //! `types/agent.ts`. The loop fires the [`crate::hooks`] lifecycle events at each
 //! point and honors their control fields (`cancel`, `retry`, `selected_tool`,
 //! `resume`, `end_turn`, and the mutable `tool_use` / `result`), raises and
-//! resumes [`crate::interrupt`]s, and emits [`crate::telemetry`] spans around the
-//! agent, each cycle, model calls, and tool calls.
+//! resumes [`crate::interrupt`]s, emits [`crate::telemetry`] spans around the
+//! agent, each cycle, model calls, and tool calls, and runs model calls and tool
+//! executions through their [`crate::middleware`] stacks.
 //!
-//! The middleware, checkpoint, session, structured-output, and cancellation
-//! surfaces of the TypeScript loop are out of scope for the vertical slice; the
-//! control flow they wrap is preserved.
+//! The checkpoint, session, structured-output, and cancellation surfaces of the
+//! TypeScript loop are out of scope for the vertical slice; the control flow they
+//! wrap is preserved.
 
 mod builder;
 mod invocation;
@@ -32,6 +33,9 @@ use crate::hooks::{
     ToolUseData,
 };
 use crate::interrupt::{InterruptError, InterruptState, PendingToolExecution};
+use crate::middleware::{
+    ExecuteToolContext, InvokeModelContext, MiddlewareStack, ToolExecutionResult,
+};
 use crate::models::{Model, StreamAggregatedResult, StreamOptions};
 use crate::telemetry::Tracer;
 use crate::tools::{Tool, ToolRegistry};
@@ -78,11 +82,13 @@ pub struct Agent {
     pub name: String,
     /// Stable agent identifier, used in telemetry (`gen_ai.agent.id`).
     pub id: String,
-    model: Box<dyn Model>,
+    model: Arc<dyn Model>,
     tool_registry: ToolRegistry,
     hooks: HookRegistry,
     interrupt_state: InterruptState,
     tracer: Tracer,
+    invoke_model_mw: MiddlewareStack<InvokeModelContext, StreamAggregatedResult>,
+    execute_tool_mw: MiddlewareStack<ExecuteToolContext, ToolExecutionResult>,
 }
 
 impl Agent {
@@ -92,7 +98,7 @@ impl Agent {
     }
 
     pub(crate) fn new(
-        model: Box<dyn Model>,
+        model: Arc<dyn Model>,
         name: String,
         system_prompt: Option<SystemPrompt>,
         messages: Vec<Message>,
@@ -109,7 +115,25 @@ impl Agent {
             hooks,
             interrupt_state: InterruptState::new(),
             tracer: Tracer::new(),
+            invoke_model_mw: MiddlewareStack::new(),
+            execute_tool_mw: MiddlewareStack::new(),
         }
+    }
+
+    /// The middleware stack wrapping model invocations, for registering handlers.
+    /// Ports the `InvokeModelStage`.
+    pub fn invoke_model_middleware(
+        &self,
+    ) -> &MiddlewareStack<InvokeModelContext, StreamAggregatedResult> {
+        &self.invoke_model_mw
+    }
+
+    /// The middleware stack wrapping tool executions, for registering handlers.
+    /// Ports the `ExecuteToolStage`.
+    pub fn execute_tool_middleware(
+        &self,
+    ) -> &MiddlewareStack<ExecuteToolContext, ToolExecutionResult> {
+        &self.execute_tool_mw
     }
 
     /// The tools registered on this agent, in registration order.
@@ -465,16 +489,49 @@ impl Agent {
                 });
             }
 
-            let options = self.build_stream_options();
-            let model_span = self.tracer.start_model_span(self.model.model_id());
-            match self.model.stream_aggregated(&self.messages, &options).await {
+            // The model call runs through the InvokeModelStage middleware; the
+            // terminal performs the actual call and owns the model span so the
+            // span records the post-middleware request. Ports
+            // `_invokeModelWithMiddleware`.
+            let context = InvokeModelContext {
+                messages: self.messages.clone(),
+                system_prompt: self.system_prompt.clone(),
+                tool_specs: self.tool_registry.tool_specs(),
+                tool_choice: None,
+                invocation_state: state.clone(),
+            };
+            let model = self.model.clone();
+            let tracer = self.tracer.clone();
+            let model_id = self.model.model_id().map(str::to_string);
+            let terminal = move |context: InvokeModelContext| {
+                let model = model.clone();
+                let tracer = tracer.clone();
+                let model_id = model_id.clone();
+                async move {
+                    let options = StreamOptions {
+                        system_prompt: context.system_prompt,
+                        tool_specs: context.tool_specs,
+                        tool_choice: context.tool_choice,
+                    };
+                    let model_span = tracer.start_model_span(model_id.as_deref());
+                    let result = model.stream_aggregated(&context.messages, &options).await;
+                    match &result {
+                        Ok(aggregated) => tracer.end_model_span(
+                            &model_span,
+                            aggregated.usage.as_ref(),
+                            aggregated.metrics.as_ref(),
+                            None,
+                        ),
+                        Err(error) => {
+                            tracer.end_model_span(&model_span, None, None, Some(&error.to_string()))
+                        }
+                    }
+                    result
+                }
+            };
+
+            match self.invoke_model_mw.invoke(context, terminal).await {
                 Ok(result) => {
-                    self.tracer.end_model_span(
-                        &model_span,
-                        result.usage.as_ref(),
-                        result.metrics.as_ref(),
-                        None,
-                    );
                     for block in &result.message.content {
                         let mut content_block = ContentBlockEvent {
                             content_block: block.clone(),
@@ -508,8 +565,6 @@ impl Agent {
                     return Ok(result);
                 }
                 Err(error) => {
-                    self.tracer
-                        .end_model_span(&model_span, None, None, Some(&error.to_string()));
                     let mut after = AfterModelCallEvent {
                         invocation_state: state.clone(),
                         attempt_count,
@@ -703,50 +758,72 @@ impl Agent {
                 ));
             }
 
-            let tool_span = self
-                .tracer
-                .start_tool_span(&tool_use.name, &tool_use.tool_use_id);
-            let (result, error) = match &effective_tool {
-                Some(tool) => {
-                    let block = ToolUseBlock {
-                        name: tool_use.name.clone(),
-                        tool_use_id: tool_use.tool_use_id.clone(),
-                        input: tool_use.input.clone(),
-                        reasoning_signature: None,
-                    };
-                    // An interrupt raised inside the tool propagates as `Err`;
-                    // an ordinary failure becomes an error result the model sees.
-                    match crate::tools::execute_tool_reporting_error(
-                        tool.as_ref(),
-                        block,
-                        self.interrupt_state.clone(),
-                    )
-                    .await
-                    {
-                        Ok(pair) => pair,
-                        Err(error) => {
-                            // Propagate the interrupt, but close the tool span first.
-                            self.tracer.end_tool_span(
-                                &tool_span,
-                                "error",
-                                Some(&error.to_string()),
-                            );
-                            return Err(error);
+            // Tool execution runs through the ExecuteToolStage middleware; the
+            // terminal performs the actual call and owns the tool span. Ports
+            // `_executeToolWithMiddleware`.
+            let context = ExecuteToolContext {
+                tool: effective_tool.clone(),
+                tool_use: tool_use.clone(),
+                invocation_state: state.clone(),
+            };
+            let tracer = self.tracer.clone();
+            let interrupt_state = self.interrupt_state.clone();
+            let original_id = tool_use_block.tool_use_id.clone();
+            let terminal = move |context: ExecuteToolContext| {
+                let tracer = tracer.clone();
+                let interrupt_state = interrupt_state.clone();
+                let original_id = original_id.clone();
+                async move {
+                    let tool_span = tracer
+                        .start_tool_span(&context.tool_use.name, &context.tool_use.tool_use_id);
+                    let (result, error) = match &context.tool {
+                        Some(tool) => {
+                            let block = ToolUseBlock {
+                                name: context.tool_use.name.clone(),
+                                tool_use_id: context.tool_use.tool_use_id.clone(),
+                                input: context.tool_use.input.clone(),
+                                reasoning_signature: None,
+                            };
+                            // An interrupt raised inside the tool propagates as
+                            // `Err`; an ordinary failure becomes an error result.
+                            match crate::tools::execute_tool_reporting_error(
+                                tool.as_ref(),
+                                block,
+                                interrupt_state,
+                            )
+                            .await
+                            {
+                                Ok(pair) => pair,
+                                Err(error) => {
+                                    tracer.end_tool_span(
+                                        &tool_span,
+                                        "error",
+                                        Some(&error.to_string()),
+                                    );
+                                    return Err(error);
+                                }
+                            }
                         }
-                    }
-                }
-                None => {
-                    let message = format!("Tool '{}' not found", tool_use.name);
-                    (error_result(&tool_use.tool_use_id, &message), Some(message))
+                        None => {
+                            let message = format!("Tool '{}' not found", context.tool_use.name);
+                            (
+                                error_result(&context.tool_use.tool_use_id, &message),
+                                Some(message),
+                            )
+                        }
+                    };
+                    let status = match result.status {
+                        ToolResultStatus::Success => "success",
+                        ToolResultStatus::Error => "error",
+                    };
+                    tracer.end_tool_span(&tool_span, status, error.as_deref());
+                    let result = normalize_tool_result_id(result, &original_id);
+                    Ok(ToolExecutionResult { result, error })
                 }
             };
 
-            let status = match result.status {
-                ToolResultStatus::Success => "success",
-                ToolResultStatus::Error => "error",
-            };
-            self.tracer
-                .end_tool_span(&tool_span, status, error.as_deref());
+            let execution = self.execute_tool_mw.invoke(context, terminal).await?;
+            let (result, error) = (execution.result, execution.error);
 
             let mut after = AfterToolCallEvent {
                 tool_use: tool_use.clone(),
@@ -780,14 +857,6 @@ impl Agent {
             invocation_state: state.clone(),
         };
         hooks.invoke_callbacks(&mut event)
-    }
-
-    fn build_stream_options(&self) -> StreamOptions {
-        StreamOptions {
-            system_prompt: self.system_prompt.clone(),
-            tool_specs: self.tool_registry.tool_specs(),
-            tool_choice: None,
-        }
     }
 
     fn last_message(&self) -> Message {
