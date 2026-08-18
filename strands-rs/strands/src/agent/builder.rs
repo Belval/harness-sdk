@@ -13,7 +13,7 @@ use crate::types::messages::{Message, SystemPrompt};
 /// Builder for constructing an [`Agent`].
 #[derive(Default)]
 pub struct AgentBuilder {
-    model: Option<Box<dyn Model>>,
+    model: Option<Arc<dyn Model>>,
     name: Option<String>,
     system_prompt: Option<SystemPrompt>,
     messages: Vec<Message>,
@@ -32,14 +32,14 @@ impl AgentBuilder {
 
     /// Sets the model provider that drives the agent loop.
     pub fn model(mut self, model: impl Model + 'static) -> Self {
-        self.model = Some(Box::new(model));
+        self.model = Some(Arc::new(model));
         self
     }
 
     /// Sets the model provider from an already-boxed trait object. Useful when
     /// the concrete model type is chosen at runtime.
     pub fn model_boxed(mut self, model: Box<dyn Model>) -> Self {
-        self.model = Some(model);
+        self.model = Some(Arc::from(model));
         self
     }
 
