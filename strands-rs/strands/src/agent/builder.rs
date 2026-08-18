@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crate::agent::{Agent, AgentState};
+use crate::conversation_manager::ConversationManager;
 use crate::errors::StrandsError;
 use crate::hooks::{HookEvent, HookRegistry, InitializedEvent};
 use crate::models::Model;
@@ -20,6 +21,7 @@ pub struct AgentBuilder {
     tool_registry: ToolRegistry,
     hooks: HookRegistry,
     state: Option<AgentState>,
+    conversation_manager: Option<Arc<dyn ConversationManager>>,
 }
 
 /// Default agent name used in telemetry when none is set.
@@ -59,6 +61,13 @@ impl AgentBuilder {
     /// Seeds the agent's persisted [`AgentState`]. Defaults to empty.
     pub fn state(mut self, state: AgentState) -> Self {
         self.state = Some(state);
+        self
+    }
+
+    /// Sets the conversation manager that reduces history on context-window
+    /// overflow. Defaults to none (an overflow propagates).
+    pub fn conversation_manager(mut self, manager: impl ConversationManager + 'static) -> Self {
+        self.conversation_manager = Some(Arc::new(manager));
         self
     }
 
@@ -128,6 +137,7 @@ impl AgentBuilder {
             self.tool_registry,
             self.hooks,
             self.state.unwrap_or_default(),
+            self.conversation_manager,
         );
         let mut initialized = InitializedEvent {
             agent: agent.agent_handle(),

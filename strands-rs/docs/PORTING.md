@@ -66,7 +66,8 @@ Following the monorepo's cross-SDK rules:
 | `agent/agent.ts` (`_stream` core) | `agent/mod.rs` |
 | `types/agent.ts` (`AgentResult`) | `agent/result.rs` |
 | `types/agent.ts` (`InvocationState`) | `agent/invocation.rs` |
-| `agent/state.ts` (`AgentState`) + `event.agent` | `agent/state.rs` (`AgentState`, `AgentHandle`) |
+| `agent/state.ts` (`AgentState`) + `event.agent` | `agent/state.rs` (`AgentState`, `AgentHandle`, `Messages`) |
+| `agent/conversation-manager/` (`ConversationManager`) | `conversation_manager/mod.rs` |
 | `hooks/registry.ts`, `hooks/types.ts` | `hooks/mod.rs` |
 | `hooks/events.ts` | `hooks/events.rs` |
 | `interrupt.ts` | `interrupt.rs` |
@@ -142,3 +143,9 @@ Following the monorepo's cross-SDK rules:
   `Arc<dyn Model>` so a stage terminal can own it, and `ToolExecutionResult`
   carries a separate `error` string in place of TypeScript's
   `ToolResultBlock.error`.
+- **`ConversationManager` reduces reactively; proactive `apply_management` is not
+  yet hook-driven.** The loop calls `reduce_context` (async) on a model
+  `ContextWindowOverflow` and retries (bounded by `MAX_CONTEXT_REDUCTIONS`).
+  `apply_management` is on the trait and the agent exposes the manager, but
+  triggering it from a hook needs async hook callbacks (a later prerequisite),
+  since strands-rs hook callbacks are synchronous.
