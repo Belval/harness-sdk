@@ -21,6 +21,16 @@ use crate::types::tools::{ToolChoice, ToolSpec};
 pub type ModelEventStream<'a> =
     Pin<Box<dyn Stream<Item = Result<ModelStreamEvent, StrandsError>> + Send + 'a>>;
 
+/// How a provider should apply prompt caching. Ports `CacheConfig.strategy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStrategy {
+    /// Enable caching only when the configured model is known to support it.
+    Auto,
+    /// Force Anthropic-style caching on (e.g. for inference-profile model ids
+    /// whose provider cannot be auto-detected).
+    Anthropic,
+}
+
 /// Options for a streaming model invocation. Ports `StreamOptions`.
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
@@ -232,7 +242,7 @@ pub trait Model: Send + Sync {
 }
 
 #[cfg(feature = "bedrock")]
-pub use bedrock::BedrockModel;
+pub use bedrock::{BedrockCacheConfig, BedrockModel};
 
 #[cfg(test)]
 mod tests {

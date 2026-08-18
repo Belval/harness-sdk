@@ -67,6 +67,8 @@ Following the monorepo's cross-SDK rules:
 | `hooks/events.ts` | `hooks/events.rs` |
 | `interrupt.ts` | `interrupt.rs` |
 | `types/interrupt.ts` | `types/interrupt.rs` |
+| `SystemPrompt` / `SystemContentBlock` / `CacheConfig` (`types/messages.ts`, `models/model.ts`) | `types/messages.rs` (`SystemPrompt`, `SystemContentBlock`), `models/mod.rs` (`CacheStrategy`) |
+| Bedrock caching (`models/bedrock.ts`) | `models/bedrock.rs` (`BedrockCacheConfig`, injection, wire lowering) |
 | `tools/tool-factory.ts` (`tool()`) | `strands-macros/src/lib.rs` (`#[tool]`) |
 
 ## Known deviations from a literal port
@@ -102,3 +104,11 @@ Following the monorepo's cross-SDK rules:
   tool execution exists, so the deferred-interrupt (let in-flight siblings
   finish) behavior does not apply. `PendingToolExecution` holds live messages and
   is not serialized in the slice.
+- **Prompt caching is Bedrock-only.** The neutral `CachePointBlock` /
+  `SystemContentBlock` / `Usage` cache fields exist regardless, but lowering is
+  implemented only for Bedrock (the sole ported provider). The Anthropic
+  `cache_control` path and the OpenAI/Google/Vercel warn-and-drop stubs port
+  once those providers do. Bedrock auto-mode injection (strip-then-inject after
+  tools and into the last user message, non-PDF-document placement rule) and
+  manual cache-point passthrough are ported; TTLs are passed through as strings
+  (`CacheTtl::from`).

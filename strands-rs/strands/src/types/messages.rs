@@ -122,9 +122,27 @@ pub struct ReasoningBlock {
 pub struct CachePointBlock {
     /// The cache type. Currently only `"default"` is supported.
     pub cache_type: String,
-    /// Optional provider-specific TTL for the cache entry.
+    /// Optional provider-specific TTL for the cache entry (e.g. `"5m"`, `"1h"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>,
+}
+
+impl CachePointBlock {
+    /// A `"default"` cache point with no TTL.
+    pub fn default_point() -> Self {
+        CachePointBlock {
+            cache_type: "default".to_string(),
+            ttl: None,
+        }
+    }
+
+    /// A `"default"` cache point with the given TTL (e.g. `"5m"`, `"1h"`).
+    pub fn with_ttl(ttl: impl Into<String>) -> Self {
+        CachePointBlock {
+            cache_type: "default".to_string(),
+            ttl: Some(ttl.into()),
+        }
+    }
 }
 
 /// A block of content within a message.
@@ -243,11 +261,76 @@ pub fn generate_tracking_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// System prompt for guiding model behavior.
+/// A block within a structured system prompt. Ports `SystemContentBlock`.
 ///
-/// The TypeScript SDK accepts either a string or an array of content blocks; the
-/// vertical slice supports the string form, which covers the common case.
-pub type SystemPrompt = String;
+/// The guardrail (`guardContent`) variant of the TypeScript union is deferred
+/// with the guardrails surface; text and cache points are supported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SystemContentBlock {
+    /// Plain system-prompt text.
+    Text(String),
+    /// A prompt-cache point marking the preceding text for caching.
+    CachePoint(CachePointBlock),
+}
+
+/// System prompt for guiding model behavior. Ports the TypeScript
+/// `SystemPrompt = string | SystemContentBlock[]`.
+///
+/// A plain string covers the common case; the block form additionally carries
+/// [`CachePointBlock`]s for prompt caching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemPrompt {
+    /// A single text prompt.
+    Text(String),
+    /// A structured prompt of text and cache-point blocks.
+    Blocks(Vec<SystemContentBlock>),
+}
+
+impl SystemPrompt {
+    /// The concatenated text of all text blocks (the whole string for the text
+    /// form).
+    pub fn text(&self) -> String {
+        match self {
+            SystemPrompt::Text(text) => text.clone(),
+            SystemPrompt::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    SystemContentBlock::Text(text) => Some(text.as_str()),
+                    SystemContentBlock::CachePoint(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    /// Normalizes to a list of system content blocks (a single text block for the
+    /// text form).
+    pub fn blocks(&self) -> Vec<SystemContentBlock> {
+        match self {
+            SystemPrompt::Text(text) => vec![SystemContentBlock::Text(text.clone())],
+            SystemPrompt::Blocks(blocks) => blocks.clone(),
+        }
+    }
+}
+
+impl From<String> for SystemPrompt {
+    fn from(text: String) -> Self {
+        SystemPrompt::Text(text)
+    }
+}
+
+impl From<&str> for SystemPrompt {
+    fn from(text: &str) -> Self {
+        SystemPrompt::Text(text.to_string())
+    }
+}
+
+impl From<Vec<SystemContentBlock>> for SystemPrompt {
+    fn from(blocks: Vec<SystemContentBlock>) -> Self {
+        SystemPrompt::Blocks(blocks)
+    }
+}
 
 /// Reason why the model stopped generating content.
 ///
@@ -451,6 +534,59 @@ mod tests {
             ],
         );
         assert_eq!(message.text(), "Hello world");
+    }
+
+    // CachePointBlock: serializes under the `cachePoint` key with camelCase fields
+    #[test]
+    fn cache_point_block_serializes_under_cache_point_key() {
+        let block = ContentBlock::CachePoint(CachePointBlock::default_point());
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "cachePoint": { "cacheType": "default" } })
+        );
+
+        let with_ttl = ContentBlock::CachePoint(CachePointBlock::with_ttl("1h"));
+        let json = serde_json::to_value(&with_ttl).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "cachePoint": { "cacheType": "default", "ttl": "1h" } })
+        );
+    }
+
+    // SystemContentBlock: text and cache-point variants use external tagging
+    #[test]
+    fn system_content_block_wire_form() {
+        let text = SystemContentBlock::Text("guide".to_string());
+        assert_eq!(
+            serde_json::to_value(&text).unwrap(),
+            serde_json::json!({ "text": "guide" })
+        );
+        let cache = SystemContentBlock::CachePoint(CachePointBlock::default_point());
+        assert_eq!(
+            serde_json::to_value(&cache).unwrap(),
+            serde_json::json!({ "cachePoint": { "cacheType": "default" } })
+        );
+    }
+
+    // SystemPrompt: string and block forms; text() concatenates, blocks() normalizes
+    #[test]
+    fn system_prompt_forms() {
+        let text: SystemPrompt = "be helpful".into();
+        assert_eq!(text.text(), "be helpful");
+        assert_eq!(
+            text.blocks(),
+            vec![SystemContentBlock::Text("be helpful".to_string())]
+        );
+
+        let blocks = SystemPrompt::Blocks(vec![
+            SystemContentBlock::Text("a".to_string()),
+            SystemContentBlock::CachePoint(CachePointBlock::default_point()),
+            SystemContentBlock::Text("b".to_string()),
+        ]);
+        // Cache points do not contribute to the concatenated text.
+        assert_eq!(blocks.text(), "ab");
+        assert_eq!(blocks.blocks().len(), 3);
     }
 }
 
