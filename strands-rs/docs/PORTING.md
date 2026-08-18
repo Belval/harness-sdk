@@ -91,9 +91,11 @@ Following the monorepo's cross-SDK rules:
   ergonomics (borrowing the event across an `await`) are deferred.
 - **Hook events carry an `AgentHandle`, not a full `&Agent`.** The loop holds the
   agent as `&mut self` while dispatching, so callbacks receive a handle over the
-  agent's shared, interior-mutable surfaces (currently the persisted
-  `AgentState`) rather than a borrow of the whole agent. The handle grows as more
-  surfaces (messages, metrics, conversation manager) are shared.
+  agent's shared, interior-mutable surfaces — the persisted `AgentState`, the
+  conversation `Messages` (read + rewrite), and the model id — rather than a
+  borrow of the whole agent. The handle grows as more surfaces (metrics,
+  conversation manager) are shared. The agent's `messages` is a shared `Messages`
+  handle; read a snapshot via `Agent::messages()`.
 - **Empty-string cancel / end-turn is not falsy.** TS treats `cancel = ""` /
   `endTurn = ""` as not-triggered (JS truthiness); Rust uses `Option`, so
   `Some(HookCancel::WithMessage("".into()))` genuinely cancels with an empty

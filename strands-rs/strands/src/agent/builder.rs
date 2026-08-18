@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::agent::{Agent, AgentHandle, AgentState};
+use crate::agent::{Agent, AgentState};
 use crate::errors::StrandsError;
 use crate::hooks::{HookEvent, HookRegistry, InitializedEvent};
 use crate::models::Model;
@@ -130,7 +130,7 @@ impl AgentBuilder {
             self.state.unwrap_or_default(),
         );
         let mut initialized = InitializedEvent {
-            agent: AgentHandle::new(agent.state().clone()),
+            agent: agent.agent_handle(),
         };
         agent.hooks().invoke_callbacks(&mut initialized)?;
         Ok(agent)

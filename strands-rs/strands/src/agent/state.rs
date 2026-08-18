@@ -5,6 +5,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::types::messages::Message;
+
 /// A persisted, agent-scoped key/value store. Ports `AgentState`.
 ///
 /// Unlike [`crate::agent::InvocationState`] (which lives for one invocation),
@@ -85,26 +87,116 @@ impl std::fmt::Debug for AgentState {
     }
 }
 
+/// The agent's conversation history as a shared, interior-mutable handle. Ports
+/// the mutable `agent.messages` list.
+///
+/// A cheap-clone handle over the message vec, so hook callbacks and conversation
+/// managers reached through [`AgentHandle`] read and rewrite the same history the
+/// loop drives. Hook dispatch is synchronous, so the loop never holds the lock
+/// across a callback.
+#[derive(Clone, Default)]
+pub struct Messages {
+    inner: Arc<Mutex<Vec<Message>>>,
+}
+
+impl Messages {
+    /// Creates a store seeded with `initial`.
+    pub fn new(initial: Vec<Message>) -> Self {
+        Messages {
+            inner: Arc::new(Mutex::new(initial)),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Message>> {
+        self.inner.lock().expect("messages mutex poisoned")
+    }
+
+    /// Appends a message to the history.
+    pub fn push(&self, message: Message) {
+        self.lock().push(message);
+    }
+
+    /// The number of messages.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether the history is empty.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// The message at `index`, cloned.
+    pub fn get(&self, index: usize) -> Option<Message> {
+        self.lock().get(index).cloned()
+    }
+
+    /// The last message, cloned.
+    pub fn last(&self) -> Option<Message> {
+        self.lock().last().cloned()
+    }
+
+    /// A cloned snapshot of the whole history.
+    pub fn snapshot(&self) -> Vec<Message> {
+        self.lock().clone()
+    }
+
+    /// Replaces the entire history — the primitive a conversation manager uses to
+    /// reduce or rewrite context.
+    pub fn replace(&self, messages: Vec<Message>) {
+        *self.lock() = messages;
+    }
+
+    /// Mutates the history in place, e.g. to append a cache point to the last
+    /// message or drop old ones.
+    pub fn update<F: FnOnce(&mut Vec<Message>)>(&self, edit: F) {
+        edit(&mut self.lock());
+    }
+}
+
+impl std::fmt::Debug for Messages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Messages")
+            .field("len", &self.lock().len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The hook-facing view of the agent. Ports the `event.agent` reference.
 ///
 /// Hook callbacks receive this on every lifecycle event to read and mutate
-/// agent-scoped state. It is a cheap-clone handle; today it exposes the
-/// persisted [`AgentState`], and it is the seam through which further shared
-/// agent surfaces (messages, metrics, conversation manager) are exposed as they
-/// are ported.
+/// agent-scoped surfaces: the persisted [`AgentState`], the conversation
+/// [`Messages`], and the model id. It is the seam through which further shared
+/// agent surfaces (metrics, conversation manager) are exposed as they are ported.
 #[derive(Clone, Debug)]
 pub struct AgentHandle {
     state: AgentState,
+    messages: Messages,
+    model_id: Option<String>,
 }
 
 impl AgentHandle {
-    pub(crate) fn new(state: AgentState) -> Self {
-        AgentHandle { state }
+    pub(crate) fn new(state: AgentState, messages: Messages, model_id: Option<String>) -> Self {
+        AgentHandle {
+            state,
+            messages,
+            model_id,
+        }
     }
 
     /// The agent's persisted state. Ports `agent.state`.
     pub fn state(&self) -> &AgentState {
         &self.state
+    }
+
+    /// The agent's conversation history. Ports `agent.messages`.
+    pub fn messages(&self) -> &Messages {
+        &self.messages
+    }
+
+    /// The configured model id. Ports `agent.model.get_config()["model_id"]`.
+    pub fn model_id(&self) -> Option<&str> {
+        self.model_id.as_deref()
     }
 }
 
@@ -138,12 +230,38 @@ mod tests {
         assert_eq!(state.to_value(), json!({ "a": 1, "b": "two" }));
     }
 
-    // AgentHandle exposes the shared state
+    // AgentHandle exposes the shared state, messages, and model id
     #[test]
-    fn handle_exposes_state() {
+    fn handle_exposes_shared_surfaces() {
         let state = AgentState::new();
-        let handle = AgentHandle::new(state.clone());
+        let messages = Messages::default();
+        let handle = AgentHandle::new(state.clone(), messages.clone(), Some("m-1".to_string()));
+
         handle.state().set("k", json!(true));
         assert_eq!(state.get("k"), Some(json!(true)));
+
+        handle
+            .messages()
+            .push(crate::types::messages::Message::user("hi"));
+        assert_eq!(messages.len(), 1);
+
+        assert_eq!(handle.model_id(), Some("m-1"));
+    }
+
+    // Messages: shared push/replace/update reflect across clones
+    #[test]
+    fn messages_shared_and_mutable() {
+        use crate::types::messages::Message;
+        let messages = Messages::new(vec![Message::user("first")]);
+        let shared = messages.clone();
+        shared.push(Message::assistant("second"));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.last().unwrap().text(), "second");
+
+        // In-place edit and full replace, the conversation-manager primitives.
+        messages.update(|history| history.truncate(1));
+        assert_eq!(messages.len(), 1);
+        messages.replace(vec![Message::user("x"), Message::user("y")]);
+        assert_eq!(shared.len(), 2);
     }
 }

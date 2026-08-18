@@ -389,7 +389,7 @@ async fn after_tool_call_carries_error_on_failure() {
         .expect("error should be captured");
     assert!(error.contains("tool exploded"));
     // The failure also becomes an error tool-result the model can react to.
-    let tool_result_message = &agent.messages[2];
+    let tool_result_message = &agent.messages()[2];
     let ContentBlock::ToolResult(block) = &tool_result_message.content[0] else {
         panic!("expected a tool result block");
     };
@@ -442,7 +442,7 @@ async fn retries_model_call_when_hook_sets_retry() {
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_eq!(result.text(), "second");
     // No duplicated user message: history is user + final assistant.
-    assert_eq!(agent.messages.len(), 2);
+    assert_eq!(agent.messages().len(), 2);
 }
 
 // AfterToolCallEvent retry: "fires BeforeToolCallEvent on each retry"
@@ -496,7 +496,7 @@ async fn cancels_individual_tool_with_custom_message() {
         .build();
 
     agent.invoke("add").await.unwrap();
-    let tool_result_message = &agent.messages[2];
+    let tool_result_message = &agent.messages()[2];
     assert_eq!(first_tool_result_text(tool_result_message), "nope");
 }
 
@@ -543,7 +543,7 @@ async fn cancels_all_tools_via_before_tools() {
     agent.invoke("add").await.unwrap();
     assert_eq!(ran.load(Ordering::SeqCst), 0);
     assert_eq!(
-        first_tool_result_text(&agent.messages[2]),
+        first_tool_result_text(&agent.messages()[2]),
         "Tool cancelled by hook"
     );
 }
@@ -565,7 +565,7 @@ async fn replaces_result_on_after_tool_call() {
         .build();
 
     agent.invoke("add").await.unwrap();
-    assert_eq!(first_tool_result_text(&agent.messages[2]), "redacted");
+    assert_eq!(first_tool_result_text(&agent.messages()[2]), "redacted");
 }
 
 // BeforeToolCallEvent selectedTool: "invokes the replacement tool instead of the registry tool"
@@ -586,7 +586,7 @@ async fn selected_tool_replaces_registry_tool() {
 
     agent.invoke("add").await.unwrap();
     assert_eq!(
-        first_tool_result_text(&agent.messages[2]),
+        first_tool_result_text(&agent.messages()[2]),
         "replacement-ran"
     );
 }
@@ -610,7 +610,7 @@ async fn cancel_wins_over_selected_tool() {
 
     agent.invoke("add").await.unwrap();
     assert_eq!(
-        first_tool_result_text(&agent.messages[2]),
+        first_tool_result_text(&agent.messages()[2]),
         "Tool cancelled by hook"
     );
 }
@@ -633,7 +633,7 @@ async fn mutated_tool_use_input_reaches_tool() {
 
     agent.invoke("add").await.unwrap();
     // 10 + 20 = 30, not 1 + 2.
-    assert_eq!(first_tool_result_text(&agent.messages[2]), "30");
+    assert_eq!(first_tool_result_text(&agent.messages()[2]), "30");
 }
 
 // cancel invocation via hooks: "cancels invocation" + "does not append user message when cancelled"
@@ -652,8 +652,8 @@ async fn cancels_invocation_and_skips_user_message() {
     assert_eq!(result.stop_reason, StopReason::EndTurn);
     assert_eq!(result.text(), "denied");
     // Only the cancel assistant message is in history — the user prompt was not appended.
-    assert_eq!(agent.messages.len(), 1);
-    assert_eq!(agent.messages[0].role, Role::Assistant);
+    assert_eq!(agent.messages().len(), 1);
+    assert_eq!(agent.messages()[0].role, Role::Assistant);
 }
 
 // cancel model call via hooks: "cancels model call" + "does not emit ModelMessageEvent when cancelled"

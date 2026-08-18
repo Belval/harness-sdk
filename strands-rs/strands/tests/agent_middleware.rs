@@ -235,5 +235,5 @@ async fn execute_tool_output_transforms_result() {
 
     agent.invoke("go").await.unwrap();
     // The tool-result message (index 2) carries the intercepted content.
-    assert_eq!(tool_result_text(&agent.messages[2]), "intercepted");
+    assert_eq!(tool_result_text(&agent.messages()[2]), "intercepted");
 }
