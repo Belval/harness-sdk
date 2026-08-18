@@ -14,11 +14,15 @@ use crate::types::messages::{Message, SystemPrompt};
 #[derive(Default)]
 pub struct AgentBuilder {
     model: Option<Box<dyn Model>>,
+    name: Option<String>,
     system_prompt: Option<SystemPrompt>,
     messages: Vec<Message>,
     tool_registry: ToolRegistry,
     hooks: HookRegistry,
 }
+
+/// Default agent name used in telemetry when none is set.
+const DEFAULT_AGENT_NAME: &str = "Strands Agents";
 
 impl AgentBuilder {
     /// Creates an empty builder.
@@ -42,6 +46,12 @@ impl AgentBuilder {
     /// Sets the system prompt.
     pub fn system_prompt(mut self, system_prompt: impl Into<SystemPrompt>) -> Self {
         self.system_prompt = Some(system_prompt.into());
+        self
+    }
+
+    /// Sets the agent name used in telemetry (`gen_ai.agent.name`).
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
         self
     }
 
@@ -105,6 +115,7 @@ impl AgentBuilder {
         })?;
         let agent = Agent::new(
             model,
+            self.name.unwrap_or_else(|| DEFAULT_AGENT_NAME.to_string()),
             self.system_prompt,
             self.messages,
             self.tool_registry,

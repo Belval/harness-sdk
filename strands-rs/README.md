@@ -77,13 +77,17 @@ registry, sequential execution), the `#[tool]` macro, the agent loop
 `InvocationState`), the **interrupt system** (human-in-the-loop `interrupt()`
 on tools and hooks, `InterruptState`, and `Agent::resume`), and **prompt
 caching** (`CachePointBlock`, structured `SystemPrompt`, and Bedrock
-`BedrockCacheConfig` auto-injection + manual cache points).
+`BedrockCacheConfig` auto-injection + manual cache points), and **telemetry**
+(`tracing` spans following the `gen_ai.*` semantic conventions around the agent,
+cycles, model calls, and tool calls).
 
 **Not yet ported** (present in the TypeScript SDK): middleware, checkpointing,
-telemetry/tracing, sessions, memory, structured output, tool progress-streaming,
-guardrails, citations, the streaming agent API, multi-agent orchestration, and
-providers other than Bedrock. A couple of streaming-update hook events are
-deferred with the streaming API — see [`docs/PORTING.md`](docs/PORTING.md).
+sessions, memory, structured output, tool progress-streaming, guardrails,
+citations, the streaming agent API, multi-agent orchestration, and providers
+other than Bedrock. Telemetry emits `tracing` spans (a subscriber is the
+backend) rather than wiring OpenTelemetry directly, and a couple of
+streaming-update hook events are deferred with the streaming API — see
+[`docs/PORTING.md`](docs/PORTING.md).
 
 See [`docs/PORTING.md`](docs/PORTING.md) for the TypeScript→Rust construct
 mapping and the per-file translation record.

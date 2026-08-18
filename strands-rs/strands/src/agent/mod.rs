@@ -4,11 +4,13 @@
 //! `_stream`, `_invokeModel`, `executeTools`) and `AgentResult` from
 //! `types/agent.ts`. The loop fires the [`crate::hooks`] lifecycle events at each
 //! point and honors their control fields (`cancel`, `retry`, `selected_tool`,
-//! `resume`, `end_turn`, and the mutable `tool_use` / `result`).
+//! `resume`, `end_turn`, and the mutable `tool_use` / `result`), raises and
+//! resumes [`crate::interrupt`]s, and emits [`crate::telemetry`] spans around the
+//! agent, each cycle, model calls, and tool calls.
 //!
-//! The interrupt, middleware, checkpoint, telemetry, session, structured-output,
-//! and cancellation surfaces of the TypeScript loop are out of scope for the
-//! vertical slice; the control flow they wrap is preserved.
+//! The middleware, checkpoint, session, structured-output, and cancellation
+//! surfaces of the TypeScript loop are out of scope for the vertical slice; the
+//! control flow they wrap is preserved.
 
 mod builder;
 mod invocation;
@@ -31,6 +33,7 @@ use crate::hooks::{
 };
 use crate::interrupt::{InterruptError, InterruptState, PendingToolExecution};
 use crate::models::{Model, StreamAggregatedResult, StreamOptions};
+use crate::telemetry::Tracer;
 use crate::tools::{Tool, ToolRegistry};
 use crate::types::interrupt::InterruptResponse;
 use crate::types::messages::{
@@ -44,6 +47,14 @@ use crate::types::messages::{
 /// the vertical slice omits that surface, so this guard prevents an unbounded
 /// tool-call loop. Reaching it stops the turn with [`StopReason::EndTurn`].
 const MAX_LOOP_ITERATIONS: usize = 100;
+
+/// Whether the loop should stop with a result or run another cycle.
+enum CycleOutcome {
+    /// The turn is complete; return this result.
+    Done(AgentResult),
+    /// Run another cycle.
+    Continue,
+}
 
 /// The outcome of running the tools for one model turn.
 struct ToolsExecutionResult {
@@ -63,10 +74,15 @@ pub struct Agent {
     pub messages: Vec<Message>,
     /// The system prompt, if any.
     pub system_prompt: Option<SystemPrompt>,
+    /// Human-readable agent name, used in telemetry (`gen_ai.agent.name`).
+    pub name: String,
+    /// Stable agent identifier, used in telemetry (`gen_ai.agent.id`).
+    pub id: String,
     model: Box<dyn Model>,
     tool_registry: ToolRegistry,
     hooks: HookRegistry,
     interrupt_state: InterruptState,
+    tracer: Tracer,
 }
 
 impl Agent {
@@ -77,6 +93,7 @@ impl Agent {
 
     pub(crate) fn new(
         model: Box<dyn Model>,
+        name: String,
         system_prompt: Option<SystemPrompt>,
         messages: Vec<Message>,
         tool_registry: ToolRegistry,
@@ -85,10 +102,13 @@ impl Agent {
         Agent {
             messages,
             system_prompt,
+            name,
+            id: crate::types::messages::generate_tracking_id(),
             model,
             tool_registry,
             hooks,
             interrupt_state: InterruptState::new(),
+            tracer: Tracer::new(),
         }
     }
 
@@ -228,9 +248,42 @@ impl Agent {
         }
     }
 
-    /// A single pass through the main loop: model call, tool execution, repeat
-    /// until the model stops requesting tools. Ports `_stream`.
+    /// A single pass through the main loop, bracketed by the agent span. Ports
+    /// `_stream`'s span lifecycle around the cycle loop.
     async fn stream_core(
+        &mut self,
+        new_input: Option<Message>,
+        state: &InvocationState,
+    ) -> Result<AgentResult, StrandsError> {
+        let tool_names: Vec<String> = self
+            .tool_registry
+            .list()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let system_prompt = self.system_prompt.as_ref().map(SystemPrompt::text);
+        let agent_span = self.tracer.start_agent_span(
+            &self.name,
+            &self.id,
+            self.model.model_id(),
+            &tool_names,
+            system_prompt.as_deref(),
+        );
+
+        let outcome = self.run_cycles(new_input, state).await;
+
+        match &outcome {
+            Ok(_) => self.tracer.end_agent_span(&agent_span, None, None),
+            Err(error) => self
+                .tracer
+                .end_agent_span(&agent_span, None, Some(&error.to_string())),
+        }
+        outcome
+    }
+
+    /// The cycle loop: send the conversation to the model, run any requested
+    /// tools, and repeat, one `execute_agent_loop_cycle` span per iteration.
+    async fn run_cycles(
         &mut self,
         mut new_input: Option<Message>,
         state: &InvocationState,
@@ -243,68 +296,97 @@ impl Agent {
             }
             iterations += 1;
 
-            // Resuming from a tool interrupt reuses the stored assistant message
-            // and completed results, skipping the model call. Ports the
-            // `getPendingExecution` short-circuit.
-            let (assistant_message, completed) = match self.interrupt_state.get_pending_execution()
-            {
-                Some(pending) => (
-                    pending.assistant_message,
-                    Some(pending.completed_tool_results),
-                ),
-                None => {
-                    if let Some(message) = new_input.take() {
-                        self.append_message(message, state)?;
-                    }
-
-                    let model_result = self.invoke_model(state).await?;
-
-                    if model_result.stop_reason != StopReason::ToolUse {
-                        self.append_message(model_result.message.clone(), state)?;
-                        return Ok(AgentResult::new(
-                            model_result.stop_reason,
-                            model_result.message,
-                        ));
-                    }
-                    (model_result.message, None)
+            let cycle_span = self.tracer.start_cycle_span(&format!("cycle-{iterations}"));
+            match self.run_one_cycle(&mut new_input, state).await {
+                Ok(CycleOutcome::Done(result)) => {
+                    self.tracer.end_cycle_span(&cycle_span, None);
+                    return Ok(result);
                 }
-            };
-
-            let tools_result = match self
-                .execute_tools(&assistant_message, state, completed)
-                .await
-            {
-                Ok(tools_result) => tools_result,
-                Err(StrandsError::Interrupt(interrupt_error)) => {
-                    // execute_tools stored the pending execution before propagating;
-                    // stop the turn to wait for human input.
-                    return self.stop_for_interrupt(interrupt_error, state);
+                Ok(CycleOutcome::Continue) => {
+                    self.tracer.end_cycle_span(&cycle_span, None);
                 }
-                Err(error) => return Err(error),
-            };
-
-            // Deferred append: both messages are pushed together after tools run,
-            // so history never holds a tool-use without its matching results.
-            self.append_message(assistant_message, state)?;
-            self.append_message(tools_result.message.clone(), state)?;
-
-            // The pair is in history, so any stored pending execution is stale;
-            // clear it and leave the interrupted state so fresh interrupts can be
-            // raised on the next cycle.
-            self.interrupt_state.clear_pending_tool_execution();
-            if self.interrupt_state.is_activated() {
-                self.interrupt_state.deactivate();
-            }
-
-            if let Some(end_turn) = &tools_result.end_turn {
-                let text = end_turn
-                    .content("Turn ended early by hook after tool execution")
-                    .to_string();
-                let message = Message::assistant(text);
-                self.append_message(message.clone(), state)?;
-                return Ok(AgentResult::new(StopReason::EndTurn, message));
+                Err(error) => {
+                    self.tracer
+                        .end_cycle_span(&cycle_span, Some(&error.to_string()));
+                    return Err(error);
+                }
             }
         }
+    }
+
+    /// Runs one loop cycle: a model call (or pending-execution replay) followed
+    /// by tool execution. Returns whether the loop should stop or continue.
+    async fn run_one_cycle(
+        &mut self,
+        new_input: &mut Option<Message>,
+        state: &InvocationState,
+    ) -> Result<CycleOutcome, StrandsError> {
+        // Resuming from a tool interrupt reuses the stored assistant message and
+        // completed results, skipping the model call. Ports the
+        // `getPendingExecution` short-circuit.
+        let (assistant_message, completed) = match self.interrupt_state.get_pending_execution() {
+            Some(pending) => (
+                pending.assistant_message,
+                Some(pending.completed_tool_results),
+            ),
+            None => {
+                if let Some(message) = new_input.take() {
+                    self.append_message(message, state)?;
+                }
+
+                let model_result = self.invoke_model(state).await?;
+
+                if model_result.stop_reason != StopReason::ToolUse {
+                    self.append_message(model_result.message.clone(), state)?;
+                    return Ok(CycleOutcome::Done(AgentResult::new(
+                        model_result.stop_reason,
+                        model_result.message,
+                    )));
+                }
+                (model_result.message, None)
+            }
+        };
+
+        let tools_result = match self
+            .execute_tools(&assistant_message, state, completed)
+            .await
+        {
+            Ok(tools_result) => tools_result,
+            Err(StrandsError::Interrupt(interrupt_error)) => {
+                // execute_tools stored the pending execution before propagating;
+                // stop the turn to wait for human input.
+                return Ok(CycleOutcome::Done(
+                    self.stop_for_interrupt(interrupt_error, state)?,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+
+        // Deferred append: both messages are pushed together after tools run, so
+        // history never holds a tool-use without its matching results.
+        self.append_message(assistant_message, state)?;
+        self.append_message(tools_result.message.clone(), state)?;
+
+        // The pair is in history, so any stored pending execution is stale; clear
+        // it and leave the interrupted state so fresh interrupts can be raised.
+        self.interrupt_state.clear_pending_tool_execution();
+        if self.interrupt_state.is_activated() {
+            self.interrupt_state.deactivate();
+        }
+
+        if let Some(end_turn) = &tools_result.end_turn {
+            let text = end_turn
+                .content("Turn ended early by hook after tool execution")
+                .to_string();
+            let message = Message::assistant(text);
+            self.append_message(message.clone(), state)?;
+            return Ok(CycleOutcome::Done(AgentResult::new(
+                StopReason::EndTurn,
+                message,
+            )));
+        }
+
+        Ok(CycleOutcome::Continue)
     }
 
     /// Registers the raised interrupts, activates the interrupted state, fires an
@@ -384,8 +466,15 @@ impl Agent {
             }
 
             let options = self.build_stream_options();
+            let model_span = self.tracer.start_model_span(self.model.model_id());
             match self.model.stream_aggregated(&self.messages, &options).await {
                 Ok(result) => {
+                    self.tracer.end_model_span(
+                        &model_span,
+                        result.usage.as_ref(),
+                        result.metrics.as_ref(),
+                        None,
+                    );
                     for block in &result.message.content {
                         let mut content_block = ContentBlockEvent {
                             content_block: block.clone(),
@@ -419,6 +508,8 @@ impl Agent {
                     return Ok(result);
                 }
                 Err(error) => {
+                    self.tracer
+                        .end_model_span(&model_span, None, None, Some(&error.to_string()));
                     let mut after = AfterModelCallEvent {
                         invocation_state: state.clone(),
                         attempt_count,
@@ -612,6 +703,9 @@ impl Agent {
                 ));
             }
 
+            let tool_span = self
+                .tracer
+                .start_tool_span(&tool_use.name, &tool_use.tool_use_id);
             let (result, error) = match &effective_tool {
                 Some(tool) => {
                     let block = ToolUseBlock {
@@ -622,18 +716,37 @@ impl Agent {
                     };
                     // An interrupt raised inside the tool propagates as `Err`;
                     // an ordinary failure becomes an error result the model sees.
-                    crate::tools::execute_tool_reporting_error(
+                    match crate::tools::execute_tool_reporting_error(
                         tool.as_ref(),
                         block,
                         self.interrupt_state.clone(),
                     )
-                    .await?
+                    .await
+                    {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            // Propagate the interrupt, but close the tool span first.
+                            self.tracer.end_tool_span(
+                                &tool_span,
+                                "error",
+                                Some(&error.to_string()),
+                            );
+                            return Err(error);
+                        }
+                    }
                 }
                 None => {
                     let message = format!("Tool '{}' not found", tool_use.name);
                     (error_result(&tool_use.tool_use_id, &message), Some(message))
                 }
             };
+
+            let status = match result.status {
+                ToolResultStatus::Success => "success",
+                ToolResultStatus::Error => "error",
+            };
+            self.tracer
+                .end_tool_span(&tool_span, status, error.as_deref());
 
             let mut after = AfterToolCallEvent {
                 tool_use: tool_use.clone(),
