@@ -22,6 +22,7 @@ translatable. It is the Rust counterpart to the construct-mapping guidance the
 | `crypto.randomUUID()` | `uuid::Uuid::new_v4()` | |
 | `Uint8Array` field, base64 in `toJSON` | `Vec<u8>` with `#[serde(with = "base64_bytes")]` | Keeps the base64 wire form identical. |
 | `AbortSignal` cancellation | (not ported in the slice) | The TS loop's cancellation path is out of scope. |
+| `Tracer` + OpenTelemetry spans | `Tracer` emitting `tracing` spans | Rust telemetry is `tracing`; a subscriber (e.g. an OTel layer) is the backend. Span *names* are static (`invoke_agent`, `chat`, …) with the dynamic OTel name in a `name` field. |
 | `InterruptError` (thrown) | `StrandsError::Interrupt(InterruptError)` (an `Err`) | Rust has no exceptions; `interrupt()` returns `Result` and the loop matches the variant. |
 | `interruptFromAgent(agent, …)` | `interrupt_from_state(&InterruptState, …)` | Events/tool context carry an `Arc`-backed `InterruptState` handle instead of an `agent` back-reference. |
 | resume via `invoke([InterruptResponseContent])` | `Agent::resume(Vec<InterruptResponse>)` | A dedicated resume entry point; `invoke` while activated errors (input gating). |
@@ -69,6 +70,7 @@ Following the monorepo's cross-SDK rules:
 | `types/interrupt.ts` | `types/interrupt.rs` |
 | `SystemPrompt` / `SystemContentBlock` / `CacheConfig` (`types/messages.ts`, `models/model.ts`) | `types/messages.rs` (`SystemPrompt`, `SystemContentBlock`), `models/mod.rs` (`CacheStrategy`) |
 | Bedrock caching (`models/bedrock.ts`) | `models/bedrock.rs` (`BedrockCacheConfig`, injection, wire lowering) |
+| `telemetry/tracer.ts` (span surface) | `telemetry/mod.rs` (`Tracer`, `tracing` spans) |
 | `tools/tool-factory.ts` (`tool()`) | `strands-macros/src/lib.rs` (`#[tool]`) |
 
 ## Known deviations from a literal port
@@ -112,3 +114,12 @@ Following the monorepo's cross-SDK rules:
   tools and into the last user message, non-PDF-document placement rule) and
   manual cache-point passthrough are ported; TTLs are passed through as strings
   (`CacheTtl::from`).
+- **Telemetry emits `tracing` spans, not OpenTelemetry directly**, and does not
+  wire an exporter — a `tracing` subscriber is the backend (per the Rust SDK
+  `AGENTS.md`). Because `tracing` span names are static, the exact OTel span-name
+  string (`invoke_agent {name}`) lives in a `name` field. The in-memory
+  `AgentTrace` tree / `AgentResult.traces`, the metrics `Meter`, and multi-agent /
+  node / memory spans are not ported. The `gen_ai.*` attribute keys/values,
+  operation names, span hierarchy, the STABLE/LATEST semconv switch
+  (`gen_ai.system` vs `gen_ai.provider.name`), and `OTEL_SERVICE_NAME` are in
+  parity.

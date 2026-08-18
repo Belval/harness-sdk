@@ -22,6 +22,7 @@ pub mod errors;
 pub mod hooks;
 pub mod interrupt;
 pub mod models;
+pub mod telemetry;
 pub mod tools;
 pub mod types;
 
@@ -30,6 +31,7 @@ pub use errors::StrandsError;
 pub use hooks::{HookCleanup, HookEvent, HookOrder, HookRegistry};
 pub use interrupt::{Interrupt, InterruptError, InterruptSource, InterruptState};
 pub use models::{CacheStrategy, Model};
+pub use telemetry::Tracer;
 pub use tools::{Tool, ToolContext};
 pub use types::interrupt::{InterruptParams, InterruptResponse, InterruptResponseContent};
 pub use types::messages::{

@@ -31,6 +31,7 @@ aws-smithy-types = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 default = ["macros", "bedrock"]
