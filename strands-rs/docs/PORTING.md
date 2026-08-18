@@ -22,6 +22,10 @@ translatable. It is the Rust counterpart to the construct-mapping guidance the
 | `crypto.randomUUID()` | `uuid::Uuid::new_v4()` | |
 | `Uint8Array` field, base64 in `toJSON` | `Vec<u8>` with `#[serde(with = "base64_bytes")]` | Keeps the base64 wire form identical. |
 | `AbortSignal` cancellation | (not ported in the slice) | The TS loop's cancellation path is out of scope. |
+| `InterruptError` (thrown) | `StrandsError::Interrupt(InterruptError)` (an `Err`) | Rust has no exceptions; `interrupt()` returns `Result` and the loop matches the variant. |
+| `interruptFromAgent(agent, …)` | `interrupt_from_state(&InterruptState, …)` | Events/tool context carry an `Arc`-backed `InterruptState` handle instead of an `agent` back-reference. |
+| resume via `invoke([InterruptResponseContent])` | `Agent::resume(Vec<InterruptResponse>)` | A dedicated resume entry point; `invoke` while activated errors (input gating). |
+| `InterruptState` (per-agent, mutable) | `InterruptState` wrapping `Arc<Mutex<…>>` | Owned by the agent, cloned onto interrupt-raising events/contexts so they share one state. |
 | `HookRegistry` (`Map<constructor, entries>`) | `HookRegistry` wrapping `Arc<Mutex<HashMap<TypeId, Vec<entry>>>>` | The event *type* is the key (`TypeId` ↔ constructor). `Arc<Mutex<…>>` lets `add_callback` return a real cleanup closure, mirroring the TS one. |
 | `HookableEvent` base class + `_shouldReverseCallbacks` | `trait HookEvent` with `should_reverse_callbacks` default | Each event `impl HookEvent`; `After*` events override the default. |
 | `HookCallback = (event) => void \| Promise<void>` | `Fn(&mut E) -> Result<(), StrandsError>` | Synchronous only in the slice (see deviations); a thrown error ↔ `Err`. |
@@ -61,6 +65,8 @@ Following the monorepo's cross-SDK rules:
 | `types/agent.ts` (`InvocationState`) | `agent/invocation.rs` |
 | `hooks/registry.ts`, `hooks/types.ts` | `hooks/mod.rs` |
 | `hooks/events.ts` | `hooks/events.rs` |
+| `interrupt.ts` | `interrupt.rs` |
+| `types/interrupt.ts` | `types/interrupt.rs` |
 | `tools/tool-factory.ts` (`tool()`) | `strands-macros/src/lib.rs` (`#[tool]`) |
 
 ## Known deviations from a literal port
@@ -83,7 +89,16 @@ Following the monorepo's cross-SDK rules:
   `Some(HookCancel::WithMessage("".into()))` genuinely cancels with an empty
   message.
 - **Deferred hook events:** `ModelStreamUpdateEvent` / `ToolStreamUpdateEvent`
-  (need the streaming loop and tool-progress streaming) and `InterruptEvent` +
-  the `Interruptible.interrupt()` surface on tool-call events (need the interrupt
-  feature) are not part of the hooks slice. `ContentBlockEvent` fires per
-  aggregated block rather than per streamed block.
+  (need the streaming loop and tool-progress streaming) are not part of the
+  slice. `ContentBlockEvent` fires per aggregated block rather than per streamed
+  block.
+- **Interrupts resume via `Agent::resume(Vec<InterruptResponse>)`**, not by
+  passing `interruptResponseContent` blocks to `invoke`. `invoke` while the agent
+  is interrupted returns an error (the gate the TS SDK expresses as a
+  `TypeError`). The `InterruptResponseContent` block type exists for session
+  serialization parity but is not a member of the model-facing `ContentBlock`
+  union.
+- **Concurrent-executor interrupt semantics are not ported** — only sequential
+  tool execution exists, so the deferred-interrupt (let in-flight siblings
+  finish) behavior does not apply. `PendingToolExecution` holds live messages and
+  is not serialized in the slice.

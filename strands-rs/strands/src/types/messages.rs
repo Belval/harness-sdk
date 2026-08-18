@@ -272,6 +272,8 @@ pub enum StopReason {
     ToolUse,
     /// Input exceeded the model's context window.
     ModelContextWindowExceeded,
+    /// Agent halted to wait for human input on a raised interrupt.
+    Interrupt,
     /// Any value not covered above, preserved verbatim.
     Other(String),
 }
@@ -288,6 +290,7 @@ impl StopReason {
             StopReason::StopSequence => "stopSequence",
             StopReason::ToolUse => "toolUse",
             StopReason::ModelContextWindowExceeded => "modelContextWindowExceeded",
+            StopReason::Interrupt => "interrupt",
             StopReason::Other(value) => value,
         }
     }
@@ -303,6 +306,7 @@ impl StopReason {
             "stopSequence" => StopReason::StopSequence,
             "toolUse" => StopReason::ToolUse,
             "modelContextWindowExceeded" => StopReason::ModelContextWindowExceeded,
+            "interrupt" => StopReason::Interrupt,
             other => StopReason::Other(other.to_string()),
         }
     }

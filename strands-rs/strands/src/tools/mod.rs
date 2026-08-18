@@ -12,9 +12,9 @@ pub mod registry;
 use async_trait::async_trait;
 
 use crate::errors::StrandsError;
-use crate::types::messages::{
-    ContentBlock, Message, ToolResultBlock, ToolResultContent, ToolResultStatus, ToolUseBlock,
-};
+use crate::interrupt::{interrupt_from_state, InterruptSource, InterruptState};
+use crate::types::interrupt::InterruptParams;
+use crate::types::messages::{ToolResultBlock, ToolResultContent, ToolResultStatus, ToolUseBlock};
 use crate::types::tools::ToolSpec;
 
 pub use function_tool::FunctionTool;
@@ -22,20 +22,44 @@ pub use registry::ToolRegistry;
 
 /// Context provided to a tool during execution. Ports `ToolContext`.
 ///
-/// The vertical slice exposes the triggering tool-use request; agent-handle and
-/// invocation-state fields from the TypeScript `ToolContext` are deferred.
+/// Exposes the triggering tool-use request and the interrupt surface. The
+/// agent-handle field from the TypeScript `ToolContext` is deferred.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     /// The tool-use request that triggered this execution.
     pub tool_use: ToolUseBlock,
+    interrupt_state: InterruptState,
+}
+
+impl ToolContext {
+    /// Creates a context for `tool_use` with a fresh, unattached interrupt state.
+    ///
+    /// The framework constructs contexts wired to the agent's interrupt state;
+    /// this constructor is for exercising a tool in isolation, where a raised
+    /// interrupt simply has no responder.
+    pub fn new(tool_use: ToolUseBlock) -> Self {
+        ToolContext {
+            tool_use,
+            interrupt_state: InterruptState::new(),
+        }
+    }
+
+    /// Raises an interrupt for human-in-the-loop workflows. Returns the response
+    /// immediately when resuming; otherwise returns `Err(`[`StrandsError::Interrupt`]`)`
+    /// to halt the agent. Ports `ToolContext.interrupt`.
+    pub fn interrupt(&self, params: InterruptParams) -> Result<serde_json::Value, StrandsError> {
+        let id = format!("tool:{}:{}", self.tool_use.tool_use_id, params.name);
+        interrupt_from_state(&self.interrupt_state, id, params, InterruptSource::Tool)
+    }
 }
 
 /// A tool an agent can invoke. Ports the abstract `Tool` class.
 ///
 /// Implementors provide identity (`name`, `description`, `tool_spec`) and an
 /// async `invoke`. The framework wraps `invoke`'s `Result` into a
-/// [`ToolResultBlock`] via [`execute_tool`], turning `Err` into an error result
-/// the model can react to, matching `FunctionTool.stream`'s error handling.
+/// [`ToolResultBlock`] via [`execute_tool`], turning an ordinary `Err` into an
+/// error result the model can react to (matching `FunctionTool.stream`'s error
+/// handling) while propagating a [`StrandsError::Interrupt`] up to the loop.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// The unique name of the tool. MUST match `tool_spec().name`.
@@ -57,39 +81,55 @@ pub trait Tool: Send + Sync {
 /// a successful JSON value becomes a success result (text for strings, JSON
 /// otherwise, matching Bedrock's content rules), and an error becomes an error
 /// result carrying the message.
-pub async fn execute_tool(tool: &dyn Tool, tool_use: ToolUseBlock) -> ToolResultBlock {
-    execute_tool_reporting_error(tool, tool_use).await.0
+pub async fn execute_tool(
+    tool: &dyn Tool,
+    tool_use: ToolUseBlock,
+    interrupt_state: InterruptState,
+) -> Result<ToolResultBlock, StrandsError> {
+    execute_tool_reporting_error(tool, tool_use, interrupt_state)
+        .await
+        .map(|(result, _error)| result)
 }
 
 /// Executes a tool like [`execute_tool`], additionally reporting the error
 /// message when the tool fails.
 ///
-/// The tuple's second element is `Some(message)` only when the tool returned
-/// `Err` — the counterpart to the `error` field the TypeScript executor sets on
-/// `AfterToolCallEvent` (distinct from a tool that deliberately returns an
-/// error-status result).
+/// The `Ok` tuple's second element is `Some(message)` only when the tool
+/// returned an ordinary `Err` — the counterpart to the `error` field the
+/// TypeScript executor sets on `AfterToolCallEvent` (distinct from a tool that
+/// deliberately returns an error-status result). A [`StrandsError::Interrupt`]
+/// is *not* turned into an error result; it propagates as `Err` so the agent
+/// loop can halt, matching the TypeScript `_executeToolCore` re-throw.
 pub async fn execute_tool_reporting_error(
     tool: &dyn Tool,
     tool_use: ToolUseBlock,
-) -> (ToolResultBlock, Option<String>) {
+    interrupt_state: InterruptState,
+) -> Result<(ToolResultBlock, Option<String>), StrandsError> {
     let tool_use_id = tool_use.tool_use_id.clone();
-    match tool.invoke(ToolContext { tool_use }).await {
-        Ok(value) => (
+    match tool
+        .invoke(ToolContext {
+            tool_use,
+            interrupt_state,
+        })
+        .await
+    {
+        Ok(value) => Ok((
             ToolResultBlock {
                 tool_use_id,
                 status: ToolResultStatus::Success,
                 content: vec![wrap_value(value)],
             },
             None,
-        ),
-        Err(error) => (
+        )),
+        Err(error @ StrandsError::Interrupt(_)) => Err(error),
+        Err(error) => Ok((
             ToolResultBlock {
                 tool_use_id,
                 status: ToolResultStatus::Error,
                 content: vec![ToolResultContent::Text(format!("Error: {error}"))],
             },
             Some(error.to_string()),
-        ),
+        )),
     }
 }
 
@@ -109,32 +149,4 @@ fn wrap_value(value: serde_json::Value) -> ToolResultContent {
             ToolResultContent::Json(serde_json::json!({ "$value": array }))
         }
     }
-}
-
-/// Runs every tool-use block in an assistant message in source order, producing
-/// the user message of tool results. Ports the sequential executor's core:
-/// unknown tools become error results (via [`ToolResultBlock`]) rather than
-/// aborting the turn.
-pub async fn execute_tools(registry: &ToolRegistry, assistant_message: &Message) -> Message {
-    let mut result_blocks = Vec::new();
-    for block in &assistant_message.content {
-        let ContentBlock::ToolUse(tool_use) = block else {
-            continue;
-        };
-        match registry.resolve(&tool_use.name) {
-            Ok(tool) => result_blocks.push(execute_tool(tool.as_ref(), tool_use.clone()).await),
-            Err(error) => result_blocks.push(ToolResultBlock {
-                tool_use_id: tool_use.tool_use_id.clone(),
-                status: ToolResultStatus::Error,
-                content: vec![ToolResultContent::Text(format!("Error: {error}"))],
-            }),
-        }
-    }
-    Message::new(
-        crate::types::messages::Role::User,
-        result_blocks
-            .into_iter()
-            .map(ContentBlock::ToolResult)
-            .collect(),
-    )
 }

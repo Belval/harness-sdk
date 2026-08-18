@@ -4,14 +4,17 @@
 //! fields a callback may set to steer the loop. `Before*`/`After*` pairs bracket
 //! agent operations; `After*` events reverse callback order for cleanup
 //! semantics. The TypeScript `agent` back-reference is omitted (see the module
-//! docs), and streaming-update / interrupt events are deferred with their
-//! respective features.
+//! docs), and the streaming-update events are deferred with the streaming
+//! feature.
 
 use std::sync::Arc;
 
 use super::HookEvent;
 use crate::agent::{AgentResult, InvocationState};
+use crate::errors::StrandsError;
+use crate::interrupt::{interrupt_from_state, Interrupt, InterruptSource, InterruptState};
 use crate::tools::Tool;
+use crate::types::interrupt::InterruptParams;
 use crate::types::messages::{ContentBlock, Message, StopReason, ToolResultBlock};
 
 /// A hook-requested cancellation. Ports the `cancel: boolean | string` field:
@@ -184,6 +187,9 @@ pub struct ContentBlockEvent {
 impl HookEvent for ContentBlockEvent {}
 
 /// Fired before executing the tools from one model turn. Ports `BeforeToolsEvent`.
+///
+/// Implements the interrupt surface: a callback may call [`Self::interrupt`] to
+/// pause the agent for human input before any tool runs.
 #[derive(Debug)]
 pub struct BeforeToolsEvent {
     /// The assistant message containing the tool-use blocks.
@@ -193,8 +199,20 @@ pub struct BeforeToolsEvent {
     /// Set by a callback to cancel all tools in the batch. Each tool then yields
     /// the resolved [`HookCancel`] message (default: `"Tool cancelled by hook"`).
     pub cancel: Option<HookCancel>,
+    /// Interrupt state handle, backing [`Self::interrupt`].
+    pub(crate) interrupt_state: InterruptState,
 }
 impl HookEvent for BeforeToolsEvent {}
+
+impl BeforeToolsEvent {
+    /// Raises an interrupt for human-in-the-loop workflows. Returns the response
+    /// immediately when resuming; otherwise returns `Err(`[`StrandsError::Interrupt`]`)`
+    /// to halt the agent. Ports `BeforeToolsEvent.interrupt`.
+    pub fn interrupt(&self, params: InterruptParams) -> Result<serde_json::Value, StrandsError> {
+        let id = format!("hook:beforeTools:{}", params.name);
+        interrupt_from_state(&self.interrupt_state, id, params, InterruptSource::Hook)
+    }
+}
 
 /// Fired after all tools in a turn complete. Ports `AfterToolsEvent`. Uses
 /// reverse callback ordering.
@@ -233,8 +251,23 @@ pub struct BeforeToolCallEvent {
     /// re-resolving a renamed `tool_use`. If several callbacks set it, the last
     /// to run wins.
     pub selected_tool: Option<Arc<dyn Tool>>,
+    /// Interrupt state handle, backing [`Self::interrupt`].
+    pub(crate) interrupt_state: InterruptState,
 }
 impl HookEvent for BeforeToolCallEvent {}
+
+impl BeforeToolCallEvent {
+    /// Raises an interrupt for human-in-the-loop workflows. Returns the response
+    /// immediately when resuming; otherwise returns `Err(`[`StrandsError::Interrupt`]`)`
+    /// to halt the agent. Ports `BeforeToolCallEvent.interrupt`.
+    pub fn interrupt(&self, params: InterruptParams) -> Result<serde_json::Value, StrandsError> {
+        let id = format!(
+            "hook:beforeToolCall:{}:{}",
+            self.tool_use.tool_use_id, params.name
+        );
+        interrupt_from_state(&self.interrupt_state, id, params, InterruptSource::Hook)
+    }
+}
 
 impl std::fmt::Debug for BeforeToolCallEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -306,3 +339,15 @@ pub struct AgentResultEvent {
     pub invocation_state: InvocationState,
 }
 impl HookEvent for AgentResultEvent {}
+
+/// Fired once per unanswered interrupt when the agent stops to wait for human
+/// input. Ports `InterruptEvent`. The `interrupt.source` field discriminates
+/// tool-callback from hook-callback origins.
+#[derive(Debug)]
+pub struct InterruptEvent {
+    /// The interrupt the agent is waiting on.
+    pub interrupt: Interrupt,
+    /// Per-invocation shared state.
+    pub invocation_state: InvocationState,
+}
+impl HookEvent for InterruptEvent {}

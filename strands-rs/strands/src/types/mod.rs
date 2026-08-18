@@ -2,6 +2,7 @@
 //! streaming events. Ports the TypeScript SDK's `src/types/` and adjacent
 //! `tools/types.ts` / `models/streaming.ts` modules.
 
+pub mod interrupt;
 pub mod media;
 pub mod messages;
 pub mod streaming;

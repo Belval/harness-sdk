@@ -20,6 +20,7 @@
 pub mod agent;
 pub mod errors;
 pub mod hooks;
+pub mod interrupt;
 pub mod models;
 pub mod tools;
 pub mod types;
@@ -27,8 +28,10 @@ pub mod types;
 pub use agent::{Agent, AgentBuilder, AgentResult, InvocationState};
 pub use errors::StrandsError;
 pub use hooks::{HookCleanup, HookEvent, HookOrder, HookRegistry};
+pub use interrupt::{Interrupt, InterruptError, InterruptSource, InterruptState};
 pub use models::Model;
 pub use tools::{Tool, ToolContext};
+pub use types::interrupt::{InterruptParams, InterruptResponse, InterruptResponseContent};
 pub use types::messages::{ContentBlock, Message, Role, StopReason};
 pub use types::tools::{ToolChoice, ToolSpec};
 
