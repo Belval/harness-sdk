@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use super::HookEvent;
-use crate::agent::{AgentResult, InvocationState};
+use crate::agent::{AgentHandle, AgentResult, InvocationState};
 use crate::errors::StrandsError;
 use crate::interrupt::{interrupt_from_state, Interrupt, InterruptSource, InterruptState};
 use crate::tools::Tool;
@@ -87,8 +87,11 @@ pub struct ModelStopData {
 }
 
 /// Fired once after the agent has been fully constructed. Ports `InitializedEvent`.
-#[derive(Debug, Default)]
-pub struct InitializedEvent {}
+#[derive(Debug)]
+pub struct InitializedEvent {
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
+}
 impl HookEvent for InitializedEvent {}
 
 /// Fired at the beginning of a new agent request. Ports `BeforeInvocationEvent`.
@@ -96,6 +99,8 @@ impl HookEvent for InitializedEvent {}
 pub struct BeforeInvocationEvent {
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
     /// Set by a callback to cancel the invocation. The assistant response is the
     /// resolved [`HookCancel`] message (default: `"invocation denied by hook"`).
     pub cancel: Option<HookCancel>,
@@ -108,6 +113,8 @@ impl HookEvent for BeforeInvocationEvent {}
 pub struct AfterInvocationEvent {
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
     /// Set by a callback to re-enter the loop with new input after this event's
     /// callbacks complete. Ignored when the invocation ended with an error. If
     /// multiple callbacks set it, the last to run wins.
@@ -127,6 +134,8 @@ pub struct MessageAddedEvent {
     pub message: Message,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
 }
 impl HookEvent for MessageAddedEvent {}
 
@@ -135,6 +144,8 @@ impl HookEvent for MessageAddedEvent {}
 pub struct BeforeModelCallEvent {
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
     /// Set by a callback to skip the model call. The assistant response is the
     /// resolved [`HookCancel`] message (default: `"model call denied by hook"`).
     pub cancel: Option<HookCancel>,
@@ -147,6 +158,8 @@ impl HookEvent for BeforeModelCallEvent {}
 pub struct AfterModelCallEvent {
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
     /// 1-indexed count of model attempts for this turn, including the attempt
     /// that just completed or failed.
     pub attempt_count: u32,
@@ -172,6 +185,8 @@ pub struct ModelMessageEvent {
     pub stop_reason: StopReason,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
 }
 impl HookEvent for ModelMessageEvent {}
 
@@ -183,6 +198,8 @@ pub struct ContentBlockEvent {
     pub content_block: ContentBlock,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
 }
 impl HookEvent for ContentBlockEvent {}
 
@@ -196,6 +213,8 @@ pub struct BeforeToolsEvent {
     pub message: Message,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
     /// Set by a callback to cancel all tools in the batch. Each tool then yields
     /// the resolved [`HookCancel`] message (default: `"Tool cancelled by hook"`).
     pub cancel: Option<HookCancel>,
@@ -222,6 +241,8 @@ pub struct AfterToolsEvent {
     pub message: Message,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
     /// Set by a callback to halt the loop without another model call. The
     /// resolved [`HookEndTurn`] content becomes the final assistant message
     /// (default: `"Turn ended early by hook after tool execution"`).
@@ -244,6 +265,8 @@ pub struct BeforeToolCallEvent {
     pub tool: Option<Arc<dyn Tool>>,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
     /// Set by a callback to cancel this tool call. The tool yields the resolved
     /// [`HookCancel`] error message (default: `"Tool cancelled by hook"`).
     pub cancel: Option<HookCancel>,
@@ -299,6 +322,8 @@ pub struct AfterToolCallEvent {
     pub error: Option<String>,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
     /// Set by a callback to re-execute the tool.
     pub retry: bool,
 }
@@ -327,6 +352,8 @@ pub struct ToolResultEvent {
     pub result: ToolResultBlock,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
 }
 impl HookEvent for ToolResultEvent {}
 
@@ -337,6 +364,8 @@ pub struct AgentResultEvent {
     pub result: AgentResult,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
 }
 impl HookEvent for AgentResultEvent {}
 
@@ -349,5 +378,7 @@ pub struct InterruptEvent {
     pub interrupt: Interrupt,
     /// Per-invocation shared state.
     pub invocation_state: InvocationState,
+    /// The hook-facing agent handle: persisted state and other shared agent surfaces.
+    pub agent: AgentHandle,
 }
 impl HookEvent for InterruptEvent {}

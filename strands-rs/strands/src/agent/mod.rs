@@ -16,10 +16,12 @@
 mod builder;
 mod invocation;
 mod result;
+mod state;
 
 pub use builder::AgentBuilder;
 pub use invocation::InvocationState;
 pub use result::AgentResult;
+pub use state::{AgentHandle, AgentState};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,6 +88,7 @@ pub struct Agent {
     tool_registry: ToolRegistry,
     hooks: HookRegistry,
     interrupt_state: InterruptState,
+    state: AgentState,
     tracer: Tracer,
     invoke_model_mw: MiddlewareStack<InvokeModelContext, StreamAggregatedResult>,
     execute_tool_mw: MiddlewareStack<ExecuteToolContext, ToolExecutionResult>,
@@ -97,6 +100,7 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         model: Arc<dyn Model>,
         name: String,
@@ -104,6 +108,7 @@ impl Agent {
         messages: Vec<Message>,
         tool_registry: ToolRegistry,
         hooks: HookRegistry,
+        state: AgentState,
     ) -> Self {
         Agent {
             messages,
@@ -114,10 +119,22 @@ impl Agent {
             tool_registry,
             hooks,
             interrupt_state: InterruptState::new(),
+            state,
             tracer: Tracer::new(),
             invoke_model_mw: MiddlewareStack::new(),
             execute_tool_mw: MiddlewareStack::new(),
         }
+    }
+
+    /// The agent's persisted state, shared with hook callbacks via
+    /// [`AgentHandle`]. Ports `agent.state`.
+    pub fn state(&self) -> &AgentState {
+        &self.state
+    }
+
+    /// Builds the hook-facing handle passed to events fired this loop.
+    fn agent_handle(&self) -> AgentHandle {
+        AgentHandle::new(self.state.clone())
     }
 
     /// The middleware stack wrapping model invocations, for registering handlers.
@@ -229,6 +246,7 @@ impl Agent {
         loop {
             let mut before = BeforeInvocationEvent {
                 invocation_state: state.clone(),
+                agent: self.agent_handle(),
                 cancel: None,
             };
             hooks.invoke_callbacks(&mut before)?;
@@ -239,6 +257,7 @@ impl Agent {
                 self.append_message(message.clone(), &state)?;
                 let mut after = AfterInvocationEvent {
                     invocation_state: state.clone(),
+                    agent: self.agent_handle(),
                     resume: None,
                 };
                 hooks.invoke_callbacks(&mut after)?;
@@ -251,6 +270,7 @@ impl Agent {
             // error propagates or resume is honored.
             let mut after = AfterInvocationEvent {
                 invocation_state: state.clone(),
+                agent: self.agent_handle(),
                 resume: None,
             };
             hooks.invoke_callbacks(&mut after)?;
@@ -265,6 +285,7 @@ impl Agent {
             let mut agent_result = AgentResultEvent {
                 result: result.clone(),
                 invocation_state: state.clone(),
+                agent: self.agent_handle(),
             };
             hooks.invoke_callbacks(&mut agent_result)?;
 
@@ -432,6 +453,7 @@ impl Agent {
             let mut event = InterruptEvent {
                 interrupt: interrupt.clone(),
                 invocation_state: state.clone(),
+                agent: self.agent_handle(),
             };
             hooks.invoke_callbacks(&mut event)?;
         }
@@ -459,6 +481,7 @@ impl Agent {
         loop {
             let mut before = BeforeModelCallEvent {
                 invocation_state: state.clone(),
+                agent: self.agent_handle(),
                 cancel: None,
             };
             hooks.invoke_callbacks(&mut before)?;
@@ -468,6 +491,7 @@ impl Agent {
                     Message::assistant(cancel.message("model call denied by hook").to_string());
                 let mut after = AfterModelCallEvent {
                     invocation_state: state.clone(),
+                    agent: self.agent_handle(),
                     attempt_count,
                     stop_data: Some(ModelStopData {
                         message: message.clone(),
@@ -536,6 +560,7 @@ impl Agent {
                         let mut content_block = ContentBlockEvent {
                             content_block: block.clone(),
                             invocation_state: state.clone(),
+                            agent: self.agent_handle(),
                         };
                         hooks.invoke_callbacks(&mut content_block)?;
                     }
@@ -544,11 +569,13 @@ impl Agent {
                         message: result.message.clone(),
                         stop_reason: result.stop_reason.clone(),
                         invocation_state: state.clone(),
+                        agent: self.agent_handle(),
                     };
                     hooks.invoke_callbacks(&mut model_message)?;
 
                     let mut after = AfterModelCallEvent {
                         invocation_state: state.clone(),
+                        agent: self.agent_handle(),
                         attempt_count,
                         stop_data: Some(ModelStopData {
                             message: result.message.clone(),
@@ -567,6 +594,7 @@ impl Agent {
                 Err(error) => {
                     let mut after = AfterModelCallEvent {
                         invocation_state: state.clone(),
+                        agent: self.agent_handle(),
                         attempt_count,
                         stop_data: None,
                         error: Some(error.to_string()),
@@ -598,6 +626,7 @@ impl Agent {
         let mut before = BeforeToolsEvent {
             message: assistant_message.clone(),
             invocation_state: state.clone(),
+            agent: self.agent_handle(),
             cancel: None,
             interrupt_state: self.interrupt_state.clone(),
         };
@@ -633,6 +662,7 @@ impl Agent {
                 let mut event = ToolResultEvent {
                     result: result.clone(),
                     invocation_state: state.clone(),
+                    agent: self.agent_handle(),
                 };
                 hooks.invoke_callbacks(&mut event)?;
                 result_blocks.push(result);
@@ -652,6 +682,7 @@ impl Agent {
                         let mut event = ToolResultEvent {
                             result: result.clone(),
                             invocation_state: state.clone(),
+                            agent: self.agent_handle(),
                         };
                         hooks.invoke_callbacks(&mut event)?;
                         results_by_id.insert(tool_use.tool_use_id.clone(), result.clone());
@@ -681,6 +712,7 @@ impl Agent {
         let mut after = AfterToolsEvent {
             message: tool_result_message.clone(),
             invocation_state: state.clone(),
+            agent: self.agent_handle(),
             end_turn: None,
         };
         hooks.invoke_callbacks(&mut after)?;
@@ -714,6 +746,7 @@ impl Agent {
                 tool_use: tool_use.clone(),
                 tool: registry_tool.clone(),
                 invocation_state: state.clone(),
+                agent: self.agent_handle(),
                 cancel: None,
                 selected_tool: None,
                 interrupt_state: self.interrupt_state.clone(),
@@ -746,6 +779,7 @@ impl Agent {
                     result,
                     error: None,
                     invocation_state: state.clone(),
+                    agent: self.agent_handle(),
                     retry: false,
                 };
                 hooks.invoke_callbacks(&mut after)?;
@@ -831,6 +865,7 @@ impl Agent {
                 result,
                 error,
                 invocation_state: state.clone(),
+                agent: self.agent_handle(),
                 retry: false,
             };
             hooks.invoke_callbacks(&mut after)?;
@@ -855,6 +890,7 @@ impl Agent {
         let mut event = MessageAddedEvent {
             message,
             invocation_state: state.clone(),
+            agent: self.agent_handle(),
         };
         hooks.invoke_callbacks(&mut event)
     }

@@ -66,6 +66,7 @@ Following the monorepo's cross-SDK rules:
 | `agent/agent.ts` (`_stream` core) | `agent/mod.rs` |
 | `types/agent.ts` (`AgentResult`) | `agent/result.rs` |
 | `types/agent.ts` (`InvocationState`) | `agent/invocation.rs` |
+| `agent/state.ts` (`AgentState`) + `event.agent` | `agent/state.rs` (`AgentState`, `AgentHandle`) |
 | `hooks/registry.ts`, `hooks/types.ts` | `hooks/mod.rs` |
 | `hooks/events.ts` | `hooks/events.rs` |
 | `interrupt.ts` | `interrupt.rs` |
@@ -88,9 +89,11 @@ Following the monorepo's cross-SDK rules:
 - **Hook callbacks are synchronous.** The TS SDK awaits sync-or-async callbacks;
   the Rust slice takes `Fn(&mut E) -> Result<(), StrandsError>`. Async-callback
   ergonomics (borrowing the event across an `await`) are deferred.
-- **Hook events carry no `agent` back-reference.** The loop holds the agent as
-  `&mut self` while dispatching and cannot also lend it to callbacks, so events
-  expose only their data plus control fields. The agent-callback path is deferred.
+- **Hook events carry an `AgentHandle`, not a full `&Agent`.** The loop holds the
+  agent as `&mut self` while dispatching, so callbacks receive a handle over the
+  agent's shared, interior-mutable surfaces (currently the persisted
+  `AgentState`) rather than a borrow of the whole agent. The handle grows as more
+  surfaces (messages, metrics, conversation manager) are shared.
 - **Empty-string cancel / end-turn is not falsy.** TS treats `cancel = ""` /
   `endTurn = ""` as not-triggered (JS truthiness); Rust uses `Option`, so
   `Some(HookCancel::WithMessage("".into()))` genuinely cancels with an empty
