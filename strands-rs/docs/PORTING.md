@@ -18,7 +18,7 @@ translatable. It is the Rust counterpart to the construct-mapping guidance the
 | `class` error hierarchy (`ModelError` + subclasses) | one `#[non_exhaustive] enum StrandsError` (thiserror) | Rust models error hierarchies with variants; `instanceof` → `matches!`. `{ cause }` → `#[source]`. |
 | `class FunctionTool` (callback union) | `struct FunctionTool` holding a boxed async closure | The tool progress-streaming surface is not ported. |
 | `Map`-backed `ToolRegistry` | `struct` wrapping `Vec<(String, Arc<dyn Tool>)>` | `Vec` preserves insertion order like the JS `Map`. |
-| `tool()` factory (Zod schema) | `#[tool]` proc macro (signature-derived schema) | Schema derived from the fn signature at compile time rather than a runtime Zod schema. |
+| `tool()` factory (Zod schema) | `#[tool]` proc macro (signature-derived schema) | Schema derived from the fn signature at compile time rather than a runtime Zod schema. `#[tool(name = "…", description = "…")]` overrides the derived name/description. A tool can also be built at runtime from an explicit `ToolSpec` via `FunctionTool::from_spec`. |
 | `crypto.randomUUID()` | `uuid::Uuid::new_v4()` | |
 | `Uint8Array` field, base64 in `toJSON` | `Vec<u8>` with `#[serde(with = "base64_bytes")]` | Keeps the base64 wire form identical. |
 | `AbortSignal` cancellation | (not ported in the slice) | The TS loop's cancellation path is out of scope. |
@@ -68,6 +68,8 @@ Following the monorepo's cross-SDK rules:
 | `types/agent.ts` (`InvocationState`) | `agent/invocation.rs` |
 | `agent/state.ts` (`AgentState`) + `event.agent` | `agent/state.rs` (`AgentState`, `AgentHandle`, `Messages`) |
 | `agent/conversation-manager/` (`ConversationManager`) | `conversation_manager/mod.rs` |
+| `tools/tool-provider.ts` (`ToolProvider`) | `tools/tool_provider.rs` |
+| `tools/decorator.ts` runtime `DecoratedFunctionTool` / `FunctionToolMetadata` | `tools/function_tool.rs` (`FunctionTool::from_spec`) |
 | `tools/structured-output-tool.ts` + structured-output loop branch | `agent/mod.rs` (`structured_output_tool_spec`, loop) + `AgentResult::structured_output` |
 | `hooks/registry.ts`, `hooks/types.ts` | `hooks/mod.rs` |
 | `hooks/events.ts` | `hooks/events.rs` |

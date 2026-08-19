@@ -8,6 +8,7 @@
 
 pub mod function_tool;
 pub mod registry;
+pub mod tool_provider;
 
 use async_trait::async_trait;
 
@@ -19,6 +20,7 @@ use crate::types::tools::ToolSpec;
 
 pub use function_tool::FunctionTool;
 pub use registry::ToolRegistry;
+pub use tool_provider::ToolProvider;
 
 /// Context provided to a tool during execution. Ports `ToolContext`.
 ///

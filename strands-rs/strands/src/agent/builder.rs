@@ -8,7 +8,7 @@ use crate::conversation_manager::ConversationManager;
 use crate::errors::StrandsError;
 use crate::hooks::{HookEvent, HookFuture, HookProvider, HookRegistry, InitializedEvent};
 use crate::models::Model;
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::{Tool, ToolProvider, ToolRegistry};
 use crate::types::messages::{Message, SystemPrompt};
 
 /// Builder for constructing an [`Agent`].
@@ -19,6 +19,7 @@ pub struct AgentBuilder {
     system_prompt: Option<SystemPrompt>,
     messages: Vec<Message>,
     tool_registry: ToolRegistry,
+    tool_providers: Vec<Arc<dyn ToolProvider>>,
     hooks: HookRegistry,
     state: Option<AgentState>,
     conversation_manager: Option<Arc<dyn ConversationManager>>,
@@ -101,6 +102,13 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Registers a [`ToolProvider`] whose tools are loaded lazily at the start of
+    /// the first invocation.
+    pub fn tool_provider(mut self, provider: impl ToolProvider + 'static) -> Self {
+        self.tool_providers.push(Arc::new(provider));
+        self
+    }
+
     /// Registers a hook callback for event type `E`, fired at the default order.
     pub fn hook<E, F>(self, callback: F) -> Self
     where
@@ -163,6 +171,7 @@ impl AgentBuilder {
             self.system_prompt,
             self.messages,
             self.tool_registry,
+            self.tool_providers,
             self.hooks,
             self.state.unwrap_or_default(),
             self.conversation_manager,

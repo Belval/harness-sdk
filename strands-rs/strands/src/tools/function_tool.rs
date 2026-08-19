@@ -22,6 +22,7 @@ pub struct FunctionTool {
     name: String,
     description: String,
     input_schema: Option<serde_json::Value>,
+    output_schema: Option<serde_json::Value>,
     callback: ToolCallback,
 }
 
@@ -44,6 +45,27 @@ impl FunctionTool {
             name: name.into(),
             description: description.into(),
             input_schema,
+            output_schema: None,
+            callback: Box::new(move |context| Box::pin(callback(context))),
+        }
+    }
+
+    /// Creates a tool at runtime from a full [`ToolSpec`] and an async callback.
+    ///
+    /// The runtime counterpart to the compile-time `#[tool]` macro (which derives
+    /// a spec from a function signature): here the caller supplies the spec
+    /// explicitly. Ports the TypeScript `DecoratedFunctionTool(name, spec, callable, …)`
+    /// runtime constructor.
+    pub fn from_spec<F, Fut>(spec: ToolSpec, callback: F) -> Self
+    where
+        F: Fn(ToolContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, StrandsError>> + Send + 'static,
+    {
+        FunctionTool {
+            name: spec.name,
+            description: spec.description,
+            input_schema: spec.input_schema,
+            output_schema: spec.output_schema,
             callback: Box::new(move |context| Box::pin(callback(context))),
         }
     }
@@ -67,7 +89,7 @@ impl Tool for FunctionTool {
             name: self.name.clone(),
             description: self.description.clone(),
             input_schema: Some(input_schema),
-            output_schema: None,
+            output_schema: self.output_schema.clone(),
         }
     }
 

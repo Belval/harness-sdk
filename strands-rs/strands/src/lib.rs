@@ -41,7 +41,7 @@ pub use middleware::{
 };
 pub use models::{CacheStrategy, Model};
 pub use telemetry::Tracer;
-pub use tools::{Tool, ToolContext};
+pub use tools::{Tool, ToolContext, ToolProvider};
 pub use types::interrupt::{InterruptParams, InterruptResponse, InterruptResponseContent};
 pub use types::messages::{
     CachePointBlock, ContentBlock, Message, Role, StopReason, SystemContentBlock, SystemPrompt,

@@ -41,7 +41,7 @@ use crate::middleware::{
 };
 use crate::models::{Model, StreamAggregatedResult, StreamOptions};
 use crate::telemetry::Tracer;
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::{Tool, ToolProvider, ToolRegistry};
 use crate::types::interrupt::InterruptResponse;
 use crate::types::messages::{
     ContentBlock, Message, Role, StopReason, SystemPrompt, ToolResultBlock, ToolResultContent,
@@ -98,6 +98,8 @@ pub struct Agent {
     pub id: String,
     model: Arc<dyn Model>,
     tool_registry: ToolRegistry,
+    tool_providers: Vec<Arc<dyn ToolProvider>>,
+    providers_loaded: bool,
     hooks: HookRegistry,
     interrupt_state: InterruptState,
     state: AgentState,
@@ -121,6 +123,7 @@ impl Agent {
         system_prompt: Option<SystemPrompt>,
         messages: Vec<Message>,
         tool_registry: ToolRegistry,
+        tool_providers: Vec<Arc<dyn ToolProvider>>,
         hooks: HookRegistry,
         state: AgentState,
         conversation_manager: Option<Arc<dyn ConversationManager>>,
@@ -133,6 +136,8 @@ impl Agent {
             id: crate::types::messages::generate_tracking_id(),
             model,
             tool_registry,
+            tool_providers,
+            providers_loaded: false,
             hooks,
             interrupt_state: InterruptState::new(),
             state,
@@ -336,6 +341,22 @@ impl Agent {
         &self.interrupt_state
     }
 
+    /// Loads tools from the configured [`ToolProvider`]s into the registry, once,
+    /// at the start of the first invocation. Ports the lazy `load_tools` behavior.
+    async fn load_tool_providers(&mut self) -> Result<(), StrandsError> {
+        if self.providers_loaded {
+            return Ok(());
+        }
+        let providers = self.tool_providers.clone();
+        for provider in &providers {
+            for tool in provider.load_tools().await? {
+                self.tool_registry.add(tool)?;
+            }
+        }
+        self.providers_loaded = true;
+        Ok(())
+    }
+
     /// The resume loop: brackets each pass with [`BeforeInvocationEvent`] /
     /// [`AfterInvocationEvent`] and re-enters when a hook sets `resume`. Ports
     /// the `while (true)` resume loop in `stream()`.
@@ -344,6 +365,8 @@ impl Agent {
         mut new_input: Option<Message>,
         state: InvocationState,
     ) -> Result<AgentResult, StrandsError> {
+        self.load_tool_providers().await?;
+
         let hooks = self.hooks.clone();
         loop {
             let mut before = BeforeInvocationEvent {
