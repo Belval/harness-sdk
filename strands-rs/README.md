@@ -90,7 +90,9 @@ be supplied at runtime through a `ToolProvider` (built with `FunctionTool::from_
 loaded lazily at invocation start.
 
 A minimal `SessionManager` (`sync_agent`) and a `ToolProvider` with runtime tool
-construction are also available.
+construction are also available, and the per-turn tool phase runs through a
+swappable `ToolExecutor` (`AgentBuilder::tool_executor`; default
+`SequentialToolExecutor`).
 
 **Not yet ported** (present in the TypeScript SDK): checkpointing, full session
 persistence, memory, tool progress-streaming, guardrails, citations, the

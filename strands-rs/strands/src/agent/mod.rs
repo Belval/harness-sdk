@@ -42,6 +42,9 @@ use crate::middleware::{
 use crate::models::{Model, StreamAggregatedResult, StreamOptions};
 use crate::session::SessionManager;
 use crate::telemetry::Tracer;
+use crate::tools::executor::{
+    SequentialToolExecutor, ToolExecutionContext, ToolExecutor, ToolsExecutionResult,
+};
 use crate::tools::{Tool, ToolProvider, ToolRegistry};
 use crate::types::interrupt::InterruptResponse;
 use crate::types::messages::{
@@ -74,14 +77,6 @@ enum CycleOutcome {
     Continue,
 }
 
-/// The outcome of running the tools for one model turn.
-struct ToolsExecutionResult {
-    /// The user message carrying every tool result.
-    message: Message,
-    /// Set when a hook requested the turn end early after tools.
-    end_turn: Option<HookEndTurn>,
-}
-
 /// A model-driven agent.
 ///
 /// Drives the loop: send the conversation to the model, and while the model
@@ -110,6 +105,7 @@ pub struct Agent {
     tracer: Tracer,
     invoke_model_mw: MiddlewareStack<InvokeModelContext, StreamAggregatedResult>,
     execute_tool_mw: MiddlewareStack<ExecuteToolContext, ToolExecutionResult>,
+    tool_executor: Arc<dyn ToolExecutor>,
 }
 
 impl Agent {
@@ -131,6 +127,7 @@ impl Agent {
         conversation_manager: Option<Arc<dyn ConversationManager>>,
         session_manager: Option<Arc<dyn SessionManager>>,
         structured_output_schema: Option<serde_json::Value>,
+        tool_executor: Arc<dyn ToolExecutor>,
     ) -> Self {
         Agent {
             messages: Messages::new(messages),
@@ -150,6 +147,7 @@ impl Agent {
             tracer: Tracer::new(),
             invoke_model_mw: MiddlewareStack::new(),
             execute_tool_mw: MiddlewareStack::new(),
+            tool_executor,
         }
     }
 
@@ -831,272 +829,25 @@ impl Agent {
         }
     }
 
-    /// Runs every tool in the assistant message, firing [`BeforeToolsEvent`],
-    /// per-tool events, [`ToolResultEvent`], and [`AfterToolsEvent`]. Ports
-    /// `executeTools` and the sequential executor's core.
+    /// Runs the tools for one turn via the configured [`ToolExecutor`], building
+    /// the execution context from the agent's shared handles.
     async fn execute_tools(
         &self,
         assistant_message: &Message,
         state: &InvocationState,
         completed: Option<HashMap<String, ToolResultBlock>>,
     ) -> Result<ToolsExecutionResult, StrandsError> {
-        let hooks = self.hooks.clone();
-        let completed = completed.unwrap_or_default();
-
-        let mut before = BeforeToolsEvent {
-            message: assistant_message.clone(),
-            invocation_state: state.clone(),
-            agent: self.agent_handle(),
-            cancel: None,
+        let ctx = ToolExecutionContext {
+            hooks: self.hooks.clone(),
+            tool_registry: self.tool_registry.clone(),
             interrupt_state: self.interrupt_state.clone(),
-        };
-        // A BeforeTools hook interrupt stores pending state with no completed
-        // results before propagating, so the whole batch replays on resume.
-        if let Err(error) = hooks.invoke_callbacks(&mut before).await {
-            if matches!(error, StrandsError::Interrupt(_)) {
-                self.interrupt_state
-                    .set_pending_tool_execution(PendingToolExecution {
-                        assistant_message: assistant_message.clone(),
-                        completed_tool_results: completed,
-                    });
-            }
-            return Err(error);
-        }
-
-        let tool_uses: Vec<ToolUseBlock> = assistant_message
-            .content
-            .iter()
-            .filter_map(ContentBlock::as_tool_use)
-            .cloned()
-            .collect();
-
-        let mut result_blocks: Vec<ToolResultBlock> = Vec::new();
-        // Accumulates results as they complete, keyed by model-issued id, so an
-        // interrupt mid-batch can store what finished for a clean resume.
-        let mut results_by_id: HashMap<String, ToolResultBlock> = completed.clone();
-
-        if let Some(cancel) = &before.cancel {
-            let message = cancel.message("Tool cancelled by hook").to_string();
-            for tool_use in &tool_uses {
-                let result = error_result(&tool_use.tool_use_id, &message);
-                let mut event = ToolResultEvent {
-                    result: result.clone(),
-                    invocation_state: state.clone(),
-                    agent: self.agent_handle(),
-                };
-                hooks.invoke_callbacks(&mut event).await?;
-                result_blocks.push(result);
-            }
-        } else {
-            for tool_use in &tool_uses {
-                // On resume, a tool that already completed is restored without
-                // replaying its lifecycle events. Ports the sequential executor's
-                // completed-result skip.
-                if let Some(done) = completed.get(&tool_use.tool_use_id) {
-                    result_blocks.push(done.clone());
-                    continue;
-                }
-
-                match self.execute_single_tool(tool_use, state).await {
-                    Ok(result) => {
-                        let mut event = ToolResultEvent {
-                            result: result.clone(),
-                            invocation_state: state.clone(),
-                            agent: self.agent_handle(),
-                        };
-                        hooks.invoke_callbacks(&mut event).await?;
-                        results_by_id.insert(tool_use.tool_use_id.clone(), result.clone());
-                        result_blocks.push(result);
-                    }
-                    Err(error) if matches!(error, StrandsError::Interrupt(_)) => {
-                        self.interrupt_state
-                            .set_pending_tool_execution(PendingToolExecution {
-                                assistant_message: assistant_message.clone(),
-                                completed_tool_results: results_by_id,
-                            });
-                        return Err(error);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-
-        let tool_result_message = Message::new(
-            Role::User,
-            result_blocks
-                .into_iter()
-                .map(ContentBlock::ToolResult)
-                .collect(),
-        );
-
-        let mut after = AfterToolsEvent {
-            message: tool_result_message.clone(),
-            invocation_state: state.clone(),
+            tool_middleware: self.execute_tool_mw.clone(),
+            tracer: self.tracer.clone(),
             agent: self.agent_handle(),
-            end_turn: None,
         };
-        hooks.invoke_callbacks(&mut after).await?;
-
-        Ok(ToolsExecutionResult {
-            message: tool_result_message,
-            end_turn: after.end_turn,
-        })
-    }
-
-    /// Runs one tool with its [`BeforeToolCallEvent`] / [`AfterToolCallEvent`]
-    /// bracket, honoring `cancel`, `selected_tool`, `tool_use` mutation, and
-    /// `retry`. Ports the per-tool `executeTool` loop.
-    async fn execute_single_tool(
-        &self,
-        tool_use_block: &ToolUseBlock,
-        state: &InvocationState,
-    ) -> Result<ToolResultBlock, StrandsError> {
-        let hooks = self.hooks.clone();
-        let original_name = tool_use_block.name.clone();
-        let registry_tool = self.tool_registry.resolve(&original_name).ok().cloned();
-
-        let mut tool_use = ToolUseData {
-            name: tool_use_block.name.clone(),
-            tool_use_id: tool_use_block.tool_use_id.clone(),
-            input: tool_use_block.input.clone(),
-        };
-
-        loop {
-            let mut before = BeforeToolCallEvent {
-                tool_use: tool_use.clone(),
-                tool: registry_tool.clone(),
-                invocation_state: state.clone(),
-                agent: self.agent_handle(),
-                cancel: None,
-                selected_tool: None,
-                interrupt_state: self.interrupt_state.clone(),
-            };
-            hooks.invoke_callbacks(&mut before).await?;
-
-            // Adopt the (possibly mutated) tool_use but keep the model-issued id.
-            tool_use = ToolUseData {
-                tool_use_id: tool_use_block.tool_use_id.clone(),
-                ..before.tool_use
-            };
-
-            // selected_tool wins; otherwise re-resolve a renamed tool, else keep
-            // the original registry match — resolved before cancel so
-            // AfterToolCallEvent reports the same effective tool on every path.
-            let effective_tool = before.selected_tool.clone().or_else(|| {
-                if tool_use.name != original_name {
-                    self.tool_registry.resolve(&tool_use.name).ok().cloned()
-                } else {
-                    registry_tool.clone()
-                }
-            });
-
-            if let Some(cancel) = &before.cancel {
-                let message = cancel.message("Tool cancelled by hook").to_string();
-                let result = error_result(&tool_use.tool_use_id, &message);
-                let mut after = AfterToolCallEvent {
-                    tool_use: tool_use.clone(),
-                    tool: effective_tool.clone(),
-                    result,
-                    error: None,
-                    invocation_state: state.clone(),
-                    agent: self.agent_handle(),
-                    retry: false,
-                };
-                hooks.invoke_callbacks(&mut after).await?;
-                if after.retry {
-                    continue;
-                }
-                return Ok(normalize_tool_result_id(
-                    after.result,
-                    &tool_use_block.tool_use_id,
-                ));
-            }
-
-            // Tool execution runs through the ExecuteToolStage middleware; the
-            // terminal performs the actual call and owns the tool span. Ports
-            // `_executeToolWithMiddleware`.
-            let context = ExecuteToolContext {
-                tool: effective_tool.clone(),
-                tool_use: tool_use.clone(),
-                invocation_state: state.clone(),
-            };
-            let tracer = self.tracer.clone();
-            let interrupt_state = self.interrupt_state.clone();
-            let original_id = tool_use_block.tool_use_id.clone();
-            let terminal = move |context: ExecuteToolContext| {
-                let tracer = tracer.clone();
-                let interrupt_state = interrupt_state.clone();
-                let original_id = original_id.clone();
-                async move {
-                    let tool_span = tracer
-                        .start_tool_span(&context.tool_use.name, &context.tool_use.tool_use_id);
-                    let (result, error) = match &context.tool {
-                        Some(tool) => {
-                            let block = ToolUseBlock {
-                                name: context.tool_use.name.clone(),
-                                tool_use_id: context.tool_use.tool_use_id.clone(),
-                                input: context.tool_use.input.clone(),
-                                reasoning_signature: None,
-                            };
-                            // An interrupt raised inside the tool propagates as
-                            // `Err`; an ordinary failure becomes an error result.
-                            match crate::tools::execute_tool_reporting_error(
-                                tool.as_ref(),
-                                block,
-                                interrupt_state,
-                            )
-                            .await
-                            {
-                                Ok(pair) => pair,
-                                Err(error) => {
-                                    tracer.end_tool_span(
-                                        &tool_span,
-                                        "error",
-                                        Some(&error.to_string()),
-                                    );
-                                    return Err(error);
-                                }
-                            }
-                        }
-                        None => {
-                            let message = format!("Tool '{}' not found", context.tool_use.name);
-                            (
-                                error_result(&context.tool_use.tool_use_id, &message),
-                                Some(message),
-                            )
-                        }
-                    };
-                    let status = match result.status {
-                        ToolResultStatus::Success => "success",
-                        ToolResultStatus::Error => "error",
-                    };
-                    tracer.end_tool_span(&tool_span, status, error.as_deref());
-                    let result = normalize_tool_result_id(result, &original_id);
-                    Ok(ToolExecutionResult { result, error })
-                }
-            };
-
-            let execution = self.execute_tool_mw.invoke(context, terminal).await?;
-            let (result, error) = (execution.result, execution.error);
-
-            let mut after = AfterToolCallEvent {
-                tool_use: tool_use.clone(),
-                tool: effective_tool.clone(),
-                result,
-                error,
-                invocation_state: state.clone(),
-                agent: self.agent_handle(),
-                retry: false,
-            };
-            hooks.invoke_callbacks(&mut after).await?;
-            if after.retry {
-                continue;
-            }
-            return Ok(normalize_tool_result_id(
-                after.result,
-                &tool_use_block.tool_use_id,
-            ));
-        }
+        self.tool_executor
+            .execute_tools(&ctx, assistant_message, state, completed)
+            .await
     }
 
     /// Pushes `message` into history and fires [`MessageAddedEvent`].
@@ -1154,27 +905,4 @@ fn structured_tool_use_id(message: &Message) -> Option<String> {
         }
         _ => None,
     })
-}
-
-/// Builds an error tool-result block carrying `message` as its text.
-fn error_result(tool_use_id: &str, message: &str) -> ToolResultBlock {
-    ToolResultBlock {
-        tool_use_id: tool_use_id.to_string(),
-        status: ToolResultStatus::Error,
-        content: vec![ToolResultContent::Text(message.to_string())],
-    }
-}
-
-/// Ensures a tool result carries the model-issued `tool_use_id`, so resume and
-/// provider correlation match the assistant's tool-use blocks. Ports
-/// `_normalizeToolResultId`.
-fn normalize_tool_result_id(result: ToolResultBlock, tool_use_id: &str) -> ToolResultBlock {
-    if result.tool_use_id == tool_use_id {
-        return result;
-    }
-    ToolResultBlock {
-        tool_use_id: tool_use_id.to_string(),
-        status: result.status,
-        content: result.content,
-    }
 }

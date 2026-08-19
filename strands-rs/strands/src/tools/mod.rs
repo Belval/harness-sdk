@@ -6,6 +6,7 @@
 //! reduced here to a single async result: the vertical slice does not port the
 //! tool progress-streaming surface.
 
+pub mod executor;
 pub mod function_tool;
 pub mod registry;
 pub mod tool_provider;
@@ -18,6 +19,9 @@ use crate::types::interrupt::InterruptParams;
 use crate::types::messages::{ToolResultBlock, ToolResultContent, ToolResultStatus, ToolUseBlock};
 use crate::types::tools::ToolSpec;
 
+pub use executor::{
+    SequentialToolExecutor, ToolExecutionContext, ToolExecutor, ToolsExecutionResult,
+};
 pub use function_tool::FunctionTool;
 pub use registry::ToolRegistry;
 pub use tool_provider::ToolProvider;
