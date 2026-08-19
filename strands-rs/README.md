@@ -84,8 +84,10 @@ handlers wrapping the model-invoke and tool-execute stages).
 
 Agent-scoped `AgentState` and a shared conversation-history handle are exposed
 to hooks via `event.agent`, a `ConversationManager` reduces context on overflow,
-and **structured output** (`AgentBuilder::structured_output_schema` →
-`AgentResult::structured_output`) is captured via a synthetic tool.
+**structured output** (`AgentBuilder::structured_output_schema` →
+`AgentResult::structured_output`) is captured via a synthetic tool, and tools can
+be supplied at runtime through a `ToolProvider` (built with `FunctionTool::from_spec`)
+loaded lazily at invocation start.
 
 **Not yet ported** (present in the TypeScript SDK): checkpointing, sessions,
 memory, tool progress-streaming, guardrails, citations, the

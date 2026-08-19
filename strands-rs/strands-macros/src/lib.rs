@@ -7,7 +7,11 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Attribute, FnArg, ItemFn, Pat, Type};
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
+use syn::{
+    parse_macro_input, Attribute, Expr, FnArg, ItemFn, Lit, MetaNameValue, Pat, Token, Type,
+};
 
 /// Transforms an `async fn` into a Strands agent [`Tool`](strands_agents::Tool).
 ///
@@ -29,14 +33,23 @@ use syn::{parse_macro_input, Attribute, FnArg, ItemFn, Pat, Type};
 /// // Register with: .tool(GetWeatherTool::new())
 /// ```
 #[proc_macro_attribute]
-pub fn tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input_fn = parse_macro_input!(item as ItemFn);
 
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
     let struct_name = format_ident!("{}Tool", to_pascal_case(&fn_name_str));
     let is_async = input_fn.sig.asyncness.is_some();
-    let description = extract_doc_comment(&input_fn.attrs);
+    let doc_description = extract_doc_comment(&input_fn.attrs);
+
+    // Optional `#[tool(name = "…", description = "…")]` overrides. The tool name
+    // defaults to the function identifier and the description to the doc comment.
+    let (name_override, description_override) = match parse_tool_attrs(attr) {
+        Ok(overrides) => overrides,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let tool_name = name_override.unwrap_or_else(|| fn_name_str.clone());
+    let description = description_override.unwrap_or(doc_description);
 
     // Collect (name, type-string, is_option) for each real parameter, skipping
     // the framework-context parameter names the caller may include.
@@ -133,7 +146,7 @@ pub fn tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[::strands_agents::reexport::async_trait]
         impl ::strands_agents::Tool for #struct_name {
             fn name(&self) -> &str {
-                #fn_name_str
+                #tool_name
             }
 
             fn description(&self) -> &str {
@@ -145,7 +158,7 @@ pub fn tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 #(#property_inserts)*
                 let required: Vec<String> = vec![#(#required.to_string()),*];
                 ::strands_agents::ToolSpec {
-                    name: #fn_name_str.to_string(),
+                    name: #tool_name.to_string(),
                     description: #description.to_string(),
                     input_schema: Some(::serde_json::json!({
                         "type": "object",
@@ -170,6 +183,38 @@ pub fn tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Parses the `#[tool(...)]` attribute arguments, returning optional `name` and
+/// `description` string overrides. Accepts `name = "…"` and `description = "…"`
+/// in any order; rejects unknown keys and non-string values.
+fn parse_tool_attrs(attr: TokenStream) -> syn::Result<(Option<String>, Option<String>)> {
+    let mut name = None;
+    let mut description = None;
+    if attr.is_empty() {
+        return Ok((name, description));
+    }
+    let metas = Punctuated::<MetaNameValue, Token![,]>::parse_terminated.parse(attr)?;
+    for meta in metas {
+        let value = match &meta.value {
+            Expr::Lit(expr_lit) => match &expr_lit.lit {
+                Lit::Str(lit_str) => lit_str.value(),
+                other => return Err(syn::Error::new_spanned(other, "expected a string literal")),
+            },
+            other => return Err(syn::Error::new_spanned(other, "expected a string literal")),
+        };
+        if meta.path.is_ident("name") {
+            name = Some(value);
+        } else if meta.path.is_ident("description") {
+            description = Some(value);
+        } else {
+            return Err(syn::Error::new_spanned(
+                &meta.path,
+                "unsupported `#[tool]` argument; expected `name` or `description`",
+            ));
+        }
+    }
+    Ok((name, description))
 }
 
 // Parameters are deserialized from an owned `serde_json::Value`, so only owned
