@@ -60,6 +60,7 @@ mod tests {
             None,
             serde_json::Map::new(),
             None,
+            None,
         );
         manager.sync_agent(&handle).await.unwrap();
         assert_eq!(syncs.load(Ordering::SeqCst), 1);

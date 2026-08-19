@@ -188,6 +188,7 @@ impl Agent {
             self.messages.clone(),
             self.model.model_id().map(str::to_string),
             self.model.get_config(),
+            self.conversation_manager.clone(),
             self.session_manager.clone(),
         )
     }

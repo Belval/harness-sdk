@@ -9,12 +9,12 @@
 //!
 //! # Deviations from the TypeScript/Python port
 //!
-//! - **`apply_management` is not yet driven from hooks.** In Python a
-//!   `ContextManager` hook calls `agent.conversation_manager.apply_management`;
-//!   strands-rs hook callbacks are synchronous and cannot await, so proactive
-//!   management is exposed on the agent/handle but its loop/hook trigger lands
-//!   with async hooks. The reactive `reduce_context` path is loop-driven and
-//!   fully integrated.
+//! - **`apply_management` is not driven from the loop itself.** The manager is
+//!   exposed on the agent and the hook handle
+//!   ([`AgentHandle::conversation_manager`]), so an async `BeforeModelCall` hook
+//!   can call [`ConversationManager::apply_management`] and await it, as the
+//!   Python `ContextManager` hook does. The reactive `reduce_context` path is
+//!   loop-driven and fully integrated.
 
 use async_trait::async_trait;
 
@@ -88,6 +88,7 @@ mod tests {
             Messages::default(),
             None,
             serde_json::Map::new(),
+            None,
             None,
         )
     }

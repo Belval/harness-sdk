@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::conversation_manager::ConversationManager;
 use crate::session::SessionManager;
 use crate::types::messages::Message;
 
@@ -167,15 +168,16 @@ impl std::fmt::Debug for Messages {
 ///
 /// Hook callbacks receive this on every lifecycle event to read and mutate
 /// agent-scoped surfaces: the persisted [`AgentState`], the conversation
-/// [`Messages`], the model id, and the [`SessionManager`]. It is the seam
-/// through which further shared agent surfaces (metrics, conversation manager)
-/// are exposed as they are ported.
+/// [`Messages`], the model id, the [`ConversationManager`], and the
+/// [`SessionManager`]. It is the seam through which further shared agent surfaces
+/// (metrics) are exposed as they are ported.
 #[derive(Clone)]
 pub struct AgentHandle {
     state: AgentState,
     messages: Messages,
     model_id: Option<String>,
     model_config: serde_json::Map<String, serde_json::Value>,
+    conversation_manager: Option<Arc<dyn ConversationManager>>,
     session_manager: Option<Arc<dyn SessionManager>>,
 }
 
@@ -185,6 +187,7 @@ impl AgentHandle {
         messages: Messages,
         model_id: Option<String>,
         model_config: serde_json::Map<String, serde_json::Value>,
+        conversation_manager: Option<Arc<dyn ConversationManager>>,
         session_manager: Option<Arc<dyn SessionManager>>,
     ) -> Self {
         AgentHandle {
@@ -192,6 +195,7 @@ impl AgentHandle {
             messages,
             model_id,
             model_config,
+            conversation_manager,
             session_manager,
         }
     }
@@ -216,6 +220,13 @@ impl AgentHandle {
         &self.model_config
     }
 
+    /// The conversation manager, if one is configured. Ports
+    /// `agent.conversation_manager`, so an async hook can call
+    /// [`ConversationManager::apply_management`] to trim or summarize history.
+    pub fn conversation_manager(&self) -> Option<&Arc<dyn ConversationManager>> {
+        self.conversation_manager.as_ref()
+    }
+
     /// The session manager, if one is configured. Ports `agent._session_manager`,
     /// so an async hook can persist after changing the conversation.
     pub fn session_manager(&self) -> Option<&Arc<dyn SessionManager>> {
@@ -229,6 +240,10 @@ impl std::fmt::Debug for AgentHandle {
             .field("state", &self.state)
             .field("messages", &self.messages)
             .field("model_id", &self.model_id)
+            .field(
+                "has_conversation_manager",
+                &self.conversation_manager.is_some(),
+            )
             .field("has_session_manager", &self.session_manager.is_some())
             .finish()
     }
@@ -276,6 +291,7 @@ mod tests {
             messages.clone(),
             Some("m-1".to_string()),
             model_config,
+            None,
             None,
         );
 

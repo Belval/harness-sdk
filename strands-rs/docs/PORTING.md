@@ -102,10 +102,11 @@ Following the monorepo's cross-SDK rules:
 - **Hook events carry an `AgentHandle`, not a full `&Agent`.** The loop holds the
   agent as `&mut self` while dispatching, so callbacks receive a handle over the
   agent's shared, interior-mutable surfaces — the persisted `AgentState`, the
-  conversation `Messages` (read + rewrite), and the model id — rather than a
-  borrow of the whole agent. The handle grows as more surfaces (metrics,
-  conversation manager) are shared. The agent's `messages` is a shared `Messages`
-  handle; read a snapshot via `Agent::messages()`.
+  conversation `Messages` (read + rewrite), the model id/config, the
+  `SessionManager`, and the `ConversationManager` — rather than a borrow of the
+  whole agent. The handle grows as more surfaces (metrics) are shared. The
+  agent's `messages` is a shared `Messages` handle; read a snapshot via
+  `Agent::messages()`.
 - **Empty-string cancel / end-turn is not falsy.** TS treats `cancel = ""` /
   `endTurn = ""` as not-triggered (JS truthiness); Rust uses `Option`, so
   `Some(HookCancel::WithMessage("".into()))` genuinely cancels with an empty
@@ -161,9 +162,10 @@ Following the monorepo's cross-SDK rules:
 - **`ConversationManager` reduces reactively.** The loop calls `reduce_context`
   (async) on a model `ContextWindowOverflow` and retries (bounded by
   `MAX_CONTEXT_REDUCTIONS`). Proactive `apply_management` is on the trait and the
-  agent exposes the manager; with async hook callbacks now available, a
-  `BeforeModelCall` hook can call it and await, as the Python `ContextManager`
-  does.
+  manager is exposed on both the agent and the hook handle
+  (`event.agent.conversation_manager()`), so a `BeforeModelCall` hook can call it
+  and await, as the Python `ContextManager` does. The loop does not yet drive
+  `apply_management` itself.
 - **`HookProvider` registers one typed callback per event.** The trait's
   `register_hooks(&self, &HookRegistry)` bundles registrations (via
   `add_callback` / `add_callback_async`) as a unit, matching Python. The Python

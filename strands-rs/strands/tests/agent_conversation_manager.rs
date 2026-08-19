@@ -12,6 +12,7 @@ use futures::stream;
 
 use strands_agents::agent::AgentHandle;
 use strands_agents::conversation_manager::ConversationManager;
+use strands_agents::hooks::BeforeModelCallEvent;
 use strands_agents::models::{Model, ModelEventStream, StreamOptions};
 use strands_agents::types::messages::Role;
 use strands_agents::types::streaming::{ContentBlockDelta, ModelStreamEvent};
@@ -121,4 +122,97 @@ async fn overflow_propagates_without_manager() {
 
     let error = agent.invoke("hi").await.unwrap_err();
     assert!(matches!(error, StrandsError::ContextWindowOverflow(_)));
+}
+
+/// A model that always returns a short text turn.
+struct TextModel;
+
+#[async_trait]
+impl Model for TextModel {
+    fn model_id(&self) -> Option<&str> {
+        Some("text-model")
+    }
+    fn stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _options: &'a StreamOptions,
+    ) -> ModelEventStream<'a> {
+        let events = vec![
+            ModelStreamEvent::MessageStart {
+                role: Role::Assistant,
+            },
+            ModelStreamEvent::ContentBlockStart { start: None },
+            ModelStreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::Text("ok".to_string()),
+            },
+            ModelStreamEvent::ContentBlockStop,
+            ModelStreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+            },
+        ];
+        Box::pin(stream::iter(events.into_iter().map(Ok)))
+    }
+}
+
+/// Records how many messages the agent had at each `apply_management` call.
+struct RecordingManager {
+    applied: Arc<AtomicUsize>,
+    seen_lengths: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+#[async_trait]
+impl ConversationManager for RecordingManager {
+    async fn apply_management(
+        &self,
+        agent: &AgentHandle,
+        _current_tokens: Option<u64>,
+        _invocation_state: &InvocationState,
+    ) -> Result<(), StrandsError> {
+        self.applied.fetch_add(1, Ordering::SeqCst);
+        self.seen_lengths
+            .lock()
+            .unwrap()
+            .push(agent.messages().len());
+        Ok(())
+    }
+    async fn reduce_context(
+        &self,
+        _agent: &AgentHandle,
+        _error: Option<&str>,
+    ) -> Result<(), StrandsError> {
+        Ok(())
+    }
+}
+
+// An async BeforeModelCall hook reaches the conversation manager via event.agent
+// and calls apply_management, which observes the current conversation.
+#[tokio::test]
+async fn async_hook_applies_management_via_conversation_manager() {
+    let applied = Arc::new(AtomicUsize::new(0));
+    let seen_lengths = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let mut agent = Agent::builder()
+        .model_boxed(Box::new(TextModel))
+        .conversation_manager(RecordingManager {
+            applied: applied.clone(),
+            seen_lengths: seen_lengths.clone(),
+        })
+        .hook_async::<BeforeModelCallEvent, _>(|event| {
+            Box::pin(async move {
+                if let Some(manager) = event.agent.conversation_manager() {
+                    let state = InvocationState::new();
+                    manager.apply_management(&event.agent, None, &state).await?;
+                }
+                Ok(())
+            })
+        })
+        .build();
+
+    agent.invoke("hi").await.unwrap();
+
+    // Applied once, and it saw the user message already in history at model-call time.
+    assert_eq!(applied.load(Ordering::SeqCst), 1);
+    assert_eq!(*seen_lengths.lock().unwrap(), vec![1]);
+    // The manager is also reachable directly off the agent.
+    assert!(agent.conversation_manager().is_some());
 }
