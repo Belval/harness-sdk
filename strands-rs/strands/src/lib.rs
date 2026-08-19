@@ -24,6 +24,7 @@ pub mod hooks;
 pub mod interrupt;
 pub mod middleware;
 pub mod models;
+pub mod session;
 pub mod telemetry;
 pub mod tools;
 pub mod types;
@@ -40,6 +41,7 @@ pub use middleware::{
     ToolExecutionResult,
 };
 pub use models::{CacheStrategy, Model};
+pub use session::SessionManager;
 pub use telemetry::Tracer;
 pub use tools::{Tool, ToolContext, ToolProvider};
 pub use types::interrupt::{InterruptParams, InterruptResponse, InterruptResponseContent};

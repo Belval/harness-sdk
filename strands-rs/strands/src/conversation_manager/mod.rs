@@ -83,7 +83,7 @@ mod tests {
     use crate::agent::{AgentState, Messages};
 
     fn handle() -> AgentHandle {
-        AgentHandle::new(AgentState::new(), Messages::default(), None)
+        AgentHandle::new(AgentState::new(), Messages::default(), None, None)
     }
 
     // NullConversationManager: apply is a no-op, reduce re-raises the overflow

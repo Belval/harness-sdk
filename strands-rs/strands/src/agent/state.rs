@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::session::SessionManager;
 use crate::types::messages::Message;
 
 /// A persisted, agent-scoped key/value store. Ports `AgentState`.
@@ -166,21 +167,29 @@ impl std::fmt::Debug for Messages {
 ///
 /// Hook callbacks receive this on every lifecycle event to read and mutate
 /// agent-scoped surfaces: the persisted [`AgentState`], the conversation
-/// [`Messages`], and the model id. It is the seam through which further shared
-/// agent surfaces (metrics, conversation manager) are exposed as they are ported.
-#[derive(Clone, Debug)]
+/// [`Messages`], the model id, and the [`SessionManager`]. It is the seam
+/// through which further shared agent surfaces (metrics, conversation manager)
+/// are exposed as they are ported.
+#[derive(Clone)]
 pub struct AgentHandle {
     state: AgentState,
     messages: Messages,
     model_id: Option<String>,
+    session_manager: Option<Arc<dyn SessionManager>>,
 }
 
 impl AgentHandle {
-    pub(crate) fn new(state: AgentState, messages: Messages, model_id: Option<String>) -> Self {
+    pub(crate) fn new(
+        state: AgentState,
+        messages: Messages,
+        model_id: Option<String>,
+        session_manager: Option<Arc<dyn SessionManager>>,
+    ) -> Self {
         AgentHandle {
             state,
             messages,
             model_id,
+            session_manager,
         }
     }
 
@@ -197,6 +206,23 @@ impl AgentHandle {
     /// The configured model id. Ports `agent.model.get_config()["model_id"]`.
     pub fn model_id(&self) -> Option<&str> {
         self.model_id.as_deref()
+    }
+
+    /// The session manager, if one is configured. Ports `agent._session_manager`,
+    /// so an async hook can persist after changing the conversation.
+    pub fn session_manager(&self) -> Option<&Arc<dyn SessionManager>> {
+        self.session_manager.as_ref()
+    }
+}
+
+impl std::fmt::Debug for AgentHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentHandle")
+            .field("state", &self.state)
+            .field("messages", &self.messages)
+            .field("model_id", &self.model_id)
+            .field("has_session_manager", &self.session_manager.is_some())
+            .finish()
     }
 }
 
@@ -235,7 +261,12 @@ mod tests {
     fn handle_exposes_shared_surfaces() {
         let state = AgentState::new();
         let messages = Messages::default();
-        let handle = AgentHandle::new(state.clone(), messages.clone(), Some("m-1".to_string()));
+        let handle = AgentHandle::new(
+            state.clone(),
+            messages.clone(),
+            Some("m-1".to_string()),
+            None,
+        );
 
         handle.state().set("k", json!(true));
         assert_eq!(state.get("k"), Some(json!(true)));
