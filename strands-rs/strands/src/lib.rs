@@ -42,7 +42,7 @@ pub use middleware::{
 };
 pub use models::{CacheStrategy, Model};
 pub use session::SessionManager;
-pub use telemetry::Tracer;
+pub use telemetry::{AttributeValue, Tracer};
 pub use tools::{
     SequentialToolExecutor, Tool, ToolContext, ToolExecutionContext, ToolExecutor, ToolProvider,
     ToolsExecutionResult,

@@ -54,7 +54,13 @@ mod tests {
         let manager = CountingManager {
             syncs: syncs.clone(),
         };
-        let handle = AgentHandle::new(AgentState::new(), Messages::default(), None, None);
+        let handle = AgentHandle::new(
+            AgentState::new(),
+            Messages::default(),
+            None,
+            serde_json::Map::new(),
+            None,
+        );
         manager.sync_agent(&handle).await.unwrap();
         assert_eq!(syncs.load(Ordering::SeqCst), 1);
     }

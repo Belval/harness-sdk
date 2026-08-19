@@ -24,7 +24,7 @@ use strands_agents::types::messages::Role;
 use strands_agents::types::streaming::{
     ContentBlockDelta, Metrics, ModelStreamEvent, ToolUseStart, Usage,
 };
-use strands_agents::{Agent, Message, StopReason, StrandsError, Tool, ToolSpec};
+use strands_agents::{Agent, AttributeValue, Message, StopReason, StrandsError, Tool, ToolSpec};
 
 // --- Capturing subscriber ---------------------------------------------------
 
@@ -320,4 +320,38 @@ async fn emits_tool_span_with_status() {
         tool_span.fields.get("gen_ai.tool.status").unwrap(),
         "success"
     );
+}
+
+// "trace_attributes": custom attributes are recorded on the agent span
+#[tokio::test]
+async fn records_trace_attributes_on_agent_span() {
+    let layer = CapturingLayer::default();
+    let subscriber = tracing_subscriber::registry().with(layer.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut attributes = std::collections::HashMap::new();
+    attributes.insert(
+        "team".to_string(),
+        AttributeValue::String("widgets".to_string()),
+    );
+    attributes.insert("attempt".to_string(), AttributeValue::Int(3));
+
+    let model = ScriptedModel::new(vec![Turn::text_with_usage("hello")]);
+    let mut agent = Agent::builder()
+        .model_boxed(Box::new(model))
+        .trace_attributes(attributes)
+        .build();
+    agent.invoke("hi").await.unwrap();
+
+    let spans = layer.spans();
+    let agent_span = find(&spans, "invoke_agent").expect("agent span");
+    // tracing span field names are static, so the attributes are a serialized
+    // JSON map under `trace_attributes`.
+    let recorded = agent_span
+        .fields
+        .get("trace_attributes")
+        .expect("trace_attributes field");
+    let parsed: serde_json::Value = serde_json::from_str(recorded).expect("valid JSON");
+    assert_eq!(parsed["team"], serde_json::json!("widgets"));
+    assert_eq!(parsed["attempt"], serde_json::json!(3));
 }

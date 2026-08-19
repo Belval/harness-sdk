@@ -20,6 +20,7 @@
 //! - **Multi-agent, node, and memory spans, and the metrics `Meter`, are
 //!   deferred** with those subsystems.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tracing::field::Empty;
@@ -73,6 +74,32 @@ struct TracerState {
 /// Emits `tracing` spans for the agent loop following the `gen_ai.*` semantic
 /// conventions. Ports the `Tracer` span surface.
 ///
+/// A scalar OpenTelemetry span-attribute value. Ports the scalar cases of
+/// `AttributeValue`; array values are deferred.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeValue {
+    /// A string attribute.
+    String(String),
+    /// A signed-integer attribute.
+    Int(i64),
+    /// A double attribute.
+    Double(f64),
+    /// A boolean attribute.
+    Bool(bool),
+}
+
+impl AttributeValue {
+    /// Converts to a JSON value for serialization onto a span.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            AttributeValue::String(value) => serde_json::Value::String(value.clone()),
+            AttributeValue::Int(value) => serde_json::json!(value),
+            AttributeValue::Double(value) => serde_json::json!(value),
+            AttributeValue::Bool(value) => serde_json::Value::Bool(*value),
+        }
+    }
+}
+
 /// A cheap-clone handle: the agent holds one and its `&self` loop methods record
 /// through it. It tracks the current agent and cycle spans so model and tool
 /// spans parent to them, mirroring the TypeScript tracer's explicit-parent model.
@@ -124,6 +151,7 @@ impl Tracer {
         model_id: Option<&str>,
         tools: &[String],
         system_prompt: Option<&str>,
+        trace_attributes: &HashMap<String, AttributeValue>,
     ) -> tracing::Span {
         let span = tracing::info_span!(
             "invoke_agent",
@@ -136,6 +164,7 @@ impl Tracer {
             "gen_ai.request.model" = model_id.unwrap_or_default(),
             "gen_ai.agent.tools" = %serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()),
             system_prompt = system_prompt.unwrap_or_default(),
+            trace_attributes = Empty,
             "gen_ai.usage.prompt_tokens" = Empty,
             "gen_ai.usage.input_tokens" = Empty,
             "gen_ai.usage.completion_tokens" = Empty,
@@ -146,6 +175,18 @@ impl Tracer {
             error = Empty,
         );
         self.record_system(&span);
+        // `tracing` span field names are static, so custom trace attributes are
+        // recorded as one serialized JSON map under `trace_attributes`.
+        if !trace_attributes.is_empty() {
+            let map: serde_json::Map<String, serde_json::Value> = trace_attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_json()))
+                .collect();
+            span.record(
+                "trace_attributes",
+                serde_json::Value::Object(map).to_string(),
+            );
+        }
         self.state().agent_span = Some(span.clone());
         span
     }

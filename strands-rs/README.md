@@ -87,7 +87,10 @@ to hooks via `event.agent`, a `ConversationManager` reduces context on overflow,
 **structured output** (`AgentBuilder::structured_output_schema` →
 `AgentResult::structured_output`) is captured via a synthetic tool, and tools can
 be supplied at runtime through a `ToolProvider` (built with `FunctionTool::from_spec`)
-loaded lazily at invocation start.
+loaded lazily at invocation start. The tool-execution phase is swappable via a
+`ToolExecutor`, a `SessionManager` can persist the agent, `Model::get_config()`
+exposes provider config, and `AgentBuilder::trace_attributes` records custom
+`AttributeValue`s on the agent span.
 
 A minimal `SessionManager` (`sync_agent`) and a `ToolProvider` with runtime tool
 construction are also available, and the per-turn tool phase runs through a

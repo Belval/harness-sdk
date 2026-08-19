@@ -175,6 +175,7 @@ pub struct AgentHandle {
     state: AgentState,
     messages: Messages,
     model_id: Option<String>,
+    model_config: serde_json::Map<String, serde_json::Value>,
     session_manager: Option<Arc<dyn SessionManager>>,
 }
 
@@ -183,12 +184,14 @@ impl AgentHandle {
         state: AgentState,
         messages: Messages,
         model_id: Option<String>,
+        model_config: serde_json::Map<String, serde_json::Value>,
         session_manager: Option<Arc<dyn SessionManager>>,
     ) -> Self {
         AgentHandle {
             state,
             messages,
             model_id,
+            model_config,
             session_manager,
         }
     }
@@ -206,6 +209,11 @@ impl AgentHandle {
     /// The configured model id. Ports `agent.model.get_config()["model_id"]`.
     pub fn model_id(&self) -> Option<&str> {
         self.model_id.as_deref()
+    }
+
+    /// The model's full configuration map. Ports `agent.model.get_config()`.
+    pub fn model_config(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.model_config
     }
 
     /// The session manager, if one is configured. Ports `agent._session_manager`,
@@ -261,10 +269,13 @@ mod tests {
     fn handle_exposes_shared_surfaces() {
         let state = AgentState::new();
         let messages = Messages::default();
+        let mut model_config = serde_json::Map::new();
+        model_config.insert("model_id".to_string(), json!("m-1"));
         let handle = AgentHandle::new(
             state.clone(),
             messages.clone(),
             Some("m-1".to_string()),
+            model_config,
             None,
         );
 
@@ -277,6 +288,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
 
         assert_eq!(handle.model_id(), Some("m-1"));
+        assert_eq!(handle.model_config().get("model_id"), Some(&json!("m-1")));
     }
 
     // Messages: shared push/replace/update reflect across clones
