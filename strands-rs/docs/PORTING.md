@@ -68,6 +68,7 @@ Following the monorepo's cross-SDK rules:
 | `types/agent.ts` (`InvocationState`) | `agent/invocation.rs` |
 | `agent/state.ts` (`AgentState`) + `event.agent` | `agent/state.rs` (`AgentState`, `AgentHandle`, `Messages`) |
 | `agent/conversation-manager/` (`ConversationManager`) | `conversation_manager/mod.rs` |
+| `ToolRegistry` dynamic tools (`register_dynamic_tool`, `dynamic_tools`, `get_all_tool_specs`) | `tools/registry.rs` (`Arc`-shared base + per-instance dynamic layer, `fork()`) |
 | `tools/tool-provider.ts` (`ToolProvider`) | `tools/tool_provider.rs` |
 | `tools/decorator.ts` runtime `DecoratedFunctionTool` / `FunctionToolMetadata` | `tools/function_tool.rs` (`FunctionTool::from_spec`) |
 | `tools/structured-output-tool.ts` + structured-output loop branch | `agent/mod.rs` (`structured_output_tool_spec`, loop) + `AgentResult::structured_output` |
@@ -179,3 +180,10 @@ Following the monorepo's cross-SDK rules:
   tool), and the structured tool is assumed to be the sole/final tool call in its
   turn (co-called normal tools in the same turn are not executed on the capture
   path). A model that refuses even when forced yields `StrandsError::StructuredOutput`.
+- **`ToolRegistry` has an `Arc`-shared base + per-instance dynamic layer.**
+  `register_dynamic_tool` adds runtime tools (overriding a base tool of the same
+  name); `fork()` shares the read-only base with a fresh empty dynamic layer (the
+  Python warm-registry fast path). `get_all_tool_specs` returns the full base +
+  dynamic union; the Python progressive-disclosure spec filter (a live
+  `hidden_tools` set toggled on skill activation) is the skills subsystem's
+  concern and is deferred — the registry offers no built-in spec filtering yet.

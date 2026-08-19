@@ -12,51 +12,83 @@ const TOOL_NAME_MAX_LENGTH: usize = 64;
 ///
 /// Insertion order is preserved (a `Vec` of `(name, tool)`), matching the
 /// TypeScript SDK's `Map`, so `tool_specs()` reports tools in registration order.
+///
+/// The registry has two layers, mirroring the Python SDK's warm-registry pattern:
+/// a **base** set built at construction (shared read-only behind an `Arc`, so a
+/// [`ToolRegistry::fork`] is cheap) and a per-instance **dynamic** set added at
+/// runtime via [`ToolRegistry::register_dynamic_tool`]. A dynamic tool overrides
+/// a base tool of the same name; resolution and specs see the union.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
-    tools: Vec<(String, Arc<dyn Tool>)>,
+    base: Arc<Vec<(String, Arc<dyn Tool>)>>,
+    dynamic: Vec<(String, Arc<dyn Tool>)>,
 }
 
 impl ToolRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
-        ToolRegistry { tools: Vec::new() }
+        ToolRegistry::default()
     }
 
-    /// Registers a tool.
+    /// Shares this registry's base layer with a fresh, empty dynamic layer.
+    ///
+    /// The expensive base set is shared read-only (an `Arc` clone); the returned
+    /// registry gets its own dynamic layer, so dynamic tools it registers do not
+    /// leak back. Ports the Python thread fast path (`cloned.registry =
+    /// prebuilt.registry`, empty `dynamic_tools`).
+    pub fn fork(&self) -> Self {
+        ToolRegistry {
+            base: Arc::clone(&self.base),
+            dynamic: Vec::new(),
+        }
+    }
+
+    /// Registers a tool in the base layer.
     ///
     /// # Errors
     /// Returns [`StrandsError::ToolValidation`] if the name is invalid, already
-    /// registered, or conflicts with an existing name that differs only by
-    /// `-`/`_`, mirroring the TypeScript `add` validation.
+    /// registered in the base, or conflicts with an existing base name that
+    /// differs only by `-`/`_`, mirroring the TypeScript `add` validation.
     pub fn add(&mut self, tool: Arc<dyn Tool>) -> Result<(), StrandsError> {
         let name = tool.name().to_string();
-        validate_name(&name)?;
-        if tool.description().is_empty() {
-            return Err(StrandsError::ToolValidation(
-                "Tool description must be a non-empty string".to_string(),
-            ));
-        }
-        if self.get(&name).is_some() {
+        validate_tool(&name, tool.as_ref())?;
+        if base_get(&self.base, &name).is_some() {
             return Err(StrandsError::ToolValidation(format!(
                 "Tool with name '{name}' already registered"
             )));
         }
-        self.check_normalized_conflict(&name)?;
-        self.tools.push((name, tool));
+        check_normalized_conflict(
+            self.base.iter().map(|(existing, _)| existing.as_str()),
+            &name,
+        )?;
+        // Copy-on-write: cheap while the base is unshared (build time), which is
+        // when `add` is used; a base shared via `fork` copies once here.
+        Arc::make_mut(&mut self.base).push((name, tool));
         Ok(())
     }
 
-    /// Retrieves a tool by exact name.
+    /// Registers a runtime **dynamic** tool. A dynamic tool overrides a base tool
+    /// of the same name, and replaces any prior dynamic tool of that name. Ports
+    /// `register_dynamic_tool`.
+    ///
+    /// # Errors
+    /// Returns [`StrandsError::ToolValidation`] if the name or description is invalid.
+    pub fn register_dynamic_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), StrandsError> {
+        let name = tool.name().to_string();
+        validate_tool(&name, tool.as_ref())?;
+        self.dynamic.retain(|(existing, _)| existing != &name);
+        self.dynamic.push((name, tool));
+        Ok(())
+    }
+
+    /// Retrieves a tool by exact name, preferring a dynamic tool over a base one.
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
-        self.tools
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, tool)| tool)
+        dynamic_get(&self.dynamic, name).or_else(|| base_get(&self.base, name))
     }
 
     /// Resolves a tool name using the TypeScript resolution order: exact match,
     /// then underscore-to-hyphen substitution, then case-insensitive match.
+    /// Dynamic tools take precedence over base tools at each step.
     ///
     /// # Errors
     /// Returns [`StrandsError::ToolNotFound`] when no tool matches.
@@ -65,58 +97,115 @@ impl ToolRegistry {
             return Ok(tool);
         }
         if name.contains('_') {
-            if let Some((_, tool)) = self
-                .tools
-                .iter()
-                .find(|(key, _)| key.replace('-', "_") == name)
-            {
+            if let Some(tool) = self.find(|key| key.replace('-', "_") == name) {
                 return Ok(tool);
             }
         }
         let lower = name.to_lowercase();
-        if let Some((_, tool)) = self
-            .tools
-            .iter()
-            .find(|(key, _)| key.to_lowercase() == lower)
-        {
+        if let Some(tool) = self.find(|key| key.to_lowercase() == lower) {
             return Ok(tool);
         }
         Err(StrandsError::ToolNotFound(name.to_string()))
     }
 
-    /// Removes a tool by name. No-op if the tool does not exist.
+    /// Removes a tool by name from both the base and dynamic layers. No-op if
+    /// absent.
     pub fn remove(&mut self, name: &str) {
-        self.tools.retain(|(key, _)| key != name);
+        if base_get(&self.base, name).is_some() {
+            Arc::make_mut(&mut self.base).retain(|(key, _)| key != name);
+        }
+        self.dynamic.retain(|(key, _)| key != name);
     }
 
-    /// Returns all registered tools in registration order.
+    /// Returns all tools (base + dynamic union, dynamic overriding base by name),
+    /// base tools first in registration order, then dynamic tools.
     pub fn list(&self) -> Vec<Arc<dyn Tool>> {
-        self.tools
+        self.combined().map(|(_, tool)| Arc::clone(tool)).collect()
+    }
+
+    /// The runtime dynamic tools, in registration order. Ports `dynamic_tools`.
+    pub fn dynamic_tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.dynamic
             .iter()
             .map(|(_, tool)| Arc::clone(tool))
             .collect()
     }
 
-    /// Returns the specs of all registered tools, in registration order.
+    /// Returns the specs of all tools (base + dynamic union). This is what the
+    /// agent offers the model, so dynamic tools are included.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
-        self.tools
-            .iter()
-            .map(|(_, tool)| tool.tool_spec())
-            .collect()
+        self.combined().map(|(_, tool)| tool.tool_spec()).collect()
     }
 
-    fn check_normalized_conflict(&self, name: &str) -> Result<(), StrandsError> {
-        let normalized = name.replace('-', "_");
-        for (existing, _) in &self.tools {
-            if existing != name && existing.replace('-', "_") == normalized {
-                return Err(StrandsError::ToolValidation(format!(
-                    "Tool name '{name}' already exists as '{existing}'. \
-                     Cannot add a duplicate tool which differs by a '-' or '_'"
-                )));
-            }
-        }
-        Ok(())
+    /// The union of base and dynamic tool specs — the progressive-disclosure
+    /// surface. Ports `get_all_tool_specs`; today it is the full union (an alias
+    /// of [`ToolRegistry::tool_specs`]). The Python spec-filtering monkey-patch
+    /// (live `hidden_tools` for skill activation) is the skills subsystem's
+    /// concern and is deferred.
+    pub fn get_all_tool_specs(&self) -> Vec<ToolSpec> {
+        self.tool_specs()
     }
+
+    /// Iterates base tools not shadowed by a dynamic tool, then dynamic tools.
+    fn combined(&self) -> impl Iterator<Item = (&String, &Arc<dyn Tool>)> {
+        let base = self
+            .base
+            .iter()
+            .filter(|(name, _)| dynamic_get(&self.dynamic, name).is_none())
+            .map(|(name, tool)| (name, tool));
+        base.chain(self.dynamic.iter().map(|(name, tool)| (name, tool)))
+    }
+
+    /// Finds the first tool (dynamic before base) whose name matches `predicate`.
+    fn find(&self, predicate: impl Fn(&str) -> bool) -> Option<&Arc<dyn Tool>> {
+        self.dynamic
+            .iter()
+            .chain(self.base.iter())
+            .find(|(key, _)| predicate(key))
+            .map(|(_, tool)| tool)
+    }
+}
+
+fn base_get<'a>(base: &'a [(String, Arc<dyn Tool>)], name: &str) -> Option<&'a Arc<dyn Tool>> {
+    base.iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, tool)| tool)
+}
+
+fn dynamic_get<'a>(
+    dynamic: &'a [(String, Arc<dyn Tool>)],
+    name: &str,
+) -> Option<&'a Arc<dyn Tool>> {
+    dynamic
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, tool)| tool)
+}
+
+fn validate_tool(name: &str, tool: &dyn Tool) -> Result<(), StrandsError> {
+    validate_name(name)?;
+    if tool.description().is_empty() {
+        return Err(StrandsError::ToolValidation(
+            "Tool description must be a non-empty string".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_normalized_conflict<'a>(
+    existing_names: impl Iterator<Item = &'a str>,
+    name: &str,
+) -> Result<(), StrandsError> {
+    let normalized = name.replace('-', "_");
+    for existing in existing_names {
+        if existing != name && existing.replace('-', "_") == normalized {
+            return Err(StrandsError::ToolValidation(format!(
+                "Tool name '{name}' already exists as '{existing}'. \
+                 Cannot add a duplicate tool which differs by a '-' or '_'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_name(name: &str) -> Result<(), StrandsError> {
@@ -355,5 +444,83 @@ mod tests {
     fn list_empty_by_default() {
         let registry = ToolRegistry::new();
         assert!(registry.list().is_empty());
+    }
+
+    // register_dynamic_tool: resolvable and included in the union specs
+    #[test]
+    fn dynamic_tool_resolves_and_appears_in_specs() {
+        let mut registry = ToolRegistry::new();
+        registry.add(MockTool::arc("base-tool")).unwrap();
+        registry
+            .register_dynamic_tool(MockTool::arc("dynamic-tool"))
+            .unwrap();
+
+        assert!(registry.get("dynamic-tool").is_some());
+        assert_eq!(
+            registry.resolve("dynamic_tool").unwrap().name(),
+            "dynamic-tool"
+        );
+        let names: Vec<_> = registry
+            .tool_specs()
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect();
+        assert_eq!(names, vec!["base-tool", "dynamic-tool"]);
+        assert_eq!(registry.dynamic_tools().len(), 1);
+        assert_eq!(registry.get_all_tool_specs().len(), 2);
+    }
+
+    // register_dynamic_tool: a dynamic tool overrides a base tool of the same name
+    #[test]
+    fn dynamic_tool_overrides_base_by_name() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .add(MockTool::arc_with_description("shared", "base description"))
+            .unwrap();
+        registry
+            .register_dynamic_tool(MockTool::arc_with_description(
+                "shared",
+                "dynamic description",
+            ))
+            .unwrap();
+
+        // Exactly one "shared" spec, and it is the dynamic one.
+        let specs: Vec<_> = registry
+            .tool_specs()
+            .into_iter()
+            .filter(|spec| spec.name == "shared")
+            .collect();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].description, "dynamic description");
+        assert_eq!(
+            registry.get("shared").unwrap().description(),
+            "dynamic description"
+        );
+
+        // Re-registering a dynamic tool of the same name replaces the prior one.
+        registry
+            .register_dynamic_tool(MockTool::arc_with_description("shared", "newer"))
+            .unwrap();
+        assert_eq!(registry.dynamic_tools().len(), 1);
+        assert_eq!(registry.get("shared").unwrap().description(), "newer");
+    }
+
+    // fork: shares the base, but dynamic tools added to the fork do not leak back
+    #[test]
+    fn fork_shares_base_and_isolates_dynamic() {
+        let mut original = ToolRegistry::new();
+        original.add(MockTool::arc("base-tool")).unwrap();
+
+        let mut forked = original.fork();
+        forked
+            .register_dynamic_tool(MockTool::arc("fork-only"))
+            .unwrap();
+
+        // Base is visible through the fork (shared, read-only).
+        assert!(forked.get("base-tool").is_some());
+        // The dynamic tool is on the fork only.
+        assert!(forked.get("fork-only").is_some());
+        assert!(original.get("fork-only").is_none());
+        assert_eq!(original.dynamic_tools().len(), 0);
     }
 }
