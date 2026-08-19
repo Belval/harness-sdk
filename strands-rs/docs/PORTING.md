@@ -211,3 +211,37 @@ Following the monorepo's cross-SDK rules:
   telemetry spans, completed-results skip, `AfterToolsEvent`); a custom executor
   that wants those must reproduce them (the per-tool lifecycle is not yet exposed
   as a standalone reusable helper).
+
+## Maintaining parity
+
+strands-rs is derived from the canonical `strands-ts` (in this same monorepo).
+Parity is kept by three mechanisms, cheapest first:
+
+1. **Provenance** — every ported item carries a `Ports <TS symbol>` doc comment,
+   and the per-file translation record above maps Rust files to their strands-ts
+   sources. `docs/parity-manifest.toml` makes that map machine-readable and pins,
+   per file, the monorepo commit the port was last reconciled against.
+2. **Drift detection** — `scripts/parity-check.sh` reads the manifest and reports
+   strands-ts sources that changed since their pinned commit (so the mapped Rust
+   file can be reviewed), plus manifest rot (a mapped Rust file gone, or a Rust
+   file with a `Ports` comment missing from the manifest). Advisory by default;
+   `--strict` exits non-zero. Intended CI use: a **non-blocking advisory** job
+   that runs `scripts/parity-check.sh` and surfaces its report on PRs — it never
+   fails the merge gate, it just tells reviewers what upstream moved.
+3. **Wire goldens** — `strands/tests/parity_wire.rs` pins the cross-SDK-sensitive
+   strings/shapes (stop-reason values, content-block JSON keys, cache-point
+   shape, usage keys, role/status literals, interrupt-source values). The
+   `gen_ai.*` telemetry keys/span names are pinned in `strands/tests/agent_telemetry.rs`.
+   These trip on drift even when code legitimately diverges.
+
+**Parity sweep** (do periodically, and whenever bumping the pinned strands-ts):
+
+1. `scripts/parity-check.sh` — see which mapped sources drifted.
+2. For each flagged Rust file: either port the upstream change, or record a
+   deliberate divergence in *Known deviations* above.
+3. Bump that entry's `upstream_commit` in `docs/parity-manifest.toml` to the
+   current monorepo HEAD.
+4. Re-run the gate (`cargo test --all-features`, incl. `parity_wire.rs`).
+
+Every intentional divergence lives in *Known deviations* — parity means "matches
+strands-ts except this reviewed list", never silent drift.

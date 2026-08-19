@@ -1,0 +1,224 @@
+# Parity manifest — strands-rs ⇔ strands-ts
+#
+# strands-rs is an idiomatic Rust port of the canonical TypeScript SDK
+# (`strands-ts/`, in this same monorepo). This file maps each ported Rust source
+# file to the strands-ts source it was derived from, and pins the monorepo commit
+# the port was last reconciled against.
+#
+# `scripts/parity-check.sh` reads this file and reports strands-ts sources that
+# changed upstream since their pinned commit, so the corresponding Rust files can
+# be reviewed. See the "Maintaining parity" section of docs/PORTING.md.
+#
+# Fields per entry:
+#   rust            - path (repo-relative) of the ported Rust file
+#   ts_source       - path(s) of the strands-ts source (file or directory,
+#                     repo-relative). Empty when the Rust file has no single
+#                     strands-ts counterpart (Rust-only glue, or a construct drawn
+#                     from the Python SDK that strands-ts does not have).
+#   upstream_commit - monorepo commit the port was last reconciled against.
+#   notes           - anything a reviewer needs when reconciling.
+#
+# To bump: after reconciling a Rust file with upstream, set its `upstream_commit`
+# to the current monorepo HEAD.
+
+pinned_default = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+
+# --- types ---------------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/types/messages.rs"
+ts_source = "strands-ts/src/types/messages.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Message/ContentBlock/Role/StopReason/SystemPrompt/CachePointBlock. Wire-sensitive; also guarded by tests/parity_wire.rs."
+
+[[entry]]
+rust = "strands-rs/strands/src/types/media.rs"
+ts_source = "strands-ts/src/types/media.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = ""
+
+[[entry]]
+rust = "strands-rs/strands/src/types/streaming.rs"
+ts_source = "strands-ts/src/models/streaming.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "ModelStreamEvent, Usage, Metrics."
+
+[[entry]]
+rust = "strands-rs/strands/src/types/tools.rs"
+ts_source = "strands-ts/src/tools/types.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "ToolSpec, ToolChoice."
+
+[[entry]]
+rust = "strands-rs/strands/src/types/interrupt.rs"
+ts_source = "strands-ts/src/types/interrupt.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = ""
+
+[[entry]]
+rust = "strands-rs/strands/src/types/mod.rs"
+ts_source = ""
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Module glue + base64 serde helper; no single strands-ts source."
+
+# --- errors --------------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/errors.rs"
+ts_source = "strands-ts/src/errors.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Collapses the TS error class hierarchy into one enum."
+
+# --- models --------------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/models/mod.rs"
+ts_source = "strands-ts/src/models/model.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Model trait, stream_aggregated, get_config, CacheStrategy."
+
+[[entry]]
+rust = "strands-rs/strands/src/models/bedrock.rs"
+ts_source = "strands-ts/src/models/bedrock.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Converse Stream mapping + prompt-cache lowering. Wire-sensitive."
+
+# --- tools ---------------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/tools/mod.rs"
+ts_source = "strands-ts/src/tools/tool.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Tool trait + execution wrapping."
+
+[[entry]]
+rust = "strands-rs/strands/src/tools/function_tool.rs"
+ts_source = "strands-ts/src/tools/function-tool.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "FunctionTool + runtime from_spec (TS DecoratedFunctionTool/FunctionToolMetadata live here)."
+
+[[entry]]
+rust = "strands-rs/strands/src/tools/registry.rs"
+ts_source = "strands-ts/src/registry/tool-registry.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Base + dynamic-tool layers, fork()."
+
+[[entry]]
+rust = "strands-rs/strands/src/tools/executor.rs"
+ts_source = "strands-ts/src/tools/executors"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "ToolExecutor + SequentialToolExecutor. Directory: executor.ts + sequential.ts (concurrent.ts not ported)."
+
+[[entry]]
+rust = "strands-rs/strands/src/tools/tool_provider.rs"
+ts_source = ""
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "ToolProvider is a Python-strands concept (strands.tools.tool_provider); no strands-ts source. Reconcile against the Python SDK."
+
+# --- agent ---------------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/agent/mod.rs"
+ts_source = "strands-ts/src/agent/agent.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "The event loop (_stream/_invokeModel/executeTools) + structured-output branch."
+
+[[entry]]
+rust = "strands-rs/strands/src/agent/builder.rs"
+ts_source = "strands-ts/src/agent/agent.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "The Agent constructor/config surface, as a Rust builder."
+
+[[entry]]
+rust = "strands-rs/strands/src/agent/result.rs"
+ts_source = "strands-ts/src/types/agent.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "AgentResult (incl. structured_output, interrupts)."
+
+[[entry]]
+rust = "strands-rs/strands/src/agent/invocation.rs"
+ts_source = "strands-ts/src/types/agent.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "InvocationState."
+
+[[entry]]
+rust = "strands-rs/strands/src/agent/state.rs"
+ts_source = "strands-ts/src/types/agent.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "AgentState + AgentHandle + Messages. AgentState lives in types/agent.ts upstream; the event.agent handle is a Rust-specific seam."
+
+# --- conversation manager ------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/conversation_manager/mod.rs"
+ts_source = "strands-ts/src/conversation-manager"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "ConversationManager trait + NullConversationManager. Directory: conversation-manager.ts + null-conversation-manager.ts (sliding/summarizing not ported)."
+
+# --- session -------------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/session/mod.rs"
+ts_source = "strands-ts/src/session/session-manager.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Minimal SessionManager (sync_agent only); full persistence deferred."
+
+# --- hooks ---------------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/hooks/mod.rs"
+ts_source = "strands-ts/src/hooks/registry.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "HookRegistry (sync + async) + HookOrder (also hooks/types.ts)."
+
+[[entry]]
+rust = "strands-rs/strands/src/hooks/events.rs"
+ts_source = "strands-ts/src/hooks/events.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Lifecycle event taxonomy. Event names are wire-sensitive; also guarded by tests/parity_wire.rs."
+
+[[entry]]
+rust = "strands-rs/strands/src/hooks/provider.rs"
+ts_source = ""
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "HookProvider is a Python-strands concept (bundled register_hooks); no strands-ts source. Reconcile against the Python SDK."
+
+# --- interrupt -----------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/interrupt.rs"
+ts_source = "strands-ts/src/interrupt.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Interrupt, InterruptError, InterruptState, interrupt_from_state."
+
+# --- middleware ----------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/middleware/mod.rs"
+ts_source = "strands-ts/src/middleware"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "MiddlewareStack + contexts. Directory: types.ts + registry.ts + stages.ts (non-streaming form; AgentStreamStage/event-yielding deferred)."
+
+# --- telemetry -----------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/telemetry/mod.rs"
+ts_source = "strands-ts/src/telemetry/tracer.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Tracer span surface via tracing. gen_ai.* attribute keys are wire-sensitive; also guarded by tests/parity_wire.rs."
+
+# --- macros --------------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands-macros/src/lib.rs"
+ts_source = "strands-ts/src/tools/tool-factory.ts"
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "#[tool] proc-macro ~ the tool() factory (signature-derived schema vs Zod)."
+
+# --- crate glue ----------------------------------------------------------------
+
+[[entry]]
+rust = "strands-rs/strands/src/lib.rs"
+ts_source = ""
+upstream_commit = "b63bb4f6d2694607907b19c04b7acf366ec091c9"
+notes = "Crate root re-exports; no single strands-ts source (cf. strands-ts/src/index.ts barrel)."
