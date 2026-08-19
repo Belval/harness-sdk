@@ -33,7 +33,7 @@ pub use agent::{
 };
 pub use conversation_manager::{ConversationManager, NullConversationManager};
 pub use errors::StrandsError;
-pub use hooks::{HookCleanup, HookEvent, HookOrder, HookRegistry};
+pub use hooks::{HookCleanup, HookEvent, HookFuture, HookOrder, HookRegistry};
 pub use interrupt::{Interrupt, InterruptError, InterruptSource, InterruptState};
 pub use middleware::{
     ExecuteToolContext, InvokeModelContext, MiddlewareCleanup, MiddlewareNext, MiddlewareStack,

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::agent::{Agent, AgentState};
 use crate::conversation_manager::ConversationManager;
 use crate::errors::StrandsError;
-use crate::hooks::{HookEvent, HookRegistry, InitializedEvent};
+use crate::hooks::{HookEvent, HookFuture, HookRegistry, InitializedEvent};
 use crate::models::Model;
 use crate::tools::{Tool, ToolRegistry};
 use crate::types::messages::{Message, SystemPrompt};
@@ -101,6 +101,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Registers an asynchronous hook callback for event type `E`, fired at the
+    /// default order. The callback returns a boxed future that may borrow the
+    /// event across `await` points.
+    pub fn hook_async<E, F>(self, callback: F) -> Self
+    where
+        E: HookEvent + 'static,
+        F: for<'a> Fn(&'a mut E) -> HookFuture<'a> + Send + Sync + 'static,
+    {
+        self.hooks.add_callback_async(callback);
+        self
+    }
+
     /// Registers a hook callback for event type `E` with an explicit order.
     pub fn hook_with_order<E, F>(self, callback: F, order: i32) -> Self
     where
@@ -142,7 +154,10 @@ impl AgentBuilder {
         let mut initialized = InitializedEvent {
             agent: agent.agent_handle(),
         };
-        agent.hooks().invoke_callbacks(&mut initialized)?;
+        // `try_build` is synchronous; sync init hooks resolve as ready futures so
+        // this needs no runtime. A genuinely-async init hook (unusual) runs to
+        // completion here on the current thread.
+        futures::executor::block_on(agent.hooks().invoke_callbacks(&mut initialized))?;
         Ok(agent)
     }
 }

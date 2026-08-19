@@ -31,9 +31,9 @@ use crate::errors::StrandsError;
 use crate::hooks::{
     AfterInvocationEvent, AfterModelCallEvent, AfterToolCallEvent, AfterToolsEvent,
     AgentResultEvent, BeforeInvocationEvent, BeforeModelCallEvent, BeforeToolCallEvent,
-    BeforeToolsEvent, ContentBlockEvent, HookCleanup, HookEndTurn, HookEvent, HookRegistry,
-    InterruptEvent, MessageAddedEvent, ModelMessageEvent, ModelStopData, ToolResultEvent,
-    ToolUseData,
+    BeforeToolsEvent, ContentBlockEvent, HookCleanup, HookEndTurn, HookEvent, HookFuture,
+    HookRegistry, InterruptEvent, MessageAddedEvent, ModelMessageEvent, ModelStopData,
+    ToolResultEvent, ToolUseData,
 };
 use crate::interrupt::{InterruptError, InterruptState, PendingToolExecution};
 use crate::middleware::{
@@ -214,6 +214,16 @@ impl Agent {
         self.hooks.add_callback_with_order(callback, order)
     }
 
+    /// Registers an asynchronous hook callback for event type `E`. The callback
+    /// returns a boxed future that may borrow the event across `await` points.
+    pub fn add_hook_async<E, F>(&self, callback: F) -> HookCleanup
+    where
+        E: HookEvent + 'static,
+        F: for<'a> Fn(&'a mut E) -> HookFuture<'a> + Send + Sync + 'static,
+    {
+        self.hooks.add_callback_async(callback)
+    }
+
     /// Runs the agent loop with a text prompt, returning the final result.
     ///
     /// Appends the prompt as a user message, then drives the loop to completion.
@@ -279,18 +289,18 @@ impl Agent {
                 agent: self.agent_handle(),
                 cancel: None,
             };
-            hooks.invoke_callbacks(&mut before)?;
+            hooks.invoke_callbacks(&mut before).await?;
 
             if let Some(cancel) = &before.cancel {
                 let message =
                     Message::assistant(cancel.message("invocation denied by hook").to_string());
-                self.append_message(message.clone(), &state)?;
+                self.append_message(message.clone(), &state).await?;
                 let mut after = AfterInvocationEvent {
                     invocation_state: state.clone(),
                     agent: self.agent_handle(),
                     resume: None,
                 };
-                hooks.invoke_callbacks(&mut after)?;
+                hooks.invoke_callbacks(&mut after).await?;
                 return Ok(AgentResult::new(StopReason::EndTurn, message));
             }
 
@@ -303,7 +313,7 @@ impl Agent {
                 agent: self.agent_handle(),
                 resume: None,
             };
-            hooks.invoke_callbacks(&mut after)?;
+            hooks.invoke_callbacks(&mut after).await?;
 
             let result = core_result?;
 
@@ -317,7 +327,7 @@ impl Agent {
                 invocation_state: state.clone(),
                 agent: self.agent_handle(),
             };
-            hooks.invoke_callbacks(&mut agent_result)?;
+            hooks.invoke_callbacks(&mut agent_result).await?;
 
             return Ok(result);
         }
@@ -406,13 +416,14 @@ impl Agent {
             ),
             None => {
                 if let Some(message) = new_input.take() {
-                    self.append_message(message, state)?;
+                    self.append_message(message, state).await?;
                 }
 
                 let model_result = self.invoke_model(state).await?;
 
                 if model_result.stop_reason != StopReason::ToolUse {
-                    self.append_message(model_result.message.clone(), state)?;
+                    self.append_message(model_result.message.clone(), state)
+                        .await?;
                     return Ok(CycleOutcome::Done(AgentResult::new(
                         model_result.stop_reason,
                         model_result.message,
@@ -431,7 +442,7 @@ impl Agent {
                 // execute_tools stored the pending execution before propagating;
                 // stop the turn to wait for human input.
                 return Ok(CycleOutcome::Done(
-                    self.stop_for_interrupt(interrupt_error, state)?,
+                    self.stop_for_interrupt(interrupt_error, state).await?,
                 ));
             }
             Err(error) => return Err(error),
@@ -439,8 +450,9 @@ impl Agent {
 
         // Deferred append: both messages are pushed together after tools run, so
         // history never holds a tool-use without its matching results.
-        self.append_message(assistant_message, state)?;
-        self.append_message(tools_result.message.clone(), state)?;
+        self.append_message(assistant_message, state).await?;
+        self.append_message(tools_result.message.clone(), state)
+            .await?;
 
         // The pair is in history, so any stored pending execution is stale; clear
         // it and leave the interrupted state so fresh interrupts can be raised.
@@ -454,7 +466,7 @@ impl Agent {
                 .content("Turn ended early by hook after tool execution")
                 .to_string();
             let message = Message::assistant(text);
-            self.append_message(message.clone(), state)?;
+            self.append_message(message.clone(), state).await?;
             return Ok(CycleOutcome::Done(AgentResult::new(
                 StopReason::EndTurn,
                 message,
@@ -467,7 +479,7 @@ impl Agent {
     /// Registers the raised interrupts, activates the interrupted state, fires an
     /// [`InterruptEvent`] per unanswered interrupt, and returns an interrupt
     /// result. Ports `_createInterruptResult` plus the interrupt fan-out.
-    fn stop_for_interrupt(
+    async fn stop_for_interrupt(
         &self,
         error: InterruptError,
         state: &InvocationState,
@@ -485,7 +497,7 @@ impl Agent {
                 invocation_state: state.clone(),
                 agent: self.agent_handle(),
             };
-            hooks.invoke_callbacks(&mut event)?;
+            hooks.invoke_callbacks(&mut event).await?;
         }
 
         let last_message = self.messages.last().unwrap_or_else(|| {
@@ -515,7 +527,7 @@ impl Agent {
                 agent: self.agent_handle(),
                 cancel: None,
             };
-            hooks.invoke_callbacks(&mut before)?;
+            hooks.invoke_callbacks(&mut before).await?;
 
             if let Some(cancel) = &before.cancel {
                 let message =
@@ -531,7 +543,7 @@ impl Agent {
                     error: None,
                     retry: false,
                 };
-                hooks.invoke_callbacks(&mut after)?;
+                hooks.invoke_callbacks(&mut after).await?;
                 if after.retry {
                     attempt_count += 1;
                     continue;
@@ -593,7 +605,7 @@ impl Agent {
                             invocation_state: state.clone(),
                             agent: self.agent_handle(),
                         };
-                        hooks.invoke_callbacks(&mut content_block)?;
+                        hooks.invoke_callbacks(&mut content_block).await?;
                     }
 
                     let mut model_message = ModelMessageEvent {
@@ -602,7 +614,7 @@ impl Agent {
                         invocation_state: state.clone(),
                         agent: self.agent_handle(),
                     };
-                    hooks.invoke_callbacks(&mut model_message)?;
+                    hooks.invoke_callbacks(&mut model_message).await?;
 
                     let mut after = AfterModelCallEvent {
                         invocation_state: state.clone(),
@@ -615,7 +627,7 @@ impl Agent {
                         error: None,
                         retry: false,
                     };
-                    hooks.invoke_callbacks(&mut after)?;
+                    hooks.invoke_callbacks(&mut after).await?;
                     if after.retry {
                         attempt_count += 1;
                         continue;
@@ -648,7 +660,7 @@ impl Agent {
                         error: Some(error.to_string()),
                         retry: false,
                     };
-                    hooks.invoke_callbacks(&mut after)?;
+                    hooks.invoke_callbacks(&mut after).await?;
                     if after.retry {
                         attempt_count += 1;
                         continue;
@@ -680,7 +692,7 @@ impl Agent {
         };
         // A BeforeTools hook interrupt stores pending state with no completed
         // results before propagating, so the whole batch replays on resume.
-        if let Err(error) = hooks.invoke_callbacks(&mut before) {
+        if let Err(error) = hooks.invoke_callbacks(&mut before).await {
             if matches!(error, StrandsError::Interrupt(_)) {
                 self.interrupt_state
                     .set_pending_tool_execution(PendingToolExecution {
@@ -712,7 +724,7 @@ impl Agent {
                     invocation_state: state.clone(),
                     agent: self.agent_handle(),
                 };
-                hooks.invoke_callbacks(&mut event)?;
+                hooks.invoke_callbacks(&mut event).await?;
                 result_blocks.push(result);
             }
         } else {
@@ -732,7 +744,7 @@ impl Agent {
                             invocation_state: state.clone(),
                             agent: self.agent_handle(),
                         };
-                        hooks.invoke_callbacks(&mut event)?;
+                        hooks.invoke_callbacks(&mut event).await?;
                         results_by_id.insert(tool_use.tool_use_id.clone(), result.clone());
                         result_blocks.push(result);
                     }
@@ -763,7 +775,7 @@ impl Agent {
             agent: self.agent_handle(),
             end_turn: None,
         };
-        hooks.invoke_callbacks(&mut after)?;
+        hooks.invoke_callbacks(&mut after).await?;
 
         Ok(ToolsExecutionResult {
             message: tool_result_message,
@@ -799,7 +811,7 @@ impl Agent {
                 selected_tool: None,
                 interrupt_state: self.interrupt_state.clone(),
             };
-            hooks.invoke_callbacks(&mut before)?;
+            hooks.invoke_callbacks(&mut before).await?;
 
             // Adopt the (possibly mutated) tool_use but keep the model-issued id.
             tool_use = ToolUseData {
@@ -830,7 +842,7 @@ impl Agent {
                     agent: self.agent_handle(),
                     retry: false,
                 };
-                hooks.invoke_callbacks(&mut after)?;
+                hooks.invoke_callbacks(&mut after).await?;
                 if after.retry {
                     continue;
                 }
@@ -916,7 +928,7 @@ impl Agent {
                 agent: self.agent_handle(),
                 retry: false,
             };
-            hooks.invoke_callbacks(&mut after)?;
+            hooks.invoke_callbacks(&mut after).await?;
             if after.retry {
                 continue;
             }
@@ -928,7 +940,7 @@ impl Agent {
     }
 
     /// Pushes `message` into history and fires [`MessageAddedEvent`].
-    fn append_message(
+    async fn append_message(
         &mut self,
         message: Message,
         state: &InvocationState,
@@ -940,7 +952,7 @@ impl Agent {
             invocation_state: state.clone(),
             agent: self.agent_handle(),
         };
-        hooks.invoke_callbacks(&mut event)
+        hooks.invoke_callbacks(&mut event).await
     }
 
     fn last_message(&self) -> Message {
