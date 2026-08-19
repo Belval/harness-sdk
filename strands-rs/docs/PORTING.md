@@ -159,3 +159,10 @@ Following the monorepo's cross-SDK rules:
   `_StreamingHook` pattern of one callback registered across many event types and
   handled polymorphically as a base event is deferred — strands-rs callbacks are
   typed per concrete event, so a provider registers one callback per event type.
+- **`InvocationState` is caller-supplied via `invoke_with_state` /
+  `invoke_message_with_state` / `resume_with_state`.** Ports the
+  `invoke_async(..., invocation_state=...)` half of the Python surface — the
+  seeded state flows to every hook event as `event.invocation_state`. The other
+  half, a streaming/async-iterator API that yields the loop's events to the
+  caller (the package's websocket `_streaming` push), is still deferred with the
+  larger streaming-agent-API milestone.

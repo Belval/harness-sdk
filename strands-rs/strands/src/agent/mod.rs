@@ -232,26 +232,59 @@ impl Agent {
 
     /// Runs the agent loop with a text prompt, returning the final result.
     ///
-    /// Appends the prompt as a user message, then drives the loop to completion.
+    /// Appends the prompt as a user message, then drives the loop to completion
+    /// with a fresh [`InvocationState`].
     pub async fn invoke(&mut self, prompt: impl Into<String>) -> Result<AgentResult, StrandsError> {
         self.invoke_message(Message::user(prompt.into())).await
     }
 
-    /// Runs the agent loop starting from a caller-constructed user message.
+    /// Like [`Agent::invoke`] but threads a caller-supplied [`InvocationState`]
+    /// through the invocation. Ports `invoke_async(..., invocation_state=...)`.
+    ///
+    /// The state is carried on every hook event of the invocation as
+    /// `event.invocation_state`, letting callers seed request-scoped context
+    /// (e.g. `user_id`, `trace_id`) that hooks and tools can read.
+    pub async fn invoke_with_state(
+        &mut self,
+        prompt: impl Into<String>,
+        state: InvocationState,
+    ) -> Result<AgentResult, StrandsError> {
+        self.invoke_message_with_state(Message::user(prompt.into()), state)
+            .await
+    }
+
+    /// Runs the agent loop starting from a caller-constructed user message, with
+    /// a fresh [`InvocationState`].
     ///
     /// # Errors
     /// Returns an error if the agent is waiting on an interrupt — resume with
     /// [`Agent::resume`] before starting a new turn.
     pub async fn invoke_message(&mut self, message: Message) -> Result<AgentResult, StrandsError> {
+        self.invoke_message_with_state(message, InvocationState::new())
+            .await
+    }
+
+    /// Like [`Agent::invoke_message`] but threads a caller-supplied
+    /// [`InvocationState`] through the invocation.
+    ///
+    /// # Errors
+    /// Returns an error if the agent is waiting on an interrupt — resume with
+    /// [`Agent::resume`] before starting a new turn.
+    pub async fn invoke_message_with_state(
+        &mut self,
+        message: Message,
+        state: InvocationState,
+    ) -> Result<AgentResult, StrandsError> {
         if self.interrupt_state.is_activated() {
             return Err(StrandsError::model(
                 "Agent is in an interrupted state. Resume with `Agent::resume` before invoking.",
             ));
         }
-        self.run(Some(message), InvocationState::new()).await
+        self.run(Some(message), state).await
     }
 
-    /// Resumes a turn that halted on an interrupt, supplying the human responses.
+    /// Resumes a turn that halted on an interrupt, supplying the human responses,
+    /// with a fresh [`InvocationState`].
     ///
     /// Applies the responses to the matching interrupts, then re-enters the loop:
     /// a pending tool execution is replayed without re-invoking the model, and
@@ -266,13 +299,28 @@ impl Agent {
         &mut self,
         responses: Vec<InterruptResponse>,
     ) -> Result<AgentResult, StrandsError> {
+        self.resume_with_state(responses, InvocationState::new())
+            .await
+    }
+
+    /// Like [`Agent::resume`] but threads a caller-supplied [`InvocationState`]
+    /// through the resumed invocation.
+    ///
+    /// # Errors
+    /// Returns an error if the agent is not in an interrupted state, or if a
+    /// response references an unknown interrupt id.
+    pub async fn resume_with_state(
+        &mut self,
+        responses: Vec<InterruptResponse>,
+        state: InvocationState,
+    ) -> Result<AgentResult, StrandsError> {
         if !self.interrupt_state.is_activated() {
             return Err(StrandsError::model(
                 "Agent is not in an interrupted state; call `invoke` to start a new turn.",
             ));
         }
         self.interrupt_state.resume(responses)?;
-        self.run(None, InvocationState::new()).await
+        self.run(None, state).await
     }
 
     /// The interrupt state backing this agent, for inspection and serialization.
