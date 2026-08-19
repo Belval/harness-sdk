@@ -62,7 +62,7 @@ Following the monorepo's cross-SDK rules:
 | `models/bedrock.ts` | `models/bedrock.rs` |
 | `tools/tool.ts`, `tools/function-tool.ts` | `tools/mod.rs`, `tools/function_tool.rs` |
 | `registry/tool-registry.ts` | `tools/registry.rs` |
-| `tools/executors/sequential.ts` | `tools/mod.rs` (`execute_tools`) |
+| `tools/executors/*.ts` (`ToolExecutor`, sequential) | `tools/executor.rs` (`ToolExecutor`, `SequentialToolExecutor`, `ToolExecutionContext`) |
 | `agent/agent.ts` (`_stream` core) | `agent/mod.rs` |
 | `types/agent.ts` (`AgentResult`) | `agent/result.rs` |
 | `types/agent.ts` (`InvocationState`) | `agent/invocation.rs` |
@@ -194,3 +194,14 @@ Following the monorepo's cross-SDK rules:
   persistence (initialize / per-message append / restore) and the manager's own
   auto-sync-on-`MessageAddedEvent` hook registration are deferred; the consumer
   drives `sync_agent` explicitly for now.
+- **`ToolExecutor` owns the whole tool phase of a turn.** A custom executor
+  (`AgentBuilder::tool_executor`) receives a `ToolExecutionContext` of the shared
+  handles (hooks, tool registry, interrupt state, the `ExecuteToolStage`
+  middleware, tracer, agent handle) and fully owns the turn's tool execution —
+  it can change the batch strategy (e.g. concurrency) or short-circuit. The
+  default `SequentialToolExecutor` carries the complete per-tool lifecycle
+  (Before/After tool-call events, `cancel`/`selected_tool`/`tool_use`-mutation/
+  `retry`, `ToolResultEvent`, middleware, interrupt + pending-execution storage,
+  telemetry spans, completed-results skip, `AfterToolsEvent`); a custom executor
+  that wants those must reproduce them (the per-tool lifecycle is not yet exposed
+  as a standalone reusable helper).

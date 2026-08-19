@@ -9,6 +9,7 @@ use crate::errors::StrandsError;
 use crate::hooks::{HookEvent, HookFuture, HookProvider, HookRegistry, InitializedEvent};
 use crate::models::Model;
 use crate::session::SessionManager;
+use crate::tools::executor::{SequentialToolExecutor, ToolExecutor};
 use crate::tools::{Tool, ToolProvider, ToolRegistry};
 use crate::types::messages::{Message, SystemPrompt};
 
@@ -26,6 +27,7 @@ pub struct AgentBuilder {
     conversation_manager: Option<Arc<dyn ConversationManager>>,
     session_manager: Option<Arc<dyn SessionManager>>,
     structured_output_schema: Option<serde_json::Value>,
+    tool_executor: Option<Arc<dyn ToolExecutor>>,
 }
 
 /// Default agent name used in telemetry when none is set.
@@ -88,6 +90,13 @@ impl AgentBuilder {
     /// value in [`crate::AgentResult::structured_output`].
     pub fn structured_output_schema(mut self, schema: serde_json::Value) -> Self {
         self.structured_output_schema = Some(schema);
+        self
+    }
+
+    /// Sets the tool executor that runs the tools of each turn. Defaults to
+    /// [`SequentialToolExecutor`]. Ports `AgentConfig.tool_executor`.
+    pub fn tool_executor(mut self, executor: impl ToolExecutor + 'static) -> Self {
+        self.tool_executor = Some(Arc::new(executor));
         self
     }
 
@@ -186,6 +195,8 @@ impl AgentBuilder {
             self.conversation_manager,
             self.session_manager,
             self.structured_output_schema,
+            self.tool_executor
+                .unwrap_or_else(|| Arc::new(SequentialToolExecutor)),
         );
         let mut initialized = InitializedEvent {
             agent: agent.agent_handle(),
