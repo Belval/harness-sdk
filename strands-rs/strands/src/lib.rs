@@ -27,7 +27,9 @@ pub mod telemetry;
 pub mod tools;
 pub mod types;
 
-pub use agent::{Agent, AgentBuilder, AgentResult, InvocationState};
+pub use agent::{
+    Agent, AgentBuilder, AgentHandle, AgentResult, AgentState, InvocationState, Messages,
+};
 pub use errors::StrandsError;
 pub use hooks::{HookCleanup, HookEvent, HookOrder, HookRegistry};
 pub use interrupt::{Interrupt, InterruptError, InterruptSource, InterruptState};

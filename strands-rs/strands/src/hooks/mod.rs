@@ -11,10 +11,11 @@
 //! - **Callbacks are synchronous** (`Fn(&mut E) -> Result<(), StrandsError>`).
 //!   The TypeScript SDK also accepts async callbacks; the async-callback
 //!   ergonomics in Rust (borrowing the event across an `await`) are deferred.
-//! - **Events carry no `agent` back-reference.** The loop owns the agent as
-//!   `&mut self` while dispatching, so it cannot also hand out a shared reference
-//!   to callbacks. Callbacks operate on the event's data plus any state they
-//!   capture. The agent-callback path is deferred.
+//! - **Events carry an [`crate::agent::AgentHandle`], not the whole agent.** The
+//!   loop owns the agent as `&mut self` while dispatching, so instead of a full
+//!   `&Agent` reference callbacks receive a handle over the agent's shared,
+//!   interior-mutable surfaces (today: the persisted [`crate::agent::AgentState`]),
+//!   which grows as more surfaces are shared.
 //! - **The streaming update events** (`ModelStreamUpdateEvent`,
 //!   `ToolStreamUpdateEvent`) are deferred with the streaming feature.
 

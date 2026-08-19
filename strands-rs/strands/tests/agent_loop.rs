@@ -129,9 +129,9 @@ async fn basic_invocation_returns_stop_reason_and_last_message() {
     assert_eq!(result.stop_reason, StopReason::EndTurn);
     assert_eq!(result.text(), "Hello there");
     // User prompt + assistant reply are both in history.
-    assert_eq!(agent.messages.len(), 2);
-    assert_eq!(agent.messages[0].role, Role::User);
-    assert_eq!(agent.messages[1].role, Role::Assistant);
+    assert_eq!(agent.messages().len(), 2);
+    assert_eq!(agent.messages()[0].role, Role::User);
+    assert_eq!(agent.messages()[1].role, Role::Assistant);
 }
 
 // invoke > with tool use: "executes tools and returns final result"
@@ -152,14 +152,14 @@ async fn tool_use_executes_tool_and_continues() {
     assert_eq!(result.text(), "The answer is 3");
 
     // History: user prompt, assistant tool-use, user tool-result, assistant reply.
-    assert_eq!(agent.messages.len(), 4);
-    assert_eq!(agent.messages[1].role, Role::Assistant);
+    assert_eq!(agent.messages().len(), 4);
+    assert_eq!(agent.messages()[1].role, Role::Assistant);
     assert!(matches!(
-        agent.messages[1].content[0],
+        agent.messages()[1].content[0],
         ContentBlock::ToolUse(_)
     ));
-    assert_eq!(agent.messages[2].role, Role::User);
-    let ContentBlock::ToolResult(result_block) = &agent.messages[2].content[0] else {
+    assert_eq!(agent.messages()[2].role, Role::User);
+    let ContentBlock::ToolResult(result_block) = &agent.messages()[2].content[0] else {
         panic!("expected a tool result block");
     };
     assert_eq!(result_block.tool_use_id, "tool-1");

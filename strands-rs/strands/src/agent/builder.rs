@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentState};
 use crate::errors::StrandsError;
 use crate::hooks::{HookEvent, HookRegistry, InitializedEvent};
 use crate::models::Model;
@@ -19,6 +19,7 @@ pub struct AgentBuilder {
     messages: Vec<Message>,
     tool_registry: ToolRegistry,
     hooks: HookRegistry,
+    state: Option<AgentState>,
 }
 
 /// Default agent name used in telemetry when none is set.
@@ -52,6 +53,12 @@ impl AgentBuilder {
     /// Sets the agent name used in telemetry (`gen_ai.agent.name`).
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Seeds the agent's persisted [`AgentState`]. Defaults to empty.
+    pub fn state(mut self, state: AgentState) -> Self {
+        self.state = Some(state);
         self
     }
 
@@ -120,8 +127,12 @@ impl AgentBuilder {
             self.messages,
             self.tool_registry,
             self.hooks,
+            self.state.unwrap_or_default(),
         );
-        agent.hooks().invoke_callbacks(&mut InitializedEvent {})?;
+        let mut initialized = InitializedEvent {
+            agent: agent.agent_handle(),
+        };
+        agent.hooks().invoke_callbacks(&mut initialized)?;
         Ok(agent)
     }
 }

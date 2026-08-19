@@ -224,7 +224,8 @@ async fn resume_returns_response_without_recalling_model_for_the_tool_cycle() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 
     // The tool result carries the human response.
-    let tool_result_message = agent.messages.iter().find(|message| {
+    let messages = agent.messages();
+    let tool_result_message = messages.iter().find(|message| {
         message
             .content
             .iter()
