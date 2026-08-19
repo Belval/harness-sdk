@@ -140,7 +140,13 @@ Following the monorepo's cross-SDK rules:
   node / memory spans are not ported. The `gen_ai.*` attribute keys/values,
   operation names, span hierarchy, the STABLE/LATEST semconv switch
   (`gen_ai.system` vs `gen_ai.provider.name`), and `OTEL_SERVICE_NAME` are in
-  parity.
+  parity. Custom `trace_attributes` (`AgentBuilder::trace_attributes`, values of
+  type `AttributeValue`) are recorded on the `invoke_agent` span as a single
+  serialized-JSON `trace_attributes` field, because `tracing` span field names
+  are static; only scalar `AttributeValue`s are supported (arrays deferred).
+- **`Model::get_config()`** returns the provider config as a JSON map (default
+  `{"model_id": …}`; `BedrockModel` adds its inference params), the counterpart
+  to `model.get_config()`; also exposed via `AgentHandle::model_config()`.
 - **Middleware is non-streaming and typed per stage.** Handlers are async
   functions (`Input`: `C -> C`, `Output`: `R -> R`, `Wrap`: `(C, next) -> R`)
   rather than event-yielding async generators, and each stage is its own

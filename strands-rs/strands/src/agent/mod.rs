@@ -41,7 +41,7 @@ use crate::middleware::{
 };
 use crate::models::{Model, StreamAggregatedResult, StreamOptions};
 use crate::session::SessionManager;
-use crate::telemetry::Tracer;
+use crate::telemetry::{AttributeValue, Tracer};
 use crate::tools::executor::{
     SequentialToolExecutor, ToolExecutionContext, ToolExecutor, ToolsExecutionResult,
 };
@@ -102,6 +102,7 @@ pub struct Agent {
     conversation_manager: Option<Arc<dyn ConversationManager>>,
     session_manager: Option<Arc<dyn SessionManager>>,
     structured_output_schema: Option<serde_json::Value>,
+    trace_attributes: HashMap<String, AttributeValue>,
     tracer: Tracer,
     invoke_model_mw: MiddlewareStack<InvokeModelContext, StreamAggregatedResult>,
     execute_tool_mw: MiddlewareStack<ExecuteToolContext, ToolExecutionResult>,
@@ -127,6 +128,7 @@ impl Agent {
         conversation_manager: Option<Arc<dyn ConversationManager>>,
         session_manager: Option<Arc<dyn SessionManager>>,
         structured_output_schema: Option<serde_json::Value>,
+        trace_attributes: HashMap<String, AttributeValue>,
         tool_executor: Arc<dyn ToolExecutor>,
     ) -> Self {
         Agent {
@@ -144,6 +146,7 @@ impl Agent {
             conversation_manager,
             session_manager,
             structured_output_schema,
+            trace_attributes,
             tracer: Tracer::new(),
             invoke_model_mw: MiddlewareStack::new(),
             execute_tool_mw: MiddlewareStack::new(),
@@ -184,6 +187,7 @@ impl Agent {
             self.state.clone(),
             self.messages.clone(),
             self.model.model_id().map(str::to_string),
+            self.model.get_config(),
             self.session_manager.clone(),
         )
     }
@@ -446,6 +450,7 @@ impl Agent {
             self.model.model_id(),
             &tool_names,
             system_prompt.as_deref(),
+            &self.trace_attributes,
         );
 
         let outcome = self.run_cycles(new_input, state).await;

@@ -214,6 +214,24 @@ impl Model for BedrockModel {
         Some(&self.model_id)
     }
 
+    fn get_config(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut config = serde_json::Map::new();
+        config.insert(
+            "model_id".to_string(),
+            serde_json::Value::String(self.model_id.clone()),
+        );
+        if let Some(max_tokens) = self.max_tokens {
+            config.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+        }
+        if let Some(temperature) = self.temperature {
+            config.insert("temperature".to_string(), serde_json::json!(temperature));
+        }
+        if let Some(top_p) = self.top_p {
+            config.insert("top_p".to_string(), serde_json::json!(top_p));
+        }
+        config
+    }
+
     fn stream<'a>(
         &'a self,
         messages: &'a [Message],

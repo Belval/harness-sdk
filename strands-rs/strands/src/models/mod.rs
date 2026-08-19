@@ -66,6 +66,23 @@ pub trait Model: Send + Sync {
     /// The configured model identifier, if any.
     fn model_id(&self) -> Option<&str>;
 
+    /// The provider's configuration as a JSON map. Ports `model.get_config()`.
+    ///
+    /// The default reports just the model id (`{"model_id": <id or null>}`);
+    /// providers override it to include their inference parameters. Consumers use
+    /// it to read fields like `model_id` without knowing the concrete provider.
+    fn get_config(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut config = serde_json::Map::new();
+        config.insert(
+            "model_id".to_string(),
+            match self.model_id() {
+                Some(id) => serde_json::Value::String(id.to_string()),
+                None => serde_json::Value::Null,
+            },
+        );
+        config
+    }
+
     /// Streams a conversation with the model, yielding events as they occur.
     fn stream<'a>(
         &'a self,
@@ -588,5 +605,16 @@ mod tests {
     async fn returns_model_id() {
         let provider = TestModelProvider { events: vec![] };
         assert_eq!(provider.model_id(), Some("test-model"));
+    }
+
+    // Model.get_config: the default reports the model id
+    #[tokio::test]
+    async fn default_get_config_reports_model_id() {
+        let provider = TestModelProvider { events: vec![] };
+        let config = provider.get_config();
+        assert_eq!(
+            config.get("model_id"),
+            Some(&serde_json::json!("test-model"))
+        );
     }
 }

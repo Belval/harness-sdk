@@ -1,6 +1,7 @@
 //! Builder for [`Agent`]. Ports the constructor-config surface of `agent/agent.ts`
 //! into the idiomatic Rust builder pattern.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::agent::{Agent, AgentState};
@@ -9,6 +10,7 @@ use crate::errors::StrandsError;
 use crate::hooks::{HookEvent, HookFuture, HookProvider, HookRegistry, InitializedEvent};
 use crate::models::Model;
 use crate::session::SessionManager;
+use crate::telemetry::AttributeValue;
 use crate::tools::executor::{SequentialToolExecutor, ToolExecutor};
 use crate::tools::{Tool, ToolProvider, ToolRegistry};
 use crate::types::messages::{Message, SystemPrompt};
@@ -28,6 +30,7 @@ pub struct AgentBuilder {
     session_manager: Option<Arc<dyn SessionManager>>,
     structured_output_schema: Option<serde_json::Value>,
     tool_executor: Option<Arc<dyn ToolExecutor>>,
+    trace_attributes: HashMap<String, AttributeValue>,
 }
 
 /// Default agent name used in telemetry when none is set.
@@ -97,6 +100,13 @@ impl AgentBuilder {
     /// [`SequentialToolExecutor`]. Ports `AgentConfig.tool_executor`.
     pub fn tool_executor(mut self, executor: impl ToolExecutor + 'static) -> Self {
         self.tool_executor = Some(Arc::new(executor));
+        self
+    }
+
+    /// Sets custom attributes recorded on the agent telemetry span. Ports
+    /// `AgentConfig.trace_attributes`.
+    pub fn trace_attributes(mut self, attributes: HashMap<String, AttributeValue>) -> Self {
+        self.trace_attributes = attributes;
         self
     }
 
@@ -195,6 +205,7 @@ impl AgentBuilder {
             self.conversation_manager,
             self.session_manager,
             self.structured_output_schema,
+            self.trace_attributes,
             self.tool_executor
                 .unwrap_or_else(|| Arc::new(SequentialToolExecutor)),
         );
