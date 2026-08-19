@@ -23,8 +23,10 @@
 //!   `ToolStreamUpdateEvent`) are deferred with the streaming feature.
 
 mod events;
+mod provider;
 
 pub use events::*;
+pub use provider::HookProvider;
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
