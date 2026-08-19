@@ -7,11 +7,11 @@
 //! `resume`, `end_turn`, and the mutable `tool_use` / `result`), raises and
 //! resumes [`crate::interrupt`]s, emits [`crate::telemetry`] spans around the
 //! agent, each cycle, model calls, and tool calls, and runs model calls and tool
-//! executions through their [`crate::middleware`] stacks.
+//! executions through their [`crate::middleware`] stacks, and captures
+//! structured output via a synthetic tool when a schema is configured.
 //!
-//! The checkpoint, session, structured-output, and cancellation surfaces of the
-//! TypeScript loop are out of scope for the vertical slice; the control flow they
-//! wrap is preserved.
+//! The checkpoint, session, and cancellation surfaces of the TypeScript loop are
+//! out of scope for the vertical slice; the control flow they wrap is preserved.
 
 mod builder;
 mod invocation;
@@ -47,6 +47,7 @@ use crate::types::messages::{
     ContentBlock, Message, Role, StopReason, SystemPrompt, ToolResultBlock, ToolResultContent,
     ToolResultStatus, ToolUseBlock,
 };
+use crate::types::tools::{ToolChoice, ToolSpec};
 
 /// Upper bound on agent-loop cycles per invocation.
 ///
@@ -59,6 +60,10 @@ const MAX_LOOP_ITERATIONS: usize = 100;
 /// manager that reports success without actually shrinking history cannot loop
 /// forever on a persistent context-window overflow.
 const MAX_CONTEXT_REDUCTIONS: usize = 10;
+
+/// Name of the synthetic tool used to capture structured output. Ports
+/// `STRUCTURED_OUTPUT_TOOL_NAME`.
+const STRUCTURED_OUTPUT_TOOL_NAME: &str = "strands_structured_output";
 
 /// Whether the loop should stop with a result or run another cycle.
 enum CycleOutcome {
@@ -97,6 +102,7 @@ pub struct Agent {
     interrupt_state: InterruptState,
     state: AgentState,
     conversation_manager: Option<Arc<dyn ConversationManager>>,
+    structured_output_schema: Option<serde_json::Value>,
     tracer: Tracer,
     invoke_model_mw: MiddlewareStack<InvokeModelContext, StreamAggregatedResult>,
     execute_tool_mw: MiddlewareStack<ExecuteToolContext, ToolExecutionResult>,
@@ -118,6 +124,7 @@ impl Agent {
         hooks: HookRegistry,
         state: AgentState,
         conversation_manager: Option<Arc<dyn ConversationManager>>,
+        structured_output_schema: Option<serde_json::Value>,
     ) -> Self {
         Agent {
             messages: Messages::new(messages),
@@ -130,6 +137,7 @@ impl Agent {
             interrupt_state: InterruptState::new(),
             state,
             conversation_manager,
+            structured_output_schema,
             tracer: Tracer::new(),
             invoke_model_mw: MiddlewareStack::new(),
             execute_tool_mw: MiddlewareStack::new(),
@@ -428,6 +436,10 @@ impl Agent {
         state: &InvocationState,
     ) -> Result<AgentResult, StrandsError> {
         let mut iterations = 0;
+        // Once the model returns plain text while a structured-output schema is
+        // set, the next cycle forces the structured-output tool. Ports the
+        // TypeScript `structuredOutputChoice` state.
+        let mut force_structured = false;
 
         loop {
             if iterations >= MAX_LOOP_ITERATIONS {
@@ -436,7 +448,10 @@ impl Agent {
             iterations += 1;
 
             let cycle_span = self.tracer.start_cycle_span(&format!("cycle-{iterations}"));
-            match self.run_one_cycle(&mut new_input, state).await {
+            match self
+                .run_one_cycle(&mut new_input, state, &mut force_structured)
+                .await
+            {
                 Ok(CycleOutcome::Done(result)) => {
                     self.tracer.end_cycle_span(&cycle_span, None);
                     return Ok(result);
@@ -459,6 +474,7 @@ impl Agent {
         &mut self,
         new_input: &mut Option<Message>,
         state: &InvocationState,
+        force_structured: &mut bool,
     ) -> Result<CycleOutcome, StrandsError> {
         // Resuming from a tool interrupt reuses the stored assistant message and
         // completed results, skipping the model call. Ports the
@@ -473,15 +489,57 @@ impl Agent {
                     self.append_message(message, state).await?;
                 }
 
-                let model_result = self.invoke_model(state).await?;
+                let model_result = self.invoke_model(state, *force_structured).await?;
+                let structured = self.structured_output_schema.is_some();
 
                 if model_result.stop_reason != StopReason::ToolUse {
+                    // With a schema set, plain text means the model ignored the
+                    // structured-output tool: drop the turn and force it next
+                    // cycle, or error if it already refused when forced. Ports
+                    // the `structuredOutputChoice` fallback.
+                    if structured {
+                        if *force_structured {
+                            return Err(StrandsError::StructuredOutput(
+                                "The model failed to invoke the structured output tool even after it was forced."
+                                    .to_string(),
+                            ));
+                        }
+                        *force_structured = true;
+                        return Ok(CycleOutcome::Continue);
+                    }
                     self.append_message(model_result.message.clone(), state)
                         .await?;
                     return Ok(CycleOutcome::Done(AgentResult::new(
                         model_result.stop_reason,
                         model_result.message,
                     )));
+                }
+
+                // The model called the structured-output tool: capture its input
+                // as the structured result, record the tool-use and a success
+                // tool-result in history, and finish.
+                if structured {
+                    if let Some(output) = extract_structured_output(&model_result.message) {
+                        let tool_use_id = structured_tool_use_id(&model_result.message);
+                        self.append_message(model_result.message.clone(), state)
+                            .await?;
+                        if let Some(tool_use_id) = tool_use_id {
+                            let result_message = Message::new(
+                                Role::User,
+                                vec![ContentBlock::ToolResult(ToolResultBlock {
+                                    tool_use_id,
+                                    status: ToolResultStatus::Success,
+                                    content: vec![ToolResultContent::Json(output.clone())],
+                                })],
+                            );
+                            self.append_message(result_message, state).await?;
+                        }
+                        return Ok(CycleOutcome::Done(AgentResult::with_structured_output(
+                            StopReason::ToolUse,
+                            model_result.message,
+                            output,
+                        )));
+                    }
                 }
                 (model_result.message, None)
             }
@@ -567,9 +625,14 @@ impl Agent {
     /// Invokes the model, firing [`BeforeModelCallEvent`], per-block
     /// [`ContentBlockEvent`], [`ModelMessageEvent`], and [`AfterModelCallEvent`],
     /// and honoring `cancel` / `retry`. Ports `_invokeModel`.
+    ///
+    /// When a structured-output schema is configured, a synthetic
+    /// `strands_structured_output` tool carrying that schema is offered to the
+    /// model; `force_structured` additionally forces the model to call it.
     async fn invoke_model(
         &self,
         state: &InvocationState,
+        force_structured: bool,
     ) -> Result<StreamAggregatedResult, StrandsError> {
         let hooks = self.hooks.clone();
         let mut attempt_count = 1;
@@ -614,11 +677,21 @@ impl Agent {
             // terminal performs the actual call and owns the model span so the
             // span records the post-middleware request. Ports
             // `_invokeModelWithMiddleware`.
+            let mut tool_specs = self.tool_registry.tool_specs();
+            let mut tool_choice = None;
+            if let Some(schema) = &self.structured_output_schema {
+                tool_specs.push(structured_output_tool_spec(schema));
+                if force_structured {
+                    tool_choice = Some(ToolChoice::Tool {
+                        name: STRUCTURED_OUTPUT_TOOL_NAME.to_string(),
+                    });
+                }
+            }
             let context = InvokeModelContext {
                 messages: self.messages.snapshot(),
                 system_prompt: self.system_prompt.clone(),
-                tool_specs: self.tool_registry.tool_specs(),
-                tool_choice: None,
+                tool_specs,
+                tool_choice,
                 invocation_state: state.clone(),
             };
             let model = self.model.clone();
@@ -1014,6 +1087,40 @@ impl Agent {
             .last()
             .unwrap_or_else(|| Message::new(Role::Assistant, vec![ContentBlock::text("")]))
     }
+}
+
+/// The synthetic tool spec offered to capture structured output: its input
+/// schema is the caller's desired output schema. Ports `StructuredOutputTool`.
+fn structured_output_tool_spec(schema: &serde_json::Value) -> ToolSpec {
+    ToolSpec {
+        name: STRUCTURED_OUTPUT_TOOL_NAME.to_string(),
+        description:
+            "This tool MUST only be invoked as the last and final tool before returning the completed result to the caller."
+                .to_string(),
+        input_schema: Some(schema.clone()),
+        output_schema: None,
+    }
+}
+
+/// Returns the input of a `strands_structured_output` tool-use in `message`, if
+/// present — the captured structured output. Ports `_extractStructuredOutput`.
+fn extract_structured_output(message: &Message) -> Option<serde_json::Value> {
+    message.content.iter().find_map(|block| match block {
+        ContentBlock::ToolUse(tool_use) if tool_use.name == STRUCTURED_OUTPUT_TOOL_NAME => {
+            Some(tool_use.input.clone())
+        }
+        _ => None,
+    })
+}
+
+/// The tool-use id of the `strands_structured_output` call in `message`, if any.
+fn structured_tool_use_id(message: &Message) -> Option<String> {
+    message.content.iter().find_map(|block| match block {
+        ContentBlock::ToolUse(tool_use) if tool_use.name == STRUCTURED_OUTPUT_TOOL_NAME => {
+            Some(tool_use.tool_use_id.clone())
+        }
+        _ => None,
+    })
 }
 
 /// Builds an error tool-result block carrying `message` as its text.

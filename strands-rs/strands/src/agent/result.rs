@@ -5,16 +5,21 @@ use crate::types::messages::{Message, StopReason};
 
 /// The outcome of an agent invocation.
 ///
-/// Carries the final stop reason, the last message, and — when the turn halted
-/// on an interrupt — the unanswered interrupts to respond to. Metrics, traces,
-/// structured output, and checkpoints from the TypeScript `AgentResult` are out
-/// of the vertical slice's scope.
+/// Carries the final stop reason, the last message, the structured output (when
+/// a structured-output schema was configured and the model produced it), and —
+/// when the turn halted on an interrupt — the unanswered interrupts to respond
+/// to. Metrics, traces, and checkpoints from the TypeScript `AgentResult` are
+/// out of the vertical slice's scope.
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     /// The stop reason from the final model response.
     pub stop_reason: StopReason,
     /// The last message added to the conversation.
     pub last_message: Message,
+    /// The structured output captured from the structured-output tool, when a
+    /// schema was configured (see [`crate::AgentBuilder::structured_output_schema`]);
+    /// `None` otherwise. Ports `AgentResult.structured_output`.
+    pub structured_output: Option<serde_json::Value>,
     /// Unanswered interrupts when `stop_reason` is [`StopReason::Interrupt`];
     /// empty otherwise. Respond to these via [`crate::Agent::resume`].
     pub interrupts: Vec<Interrupt>,
@@ -25,6 +30,7 @@ impl AgentResult {
         AgentResult {
             stop_reason,
             last_message,
+            structured_output: None,
             interrupts: Vec::new(),
         }
     }
@@ -37,7 +43,21 @@ impl AgentResult {
         AgentResult {
             stop_reason,
             last_message,
+            structured_output: None,
             interrupts,
+        }
+    }
+
+    pub(crate) fn with_structured_output(
+        stop_reason: StopReason,
+        last_message: Message,
+        structured_output: serde_json::Value,
+    ) -> Self {
+        AgentResult {
+            stop_reason,
+            last_message,
+            structured_output: Some(structured_output),
+            interrupts: Vec::new(),
         }
     }
 

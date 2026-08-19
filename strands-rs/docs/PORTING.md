@@ -68,6 +68,7 @@ Following the monorepo's cross-SDK rules:
 | `types/agent.ts` (`InvocationState`) | `agent/invocation.rs` |
 | `agent/state.ts` (`AgentState`) + `event.agent` | `agent/state.rs` (`AgentState`, `AgentHandle`, `Messages`) |
 | `agent/conversation-manager/` (`ConversationManager`) | `conversation_manager/mod.rs` |
+| `tools/structured-output-tool.ts` + structured-output loop branch | `agent/mod.rs` (`structured_output_tool_spec`, loop) + `AgentResult::structured_output` |
 | `hooks/registry.ts`, `hooks/types.ts` | `hooks/mod.rs` |
 | `hooks/events.ts` | `hooks/events.rs` |
 | `HookProvider` (`register_hooks`) | `hooks/provider.rs` |
@@ -166,3 +167,13 @@ Following the monorepo's cross-SDK rules:
   half, a streaming/async-iterator API that yields the loop's events to the
   caller (the package's websocket `_streaming` push), is still deferred with the
   larger streaming-agent-API milestone.
+- **Structured output captures the tool-use input directly.** With a schema set
+  (`AgentBuilder::structured_output_schema`), the loop offers a synthetic
+  `strands_structured_output` tool carrying that schema, forces it if the model
+  replies with plain text, and — when the model calls it — captures the tool-use
+  *input* as `AgentResult::structured_output`, recording a success tool-result in
+  history. Simplifications vs. TypeScript: no schema *validation* of the input
+  (the JSON is captured as-is rather than validated/retried via a Zod-backed
+  tool), and the structured tool is assumed to be the sole/final tool call in its
+  turn (co-called normal tools in the same turn are not executed on the capture
+  path). A model that refuses even when forced yields `StrandsError::StructuredOutput`.

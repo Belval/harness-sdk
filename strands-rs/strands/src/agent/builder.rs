@@ -22,6 +22,7 @@ pub struct AgentBuilder {
     hooks: HookRegistry,
     state: Option<AgentState>,
     conversation_manager: Option<Arc<dyn ConversationManager>>,
+    structured_output_schema: Option<serde_json::Value>,
 }
 
 /// Default agent name used in telemetry when none is set.
@@ -68,6 +69,15 @@ impl AgentBuilder {
     /// overflow. Defaults to none (an overflow propagates).
     pub fn conversation_manager(mut self, manager: impl ConversationManager + 'static) -> Self {
         self.conversation_manager = Some(Arc::new(manager));
+        self
+    }
+
+    /// Configures structured output: a JSON Schema for the desired result. When
+    /// set, the agent offers a `strands_structured_output` tool with this schema,
+    /// forces it if the model replies with plain text, and returns the captured
+    /// value in [`crate::AgentResult::structured_output`].
+    pub fn structured_output_schema(mut self, schema: serde_json::Value) -> Self {
+        self.structured_output_schema = Some(schema);
         self
     }
 
@@ -156,6 +166,7 @@ impl AgentBuilder {
             self.hooks,
             self.state.unwrap_or_default(),
             self.conversation_manager,
+            self.structured_output_schema,
         );
         let mut initialized = InitializedEvent {
             agent: agent.agent_handle(),
