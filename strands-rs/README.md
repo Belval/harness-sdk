@@ -83,11 +83,12 @@ cycles, model calls, and tool calls), and **middleware** (`Input`/`Output`/`Wrap
 handlers wrapping the model-invoke and tool-execute stages).
 
 Agent-scoped `AgentState` and a shared conversation-history handle are exposed
-to hooks via `event.agent`, and a `ConversationManager` reduces context on
-overflow.
+to hooks via `event.agent`, a `ConversationManager` reduces context on overflow,
+and **structured output** (`AgentBuilder::structured_output_schema` →
+`AgentResult::structured_output`) is captured via a synthetic tool.
 
 **Not yet ported** (present in the TypeScript SDK): checkpointing, sessions,
-memory, structured output, tool progress-streaming, guardrails, citations, the
+memory, tool progress-streaming, guardrails, citations, the
 streaming agent API, multi-agent orchestration, and providers other than Bedrock.
 Telemetry emits `tracing` spans (a subscriber is the backend) rather than wiring
 OpenTelemetry directly; middleware is the non-streaming form (the event-yielding
