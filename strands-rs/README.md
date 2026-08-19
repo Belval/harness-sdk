@@ -82,6 +82,10 @@ caching** (`CachePointBlock`, structured `SystemPrompt`, and Bedrock
 cycles, model calls, and tool calls), and **middleware** (`Input`/`Output`/`Wrap`
 handlers wrapping the model-invoke and tool-execute stages).
 
+Agent-scoped `AgentState` and a shared conversation-history handle are exposed
+to hooks via `event.agent`, and a `ConversationManager` reduces context on
+overflow.
+
 **Not yet ported** (present in the TypeScript SDK): checkpointing, sessions,
 memory, structured output, tool progress-streaming, guardrails, citations, the
 streaming agent API, multi-agent orchestration, and providers other than Bedrock.

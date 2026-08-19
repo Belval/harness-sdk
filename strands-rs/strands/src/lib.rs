@@ -18,6 +18,7 @@
 //! ```
 
 pub mod agent;
+pub mod conversation_manager;
 pub mod errors;
 pub mod hooks;
 pub mod interrupt;
@@ -30,6 +31,7 @@ pub mod types;
 pub use agent::{
     Agent, AgentBuilder, AgentHandle, AgentResult, AgentState, InvocationState, Messages,
 };
+pub use conversation_manager::{ConversationManager, NullConversationManager};
 pub use errors::StrandsError;
 pub use hooks::{HookCleanup, HookEvent, HookOrder, HookRegistry};
 pub use interrupt::{Interrupt, InterruptError, InterruptSource, InterruptState};

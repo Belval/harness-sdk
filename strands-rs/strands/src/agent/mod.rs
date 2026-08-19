@@ -26,6 +26,7 @@ pub use state::{AgentHandle, AgentState, Messages};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::conversation_manager::ConversationManager;
 use crate::errors::StrandsError;
 use crate::hooks::{
     AfterInvocationEvent, AfterModelCallEvent, AfterToolCallEvent, AfterToolsEvent,
@@ -53,6 +54,11 @@ use crate::types::messages::{
 /// the vertical slice omits that surface, so this guard prevents an unbounded
 /// tool-call loop. Reaching it stops the turn with [`StopReason::EndTurn`].
 const MAX_LOOP_ITERATIONS: usize = 100;
+
+/// Upper bound on conversation-manager context reductions per model call, so a
+/// manager that reports success without actually shrinking history cannot loop
+/// forever on a persistent context-window overflow.
+const MAX_CONTEXT_REDUCTIONS: usize = 10;
 
 /// Whether the loop should stop with a result or run another cycle.
 enum CycleOutcome {
@@ -90,6 +96,7 @@ pub struct Agent {
     hooks: HookRegistry,
     interrupt_state: InterruptState,
     state: AgentState,
+    conversation_manager: Option<Arc<dyn ConversationManager>>,
     tracer: Tracer,
     invoke_model_mw: MiddlewareStack<InvokeModelContext, StreamAggregatedResult>,
     execute_tool_mw: MiddlewareStack<ExecuteToolContext, ToolExecutionResult>,
@@ -110,6 +117,7 @@ impl Agent {
         tool_registry: ToolRegistry,
         hooks: HookRegistry,
         state: AgentState,
+        conversation_manager: Option<Arc<dyn ConversationManager>>,
     ) -> Self {
         Agent {
             messages: Messages::new(messages),
@@ -121,6 +129,7 @@ impl Agent {
             hooks,
             interrupt_state: InterruptState::new(),
             state,
+            conversation_manager,
             tracer: Tracer::new(),
             invoke_model_mw: MiddlewareStack::new(),
             execute_tool_mw: MiddlewareStack::new(),
@@ -141,6 +150,12 @@ impl Agent {
     /// The shared conversation-history handle, for advanced in-place access.
     pub fn messages_handle(&self) -> &Messages {
         &self.messages
+    }
+
+    /// The conversation manager, if one is configured. Ports
+    /// `agent.conversation_manager`.
+    pub fn conversation_manager(&self) -> Option<&Arc<dyn ConversationManager>> {
+        self.conversation_manager.as_ref()
     }
 
     /// Builds the hook-facing handle passed to events fired this loop.
@@ -492,6 +507,7 @@ impl Agent {
     ) -> Result<StreamAggregatedResult, StrandsError> {
         let hooks = self.hooks.clone();
         let mut attempt_count = 1;
+        let mut reduce_attempts = 0;
 
         loop {
             let mut before = BeforeModelCallEvent {
@@ -607,6 +623,23 @@ impl Agent {
                     return Ok(result);
                 }
                 Err(error) => {
+                    // Context-window overflow: ask the conversation manager to
+                    // reduce the history, then retry. Bounded so a manager that
+                    // reports success without shrinking cannot loop forever.
+                    if matches!(error, StrandsError::ContextWindowOverflow(_)) {
+                        if let Some(manager) = &self.conversation_manager {
+                            if reduce_attempts < MAX_CONTEXT_REDUCTIONS
+                                && manager
+                                    .reduce_context(&self.agent_handle(), Some(&error.to_string()))
+                                    .await
+                                    .is_ok()
+                            {
+                                reduce_attempts += 1;
+                                continue;
+                            }
+                        }
+                    }
+
                     let mut after = AfterModelCallEvent {
                         invocation_state: state.clone(),
                         agent: self.agent_handle(),
