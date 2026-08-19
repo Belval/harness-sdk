@@ -89,8 +89,11 @@ to hooks via `event.agent`, a `ConversationManager` reduces context on overflow,
 be supplied at runtime through a `ToolProvider` (built with `FunctionTool::from_spec`)
 loaded lazily at invocation start.
 
-**Not yet ported** (present in the TypeScript SDK): checkpointing, sessions,
-memory, tool progress-streaming, guardrails, citations, the
+A minimal `SessionManager` (`sync_agent`) and a `ToolProvider` with runtime tool
+construction are also available.
+
+**Not yet ported** (present in the TypeScript SDK): checkpointing, full session
+persistence, memory, tool progress-streaming, guardrails, citations, the
 streaming agent API, multi-agent orchestration, and providers other than Bedrock.
 Telemetry emits `tracing` spans (a subscriber is the backend) rather than wiring
 OpenTelemetry directly; middleware is the non-streaming form (the event-yielding

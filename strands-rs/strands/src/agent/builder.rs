@@ -8,6 +8,7 @@ use crate::conversation_manager::ConversationManager;
 use crate::errors::StrandsError;
 use crate::hooks::{HookEvent, HookFuture, HookProvider, HookRegistry, InitializedEvent};
 use crate::models::Model;
+use crate::session::SessionManager;
 use crate::tools::{Tool, ToolProvider, ToolRegistry};
 use crate::types::messages::{Message, SystemPrompt};
 
@@ -23,6 +24,7 @@ pub struct AgentBuilder {
     hooks: HookRegistry,
     state: Option<AgentState>,
     conversation_manager: Option<Arc<dyn ConversationManager>>,
+    session_manager: Option<Arc<dyn SessionManager>>,
     structured_output_schema: Option<serde_json::Value>,
 }
 
@@ -70,6 +72,13 @@ impl AgentBuilder {
     /// overflow. Defaults to none (an overflow propagates).
     pub fn conversation_manager(mut self, manager: impl ConversationManager + 'static) -> Self {
         self.conversation_manager = Some(Arc::new(manager));
+        self
+    }
+
+    /// Sets the session manager, exposed to hooks via `event.agent.session_manager()`
+    /// so an async hook can persist the session. Defaults to none.
+    pub fn session_manager(mut self, manager: impl SessionManager + 'static) -> Self {
+        self.session_manager = Some(Arc::new(manager));
         self
     }
 
@@ -175,6 +184,7 @@ impl AgentBuilder {
             self.hooks,
             self.state.unwrap_or_default(),
             self.conversation_manager,
+            self.session_manager,
             self.structured_output_schema,
         );
         let mut initialized = InitializedEvent {

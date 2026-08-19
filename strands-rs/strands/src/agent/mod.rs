@@ -40,6 +40,7 @@ use crate::middleware::{
     ExecuteToolContext, InvokeModelContext, MiddlewareStack, ToolExecutionResult,
 };
 use crate::models::{Model, StreamAggregatedResult, StreamOptions};
+use crate::session::SessionManager;
 use crate::telemetry::Tracer;
 use crate::tools::{Tool, ToolProvider, ToolRegistry};
 use crate::types::interrupt::InterruptResponse;
@@ -104,6 +105,7 @@ pub struct Agent {
     interrupt_state: InterruptState,
     state: AgentState,
     conversation_manager: Option<Arc<dyn ConversationManager>>,
+    session_manager: Option<Arc<dyn SessionManager>>,
     structured_output_schema: Option<serde_json::Value>,
     tracer: Tracer,
     invoke_model_mw: MiddlewareStack<InvokeModelContext, StreamAggregatedResult>,
@@ -127,6 +129,7 @@ impl Agent {
         hooks: HookRegistry,
         state: AgentState,
         conversation_manager: Option<Arc<dyn ConversationManager>>,
+        session_manager: Option<Arc<dyn SessionManager>>,
         structured_output_schema: Option<serde_json::Value>,
     ) -> Self {
         Agent {
@@ -142,6 +145,7 @@ impl Agent {
             interrupt_state: InterruptState::new(),
             state,
             conversation_manager,
+            session_manager,
             structured_output_schema,
             tracer: Tracer::new(),
             invoke_model_mw: MiddlewareStack::new(),
@@ -171,12 +175,18 @@ impl Agent {
         self.conversation_manager.as_ref()
     }
 
+    /// The session manager, if one is configured. Ports `agent._session_manager`.
+    pub fn session_manager(&self) -> Option<&Arc<dyn SessionManager>> {
+        self.session_manager.as_ref()
+    }
+
     /// Builds the hook-facing handle passed to events fired this loop.
     fn agent_handle(&self) -> AgentHandle {
         AgentHandle::new(
             self.state.clone(),
             self.messages.clone(),
             self.model.model_id().map(str::to_string),
+            self.session_manager.clone(),
         )
     }
 

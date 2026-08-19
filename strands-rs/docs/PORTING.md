@@ -68,6 +68,7 @@ Following the monorepo's cross-SDK rules:
 | `types/agent.ts` (`InvocationState`) | `agent/invocation.rs` |
 | `agent/state.ts` (`AgentState`) + `event.agent` | `agent/state.rs` (`AgentState`, `AgentHandle`, `Messages`) |
 | `agent/conversation-manager/` (`ConversationManager`) | `conversation_manager/mod.rs` |
+| `session/` (`SessionManager`) | `session/mod.rs` |
 | `ToolRegistry` dynamic tools (`register_dynamic_tool`, `dynamic_tools`, `get_all_tool_specs`) | `tools/registry.rs` (`Arc`-shared base + per-instance dynamic layer, `fork()`) |
 | `tools/tool-provider.ts` (`ToolProvider`) | `tools/tool_provider.rs` |
 | `tools/decorator.ts` runtime `DecoratedFunctionTool` / `FunctionToolMetadata` | `tools/function_tool.rs` (`FunctionTool::from_spec`) |
@@ -187,3 +188,9 @@ Following the monorepo's cross-SDK rules:
   dynamic union; the Python progressive-disclosure spec filter (a live
   `hidden_tools` set toggled on skill activation) is the skills subsystem's
   concern and is deferred — the registry offers no built-in spec filtering yet.
+- **`SessionManager` is a minimal surface.** Only `sync_agent(agent)` is ported
+  (readable surfaces via `AgentHandle`), exposed on the agent and the hook handle
+  so an async hook can persist after changing the conversation. Full session
+  persistence (initialize / per-message append / restore) and the manager's own
+  auto-sync-on-`MessageAddedEvent` hook registration are deferred; the consumer
+  drives `sync_agent` explicitly for now.
