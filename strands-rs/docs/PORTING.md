@@ -70,6 +70,7 @@ Following the monorepo's cross-SDK rules:
 | `agent/conversation-manager/` (`ConversationManager`) | `conversation_manager/mod.rs` |
 | `hooks/registry.ts`, `hooks/types.ts` | `hooks/mod.rs` |
 | `hooks/events.ts` | `hooks/events.rs` |
+| `HookProvider` (`register_hooks`) | `hooks/provider.rs` |
 | `interrupt.ts` | `interrupt.rs` |
 | `types/interrupt.ts` | `types/interrupt.rs` |
 | `SystemPrompt` / `SystemContentBlock` / `CacheConfig` (`types/messages.ts`, `models/model.ts`) | `types/messages.rs` (`SystemPrompt`, `SystemContentBlock`), `models/mod.rs` (`CacheStrategy`) |
@@ -152,3 +153,9 @@ Following the monorepo's cross-SDK rules:
   agent exposes the manager; with async hook callbacks now available, a
   `BeforeModelCall` hook can call it and await, as the Python `ContextManager`
   does.
+- **`HookProvider` registers one typed callback per event.** The trait's
+  `register_hooks(&self, &HookRegistry)` bundles registrations (via
+  `add_callback` / `add_callback_async`) as a unit, matching Python. The Python
+  `_StreamingHook` pattern of one callback registered across many event types and
+  handled polymorphically as a base event is deferred — strands-rs callbacks are
+  typed per concrete event, so a provider registers one callback per event type.

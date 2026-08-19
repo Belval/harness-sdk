@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::agent::{Agent, AgentState};
 use crate::conversation_manager::ConversationManager;
 use crate::errors::StrandsError;
-use crate::hooks::{HookEvent, HookFuture, HookRegistry, InitializedEvent};
+use crate::hooks::{HookEvent, HookFuture, HookProvider, HookRegistry, InitializedEvent};
 use crate::models::Model;
 use crate::tools::{Tool, ToolRegistry};
 use crate::types::messages::{Message, SystemPrompt};
@@ -120,6 +120,12 @@ impl AgentBuilder {
         F: Fn(&mut E) -> Result<(), StrandsError> + Send + Sync + 'static,
     {
         self.hooks.add_callback_with_order(callback, order);
+        self
+    }
+
+    /// Registers all of a [`HookProvider`]'s callbacks as one unit.
+    pub fn hook_provider(self, provider: impl HookProvider) -> Self {
+        provider.register_hooks(&self.hooks);
         self
     }
 

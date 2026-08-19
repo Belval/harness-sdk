@@ -32,8 +32,8 @@ use crate::hooks::{
     AfterInvocationEvent, AfterModelCallEvent, AfterToolCallEvent, AfterToolsEvent,
     AgentResultEvent, BeforeInvocationEvent, BeforeModelCallEvent, BeforeToolCallEvent,
     BeforeToolsEvent, ContentBlockEvent, HookCleanup, HookEndTurn, HookEvent, HookFuture,
-    HookRegistry, InterruptEvent, MessageAddedEvent, ModelMessageEvent, ModelStopData,
-    ToolResultEvent, ToolUseData,
+    HookProvider, HookRegistry, InterruptEvent, MessageAddedEvent, ModelMessageEvent,
+    ModelStopData, ToolResultEvent, ToolUseData,
 };
 use crate::interrupt::{InterruptError, InterruptState, PendingToolExecution};
 use crate::middleware::{
@@ -222,6 +222,12 @@ impl Agent {
         F: for<'a> Fn(&'a mut E) -> HookFuture<'a> + Send + Sync + 'static,
     {
         self.hooks.add_callback_async(callback)
+    }
+
+    /// Registers all of a [`HookProvider`]'s callbacks on this agent, for
+    /// post-build registration. Ports registering a `HookProvider`.
+    pub fn add_hook_provider(&self, provider: &impl HookProvider) {
+        provider.register_hooks(&self.hooks);
     }
 
     /// Runs the agent loop with a text prompt, returning the final result.

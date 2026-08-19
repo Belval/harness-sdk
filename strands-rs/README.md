@@ -71,10 +71,10 @@ strands-rs/
 **Ported:** core message/content types, `Model` trait + `stream_aggregated`,
 Bedrock provider (Converse Stream API), tool system (`Tool`, `FunctionTool`,
 registry, sequential execution), the `#[tool]` macro, the agent loop
-(`Agent::invoke`), the lifecycle **hook system** (`HookRegistry`, the
-`Before*`/`After*` events with their `cancel` / `retry` / `selected_tool` /
-`resume` / `end_turn` / mutable `tool_use` / `result` control fields, and
-`InvocationState`), the **interrupt system** (human-in-the-loop `interrupt()`
+(`Agent::invoke`), the lifecycle **hook system** (`HookRegistry`, sync and async
+callbacks, `HookProvider` bundles, the `Before*`/`After*` events with their
+`cancel` / `retry` / `selected_tool` / `resume` / `end_turn` / mutable
+`tool_use` / `result` control fields, and `InvocationState`), the **interrupt system** (human-in-the-loop `interrupt()`
 on tools and hooks, `InterruptState`, and `Agent::resume`), and **prompt
 caching** (`CachePointBlock`, structured `SystemPrompt`, and Bedrock
 `BedrockCacheConfig` auto-injection + manual cache points), and **telemetry**
