@@ -323,6 +323,14 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
                 .await
                 .map(|id| format!("started {} with a goal", swarm.label(&id)))
         }
+        (Command::To { text, .. }, _) if text.is_empty() => {
+            Err(strands_agents::Error::other("usage: /to <agent> <message>"))
+        }
+        (Command::To { who, text }, _) => swarm.resolve(&who).and_then(|id| {
+            swarm
+                .send(USER, &id, text)
+                .map(|()| format!("sent to {}", swarm.label(&id)))
+        }),
         (Command::Message(text), Some(id)) => swarm
             .send(USER, &id, text)
             .map(|()| format!("sent to {}", swarm.label(&id))),

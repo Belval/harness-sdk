@@ -50,7 +50,7 @@ output) the whole swarm may use: once spent, model calls fail with a "budget exh
 travels up to you, and `/budget N` in the TUI raises it (`/budget off` lifts it, `/budget` shows usage),
 which tells every stopped agent to continue. The budget is saved with the run.
 
-TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/stop`, `/cancel`,
+TUI: ↑/↓ select an agent, type to message it, `/to <agent> <message>` (by name or id, without selecting it), `/new <task>`, `/goal <goal>`, `/stop`, `/cancel`,
 `/gc`, Ctrl-C quits.
 `/stop` (or Esc twice within a second on an empty input) interrupts the selected agent's turn without
 cancelling it, like Esc in Claude Code: an open tool call is closed as cancelled, the agent goes idle

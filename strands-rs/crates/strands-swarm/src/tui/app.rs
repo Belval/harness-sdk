@@ -270,6 +270,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "start a root agent that works until the goal is met",
     },
     SlashCommand {
+        name: "/to",
+        args: "<agent> <message>",
+        help: "message an agent by name or id without selecting it",
+    },
+    SlashCommand {
         name: "/model",
         args: "[<id>|default]",
         help: "show or switch the selected agent's model",
@@ -642,6 +647,13 @@ pub enum Command {
     Goal(String),
     /// Send a message to the selected agent.
     Message(String),
+    /// Send a message to the agent with this id or name, whatever is selected.
+    To {
+        /// Agent id or name.
+        who: String,
+        /// Message text (empty when the user left it out).
+        text: String,
+    },
     /// Cancel the selected agent.
     Cancel,
     /// Interrupt the selected agent's current turn; it stays alive and idle.
@@ -692,6 +704,14 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         let (path, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         return Some(Command::Image {
             path: path.into(),
+            text: text.trim().to_owned(),
+        });
+    }
+    if let Some(rest) = line.strip_prefix("/to ") {
+        let rest = rest.trim();
+        let (who, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        return Some(Command::To {
+            who: who.to_owned(),
             text: text.trim().to_owned(),
         });
     }
@@ -1121,6 +1141,20 @@ mod tests {
             Some(Command::Goal("ship it".into()))
         );
         assert_eq!(parse_command("/model", true), Some(Command::ShowModel));
+        assert_eq!(
+            parse_command("/to a10  monitor my Slack ", false),
+            Some(Command::To {
+                who: "a10".into(),
+                text: "monitor my Slack".into()
+            })
+        );
+        assert_eq!(
+            parse_command("/to a10", true),
+            Some(Command::To {
+                who: "a10".into(),
+                text: String::new()
+            })
+        );
         assert_eq!(parse_command("/gc", false), Some(Command::Gc));
         assert_eq!(
             parse_command("/model  anthropic/claude-x ", true),
