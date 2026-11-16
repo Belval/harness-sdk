@@ -1018,23 +1018,25 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
         (saved.agents[0].input_tokens, saved.agents[0].output_tokens),
         (1005, 11)
     );
+    assert_eq!(saved.agents[0].context, Some(5.0 / 4000.0));
     let (_resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
     let restored = async {
         loop {
             if let Some(SwarmEvent::Usage {
                 input_tokens,
                 output_tokens,
+                context,
                 ..
             }) = events.recv().await
             {
-                return (input_tokens, output_tokens);
+                return (input_tokens, output_tokens, context);
             }
         }
     };
     let restored = tokio::time::timeout(Duration::from_secs(10), restored)
         .await
         .expect("no usage after resume");
-    assert_eq!(restored, (1005, 11));
+    assert_eq!(restored, (1005, 11, Some(5.0 / 4000.0)));
 }
 
 #[tokio::test]

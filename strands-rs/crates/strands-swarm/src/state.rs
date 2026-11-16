@@ -17,7 +17,7 @@ pub const STATE_FILE: &str = "swarm.json";
 pub const SESSIONS_DIR: &str = "sessions";
 
 /// Persisted swarm.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwarmState {
     /// Run id.
     pub run_id: String,
@@ -33,7 +33,7 @@ pub struct SwarmState {
 }
 
 /// Persisted agent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentState {
     /// Id.
     pub id: String,
@@ -64,6 +64,9 @@ pub struct AgentState {
     /// Output tokens used so far, across restarts.
     #[serde(default)]
     pub output_tokens: u64,
+    /// Context window utilization of the last model call (`0..1+`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<f64>,
 }
 
 /// Persisted mail.

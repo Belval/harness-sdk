@@ -339,4 +339,29 @@ mod tests {
         let error = resolve(None).await.err().expect("default used");
         assert!(error.to_string().contains("nope"), "{error}");
     }
+
+    /// The tree's context % and the summarization gate both need the window of the models the
+    /// swarm runs; an unknown one would silently fall back to a 200k default.
+    #[tokio::test]
+    async fn the_swarms_models_have_a_known_context_window() {
+        let resolve = harness_model_resolver(HarnessFactoryOptions::default());
+        for id in [
+            "bedrock/global.anthropic.claude-opus-5-5",
+            "bedrock/global.anthropic.claude-sonnet-5-5",
+            "bedrock/us.anthropic.claude-haiku-5-5",
+            "bedrock/us.anthropic.claude-opus-4-6-v1",
+            "global.anthropic.claude-opus-5",
+        ] {
+            let model = resolve(Some(id.into())).await.unwrap();
+            assert!(model.context_window_limit().is_some(), "{id}");
+        }
+        let default = resolve(None).await.unwrap();
+        assert!(default.context_window_limit().is_some(), "{DEFAULT_MODEL}");
+        for id in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"] {
+            assert!(
+                strands_agents::models::defaults::get_context_window_limit(id).is_some(),
+                "anthropic/{id}"
+            );
+        }
+    }
 }

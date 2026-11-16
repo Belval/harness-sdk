@@ -288,8 +288,8 @@ pub enum SwarmEvent {
         input_tokens: u64,
         /// Output tokens so far.
         output_tokens: u64,
-        /// Share of the model's context window the last model call's input filled (`0..1+`);
-        /// `None` when unknown.
+        /// Share of the model's context window the last model call's input filled (`0..1+`), as
+        /// the context manager estimates it; `None` before the first model call.
         context: Option<f64>,
     },
     /// The token budget was set or lifted (`None`).
@@ -367,6 +367,8 @@ struct Node {
     finished: AtomicBool,
     /// Background disk reclamation has been started for this agent.
     collected: AtomicBool,
+    /// Context window utilization of the last model call, across restarts.
+    context: Mutex<Option<f64>>,
 }
 
 /// Cumulative `(input, output)` tokens.
@@ -530,6 +532,7 @@ impl Swarm {
                 usage: Mutex::new((0, 0)),
                 finished: AtomicBool::new(false),
                 collected: AtomicBool::new(false),
+                context: Mutex::new(None),
             });
             agents.insert(id.clone(), node.clone());
             node
@@ -849,6 +852,7 @@ impl Swarm {
             usage: Mutex::new((saved.input_tokens, saved.output_tokens)),
             finished: AtomicBool::new(!status.is_live()),
             collected: AtomicBool::new(false),
+            context: Mutex::new(saved.context),
         });
         agents.insert(saved.id.clone(), node.clone());
         drop(agents);
@@ -865,7 +869,7 @@ impl Swarm {
             id: node.id.clone(),
             status: status.clone(),
         });
-        self.emit_usage(&node, None);
+        self.emit_usage(&node);
         if status.is_live() {
             self.start_actor(node, Start::Resume { interrupted });
         }
@@ -1259,16 +1263,17 @@ impl Swarm {
             total.0 += input;
             total.1 += usage.output_tokens;
         }
-        let window = node
-            .agent
-            .get()
-            .and_then(|agent| agent.model().context_window_limit())
-            .filter(|window| *window > 0);
-        self.emit_usage(node, window.map(|window| input as f64 / window as f64));
+        // The same estimate the context manager gates summarization on, including its default
+        // window for models whose window is unknown.
+        if let Some(agent) = node.agent.get() {
+            *node.context.lock() = Some(agent.model().estimate_utilization(input));
+        }
+        self.emit_usage(node);
     }
 
-    fn emit_usage(&self, node: &Node, context: Option<f64>) {
+    fn emit_usage(&self, node: &Node) {
         let (input_tokens, output_tokens) = *node.usage.lock();
+        let context = *node.context.lock();
         self.emit(SwarmEvent::Usage {
             id: node.id.clone(),
             input_tokens,
@@ -1455,6 +1460,7 @@ fn node_state(node: &Node) -> AgentState {
         env: node.env.clone(),
         input_tokens,
         output_tokens,
+        context: *node.context.lock(),
     }
 }
 

@@ -420,6 +420,7 @@ mod tests {
             env: env(&tmp.path().join(format!("target-worktrees/r1/{id}"))),
             input_tokens: 0,
             output_tokens: 0,
+            context: None,
         };
         fs::create_dir_all(tmp.path().join("target-worktrees/r1/a1")).unwrap();
         fs::create_dir_all(tmp.path().join("target-worktrees/r1/a2")).unwrap();

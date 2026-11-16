@@ -4,6 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
+use strands_agents::context_manager::AUTO_SUMMARIZE_UTILIZATION;
 
 use strands_agents::types::{ContentBlock, Message, Role, ToolResultStatus};
 
@@ -331,6 +332,14 @@ impl App {
             } => self.with(&id, |view| {
                 view.input_tokens = input_tokens;
                 view.output_tokens = output_tokens;
+                // Note the crossing once, from a known lower value, so a restart does not repeat it.
+                let crossed = |c: Option<f64>| c.is_some_and(|c| c >= AUTO_SUMMARIZE_UTILIZATION);
+                if crossed(context) && view.context.is_some() && !crossed(view.context) {
+                    let percent = (context.unwrap_or_default() * 100.0).round();
+                    view.push(LogEntry::Status(format!(
+                        "context {percent}% — older turns will be summarized"
+                    )));
+                }
                 view.context = context.or(view.context);
             }),
         }
@@ -994,5 +1003,34 @@ mod tests {
         });
         assert_eq!(app.notice.as_deref(), Some("gc: nothing to reclaim"));
         assert!(SLASH_COMMANDS.iter().any(|command| command.name == "/gc"));
+    }
+
+    #[test]
+    fn crossing_the_summarize_threshold_is_noted_once() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        let usage = |context: Option<f64>| SwarmEvent::Usage {
+            id: "a1".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            context,
+        };
+        let notes = |app: &App| {
+            app.agents["a1"]
+                .log
+                .iter()
+                .filter(|entry| matches!(entry, LogEntry::Status(note) if note.contains("summarized")))
+                .count()
+        };
+        // A restored value above the threshold is not a crossing.
+        app.apply(usage(Some(0.9)));
+        assert_eq!(notes(&app), 0);
+        app.apply(usage(Some(0.3)));
+        app.apply(usage(Some(0.86)));
+        app.apply(usage(Some(0.88)));
+        assert_eq!(notes(&app), 1);
+        assert!(app.agents["a1"].log.iter().any(
+            |entry| matches!(entry, LogEntry::Status(note) if note == "context 86% — older turns will be summarized")
+        ));
     }
 }
