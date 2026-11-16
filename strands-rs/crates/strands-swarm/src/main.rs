@@ -151,7 +151,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         instructions,
         tools,
         catalog,
-        skills: skills.for_agents(),
+        skills: std::sync::Arc::new(skills.for_agents()),
     };
     let root = root_request(cli.task, cli.goal);
     let mut config = SwarmConfig::new(harness_factory(options.clone()), cwd);

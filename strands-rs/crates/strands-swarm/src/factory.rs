@@ -10,7 +10,7 @@ use strands_agents::context_manager::{
     ContextManagerConfig, ContextManagerOption, StashOption, AGENTIC_TRUNCATE_THRESHOLD,
     AUTO_SUMMARIZE_UTILIZATION,
 };
-use strands_agents::plugins::vended::{GoalLoop, Skill, SkillSource};
+use strands_agents::plugins::vended::{GoalLoop, Skill};
 use strands_agents::sandbox::LocalSandbox;
 use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
 use strands_agents::tools::ToolRef;
@@ -25,15 +25,11 @@ use strands_harness::{
 
 use crate::catalog::ToolCatalog;
 use crate::runtime::{AgentFactory, AgentSpec, ModelResolver};
+use crate::skills::{skills_prompt, skills_tool};
 
 /// `subagent` is replaced by the swarm tools; `web_search` fails construction on models without
 /// native search (every Bedrock model), so it is opt-in through MCP instead.
 const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search"];
-
-/// Told to agents that have skills; the SDK plugin lists them in `<available_skills>`.
-const SKILLS_INSTRUCTIONS: &str = "You have skills: task-specific instructions listed in \
-    <available_skills>. When a task matches a skill, load it with the `skills` tool before you \
-    start and follow it; files it mentions are relative to its location.";
 
 /// Preview kept in context when a large tool result is offloaded to the stash.
 const TRUNCATE_PREVIEW_TOKENS: usize = 2_000;
@@ -52,9 +48,9 @@ pub struct HarnessFactoryOptions {
     /// Tools every agent can enable on demand through `find_tools`, e.g. the shared MCP tools.
     /// `find_tools` is registered only when the catalog has tools.
     pub catalog: Option<Arc<ToolCatalog>>,
-    /// Skills offered to every agent: listed in the system prompt, loaded with the `skills` tool.
-    /// No skills plugin when empty.
-    pub skills: Vec<Skill>,
+    /// Skills offered to every agent: one line each in the system prompt, loaded with the
+    /// `skills` tool. Neither when empty.
+    pub skills: Arc<Vec<Skill>>,
 }
 
 /// A factory that builds harness agents.
@@ -173,22 +169,10 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         Some(extra) => format!("{extra}\n\n{}", spec.instructions),
         None => spec.instructions,
     };
-    // Discovery happens once at startup, so the harness's own `./.agent/skills` lookup (relative to
-    // the process, not the agent) stays off.
-    let skills = match options.skills.is_empty() {
-        true => SkillsOption::Off,
-        false => {
-            instructions = format!("{instructions}\n\n{SKILLS_INSTRUCTIONS}");
-            SkillsOption::Sources(
-                options
-                    .skills
-                    .iter()
-                    .cloned()
-                    .map(SkillSource::Instance)
-                    .collect(),
-            )
-        }
-    };
+    if !options.skills.is_empty() {
+        instructions = format!("{instructions}\n\n{}", skills_prompt(&options.skills));
+        tools.push(skills_tool(options.skills.clone()));
+    }
     Ok(HarnessAgentOptions {
         model: model_option(options, spec.model),
         effort: options.effort,
@@ -199,7 +183,9 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         sandbox: SandboxOption::Instance(Arc::new(sandbox)),
         session,
         memory: MemoryOption::Off,
-        skills,
+        // Discovery happens once at startup (crate::skills); the harness's own `./.agent/skills`
+        // lookup, relative to the process rather than the agent, stays off.
+        skills: SkillsOption::Off,
         context_manager: context_manager(),
         id: Some(spec.id),
         name: Some(spec.name),
@@ -301,7 +287,7 @@ mod tests {
         let mut skill = Skill::new("review", "Review a change.", "Step 1: read the diff.");
         skill.path = Some(dir.path().join("review"));
         let options = HarnessFactoryOptions {
-            skills: vec![skill],
+            skills: Arc::new(vec![skill]),
             ..Default::default()
         };
         let mut harness = harness_options(&options, spec()).unwrap();
@@ -317,19 +303,24 @@ mod tests {
 
         let calls = model.calls();
         let prompt = calls[0].1.system_prompt.as_ref().unwrap().text();
-        assert!(prompt.contains("<name>review</name>"), "{prompt}");
-        assert!(prompt.contains("Review a change."));
+        assert!(prompt.contains("\n- review: Review a change."), "{prompt}");
         assert!(!prompt.contains("Step 1"));
+        assert!(!prompt.contains("<available_skills>"), "the SDK plugin stays off");
+        assert!(
+            !prompt.contains(&dir.path().display().to_string()),
+            "no paths in the prompt"
+        );
         let loaded = calls[1].0.last().unwrap().tool_results().next().unwrap().text();
         assert!(loaded.contains("Step 1: read the diff."), "{loaded}");
         assert!(loaded.contains("review/SKILL.md"), "{loaded}");
     }
 
     #[test]
-    fn no_skills_means_no_skills_plugin_or_instructions() {
+    fn no_skills_means_no_skills_tool_or_instructions() {
         let harness = harness_options(&HarnessFactoryOptions::default(), spec()).unwrap();
         assert!(matches!(harness.skills, SkillsOption::Off));
         assert!(!harness.instructions.unwrap().contains("skills"));
+        assert!(harness.tools.iter().all(|tool| tool.name() != "skills"));
     }
 
     #[tokio::test]

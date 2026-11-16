@@ -1,16 +1,30 @@
 //! Skills found on this machine: Claude Code and Codex `SKILL.md` directories, discovered once at
-//! startup and offered to every agent through the SDK's progressive-disclosure skills plugin
-//! (names and descriptions in the system prompt, the full `SKILL.md` on demand).
+//! startup and offered to every agent with progressive disclosure: one compact line per skill in
+//! the system prompt, the full `SKILL.md`, its location and bundled files through the `skills` tool.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use serde::Deserialize;
 use serde_json::Value;
 use strands_agents::plugins::vended::Skill;
+use strands_agents::tools::{FunctionTool, ToolContext, ToolRef};
 use strands_agents::{Error, Result};
 
-/// Longest description shown in the system prompt; the full text is in the loaded skill.
-const MAX_DESCRIPTION_CHARS: usize = 300;
+/// Name of the tool that loads a skill.
+pub const SKILLS_TOOL_NAME: &str = "skills";
+
+/// Longest description line in the system prompt; the full skill loads on demand.
+const SUMMARY_CHARS: usize = 200;
+
+/// Most bundled files listed when a skill loads.
+const MAX_LISTED_FILES: usize = 30;
+
+const SKILLS_TOOL_DESCRIPTION: &str = concat!(
+    "Load a skill: its full instructions, its directory, and the files bundled with it. ",
+    "The available skills are listed in the Skills section of your system prompt."
+);
 
 /// A directory of skills (or a single skill directory) and where it comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,17 +63,96 @@ pub struct Skills {
 }
 
 impl Skills {
-    /// The skills as given to agents: descriptions capped at [`MAX_DESCRIPTION_CHARS`] to keep
-    /// the system prompt small (the full `SKILL.md` body is what matters, and loads on demand).
+    /// The skills given to agents, in precedence order.
     pub fn for_agents(&self) -> Vec<Skill> {
-        self.skills
+        self.skills.iter().map(|found| found.skill.clone()).collect()
+    }
+}
+
+/// The system-prompt section listing `skills` as `- name: first sentence of the description`.
+pub fn skills_prompt(skills: &[Skill]) -> String {
+    let mut lines = vec![
+        "## Skills".to_owned(),
+        "Task-specific instructions. When a task matches a skill, load it with the `skills` tool before \
+         you start and follow it."
+            .to_owned(),
+    ];
+    lines.extend(
+        skills
             .iter()
-            .map(|found| {
-                let mut skill = found.skill.clone();
-                skill.description = cap(&skill.description);
-                skill
-            })
-            .collect()
+            .map(|skill| format!("- {}: {}", skill.name, summary(&skill.description))),
+    );
+    lines.join("\n")
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SkillInput {
+    /// Name of the skill to load.
+    skill_name: String,
+}
+
+/// The `skills` tool: returns a skill's instructions, location and bundled files.
+pub fn skills_tool(skills: Arc<Vec<Skill>>) -> ToolRef {
+    let tool = FunctionTool::builder(SKILLS_TOOL_NAME)
+        .description(SKILLS_TOOL_DESCRIPTION)
+        .typed_handler(move |input: SkillInput, _ctx: ToolContext| {
+            let skills = skills.clone();
+            async move { Result::Ok(load_skill(&skills, &input.skill_name)) }
+        });
+    Arc::new(tool)
+}
+
+fn load_skill(skills: &[Skill], name: &str) -> String {
+    let Some(skill) = skills.iter().find(|skill| skill.name == name) else {
+        let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        return format!("No skill named '{name}'. Available: {}", names.join(", "));
+    };
+    let mut out = vec![skill.instructions.clone()];
+    if let Some(dir) = &skill.path {
+        out.push(format!(
+            "\n---\nLocation: {}/SKILL.md (relative paths in this skill are relative to {})",
+            dir.display(),
+            dir.display()
+        ));
+        let mut files = Vec::new();
+        list_files(dir, "", 0, &mut files);
+        if !files.is_empty() {
+            out.push(format!("Bundled files:\n{}", files.join("\n")));
+        }
+    }
+    out.join("\n")
+}
+
+/// Files under `dir` (depth ≤ 3, no hidden entries, `SKILL.md` excluded), capped.
+fn list_files(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<(String, bool)> = read
+        .flatten()
+        .map(|entry| {
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path().is_dir(),
+            )
+        })
+        .filter(|(name, _)| !name.starts_with('.'))
+        .collect();
+    entries.sort();
+    for (name, is_dir) in entries {
+        if out.len() >= MAX_LISTED_FILES {
+            if out.last().is_none_or(|last| last != "  …") {
+                out.push("  …".to_owned());
+            }
+            return;
+        }
+        let path = format!("{prefix}{name}");
+        match is_dir {
+            true if depth < 2 => list_files(&dir.join(&name), &format!("{path}/"), depth + 1, out),
+            true => out.push(format!("  {path}/")),
+            false if depth == 0 && name.eq_ignore_ascii_case("SKILL.md") => {}
+            false => out.push(format!("  {path}")),
+        }
     }
 }
 
@@ -213,11 +306,67 @@ pub fn load_skills(dirs: &[SkillDir]) -> Skills {
     out
 }
 
-fn cap(text: &str) -> String {
-    match text.char_indices().nth(MAX_DESCRIPTION_CHARS) {
-        Some((cut, _)) => format!("{}…", text[..cut].trim_end()),
-        None => text.to_owned(),
+/// The description on one line, at most [`SUMMARY_CHARS`]. When it is longer and a later
+/// "Use when/for …" sentence (the trigger for picking the skill) would be cut off, the summary
+/// is the first sentence plus that sentence instead, each shortened to fit.
+fn summary(description: &str) -> String {
+    let text = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= SUMMARY_CHARS {
+        return text;
     }
+    let sentences = sentences(&text);
+    let trigger = sentences.iter().skip(1).find(|sentence| {
+        let lower = sentence.to_lowercase();
+        lower.starts_with("use when") || lower.starts_with("use for")
+    });
+    let Some(trigger) = trigger else {
+        return shorten(&text, SUMMARY_CHARS);
+    };
+    let prefix = shorten(&text, SUMMARY_CHARS);
+    if prefix.contains(trigger.as_str()) {
+        return prefix;
+    }
+    // Give the trigger what the first sentence leaves, but the first sentence at least half.
+    let trigger_len = trigger.chars().count();
+    let first_budget = SUMMARY_CHARS
+        .saturating_sub(trigger_len + 1)
+        .max(SUMMARY_CHARS / 2);
+    let first = shorten(&sentences[0], first_budget);
+    let rest = SUMMARY_CHARS.saturating_sub(first.chars().count() + 1);
+    format!("{first} {}", shorten(trigger, rest))
+}
+
+/// Sentences of `text`. A period ends one only before a space and after a word without another
+/// period, so "e.g. x" does not.
+fn sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (at, _) in text.match_indices(". ") {
+        let word = text[start..at].rsplit(' ').next().unwrap_or_default();
+        if !word.contains('.') {
+            out.push(text[start..=at].to_owned());
+            start = at + 2;
+        }
+    }
+    out.push(text[start..].to_owned());
+    out
+}
+
+/// `text` cut to at most `max` chars (the "…" included), at a word boundary when there is one.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let cut = text
+        .char_indices()
+        .nth(max.saturating_sub(1))
+        .map_or(text.len(), |(at, _)| at);
+    let head = &text[..cut];
+    let head = match head.rfind(' ') {
+        Some(space) if space > cut / 2 => &head[..space],
+        _ => head,
+    };
+    format!("{}…", head.trim_end_matches([' ', ',', ';', ':']))
 }
 
 #[cfg(test)]
@@ -363,13 +512,75 @@ mod tests {
     }
 
     #[test]
-    fn agents_get_capped_descriptions_and_full_instructions() {
+    fn summaries_keep_the_description_and_its_use_when_trigger_within_the_limit() {
+        assert_eq!(
+            summary("Review a CR. Use for reviews."),
+            "Review a CR. Use for reviews."
+        );
+        assert_eq!(summary("First line\n  second line"), "First line second line");
+        let filler = "padding ".repeat(30);
+        let long = summary(&format!(
+            "Review a CR, e.g. a PR. {filler}. Use when asked to review."
+        ));
+        assert_eq!(long, "Review a CR, e.g. a PR. Use when asked to review.");
+        let huge_first = summary(&format!("Review {filler}. Use when asked to review."));
+        assert!(
+            huge_first.ends_with("… Use when asked to review."),
+            "{huge_first}"
+        );
+        assert!(huge_first.chars().count() <= SUMMARY_CHARS, "{huge_first}");
+        let plain = summary(&"word ".repeat(100));
+        assert!(
+            plain.ends_with("word…") && plain.chars().count() <= SUMMARY_CHARS,
+            "{plain}"
+        );
+        // A trigger that fits in the plain cut is kept in place.
+        let early = summary(&format!("Review. Use when asked. {filler}"));
+        assert!(
+            early.starts_with("Review. Use when asked. padding") && early.ends_with('…'),
+            "{early}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_lists_one_line_per_skill_without_paths() {
         let root = tempfile::tempdir().unwrap();
-        skill(root.path(), "long", &"word ".repeat(100));
+        skill(root.path(), "review", "Review a change. Use before merging.");
         let skills = discover_skills(&[root.path().to_path_buf()], false, root.path(), None).unwrap();
-        let agent_skill = &skills.for_agents()[0];
-        assert!(agent_skill.description.ends_with('…'));
-        assert!(agent_skill.description.chars().count() <= MAX_DESCRIPTION_CHARS + 1);
-        assert_eq!(agent_skill.instructions, "Do long.");
+        let prompt = skills_prompt(&skills.for_agents());
+        assert!(
+            prompt.ends_with("\n- review: Review a change. Use before merging."),
+            "{prompt}"
+        );
+        assert!(!prompt.contains(&root.path().display().to_string()));
+    }
+
+    #[test]
+    fn loading_a_skill_returns_its_body_location_and_files() {
+        let root = tempfile::tempdir().unwrap();
+        skill(root.path(), "review", "Review a change.");
+        let dir = root.path().join("review");
+        fs::create_dir_all(dir.join("scripts/lib")).unwrap();
+        fs::write(dir.join("scripts/check.sh"), "").unwrap();
+        fs::write(dir.join("scripts/lib/util.sh"), "").unwrap();
+        fs::write(dir.join(".hidden"), "").unwrap();
+        let skills = discover_skills(&[root.path().to_path_buf()], false, root.path(), None).unwrap();
+
+        let text = load_skill(&skills.for_agents(), "review");
+        assert!(text.starts_with("Do review."), "{text}");
+        assert!(
+            text.contains(&format!("Location: {}/SKILL.md", dir.display())),
+            "{text}"
+        );
+        assert!(
+            text.contains("  scripts/check.sh\n  scripts/lib/util.sh"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(".hidden") && !text.contains("  SKILL.md"),
+            "{text}"
+        );
+        let missing = load_skill(&skills.for_agents(), "nope");
+        assert_eq!(missing, "No skill named 'nope'. Available: review");
     }
 }
