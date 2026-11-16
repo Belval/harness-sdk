@@ -100,15 +100,18 @@ status() {
   done
 }
 
+# The current crontab minus `line`; empty (not an error) when there is no crontab yet.
+crontab_without() { { crontab -l 2>/dev/null || true; } | { grep -vF "$1" || true; }; }
+
 boot() {
   local line="@reboot $SELF resume $1"
-  (crontab -l 2>/dev/null | grep -vF "$line"; echo "$line") | crontab -
+  { crontab_without "$line"; echo "$line"; } | crontab -
   echo "run $1 will resume after reboot"
 }
 
 unboot() {
   local line="@reboot $SELF resume $1"
-  crontab -l 2>/dev/null | grep -vF "$line" | crontab -
+  crontab_without "$line" | crontab -
 }
 
 cmd="${1:-}"; shift || true
