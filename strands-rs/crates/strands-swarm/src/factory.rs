@@ -32,6 +32,14 @@ use crate::skills::{skills_prompt, skills_tool};
 const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search"];
 
 /// Preview kept in context when a large tool result is offloaded to the stash.
+/// How to use the file tools: agents otherwise script edits with `python3`/`sed` through `shell`,
+/// which hides the change from the log and skips the uniqueness check `edit` makes.
+const FILE_TOOLS_PROMPT: &str = "# Files\n\
+Read files with `read` (use `offset`/`limit` to page through large ones) instead of `cat`/`sed -n`; \
+change them with `edit` (replaces one exact, unique string) or `write` (whole file) instead of \
+`python3`/`sed` scripts in `shell`. Search with `rg -n` (or `grep -n`) in `shell`. The file tools \
+take absolute paths; relative ones do not resolve against your working directory.";
+
 const TRUNCATE_PREVIEW_TOKENS: usize = 2_000;
 
 /// Transcript the goal judge sees, in characters (about 10k tokens): the task, the latest
@@ -180,6 +188,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         Some(extra) => format!("{extra}\n\n{}", spec.instructions),
         None => spec.instructions,
     };
+    instructions = format!("{instructions}\n\n{FILE_TOOLS_PROMPT}");
     if !options.skills.is_empty() {
         instructions = format!("{instructions}\n\n{}", skills_prompt(&options.skills));
         tools.push(skills_tool(options.skills.clone()));
@@ -403,6 +412,21 @@ mod tests {
         let result = calls[1].0.last().unwrap().tool_results().next().unwrap();
         let output = format!("{:?}", result.content);
         assert!(output.contains(&cwd.display().to_string()), "{output}");
+    }
+
+    #[test]
+    fn agents_are_told_to_prefer_the_file_tools_over_shell_edits() {
+        let harness = harness_options(&HarnessFactoryOptions::default(), spec()).unwrap();
+        let names: Vec<_> = DEFAULT_BUILTIN_TOOLS
+            .iter()
+            .filter(|name| !EXCLUDED_BUILTINS.contains(name))
+            .collect();
+        for tool in ["read", "edit", "write", "shell"] {
+            assert!(names.contains(&&tool), "{tool} is a builtin");
+        }
+        let instructions = harness.instructions.unwrap();
+        assert!(instructions.contains("`edit`"), "{instructions}");
+        assert!(instructions.contains("`offset`/`limit`"), "{instructions}");
     }
 
     #[test]
