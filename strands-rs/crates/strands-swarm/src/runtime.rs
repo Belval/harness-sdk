@@ -694,13 +694,9 @@ impl Swarm {
 
     /// The persistable view of the swarm.
     pub fn snapshot(&self) -> SwarmState {
-        let agents = self
-            .inner
-            .agents
-            .lock()
-            .values()
-            .map(|node| node_state(node))
-            .collect();
+        // Release the agents lock before taking per-agent locks.
+        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        let agents = nodes.iter().map(|node| node_state(node)).collect();
         SwarmState {
             run_id: self.inner.config.run_id.clone(),
             cwd: self.inner.config.cwd.clone(),
@@ -831,11 +827,14 @@ impl Swarm {
     }
 
     async fn run_actor(self, node: Arc<Node>, start: Start) {
+        // Read under its own statement: `instructions` takes the agents lock, and `snapshot` takes
+        // the agents lock before per-agent locks.
+        let model = node.model.lock().clone();
         let spec = AgentSpec {
             id: node.id.clone(),
             name: node.name.clone(),
             cwd: node.cwd.clone(),
-            model: node.model.lock().clone(),
+            model,
             instructions: self.instructions(&node, node.goal.as_deref()),
             tools: swarm_tools(self.clone(), &node.id),
             goal: node.goal.clone(),
