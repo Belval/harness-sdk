@@ -184,6 +184,9 @@ pub struct App {
     pub notice: Option<String>,
     /// Set when the user asked to quit.
     pub quit: bool,
+    /// Set when the user asked to read the selected log as plain text in the terminal's own
+    /// scrollback (for native scrolling, search and copy-paste).
+    pub show_plain: bool,
 }
 
 impl App {

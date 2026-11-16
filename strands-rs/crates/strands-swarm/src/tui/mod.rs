@@ -41,10 +41,14 @@ pub async fn run(
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     let mut tick = 0usize;
 
+    // While the plain log is shown on the main screen the TUI is not drawn; any key returns.
+    let mut plain = false;
     let outcome = loop {
         app.mark_seen();
-        if let Err(error) = terminal.draw(|frame| view::draw(frame, &app, swarm.run_id(), tick)) {
-            break Err(strands_agents::Error::other(format!("terminal error: {error}")));
+        if !plain {
+            if let Err(error) = terminal.draw(|frame| view::draw(frame, &app, swarm.run_id(), tick)) {
+                break Err(strands_agents::Error::other(format!("terminal error: {error}")));
+            }
         }
         tokio::select! {
             Some(event) = events.recv() => {
@@ -53,18 +57,54 @@ pub async fn run(
                     app.apply(event);
                 }
             }
-            Some(Ok(event)) = keys.next() => on_terminal_event(&swarm, &mut app, event).await,
+            Some(Ok(event)) = keys.next() => match plain {
+                true if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press) => {
+                    plain = false;
+                    if let Err(error) = leave_plain(&mut terminal) {
+                        break Err(strands_agents::Error::other(format!("terminal error: {error}")));
+                    }
+                }
+                true => {}
+                false => on_terminal_event(&swarm, &mut app, event).await,
+            },
             _ = ticker.tick() => tick = tick.wrapping_add(1),
             _ = swarm.reload_requested() => break Ok(Exit::Reload),
         }
         if app.quit {
             break Ok(Exit::Quit);
         }
+        if std::mem::take(&mut app.show_plain) {
+            plain = true;
+            if let Err(error) = enter_plain(&app) {
+                break Err(strands_agents::Error::other(format!("terminal error: {error}")));
+            }
+        }
     };
 
     ratatui::restore();
     swarm.shutdown().await;
     outcome
+}
+
+/// Leave the alternate screen and print the selected agent's log as plain text, so it lands in
+/// the terminal's own scrollback where it can be scrolled, searched and copied natively.
+fn enter_plain(app: &App) -> std::io::Result<()> {
+    use std::io::Write;
+    let text = app
+        .selected_id()
+        .and_then(|id| app.agents.get(&id))
+        .map_or_else(|| "(no agent selected)\n".to_owned(), view::plain_log);
+    let mut out = std::io::stdout();
+    crossterm::execute!(out, crossterm::terminal::LeaveAlternateScreen)?;
+    crossterm::terminal::disable_raw_mode()?;
+    write!(out, "\n{text}\n— press any key to return to the swarm —")?;
+    out.flush()?;
+    crossterm::terminal::enable_raw_mode()
+}
+
+fn leave_plain(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    terminal.clear()
 }
 
 async fn on_terminal_event(swarm: &Swarm, app: &mut App, event: Event) {
@@ -90,6 +130,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
         KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(10),
         KeyCode::End => app.scroll = 0,
         KeyCode::Esc => app.input.clear(),
+        KeyCode::F(2) => app.show_plain = true,
         KeyCode::Enter => {
             let line = std::mem::take(&mut app.input);
             return parse_command(&line, !app.agents.is_empty());
@@ -324,7 +365,12 @@ mod tests {
             });
         }
         let last = format!("⋯ shell step {}", app::MAX_LOG_ENTRIES + 49);
-        assert!(screen(&app).contains(&last));
+        let shown = screen(&app);
+        let last_log_row = shown.lines().nth(usize::from(HEIGHT) - 4).unwrap();
+        assert!(
+            last_log_row.contains(&last),
+            "newest entry on the pane's last row\n{shown}"
+        );
 
         press(&mut app, KeyCode::PageUp);
         let shown = screen(&app);
@@ -341,6 +387,46 @@ mod tests {
 
         press(&mut app, KeyCode::End);
         assert!(screen(&app).contains(&last));
+    }
+
+    #[test]
+    fn f2_asks_for_the_selected_log_as_plain_text() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        app.apply(SwarmEvent::Text {
+            id: "a1".into(),
+            delta: "a long line that the pane would wrap\nsecond".into(),
+        });
+        app.apply(SwarmEvent::ToolStarted {
+            id: "a1".into(),
+            name: "shell".into(),
+            summary: "ls".into(),
+        });
+        press(&mut app, KeyCode::F(2));
+        assert!(app.show_plain);
+        let text = view::plain_log(&app.agents["a1"]);
+        assert!(text.starts_with("name-a1 (a1) · idle · /w"), "{text}");
+        assert!(
+            text.contains(
+                "▶ task\n  task for a1\n\na long line that the pane would wrap\nsecond\n\n⋯ shell ls\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains('│') && !text.contains('─'), "{text}");
+    }
+
+    #[test]
+    fn log_rows_carry_no_border_glyphs() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        app.apply(SwarmEvent::Text {
+            id: "a1".into(),
+            delta: "copy me".into(),
+        });
+        let shown = screen(&app);
+        let row = shown.lines().find(|l| l.contains("copy me")).unwrap();
+        let log_part = &row[row.find("copy me").unwrap()..];
+        assert_eq!(log_part.trim_end(), "copy me", "{shown}");
     }
 
     #[test]

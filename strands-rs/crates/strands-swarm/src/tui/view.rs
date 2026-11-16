@@ -3,22 +3,22 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::app::{AgentView, App, LogEntry};
 use crate::runtime::{AgentStatus, USER};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const HELP: &str =
-    "enter send · /new <task> · /goal <goal> · /model [<id>|default] · /cancel · ↑↓ select · pgup/pgdn scroll · ctrl-c quit";
+const HELP: &str = "enter send · /new <task> · /goal <goal> · /model [<id>|default] · /cancel · ↑↓ select · \
+     pgup/pgdn scroll · f2 plain text · ctrl-c quit";
 
 /// Draw the whole screen. `tick` animates spinners.
 pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
     let [header, body, input, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(5),
-        Constraint::Length(3),
+        Constraint::Length(2),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -59,7 +59,11 @@ fn draw_agents(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         .map(|(depth, view)| ListItem::new(agent_item(depth, view, tick)))
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" agents "))
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::RIGHT)
+                .title(" agents "),
+        )
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected((!app.agents.is_empty()).then_some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
@@ -103,7 +107,7 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let selected = app.selected_id().and_then(|id| app.agents.get(&id));
     let Some(view) = selected else {
         let hint = Paragraph::new("Type a task below and press enter to start the root agent.")
-            .block(Block::default().borders(Borders::ALL).title(" log "));
+            .block(Block::default().borders(Borders::TOP).title(" log "));
         frame.render_widget(hint, area);
         return;
     };
@@ -117,11 +121,18 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         ));
     }
     let text = Text::from(lines);
-    let paragraph = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(title));
-    let inner_height = area.height.saturating_sub(2);
-    let total = u16::try_from(paragraph.line_count(area.width.saturating_sub(2))).unwrap_or(u16::MAX);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::TOP)
+            .padding(Padding::left(1))
+            .title(title),
+    );
+    // `line_count` takes the inner width but counts the block's top border as a line.
+    let inner_height = area.height.saturating_sub(1);
+    let count = paragraph
+        .line_count(area.width.saturating_sub(1))
+        .saturating_sub(1);
+    let total = u16::try_from(count).unwrap_or(u16::MAX);
     let bottom = total.saturating_sub(inner_height);
     let offset = bottom.saturating_sub(app.scroll);
     frame.render_widget(paragraph.scroll((offset, 0)), area);
@@ -142,6 +153,17 @@ fn log_title(view: &AgentView) -> String {
         compact(view.input_tokens),
         compact(view.output_tokens)
     )
+}
+
+/// An agent's log as plain text: the same lines the log pane shows, without styling, borders or
+/// wrapping, so the terminal can scroll, search and copy it natively.
+pub fn plain_log(view: &AgentView) -> String {
+    let mut out = format!("{}\n\n", log_title(view).trim());
+    for line in view.log.iter().flat_map(entry_lines) {
+        out.extend(line.spans.iter().map(|span| span.content.as_ref()));
+        out.push('\n');
+    }
+    out
 }
 
 fn entry_lines(entry: &LogEntry) -> Vec<Line<'static>> {
@@ -207,10 +229,10 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
             |label| format!(" message → {label} "),
         );
     let input =
-        Paragraph::new(app.input.as_str()).block(Block::default().borders(Borders::ALL).title(target));
+        Paragraph::new(app.input.as_str()).block(Block::default().borders(Borders::TOP).title(target));
     frame.render_widget(input, area);
-    let cursor_x = area.x + 1 + u16::try_from(app.input.chars().count()).unwrap_or(u16::MAX);
-    frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(2)), area.y + 1));
+    let cursor_x = area.x + u16::try_from(app.input.chars().count()).unwrap_or(u16::MAX);
+    frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(1)), area.y + 1));
 }
 
 fn compact(n: u64) -> String {
