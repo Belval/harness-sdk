@@ -10,7 +10,7 @@ use strands_agents::context_manager::{
     ContextManagerConfig, ContextManagerOption, StashOption, AGENTIC_TRUNCATE_THRESHOLD,
     AUTO_SUMMARIZE_UTILIZATION,
 };
-use strands_agents::plugins::vended::GoalLoop;
+use strands_agents::plugins::vended::{GoalLoop, Skill, SkillSource};
 use strands_agents::sandbox::LocalSandbox;
 use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
 use strands_agents::tools::ToolRef;
@@ -20,6 +20,7 @@ use strands_harness::defaults::{DEFAULT_BUILTIN_TOOLS, DEFAULT_MODEL};
 use strands_harness::{
     create_harness, resolve_model, BuiltinToolsConfig, Effort, EnvironmentContext, EnvironmentContextConfig,
     HarnessAgentOptions, MemoryOption, ModelOption, ResolveModelOptions, SandboxOption, SessionOption,
+    SkillsOption,
 };
 
 use crate::catalog::ToolCatalog;
@@ -28,6 +29,11 @@ use crate::runtime::{AgentFactory, AgentSpec, ModelResolver};
 /// `subagent` is replaced by the swarm tools; `web_search` fails construction on models without
 /// native search (every Bedrock model), so it is opt-in through MCP instead.
 const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search"];
+
+/// Told to agents that have skills; the SDK plugin lists them in `<available_skills>`.
+const SKILLS_INSTRUCTIONS: &str = "You have skills: task-specific instructions listed in \
+    <available_skills>. When a task matches a skill, load it with the `skills` tool before you \
+    start and follow it; files it mentions are relative to its location.";
 
 /// Preview kept in context when a large tool result is offloaded to the stash.
 const TRUNCATE_PREVIEW_TOKENS: usize = 2_000;
@@ -46,6 +52,9 @@ pub struct HarnessFactoryOptions {
     /// Tools every agent can enable on demand through `find_tools`, e.g. the shared MCP tools.
     /// `find_tools` is registered only when the catalog has tools.
     pub catalog: Option<Arc<ToolCatalog>>,
+    /// Skills offered to every agent: listed in the system prompt, loaded with the `skills` tool.
+    /// No skills plugin when empty.
+    pub skills: Vec<Skill>,
 }
 
 /// A factory that builds harness agents.
@@ -160,9 +169,25 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
     if let Some(catalog) = options.catalog.as_ref().filter(|catalog| !catalog.is_empty()) {
         tools.push(catalog.find_tool());
     }
-    let instructions = match &options.instructions {
+    let mut instructions = match &options.instructions {
         Some(extra) => format!("{extra}\n\n{}", spec.instructions),
         None => spec.instructions,
+    };
+    // Discovery happens once at startup, so the harness's own `./.agent/skills` lookup (relative to
+    // the process, not the agent) stays off.
+    let skills = match options.skills.is_empty() {
+        true => SkillsOption::Off,
+        false => {
+            instructions = format!("{instructions}\n\n{SKILLS_INSTRUCTIONS}");
+            SkillsOption::Sources(
+                options
+                    .skills
+                    .iter()
+                    .cloned()
+                    .map(SkillSource::Instance)
+                    .collect(),
+            )
+        }
     };
     Ok(HarnessAgentOptions {
         model: model_option(options, spec.model),
@@ -174,6 +199,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         sandbox: SandboxOption::Instance(Arc::new(sandbox)),
         session,
         memory: MemoryOption::Off,
+        skills,
         context_manager: context_manager(),
         id: Some(spec.id),
         name: Some(spec.name),
@@ -266,6 +292,44 @@ mod tests {
         let empty = ToolCatalog::new(Vec::new(), vec![("srv".into(), 0)]);
         assert!(tool_names(Some(Arc::new(empty))).is_empty());
         assert!(tool_names(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn agents_see_the_skill_catalog_and_load_a_skill_on_demand() {
+        use strands_agents::testing::MockResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let mut skill = Skill::new("review", "Review a change.", "Step 1: read the diff.");
+        skill.path = Some(dir.path().join("review"));
+        let options = HarnessFactoryOptions {
+            skills: vec![skill],
+            ..Default::default()
+        };
+        let mut harness = harness_options(&options, spec()).unwrap();
+        assert!(harness.instructions.as_deref().unwrap().contains("`skills` tool"));
+        let call = ToolUseBlock::new("skills", "s1", serde_json::json!({ "skill_name": "review" }));
+        let model = MockMessageModel::shared(vec![
+            MockResponse::message(Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)])),
+            MockResponse::message(Message::assistant("done")),
+        ]);
+        harness.model = Some(ModelOption::Instance(model.clone()));
+        let agent = create_harness(harness).await.unwrap();
+        agent.invoke("review my change").await.unwrap();
+
+        let calls = model.calls();
+        let prompt = calls[0].1.system_prompt.as_ref().unwrap().text();
+        assert!(prompt.contains("<name>review</name>"), "{prompt}");
+        assert!(prompt.contains("Review a change."));
+        assert!(!prompt.contains("Step 1"));
+        let loaded = calls[1].0.last().unwrap().tool_results().next().unwrap().text();
+        assert!(loaded.contains("Step 1: read the diff."), "{loaded}");
+        assert!(loaded.contains("review/SKILL.md"), "{loaded}");
+    }
+
+    #[test]
+    fn no_skills_means_no_skills_plugin_or_instructions() {
+        let harness = harness_options(&HarnessFactoryOptions::default(), spec()).unwrap();
+        assert!(matches!(harness.skills, SkillsOption::Off));
+        assert!(!harness.instructions.unwrap().contains("skills"));
     }
 
     #[tokio::test]

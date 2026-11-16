@@ -306,8 +306,24 @@ fn parse_yaml_mapping(text: &str) -> Map<String, JsonValue> {
         };
         let key = key.trim().to_owned();
         let value = value.trim();
+        // Indented lines after a value: a block scalar's content, or a plain scalar's continuation.
+        let mut continuation = Vec::new();
+        while !value.is_empty() && i < lines.len() {
+            let next = lines[i];
+            if !next.trim().is_empty() && next.starts_with(|c: char| !c.is_whitespace()) {
+                break;
+            }
+            continuation.push(next);
+            i += 1;
+        }
+        if let Some(block) = block_scalar(value, &continuation) {
+            map.insert(key, JsonValue::String(block));
+            continue;
+        }
         if !value.is_empty() {
-            map.insert(key, parse_scalar(value));
+            let mut parts = vec![value];
+            parts.extend(continuation.iter().map(|l| l.trim()).filter(|l| !l.is_empty()));
+            map.insert(key, parse_scalar(&parts.join(" ")));
             continue;
         }
         // Block sequence or nested mapping on the following indented lines.
@@ -337,6 +353,35 @@ fn parse_yaml_mapping(text: &str) -> Map<String, JsonValue> {
         }
     }
     map
+}
+
+/// A `|` (literal) or `>` (folded) block scalar with optional chomping/indent indicators, from
+/// its indented `lines`. Trailing newlines are dropped either way. `None` for any other value.
+fn block_scalar(indicator: &str, lines: &[&str]) -> Option<String> {
+    let mut chars = indicator.chars();
+    let style = chars.next().filter(|c| *c == '|' || *c == '>')?;
+    if !chars.all(|c| c == '-' || c == '+' || c.is_ascii_digit()) {
+        return None;
+    }
+    let indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let body: Vec<&str> = lines
+        .iter()
+        .map(|l| l.get(indent..).unwrap_or("").trim_end())
+        .collect();
+    let text = match style {
+        '|' => body.join("\n"),
+        _ => body
+            .split(|l| l.is_empty())
+            .map(|paragraph| paragraph.join(" "))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    Some(text.trim_matches('\n').to_owned())
 }
 
 fn parse_scalar(raw: &str) -> JsonValue {
@@ -990,6 +1035,28 @@ mod tests {
         assert_eq!(skill.compatibility.unwrap(), "strands >= 1");
         assert_eq!(skill.metadata["owner"], json!("team"));
         assert_eq!(skill.instructions, "body text");
+    }
+
+    #[test]
+    fn parses_block_and_multi_line_scalars() {
+        let parse = |description: &str| {
+            Skill::from_content(
+                &format!("---\nname: alpha\ndescription: {description}\nlicense: MIT\n---\nbody"),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        let folded = parse(">-\n  Review a change\n  for defects.\n\n  Use before merging.");
+        assert_eq!(
+            folded.description,
+            "Review a change for defects.\nUse before merging."
+        );
+        assert_eq!(folded.license.as_deref(), Some("MIT"));
+        let literal = parse("|\n  line one\n    indented\n");
+        assert_eq!(literal.description, "line one\n  indented");
+        let plain = parse("Review a change\n  for defects.");
+        assert_eq!(plain.description, "Review a change for defects.");
     }
 
     #[test]

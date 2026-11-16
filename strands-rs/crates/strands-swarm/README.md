@@ -12,6 +12,7 @@ agent with six extra tools, and decides for itself whether and how to split the 
 | `cancel_agent` | Stop an agent and everything it spawned. |
 | `reload_swarm` | Restart the whole swarm into a newly built binary; every agent resumes. |
 | `find_tools` | Only with MCP servers: search the shared MCP tools by keyword and enable some for the calling agent. |
+| `skills` | Only with skills: load a skill's full `SKILL.md` instructions (names and descriptions are in the system prompt). |
 
 Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else one derived
 from its task; ids and names work interchangeably. Each agent's final reply per turn goes to its parent. A `goal` (TUI `/goal`, CLI `--goal`, or on
@@ -22,7 +23,8 @@ from its task; ids and names work interchangeably. Each agent's final reply per 
 ```sh
 cargo build --release -p strands-swarm
 strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--mcp-config mcp.json]... [--mcp-deny REGEX]...
-              [--mcp-eager] [--list-tools] [--headless] [TASK]
+              [--mcp-eager] [--list-tools] [--skills-dir DIR]... [--no-default-skills] [--list-skills]
+              [--headless] [TASK]
 ```
 
 TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/cancel`, Ctrl-C quits.
@@ -50,6 +52,16 @@ to and from the user (tasks, messages, replies, errors) and `events.jsonl` compa
 (spawns, status changes, tool calls, model switches, resumes, reloads, shutdowns). Both are JSON
 lines with a UTC `ts`, written by a background thread and rotated to `<file>.1` at 8 MB.
 `strands-swarm --run NAME --journal` prints the journal and exits.
+
+Skills (`<name>/SKILL.md` with `name` and `description` frontmatter, as in Claude Code and Codex)
+are discovered once at startup and offered to every agent with progressive disclosure: the system
+prompt lists each skill's name, description (capped at 300 characters) and location, and the
+`skills` tool loads the full instructions on demand. On a name clash the first source wins:
+`--skills-dir` (repeatable), then the project's `.claude/skills`, `.agents/skills` and
+`.agent/skills`, then `~/.claude/skills`, then the skills of Claude Code plugins that are installed
+(user scope, or project scope for this directory) and not disabled in `enabledPlugins`, then
+`~/.codex/skills` and `~/.agents/skills`. `--no-default-skills` keeps only `--skills-dir`;
+`--list-skills` prints what agents get and what is shadowed.
 
 ## Operate 24/7
 

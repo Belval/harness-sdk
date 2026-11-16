@@ -11,8 +11,8 @@ use strands_swarm::state;
 use strands_swarm::tui::Exit;
 use strands_swarm::RELOAD_EXIT_CODE;
 use strands_swarm::{
-    harness_factory, harness_model_resolver, load_shared_mcp, HarnessFactoryOptions, SpawnRequest, Swarm,
-    SwarmConfig, SwarmEvent, USER,
+    discover_skills, harness_factory, harness_model_resolver, load_shared_mcp, HarnessFactoryOptions, Skills,
+    SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -54,6 +54,18 @@ struct Cli {
     /// Print the MCP tools agents would get (and those denied), then exit.
     #[arg(long)]
     list_tools: bool,
+    /// Directory of skills (`<name>/SKILL.md`), or one skill directory, offered to every agent
+    /// ahead of the default locations. Repeatable.
+    #[arg(long = "skills-dir")]
+    skills_dirs: Vec<PathBuf>,
+    /// Skip the default skill locations: the project's `.claude/skills`, `.agents/skills` and
+    /// `.agent/skills`, `~/.claude/skills`, enabled Claude Code plugins, `~/.codex/skills` and
+    /// `~/.agents/skills`.
+    #[arg(long)]
+    no_default_skills: bool,
+    /// Print the skills agents would get (and those shadowed by an earlier one), then exit.
+    #[arg(long)]
+    list_skills: bool,
     /// Name of a persistent run. State lives in `~/.local/state/strands-swarm/<name>`; starting
     /// again with the same name resumes it (agents, conversations, unread messages).
     #[arg(long)]
@@ -97,6 +109,17 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         .as_ref()
         .map(std::fs::read_to_string)
         .transpose()?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let skills = discover_skills(&cli.skills_dirs, !cli.no_default_skills, &cwd, home.as_deref())?;
+    if cli.list_skills {
+        print_skills(&skills);
+        return Ok(Exit::Quit);
+    }
+    eprintln!(
+        "strands-swarm: {} skills ({} shadowed; --list-skills shows them)",
+        skills.skills.len(),
+        skills.shadowed.len()
+    );
     let mcp = load_shared_mcp(&cli.mcp_configs, &cli.mcp_deny).await?;
     if !cli.mcp_configs.is_empty() {
         eprintln!(
@@ -128,6 +151,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         instructions,
         tools,
         catalog,
+        skills: skills.for_agents(),
     };
     let root = root_request(cli.task, cli.goal);
     let mut config = SwarmConfig::new(harness_factory(options.clone()), cwd);
@@ -174,6 +198,23 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     let exit = run_headless(&swarm, events).await;
     swarm.shutdown().await;
     Ok(exit)
+}
+
+fn print_skills(skills: &Skills) {
+    let rows = skills
+        .skills
+        .iter()
+        .map(|s| ("skill   ", s))
+        .chain(skills.shadowed.iter().map(|s| ("shadowed", s)));
+    for (kind, found) in rows {
+        let path = found
+            .skill
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        println!("{kind} {} [{}] {path}", found.skill.name, found.origin);
+    }
 }
 
 fn root_request(task: Option<String>, goal: Option<String>) -> Option<SpawnRequest> {

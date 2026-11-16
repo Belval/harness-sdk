@@ -18,6 +18,7 @@ pub mod journal;
 pub mod mcp;
 pub mod names;
 pub mod runtime;
+pub mod skills;
 pub mod state;
 pub mod tools;
 pub mod tui;
@@ -31,3 +32,4 @@ pub use runtime::{
     AgentFactory, AgentInfo, AgentSpec, AgentStatus, Mail, ModelResolver, SpawnRequest, Swarm, SwarmConfig,
     SwarmEvent, RELOAD_EXIT_CODE, USER,
 };
+pub use skills::{discover_skills, Skills};
