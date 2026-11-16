@@ -33,6 +33,7 @@ returns it to `--model`; `/model` alone shows the current one). The id is resolv
 (`provider/name` or a Bedrock id, same effort), an invalid one is rejected without touching the
 agent, and the choice is saved with the run. Programmatically: `Swarm::set_model`.
 Ctrl-←/→ (or Alt-←/→) narrows or widens the agent tree; narrow it past its minimum to hide it.
+Cancelled agents are hidden from the tree (the header counts them); F3 shows them.
 F2 prints the selected agent's log as plain text into the terminal's own scrollback (native
 scrolling, search and copy-paste); any key returns. A resumed run shows each agent's restored
 conversation.

@@ -190,11 +190,19 @@ pub struct App {
     /// Columns added to (or taken from) the agent tree's fitted width; the tree hides when
     /// shrunk below a few columns.
     pub tree_adjust: i16,
+    /// Show cancelled agents in the tree (hidden by default).
+    pub show_cancelled: bool,
 }
 
 impl App {
     /// Fold one swarm event into the state.
     pub fn apply(&mut self, event: SwarmEvent) {
+        let selected = self.selected_id();
+        self.apply_event(event);
+        self.reselect(selected);
+    }
+
+    fn apply_event(&mut self, event: SwarmEvent) {
         match event {
             SwarmEvent::Spawned {
                 id,
@@ -301,9 +309,41 @@ impl App {
 
     fn walk<'a>(&'a self, parent: &str, depth: usize, out: &mut Vec<(usize, &'a AgentView)>) {
         for view in self.agents.values().filter(|view| view.parent == parent) {
+            if !self.show_cancelled && !self.has_live(view) {
+                continue;
+            }
             out.push((depth, view));
             self.walk(&view.id, depth + 1, out);
         }
+    }
+
+    /// Whether `view` or any of its descendants is not cancelled.
+    fn has_live(&self, view: &AgentView) -> bool {
+        view.status.is_live()
+            || self
+                .agents
+                .values()
+                .any(|child| child.parent == view.id && self.has_live(child))
+    }
+
+    /// Cancelled agents left out of the tree.
+    pub fn hidden(&self) -> usize {
+        self.agents.len().saturating_sub(self.tree().len())
+    }
+
+    /// Show or hide cancelled agents, keeping the selected agent selected when it stays visible.
+    pub fn toggle_cancelled(&mut self) {
+        let selected = self.selected_id();
+        self.show_cancelled = !self.show_cancelled;
+        self.reselect(selected);
+    }
+
+    /// Keep `previous` selected after the tree changed; when it is gone, stay on the same row.
+    fn reselect(&mut self, previous: Option<String>) {
+        let tree = self.tree();
+        self.selected = previous
+            .and_then(|id| tree.iter().position(|(_, view)| view.id == id))
+            .unwrap_or_else(|| self.selected.min(tree.len().saturating_sub(1)));
     }
 
     /// Id of the selected agent.
@@ -315,7 +355,7 @@ impl App {
 
     /// Move the selection by `delta` rows, clamped.
     pub fn select_by(&mut self, delta: isize) {
-        let len = self.agents.len();
+        let len = self.tree().len();
         if len == 0 {
             return;
         }
@@ -666,6 +706,61 @@ mod tests {
                 LogEntry::Note("restarted".into()),
                 LogEntry::Status("error: boom".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn hides_cancelled_agents_and_keeps_the_selection() {
+        let mut app = App::default();
+        for (id, parent) in [
+            ("a1", USER),
+            ("a2", "a1"),
+            ("a3", "a2"),
+            ("a4", USER),
+            ("a5", USER),
+        ] {
+            app.apply(spawned(id, parent));
+        }
+        let cancel = |app: &mut App, id: &str| {
+            app.apply(SwarmEvent::Status {
+                id: id.into(),
+                status: AgentStatus::Cancelled,
+            })
+        };
+        let ids = |app: &App| app.tree().iter().map(|(_, v)| v.id.clone()).collect::<Vec<_>>();
+        app.selected = 3; // a4
+        cancel(&mut app, "a2");
+        assert_eq!(ids(&app), ["a1", "a2", "a3", "a4", "a5"], "a2 has a live child");
+        cancel(&mut app, "a3");
+        assert_eq!(ids(&app), ["a1", "a4", "a5"]);
+        assert_eq!(
+            app.selected_id().as_deref(),
+            Some("a4"),
+            "selection follows its agent"
+        );
+        assert_eq!(app.hidden(), 2);
+
+        cancel(&mut app, "a4");
+        assert_eq!(
+            app.selected_id().as_deref(),
+            Some("a5"),
+            "a hidden selection moves on"
+        );
+        cancel(&mut app, "a5");
+        assert_eq!(app.selected_id().as_deref(), Some("a1"));
+
+        app.toggle_cancelled();
+        assert_eq!(ids(&app), ["a1", "a2", "a3", "a4", "a5"]);
+        assert_eq!(app.selected_id().as_deref(), Some("a1"));
+        app.select_by(4);
+        assert_eq!(app.selected_id().as_deref(), Some("a5"));
+        app.toggle_cancelled();
+        assert_eq!(app.selected_id().as_deref(), Some("a1"));
+        app.select_by(4);
+        assert_eq!(
+            app.selected_id().as_deref(),
+            Some("a1"),
+            "only visible rows are selectable"
         );
     }
 

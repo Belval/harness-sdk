@@ -13,7 +13,7 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 /// Narrowest agent tree; shrinking it further hides it.
 const MIN_TREE: usize = 10;
 const HELP: &str = "enter send · /new <task> · /goal <goal> · /model [<id>|default] · /cancel · ↑↓ select · \
-     pgup/pgdn scroll · ctrl-←→ tree width · f2 plain text · ctrl-c quit";
+     pgup/pgdn scroll · ctrl-←→ tree width · f2 plain text · f3 cancelled · ctrl-c quit";
 
 /// Draw the whole screen. `tick` animates spinners.
 pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
@@ -44,10 +44,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
         .filter(|v| v.status == AgentStatus::Running)
         .count();
     let (input, output) = app.total_tokens();
+    let hidden = match app.hidden() {
+        0 => String::new(),
+        n => format!(" · {n} cancelled hidden (f3)"),
+    };
     let line = Line::from(vec![
         Span::styled(" strands-swarm ", Style::new().bold().reversed()),
         Span::raw(format!(
-            "  run {run_id} · {} agents · {running} running · {} in / {} out tokens",
+            "  run {run_id} · {} agents · {running} running · {} in / {} out tokens{hidden}",
             app.agents.len(),
             compact(input),
             compact(output)
@@ -69,7 +73,7 @@ fn draw_agents(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
                 .title(" agents "),
         )
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default().with_selected((!app.agents.is_empty()).then_some(app.selected));
+    let mut state = ListState::default().with_selected(app.selected_id().map(|_| app.selected));
     frame.render_stateful_widget(list, area, &mut state);
 }
 

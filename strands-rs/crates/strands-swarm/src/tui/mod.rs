@@ -135,11 +135,12 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
         KeyCode::End => app.scroll = 0,
         KeyCode::Esc => app.input.clear(),
         KeyCode::F(2) => app.show_plain = true,
+        KeyCode::F(3) => app.toggle_cancelled(),
         KeyCode::Left if ctrl || alt => app.resize_tree(-TREE_STEP),
         KeyCode::Right if ctrl || alt => app.resize_tree(TREE_STEP),
         KeyCode::Enter => {
             let line = std::mem::take(&mut app.input);
-            return parse_command(&line, !app.agents.is_empty());
+            return parse_command(&line, app.selected_id().is_some());
         }
         _ => {}
     }
@@ -466,6 +467,25 @@ mod tests {
         }
         let widest = tree_column(&screen(&app)).unwrap();
         assert!(widest <= usize::from(WIDTH) * 6 / 10, "capped: {widest}");
+    }
+
+    #[test]
+    fn cancelled_agents_are_hidden_until_f3() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        spawn(&mut app, "a2", USER);
+        app.apply(SwarmEvent::Status {
+            id: "a2".into(),
+            status: AgentStatus::Cancelled,
+        });
+        let shown = screen(&app);
+        assert!(!shown.contains("name-a2"), "{shown}");
+        assert!(shown.contains("1 cancelled hidden (f3)"), "{shown}");
+
+        press(&mut app, KeyCode::F(3));
+        let shown = screen(&app);
+        assert!(shown.contains("⊘ name-a2 a2"), "{shown}");
+        assert!(!shown.contains("cancelled hidden"), "{shown}");
     }
 
     #[test]
