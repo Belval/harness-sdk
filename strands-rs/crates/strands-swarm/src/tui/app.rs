@@ -206,8 +206,16 @@ pub struct App {
     pub agents: IndexMap<String, AgentView>,
     /// Index into [`App::tree`] of the selected agent.
     pub selected: usize,
-    /// The input line.
+    /// The input box (may hold several lines).
     pub input: String,
+    /// Cursor in [`App::input`] as a byte offset; `None` is the end (see [`App::cursor`]).
+    pub cursor: Option<usize>,
+    /// Lines sent from the input, oldest first, for ↑/↓.
+    pub history: Vec<String>,
+    /// Index into [`App::history`] being shown while browsing it.
+    pub history_at: Option<usize>,
+    /// What was typed before history browsing started.
+    pub draft: String,
     /// Lines scrolled up from the bottom of the log; 0 follows new output.
     pub scroll: u16,
     /// Last error or notice, shown in the footer.
@@ -577,6 +585,7 @@ impl App {
             true => command.name.to_owned(),
             false => format!("{} ", command.name),
         };
+        self.cursor = None;
         self.completion = 0;
         true
     }

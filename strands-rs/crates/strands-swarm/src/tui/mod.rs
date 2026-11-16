@@ -2,6 +2,7 @@
 //! input line that messages the selected agent (or starts a root agent).
 
 pub mod app;
+mod edit;
 pub mod images;
 pub mod select;
 pub mod view;
@@ -220,31 +221,38 @@ fn on_mouse(app: &mut App, mouse: MouseEvent, screen: &Buffer) -> Option<String>
 /// Two Esc presses this close together stop the selected agent's turn.
 const DOUBLE_ESC: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Columns one Ctrl-←/→ press resizes the agent tree by.
+/// Columns one Alt-←/→ press resizes the agent tree by.
 const TREE_STEP: i16 = 4;
 
 /// Apply a key press to the state; returns a command when the input line was submitted.
 fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let up_down = |code: KeyCode| if code == KeyCode::Up { -1 } else { 1 };
     match key.code {
         KeyCode::Char('c') if ctrl => app.quit = true,
-        KeyCode::Char(c) => {
-            app.input.push(c);
-            app.completion = 0;
-        }
-        KeyCode::Backspace => {
-            app.input.pop();
-            app.completion = 0;
-        }
+        KeyCode::Char('a') if ctrl => app.home(),
+        KeyCode::Char('e') if ctrl => app.end(),
+        KeyCode::Char('w') if ctrl => app.delete_word(),
+        KeyCode::Char('u') if ctrl => app.delete_to_line_start(),
+        KeyCode::Char('p') if ctrl => app.browse_history(-1),
+        KeyCode::Char('n') if ctrl => app.browse_history(1),
+        KeyCode::Char(_) if ctrl => {}
+        KeyCode::Char(c) => app.insert(c),
+        KeyCode::Backspace if alt => app.delete_word(),
+        KeyCode::Backspace => app.backspace(),
+        KeyCode::Delete => app.delete(),
         KeyCode::Tab => drop(app.complete()),
         KeyCode::Up | KeyCode::Down if !app.completions().is_empty() => {
-            app.move_completion(if key.code == KeyCode::Up { -1 } else { 1 })
+            app.move_completion(up_down(key.code))
         }
-        KeyCode::Up => app.select_by(-1),
-        KeyCode::Down => app.select_by(1),
+        KeyCode::Up | KeyCode::Down if app.wants_history() => app.browse_history(up_down(key.code)),
+        KeyCode::Up | KeyCode::Down => app.select_by(up_down(key.code)),
         KeyCode::PageUp => app.scroll = app.scroll.saturating_add(10),
         KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(10),
+        KeyCode::Home if !app.input.is_empty() => app.home(),
+        KeyCode::End if !app.input.is_empty() => app.end(),
         KeyCode::End => app.scroll = 0,
         KeyCode::Esc if app.show_keys => app.show_keys = false,
         KeyCode::Esc if app.input.is_empty() && app.selection.is_none() => {
@@ -258,18 +266,28 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
             }
         }
         KeyCode::Esc => {
-            app.input.clear();
+            app.clear_input();
             app.selection = None;
         }
         KeyCode::F(1) => app.show_keys = !app.show_keys,
         KeyCode::F(2) => app.show_plain = true,
         KeyCode::F(3) => app.toggle_cancelled(),
-        KeyCode::Left if ctrl || alt => app.resize_tree(-TREE_STEP),
-        KeyCode::Right if ctrl || alt => app.resize_tree(TREE_STEP),
+        KeyCode::Left | KeyCode::Right if alt => app.resize_tree(if key.code == KeyCode::Left {
+            -TREE_STEP
+        } else {
+            TREE_STEP
+        }),
+        KeyCode::Left | KeyCode::Right if ctrl => {
+            app.move_word(if key.code == KeyCode::Left { -1 } else { 1 })
+        }
+        KeyCode::Left => app.move_char(-1),
+        KeyCode::Right => app.move_char(1),
+        // Shift-Enter (where the terminal reports it) or Alt-Enter starts a new line.
+        KeyCode::Enter if shift || alt => app.insert('\n'),
         // Enter on a partly typed command picks it from the popup instead of sending it.
         KeyCode::Enter if !app.input_is_command() && app.complete() => {}
         KeyCode::Enter => {
-            let line = std::mem::take(&mut app.input);
+            let line = app.take_input();
             return parse_command(&line, app.selected_id().is_some());
         }
         _ => {}
@@ -680,18 +698,18 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_tree_fits_its_labels_and_resizes_with_ctrl_arrows() {
+    fn the_agent_tree_fits_its_labels_and_resizes_with_alt_arrows() {
         let mut app = App::default();
         spawn(&mut app, "a1", USER);
         spawn(&mut app, "a2", "a1");
         let fitted = tree_column(&screen(&app)).unwrap();
         assert!(fitted < usize::from(WIDTH) / 4, "fits short labels: {fitted}");
 
-        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
-        on_key(&mut app, ctrl(KeyCode::Right));
+        let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
+        on_key(&mut app, alt(KeyCode::Right));
         assert_eq!(tree_column(&screen(&app)), Some(fitted + 4));
         for _ in 0..5 {
-            on_key(&mut app, ctrl(KeyCode::Left));
+            on_key(&mut app, alt(KeyCode::Left));
         }
         let hidden = screen(&app);
         assert_eq!(tree_column(&hidden), None, "{hidden}");
@@ -705,6 +723,45 @@ mod tests {
         }
         let widest = tree_column(&screen(&app)).unwrap();
         assert!(widest <= usize::from(WIDTH) * 6 / 10, "capped: {widest}");
+    }
+
+    #[test]
+    fn the_input_box_edits_like_a_line_editor_and_recalls_sent_lines() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let none = KeyModifiers::NONE;
+        for c in "fix bug".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        on_key(&mut app, key(KeyCode::Left, KeyModifiers::CONTROL));
+        for c in "the ".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        on_key(&mut app, key(KeyCode::Enter, KeyModifiers::ALT));
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(app.input, "fix the \n!bug");
+        let shown = screen(&app);
+        assert!(shown.contains("fix the"), "multi-line input is drawn\n{shown}");
+        on_key(&mut app, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Delete);
+        on_key(&mut app, key(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "fix the \nbug");
+        assert_eq!(
+            on_key(&mut app, key(KeyCode::Enter, none)),
+            Some(Command::Message("fix the \nbug".into()))
+        );
+
+        // An empty input keeps ↑/↓ for selecting agents; with text, they walk the history.
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input, "fix the \nbug");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.input, "x");
+        on_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        on_key(&mut app, key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "fix the \nbug", "ctrl-p recalls from an empty input");
     }
 
     #[test]

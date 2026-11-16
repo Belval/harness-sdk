@@ -78,7 +78,11 @@ at most 12 rows below it, drawn with kitty, iTerm2 or sixel graphics when the te
 query, and with unicode halfblocks otherwise and always inside tmux. Only the newest 4 thumbnails
 stay decoded; older images keep just their placeholder, which is also what F2 and mouse copies
 show.
-Ctrl-←/→ (or Alt-←/→) narrows or widens the agent tree; narrow it past its minimum to hide it.
+The input box edits like a shell line: ←/→, Home/End (Ctrl-A/Ctrl-E), Ctrl-←/→ by word, Delete,
+Ctrl-W/Ctrl-U (Alt-Backspace too), Alt-Enter (or Shift-Enter where the terminal reports it) for a
+new line, and ↑/↓ through sent messages while it holds text (Ctrl-P/Ctrl-N from an empty one; on an
+empty input ↑/↓ select agents). Alt-←/→ narrows or widens the agent tree; narrow it past its
+minimum to hide it.
 Cancelled agents are hidden from the tree (the header counts them); F3 shows them.
 F2 prints the selected agent's log as plain text into the terminal's own scrollback (native
 scrolling, search and copy-paste); any key returns. A resumed run shows each agent's restored

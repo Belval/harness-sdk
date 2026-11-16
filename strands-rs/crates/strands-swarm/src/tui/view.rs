@@ -14,6 +14,9 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 /// Narrowest agent tree; shrinking it further hides it.
 const MIN_TREE: usize = 10;
 const HINT: &str = "/ commands · f1 keys";
+/// Most input lines shown at once; a longer message scrolls with the cursor.
+const MAX_INPUT_LINES: usize = 6;
+
 /// Key bindings, for the F1 popup.
 const KEYS: &[(&str, &str)] = &[
     ("enter", "send to the selected agent"),
@@ -21,7 +24,18 @@ const KEYS: &[(&str, &str)] = &[
     ("↑ ↓", "select an agent (or a command)"),
     ("pgup pgdn end", "scroll the log (or the mouse wheel)"),
     ("drag", "select in one pane and copy (shift-drag: terminal's own)"),
-    ("ctrl-← →", "tree width (hides when narrow)"),
+    (
+        "← → home end",
+        "move in the input (ctrl-a ctrl-e: line start, end)",
+    ),
+    ("ctrl-← →", "move by word"),
+    ("ctrl-w ctrl-u", "delete the word, or to the line start"),
+    (
+        "alt-enter",
+        "new line (shift-enter where the terminal reports it)",
+    ),
+    ("↑ ↓ with text", "earlier and later sent messages (ctrl-p ctrl-n)"),
+    ("alt-← →", "tree width (hides when narrow)"),
     ("f2", "plain-text log, for native scroll and copy"),
     ("f3", "show or hide cancelled agents"),
     ("esc", "clear the input and selection, close this"),
@@ -77,10 +91,11 @@ impl Areas {
 
 /// Lay out a screen of `area` for `app`.
 pub fn areas(app: &App, area: Rect) -> Areas {
+    let lines = app.input.split('\n').count().clamp(1, MAX_INPUT_LINES) as u16;
     let [header, body, input, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(5),
-        Constraint::Length(2),
+        Constraint::Length(1 + lines),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -552,11 +567,24 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
             || " new root task ".to_owned(),
             |label| format!(" message → {label} "),
         );
-    let input =
-        Paragraph::new(app.input.as_str()).block(Block::default().borders(Borders::TOP).title(target));
+    // Scroll so the cursor stays in view, both down a long message and along a long line.
+    let (line, col) = app.cursor_line_col();
+    let rows = usize::from(area.height.saturating_sub(1)).max(1);
+    let cols = usize::from(area.width).max(1);
+    let top = line.saturating_sub(rows - 1);
+    let left = col.saturating_sub(cols - 1);
+    let scroll = (to_u16(top), to_u16(left));
+    let input = Paragraph::new(app.input.as_str())
+        .block(Block::default().borders(Borders::TOP).title(target))
+        .scroll(scroll);
     frame.render_widget(input, area);
-    let cursor_x = area.x + u16::try_from(app.input.chars().count()).unwrap_or(u16::MAX);
-    frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(1)), area.y + 1));
+    let x = area.x.saturating_add(to_u16(col - left));
+    let y = area.y.saturating_add(1).saturating_add(to_u16(line - top));
+    frame.set_cursor_position((x.min(area.right().saturating_sub(1)), y));
+}
+
+fn to_u16(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
 }
 
 /// The slash-command popup, just above the input box.
@@ -701,6 +729,28 @@ mod tests {
             .collect();
         assert!(screen.contains("/cancel"), "{screen}");
         assert!(!screen.contains("/model"), "{screen}");
+    }
+
+    #[test]
+    fn the_input_grows_with_its_lines_and_shows_the_cursor_where_it_is() {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 20)).unwrap();
+        let mut app = App {
+            input: "first line\nsecond".into(),
+            cursor: Some(3),
+            ..Default::default()
+        };
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let input = areas(&app, Rect::new(0, 0, 40, 20)).input;
+        assert_eq!(input.height, 3, "a border and two lines");
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!((cursor.x, cursor.y), (3, input.y + 1));
+
+        // A long line scrolls sideways so the cursor stays visible.
+        app.input = "x".repeat(100);
+        app.cursor = None;
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!(cursor.x, 39);
     }
 
     #[test]
