@@ -197,6 +197,8 @@ pub struct App {
     pub show_cancelled: bool,
     /// Highlighted entry of the slash-command popup.
     pub completion: usize,
+    /// Swarm-wide token budget, if any.
+    pub budget: Option<u64>,
 }
 
 /// A slash command, for the popup that opens when the input starts with `/`.
@@ -226,6 +228,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/model",
         args: "[<id>|default]",
         help: "show or switch the selected agent's model",
+    },
+    SlashCommand {
+        name: "/budget",
+        args: "[N|off]",
+        help: "show, set or remove the swarm-wide token budget",
     },
     SlashCommand {
         name: "/cancel",
@@ -293,6 +300,7 @@ impl App {
             SwarmEvent::Model { id, model } => self.with(&id, |view| view.model = Some(model)),
             SwarmEvent::MailRead { id } => self.with(&id, AgentView::mark_read),
             SwarmEvent::ModelQueued { id, queued } => self.with(&id, |view| view.queued = queued),
+            SwarmEvent::Budget { tokens } => self.budget = tokens,
             SwarmEvent::History {
                 id,
                 messages,
@@ -518,6 +526,8 @@ pub enum Command {
     ShowModel,
     /// Switch the selected agent's model; `None` returns it to the default.
     SetModel(Option<String>),
+    /// Show the token budget, or set it (`off` lifts it).
+    Budget(Option<String>),
     /// Quit.
     Quit,
 }
@@ -534,6 +544,9 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     if let Some(task) = line.strip_prefix("/new ") {
         return Some(Command::NewRoot(task.trim().to_owned()));
     }
+    if let Some(budget) = line.strip_prefix("/budget ") {
+        return Some(Command::Budget(Some(budget.trim().to_owned())));
+    }
     if let Some(model) = line.strip_prefix("/model ") {
         return Some(Command::SetModel(match model.trim() {
             "default" => None,
@@ -543,6 +556,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     match line {
         "/cancel" => return Some(Command::Cancel),
         "/model" => return Some(Command::ShowModel),
+        "/budget" => return Some(Command::Budget(None)),
         "/quit" | "/q" => return Some(Command::Quit),
         _ => {}
     }
@@ -882,6 +896,11 @@ mod tests {
             Some(Command::NewRoot("other".into()))
         );
         assert_eq!(parse_command("/cancel", true), Some(Command::Cancel));
+        assert_eq!(parse_command("/budget", true), Some(Command::Budget(None)));
+        assert_eq!(
+            parse_command("/budget 2M", false),
+            Some(Command::Budget(Some("2M".into())))
+        );
         assert_eq!(
             parse_command("/goal ship it", true),
             Some(Command::Goal("ship it".into()))

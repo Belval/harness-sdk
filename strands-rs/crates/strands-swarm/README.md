@@ -29,7 +29,10 @@ strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--mcp-config mcp.json]...
 
 `--max-agents` (16) caps live agents; `--max-concurrent-calls` (8, `0` = unlimited) caps model calls in
 flight across the whole swarm, so a large swarm queues ("queued for a model slot…" in the log)
-instead of tripping provider throttling.
+instead of tripping provider throttling. `--budget-tokens N` (e.g. `5M`) caps the tokens (input +
+output) the whole swarm may use: once spent, model calls fail with a "budget exhausted" error that
+travels up to you, and `/budget N` in the TUI raises it (`/budget off` lifts it, `/budget` shows usage),
+which tells every stopped agent to continue. The budget is saved with the run.
 
 TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/cancel`, Ctrl-C quits.
 Typing `/` opens a popup of the commands with one-line help, filtered as you type; ↑/↓ and

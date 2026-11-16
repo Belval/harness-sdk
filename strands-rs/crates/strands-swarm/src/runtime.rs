@@ -24,6 +24,7 @@ use strands_agents::{Agent, Error, Model, Result};
 use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::budget;
 use crate::journal::Journal;
 use crate::names;
 use crate::state::{AgentState, MailState, Persister, SwarmState, SESSIONS_DIR};
@@ -146,6 +147,9 @@ pub struct SwarmConfig {
     /// Upper bound on model calls in flight across the swarm; further calls queue. `0` means no
     /// limit.
     pub max_concurrent_calls: usize,
+    /// Swarm-wide token budget (input + output over all agents); once spent, model calls fail
+    /// until [`Swarm::set_budget`] raises it. A resumed run keeps the budget it was saved with.
+    pub budget_tokens: Option<u64>,
     /// Run id, used in worktree paths and branch names.
     pub run_id: String,
     /// Run directory for state and sessions; `None` keeps everything in memory.
@@ -166,6 +170,7 @@ impl SwarmConfig {
             cwd: cwd.into(),
             max_agents: 16,
             max_concurrent_calls: 8,
+            budget_tokens: None,
             run_id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
             state_dir: None,
             cargo_target_dir: None,
@@ -283,6 +288,11 @@ pub enum SwarmEvent {
         /// Output tokens so far.
         output_tokens: u64,
     },
+    /// The token budget was set or lifted (`None`).
+    Budget {
+        /// New budget.
+        tokens: Option<u64>,
+    },
     /// An agent started or stopped waiting for a free model-call slot
     /// ([`SwarmConfig::max_concurrent_calls`]).
     ModelQueued {
@@ -387,6 +397,9 @@ struct Inner {
     actors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     reload: CancellationToken,
     model_calls: Option<Arc<Semaphore>>,
+    budget: Mutex<Option<u64>>,
+    /// Agents whose model call was refused for lack of budget, to wake when it is raised.
+    over_budget: Mutex<Vec<String>>,
 }
 
 /// Handle to a running swarm. Cheap to clone.
@@ -412,14 +425,17 @@ impl Swarm {
             reload: CancellationToken::new(),
             model_calls: (config.max_concurrent_calls > 0)
                 .then(|| Arc::new(Semaphore::new(config.max_concurrent_calls))),
+            budget: Mutex::new(config.budget_tokens),
+            over_budget: Mutex::new(Vec::new()),
             config,
         };
-        (
-            Self {
-                inner: Arc::new(inner),
-            },
-            rx,
-        )
+        let swarm = Self {
+            inner: Arc::new(inner),
+        };
+        if let Some(tokens) = swarm.budget() {
+            swarm.emit(SwarmEvent::Budget { tokens: Some(tokens) });
+        }
+        (swarm, rx)
     }
 
     /// The run id.
@@ -685,6 +701,10 @@ impl Swarm {
     ) -> Result<(Self, mpsc::UnboundedReceiver<SwarmEvent>)> {
         let (swarm, events) = Self::new(config);
         swarm.inner.next_id.store(state.next_id, Ordering::SeqCst);
+        if let Some(tokens) = state.budget_tokens {
+            *swarm.inner.budget.lock() = Some(tokens);
+            swarm.emit(SwarmEvent::Budget { tokens: Some(tokens) });
+        }
         if let Some(journal) = &swarm.inner.journal {
             journal.event("resume", serde_json::json!({ "agents": state.agents.len() }));
         }
@@ -791,6 +811,7 @@ impl Swarm {
             cwd: self.inner.config.cwd.clone(),
             next_id: self.inner.next_id.load(Ordering::SeqCst),
             agents,
+            budget_tokens: *self.inner.budget.lock(),
         }
     }
 
@@ -846,6 +867,50 @@ impl Swarm {
                 ids.join(", ")
             ))),
         }
+    }
+
+    /// Tokens (input + output) used by every agent so far, saved runs included.
+    pub fn tokens_used(&self) -> u64 {
+        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        nodes
+            .iter()
+            .map(|node| {
+                let (input, output) = *node.usage.lock();
+                input + output
+            })
+            .sum()
+    }
+
+    /// The swarm-wide token budget; `None` for no limit.
+    pub fn budget(&self) -> Option<u64> {
+        *self.inner.budget.lock()
+    }
+
+    /// Set (or, with `None`, lift) the token budget. If that leaves budget to spend, every agent
+    /// that was stopped for lack of it is told to continue.
+    pub fn set_budget(&self, tokens: Option<u64>) {
+        *self.inner.budget.lock() = tokens;
+        self.persist();
+        self.emit(SwarmEvent::Budget { tokens });
+        if self.budget_exhausted().is_some() {
+            return;
+        }
+        let stopped: Vec<String> = std::mem::take(&mut *self.inner.over_budget.lock());
+        let limit = tokens.map_or_else(
+            || "lifted".to_owned(),
+            |t| format!("raised to {}", budget::compact(t)),
+        );
+        for id in stopped {
+            let note = format!("[The token budget was {limit}. Continue where you left off.]");
+            let _ = self.send(USER, &id, note);
+        }
+    }
+
+    /// The refusal message when the budget is spent.
+    fn budget_exhausted(&self) -> Option<String> {
+        let budget = self.budget()?;
+        let used = self.tokens_used();
+        (used >= budget).then(|| budget::exhausted_message(used, budget))
     }
 
     /// `parser (a2)` for an agent, `id` itself for anyone else (the user).
@@ -983,7 +1048,11 @@ impl Swarm {
                 continue;
             };
             // A goal-driven agent must survive transient failures (throttling, outages) unattended.
-            if node.goal.is_some() && self.sleep_unless_cancelled(&node, backoff).await {
+            // Out of budget, it waits for the mail that `set_budget` sends instead of retrying.
+            if node.goal.is_some()
+                && self.budget_exhausted().is_none()
+                && self.sleep_unless_cancelled(&node, backoff).await
+            {
                 input = Some(InvokeInput::Text(format!(
                     "Your previous turn failed with: {error}\nContinue working toward your goal."
                 )));
@@ -1105,18 +1174,26 @@ impl Swarm {
         });
     }
 
-    /// Hold a swarm-wide permit for each model call, so a large swarm queues instead of tripping
-    /// provider throttling. Waiting is published as [`SwarmEvent::ModelQueued`].
+    /// Gate every model call: refuse it once the token budget is spent, and hold a swarm-wide
+    /// permit for its duration, so a large swarm queues instead of tripping provider throttling.
+    /// Waiting is published as [`SwarmEvent::ModelQueued`].
     fn install_model_gate(&self, agent: &Agent, node: &Node) {
-        let Some(permits) = self.inner.model_calls.clone() else {
-            return;
-        };
         let swarm = self.clone();
         let id = node.id.clone();
         let cancel = node.cancel.clone();
         agent.add_middleware::<InvokeModelStage>(wrap_fn(move |context, events, next| {
-            let (swarm, id, cancel, permits) = (swarm.clone(), id.clone(), cancel.clone(), permits.clone());
+            let (swarm, id, cancel) = (swarm.clone(), id.clone(), cancel.clone());
             async move {
+                if let Some(message) = swarm.budget_exhausted() {
+                    let mut stopped = swarm.inner.over_budget.lock();
+                    if !stopped.contains(&id) {
+                        stopped.push(id);
+                    }
+                    return Err(Error::other(message));
+                }
+                let Some(permits) = swarm.inner.model_calls.clone() else {
+                    return next.run(context, &events).await;
+                };
                 let _permit = match permits.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {

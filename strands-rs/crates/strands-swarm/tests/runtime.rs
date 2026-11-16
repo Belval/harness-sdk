@@ -1167,3 +1167,59 @@ async fn model_calls_beyond_the_swarm_cap_queue() {
     assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(queued >= 1, "no agent was queued");
 }
+
+#[tokio::test]
+async fn a_spent_token_budget_stops_model_calls_until_it_is_raised() {
+    let dir = tempfile::tempdir().unwrap();
+    let usage = strands_agents::types::Usage {
+        input_tokens: 15,
+        output_tokens: 5,
+        total_tokens: 20,
+        ..Default::default()
+    };
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![(
+            "a1",
+            vec![
+                MockResponse::with_usage(Message::assistant("hello"), usage),
+                say("continued"),
+            ],
+        )],
+        dir.path(),
+    );
+    swarm.set_budget(Some(10));
+    let id = swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "go".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "hello");
+    assert_eq!(swarm.tokens_used(), 20);
+
+    swarm.send(USER, &id, "more").unwrap();
+    let refused = async {
+        loop {
+            if let Some(SwarmEvent::Mail { to, mail }) = events.recv().await {
+                if to == USER && mail.kind == "error" {
+                    return mail.text;
+                }
+            }
+        }
+    };
+    let refused = tokio::time::timeout(Duration::from_secs(10), refused)
+        .await
+        .unwrap();
+    assert!(refused.contains("Token budget exhausted"), "{refused}");
+    let root = scripts.lock()["a1"].clone();
+    assert_eq!(root.call_count(), 1, "the refused call reached the model");
+
+    swarm.set_budget(Some(1_000));
+    assert_eq!(reply_to(&mut events, USER).await, "continued");
+    assert!(sent_text(&root, 1).contains("The token budget was raised to 1.0k"));
+    assert_eq!(swarm.snapshot().budget_tokens, Some(1_000));
+}

@@ -49,10 +49,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
         0 => String::new(),
         n => format!(" · {n} cancelled hidden (f3)"),
     };
+    let budget = app
+        .budget
+        .map(|budget| format!(" · budget {}", compact(budget)))
+        .unwrap_or_default();
     let line = Line::from(vec![
         Span::styled(" strands-swarm ", Style::new().bold().reversed()),
         Span::raw(format!(
-            "  run {run_id} · {} agents · {running} running · {} in / {} out tokens{hidden}",
+            "  run {run_id} · {} agents · {running} running · {} in / {} out tokens{budget}{hidden}",
             app.agents.len(),
             compact(input),
             compact(output)

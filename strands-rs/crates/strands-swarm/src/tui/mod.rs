@@ -201,9 +201,27 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             .set_model(&id, model)
             .await
             .map(|model| format!("{} now uses {model}", swarm.label(&id))),
+        (Command::Budget(None), _) => Ok(budget_notice(swarm)),
+        (Command::Budget(Some(tokens)), _) => match tokens.as_str() {
+            "off" | "none" => Ok(None),
+            tokens => crate::budget::parse_tokens(tokens).map(Some),
+        }
+        .map(|tokens| {
+            swarm.set_budget(tokens);
+            budget_notice(swarm)
+        })
+        .map_err(strands_agents::Error::other),
         (_, None) => Ok("no agent selected".to_owned()),
     };
     app.notice = Some(outcome.unwrap_or_else(|error| format!("error: {error}")));
+}
+
+fn budget_notice(swarm: &Swarm) -> String {
+    let used = crate::budget::compact(swarm.tokens_used());
+    match swarm.budget() {
+        Some(budget) => format!("{used} of {} tokens used", crate::budget::compact(budget)),
+        None => format!("{used} tokens used, no budget"),
+    }
 }
 
 /// End-to-end: drive [`App`] with key events and swarm events, render into a [`TestBackend`]

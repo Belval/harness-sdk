@@ -138,6 +138,7 @@ impl Journal {
                 ("tool_done", json!({"id": id, "tool": name, "ok": ok}))
             }
             SwarmEvent::Model { id, model } => ("model", json!({"id": id, "model": model})),
+            SwarmEvent::Budget { tokens } => ("budget", json!({"tokens": tokens})),
             SwarmEvent::Text { .. }
             | SwarmEvent::Usage { .. }
             | SwarmEvent::Mail { .. }

@@ -38,6 +38,10 @@ struct Cli {
     /// Maximum number of model calls in flight across the swarm; more queue. 0 means no limit.
     #[arg(long, default_value_t = 8)]
     max_concurrent_calls: usize,
+    /// Swarm-wide token budget (input + output, e.g. `5M`); once spent, model calls stop until it
+    /// is raised (TUI `/budget N`). A resumed run keeps its last budget.
+    #[arg(long, value_parser = strands_swarm::budget::parse_tokens)]
+    budget_tokens: Option<u64>,
     /// File with extra instructions given to every agent.
     #[arg(long)]
     instructions: Option<PathBuf>,
@@ -161,6 +165,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.models = Some(harness_model_resolver(options));
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
+    config.budget_tokens = cli.budget_tokens;
     config.cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
     let saved = match &cli.run {
         Some(name) => {
@@ -274,6 +279,10 @@ fn print_event(event: &SwarmEvent) {
         | SwarmEvent::ModelQueued { .. }
         | SwarmEvent::History { .. } => {}
         SwarmEvent::Model { id, model } => eprintln!("[{id}] model {model}"),
+        SwarmEvent::Budget { tokens } => match tokens {
+            Some(tokens) => eprintln!("token budget {tokens}"),
+            None => eprintln!("no token budget"),
+        },
         SwarmEvent::ToolStarted { id, name, summary } => eprintln!("[{id}] {name} {summary}"),
         SwarmEvent::ToolFinished { id, name, ok: false } => eprintln!("[{id}] {name} failed"),
         SwarmEvent::ToolFinished { .. } => {}

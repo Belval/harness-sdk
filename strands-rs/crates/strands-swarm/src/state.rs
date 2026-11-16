@@ -27,6 +27,9 @@ pub struct SwarmState {
     pub next_id: u64,
     /// Agents in spawn order.
     pub agents: Vec<AgentState>,
+    /// Swarm-wide token budget (input + output), as last set; `None` for no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u64>,
 }
 
 /// Persisted agent.
