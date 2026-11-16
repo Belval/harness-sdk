@@ -14,7 +14,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use strands_agents::agent::{AgentStreamEvent, InvokeInput, InvokeOptions};
 use strands_agents::hooks::AfterToolCallEvent;
-use strands_agents::middleware::{wrap_fn, InvokeModelStage};
+use strands_agents::middleware::{wrap_fn, InvokeModelContext, InvokeModelStage};
 use strands_agents::models::streaming::{ContentBlockDelta, ModelStreamEvent};
 use strands_agents::models::{ModelEventStream, StreamOptions};
 use strands_agents::tools::ToolRef;
@@ -348,6 +348,9 @@ pub enum SwarmEvent {
     },
 }
 
+/// What the parent of an interrupted agent is told.
+pub const INTERRUPTED_TEXT: &str = "Interrupted by the user before finishing this turn.";
+
 /// How many restored messages [`SwarmEvent::History`] carries at most.
 pub const HISTORY_MESSAGES: usize = 100;
 
@@ -387,12 +390,21 @@ struct Node {
     collected: AtomicBool,
     /// Context window utilization of the last model call, across restarts.
     context: Mutex<Option<f64>>,
+    /// Cancels the turn in progress only ([`Swarm::interrupt`]); a child of `cancel`.
+    turn: Mutex<Option<CancellationToken>>,
+    /// Interrupted by the user and not messaged since: a goal agent does not resume on restart.
+    paused: AtomicBool,
 }
 
 /// Cumulative `(input, output)` tokens.
 type Tokens = (u64, u64);
 
 impl Node {
+    /// The current turn's token, else the agent's own (between turns).
+    fn turn_token(&self) -> CancellationToken {
+        self.turn.lock().clone().unwrap_or_else(|| self.cancel.clone())
+    }
+
     /// `parser (a2)`.
     fn label(&self) -> String {
         format!("{} ({})", self.name, self.id)
@@ -468,9 +480,16 @@ impl Model for SideModel {
             let gone = || Error::other("The agent of this side call is gone.");
             let node = self.node.upgrade().ok_or_else(gone)?;
             let model = self.current().ok_or_else(gone)?;
-            let _permit = self.swarm.admit_model_call(&node.id, &node.cancel).await?;
+            // Side calls (the goal judge) belong to the turn: an interrupt stops them too.
+            let cancel = node.turn_token();
+            let _permit = self.swarm.admit_model_call(&node.id, &cancel).await?;
             let mut events = model.stream(messages, options);
-            while let Some(event) = events.next().await {
+            loop {
+                let next = tokio::select! {
+                    next = events.next() => next,
+                    _ = cancel.cancelled() => Some(Err(Error::Cancelled)),
+                };
+                let Some(event) = next else { break };
                 let event = event?;
                 if let ModelStreamEvent::Metadata { usage: Some(usage), .. } = &event {
                     self.swarm.add_usage(&node, usage, false);
@@ -594,6 +613,8 @@ impl Swarm {
                 finished: AtomicBool::new(false),
                 collected: AtomicBool::new(false),
                 context: Mutex::new(None),
+                turn: Mutex::new(None),
+                paused: AtomicBool::new(false),
             });
             agents.insert(id.clone(), node.clone());
             node
@@ -619,6 +640,27 @@ impl Swarm {
     /// Post `text` from `from` to `to`'s mailbox. `to` may be [`USER`].
     pub fn send(&self, from: &str, to: &str, text: impl Into<String>) -> Result<()> {
         self.post(from, to, "message", text.into())
+    }
+
+    /// Stop `id`'s current turn, like Esc in Claude Code, without cancelling it: the agent
+    /// becomes idle with its conversation intact (an open tool call is closed as cancelled), its
+    /// parent gets an `interrupted` message, and its children keep running. A goal agent stays
+    /// idle until its next message. Errors when the agent is not in a turn.
+    pub fn interrupt(&self, id: &str) -> Result<()> {
+        let node = self
+            .node(id)
+            .ok_or_else(|| Error::other(format!("Unknown agent id {id}.")))?;
+        let turn = node.turn.lock().clone();
+        match turn {
+            Some(turn) if node.status.lock().is_live() => {
+                turn.cancel();
+                Ok(())
+            }
+            _ => Err(Error::other(format!(
+                "{} is not working on a turn.",
+                node.label()
+            ))),
+        }
     }
 
     /// Cancel an agent and, through its token, every agent it spawned.
@@ -959,6 +1001,8 @@ impl Swarm {
             finished: AtomicBool::new(!status.is_live()),
             collected: AtomicBool::new(false),
             context: Mutex::new(saved.context),
+            turn: Mutex::new(None),
+            paused: AtomicBool::new(saved.paused),
         });
         agents.insert(saved.id.clone(), node.clone());
         drop(agents);
@@ -998,7 +1042,8 @@ impl Swarm {
                 omitted,
             });
         }
-        if !interrupted && node.goal.is_none() {
+        let paused = node.paused.load(Ordering::SeqCst);
+        if !interrupted && (node.goal.is_none() || paused) {
             return None;
         }
         let folded = agent.with_messages(append_restart_notice);
@@ -1307,9 +1352,12 @@ impl Swarm {
 
     /// Run one turn; returns the error message when it failed (not when it was cancelled).
     async fn run_turn(&self, node: &Node, agent: &Agent, input: InvokeInput) -> Option<String> {
+        let turn = node.cancel.child_token();
+        *node.turn.lock() = Some(turn.clone());
+        node.paused.store(false, Ordering::SeqCst);
         self.set_status(node, AgentStatus::Running);
         self.refresh_memory(agent).await;
-        let options = InvokeOptions::default().with_cancel(node.cancel.clone());
+        let options = InvokeOptions::default().with_cancel(turn.clone());
         let mut stream = agent.stream_with(input, options);
         let mut reply = None;
         let mut failure = None;
@@ -1319,7 +1367,17 @@ impl Swarm {
                 Err(error) => failure = Some(error),
             }
         }
+        drop(stream);
+        node.turn.lock().take();
         if node.cancel.is_cancelled() || self.inner.shutting_down.load(Ordering::SeqCst) {
+            return None;
+        }
+        if turn.is_cancelled() {
+            // Interrupted: the SDK has already closed any open tool call, so the conversation
+            // continues cleanly with the next message. No retry, even with a goal.
+            node.paused.store(true, Ordering::SeqCst);
+            self.set_status(node, AgentStatus::Idle);
+            let _ = self.post(&node.id, &node.parent, "interrupted", INTERRUPTED_TEXT.to_owned());
             return None;
         }
         if let Some(error) = failure {
@@ -1401,14 +1459,17 @@ impl Swarm {
     fn install_model_gate(&self, agent: &Agent, node: &Node) {
         let swarm = self.clone();
         let id = node.id.clone();
-        let cancel = node.cancel.clone();
-        agent.add_middleware::<InvokeModelStage>(wrap_fn(move |context, events, next| {
-            let (swarm, id, cancel) = (swarm.clone(), id.clone(), cancel.clone());
-            async move {
-                let _permit = swarm.admit_model_call(&id, &cancel).await?;
-                next.run(context, &events).await
-            }
-        }));
+        agent.add_middleware::<InvokeModelStage>(wrap_fn(
+            move |context: InvokeModelContext, events, next| {
+                let (swarm, id) = (swarm.clone(), id.clone());
+                // The invocation's token: cancelled by an interrupt as well as by a cancel.
+                let cancel = context.agent.cancel_token();
+                async move {
+                    let _permit = swarm.admit_model_call(&id, &cancel).await?;
+                    next.run(context, &events).await
+                }
+            },
+        ));
     }
 
     /// Refuse a model call of agent `id` once the budget is spent, else wait for a swarm-wide
@@ -1585,6 +1646,7 @@ fn node_state(node: &Node) -> AgentState {
         input_tokens,
         output_tokens,
         context: *node.context.lock(),
+        paused: node.paused.load(Ordering::SeqCst),
     }
 }
 
@@ -1601,6 +1663,7 @@ fn mail_from_state(mail: MailState) -> Mail {
     let kind = match mail.kind.as_str() {
         "reply" => "reply",
         "error" => "error",
+        "interrupted" => "interrupted",
         _ => "message",
     };
     Mail {

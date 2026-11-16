@@ -25,6 +25,7 @@ const KEYS: &[(&str, &str)] = &[
     ("f2", "plain-text log, for native scroll and copy"),
     ("f3", "show or hide cancelled agents"),
     ("esc", "clear the input and selection, close this"),
+    ("esc esc", "stop the selected agent's turn (it stays alive)"),
     ("ctrl-c", "quit"),
 ];
 

@@ -206,6 +206,8 @@ pub struct App {
     pub show_keys: bool,
     /// The mouse selection being made or last made, highlighted until the next click.
     pub selection: Option<super::select::Selection>,
+    /// When Esc was last pressed on an empty input; a second press soon after stops the turn.
+    pub last_esc: Option<std::time::Instant>,
 }
 
 /// A slash command, for the popup that opens when the input starts with `/`.
@@ -250,6 +252,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/forget",
         args: "<text>",
         help: "drop memory lines containing the text",
+    },
+    SlashCommand {
+        name: "/stop",
+        args: "",
+        help: "interrupt the selected agent's turn; it stays alive (esc esc)",
     },
     SlashCommand {
         name: "/cancel",
@@ -560,6 +567,8 @@ pub enum Command {
     Message(String),
     /// Cancel the selected agent.
     Cancel,
+    /// Interrupt the selected agent's current turn; it stays alive and idle.
+    Stop,
     /// Show the selected agent's model.
     ShowModel,
     /// Switch the selected agent's model; `None` returns it to the default.
@@ -605,6 +614,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     }
     match line {
         "/cancel" => return Some(Command::Cancel),
+        "/stop" => return Some(Command::Stop),
         "/model" => return Some(Command::ShowModel),
         "/budget" => return Some(Command::Budget(None)),
         "/remember" => return Some(Command::Remember(None)),
@@ -948,6 +958,7 @@ mod tests {
             Some(Command::NewRoot("other".into()))
         );
         assert_eq!(parse_command("/cancel", true), Some(Command::Cancel));
+        assert_eq!(parse_command("/stop", true), Some(Command::Stop));
         assert_eq!(parse_command("/budget", true), Some(Command::Budget(None)));
         assert_eq!(parse_command("/remember", true), Some(Command::Remember(None)));
         assert_eq!(

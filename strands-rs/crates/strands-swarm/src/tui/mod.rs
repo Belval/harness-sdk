@@ -205,6 +205,9 @@ fn on_mouse(app: &mut App, mouse: MouseEvent, screen: &Buffer) -> Option<String>
     None
 }
 
+/// Two Esc presses this close together stop the selected agent's turn.
+const DOUBLE_ESC: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Columns one Ctrl-←/→ press resizes the agent tree by.
 const TREE_STEP: i16 = 4;
 
@@ -232,6 +235,16 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
         KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(10),
         KeyCode::End => app.scroll = 0,
         KeyCode::Esc if app.show_keys => app.show_keys = false,
+        KeyCode::Esc if app.input.is_empty() && app.selection.is_none() => {
+            let now = std::time::Instant::now();
+            match app.last_esc.take() {
+                Some(at) if now.duration_since(at) <= DOUBLE_ESC => return Some(Command::Stop),
+                _ => {
+                    app.last_esc = Some(now);
+                    app.notice = Some("press esc again to stop the selected agent's turn".to_owned());
+                }
+            }
+        }
         KeyCode::Esc => {
             app.input.clear();
             app.selection = None;
@@ -283,6 +296,9 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
         (Command::Message(text), Some(id)) => swarm
             .send(USER, &id, text)
             .map(|()| format!("sent to {}", swarm.label(&id))),
+        (Command::Stop, Some(id)) => swarm
+            .interrupt(&id)
+            .map(|()| format!("stopping {}'s turn", swarm.label(&id))),
         (Command::Cancel, Some(id)) => swarm
             .cancel(&id)
             .map(|()| format!("cancelled {}", swarm.label(&id))),
@@ -471,6 +487,23 @@ mod tests {
             Some(Command::Message("status?".into()))
         );
         assert_eq!(type_line(&mut app, "/cancel"), Some(Command::Cancel));
+    }
+
+    #[test]
+    fn esc_twice_on_an_empty_input_stops_the_turn() {
+        let mut app = App {
+            input: "draft".into(),
+            ..Default::default()
+        };
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.input.is_empty(), "the first esc clears the input");
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.notice.as_deref().unwrap().contains("esc again"));
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Command::Stop));
+        // A slow second press only arms again.
+        app.last_esc = Some(std::time::Instant::now() - 2 * DOUBLE_ESC);
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert!(app.last_esc.is_some());
     }
 
     #[test]

@@ -67,6 +67,9 @@ pub struct AgentState {
     /// Context window utilization of the last model call (`0..1+`), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<f64>,
+    /// Interrupted by the user: a goal agent stays idle until its next message, restarts included.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
 }
 
 /// Persisted mail.

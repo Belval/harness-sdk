@@ -1608,3 +1608,179 @@ async fn a_spent_budget_also_stops_the_goal_judge() {
     assert_eq!(swarm.tokens_used(), 110);
     swarm.shutdown().await;
 }
+
+/// Like [`mock_factory`], plus a `slow` tool that runs until it is cancelled.
+fn slow_tool_factory(scripts: &Scripts) -> AgentFactory {
+    let inner = mock_factory(scripts);
+    Arc::new(move |mut spec: AgentSpec| {
+        let slow = strands_agents::tools::FunctionTool::builder("slow")
+            .description("Takes forever.")
+            .handler(
+                |_input: serde_json::Value, ctx: strands_agents::tools::ToolContext| async move {
+                    ctx.cancel.cancelled().await;
+                    strands_agents::Result::Ok("stopped".to_owned())
+                },
+            );
+        spec.tools.push(Arc::new(slow));
+        inner(spec)
+    })
+}
+
+async fn tool_started(events: &mut UnboundedReceiver<SwarmEvent>, tool: &str) {
+    let wait = async {
+        loop {
+            if let Some(SwarmEvent::ToolStarted { name, .. }) = events.recv().await {
+                if name == tool {
+                    return;
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap();
+}
+
+async fn mail_to(events: &mut UnboundedReceiver<SwarmEvent>, to: &str, kind: &str) -> String {
+    let wait = async {
+        loop {
+            if let Some(SwarmEvent::Mail { to: receiver, mail }) = events.recv().await {
+                if receiver == to && mail.kind == kind {
+                    return mail.text;
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap()
+}
+
+#[tokio::test]
+async fn interrupting_mid_tool_idles_the_agent_and_the_next_message_continues_the_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![
+        (
+            "a1",
+            vec![
+                tool_call("spawn_agent", "s1", json!({ "task": "help", "name": "helper" })),
+                tool_call("slow", "t1", json!({})),
+                say("picked up again"),
+            ],
+        ),
+        ("a2", vec![tool_call("slow", "t2", json!({})), say("helper done")]),
+    ]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(slow_tool_factory(&scripts), dir.path()));
+    let root = spawn_root(&swarm, "work").await;
+    tool_started(&mut events, "slow").await;
+    tool_started(&mut events, "slow").await;
+
+    swarm.interrupt(&root).unwrap();
+    let told = mail_to(&mut events, USER, "interrupted").await;
+    assert!(told.contains("Interrupted by the user"), "{told}");
+    assert_eq!(swarm.agent(&root).unwrap().status, AgentStatus::Idle);
+    assert_eq!(
+        swarm.agent("a2").unwrap().status,
+        AgentStatus::Running,
+        "children keep going"
+    );
+    assert!(swarm.interrupt(&root).is_err(), "nothing left to interrupt");
+
+    swarm.send(USER, &root, "carry on").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "picked up again");
+    let model = scripts.lock()[&root].clone();
+    let (messages, _) = model.calls().pop().unwrap();
+    let uses: Vec<String> = messages
+        .iter()
+        .flat_map(|m| m.tool_uses().map(|u| u.tool_use_id.clone()).collect::<Vec<_>>())
+        .collect();
+    let results: Vec<String> = messages
+        .iter()
+        .flat_map(|m| {
+            m.tool_results()
+                .map(|r| r.tool_use_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(uses, results, "every tool call is answered");
+    assert!(
+        messages.iter().any(|m| m.text().contains("work")),
+        "same conversation"
+    );
+    assert!(messages.last().unwrap().text().contains("carry on"));
+    swarm.cancel("a2").unwrap();
+}
+
+#[tokio::test]
+async fn an_interrupted_goal_agent_stays_idle_until_its_next_message_even_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![tool_call("slow", "t1", json!({})), say("back to the goal")],
+    )]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(slow_tool_factory(&scripts), dir.path()));
+    let request = SpawnRequest {
+        task: "ship it".into(),
+        goal: Some("shipped".into()),
+        ..Default::default()
+    };
+    let id = swarm.spawn(USER, request).await.unwrap();
+    tool_started(&mut events, "slow").await;
+    swarm.interrupt(&id).unwrap();
+    mail_to(&mut events, USER, "interrupted").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let model = scripts.lock()[&id].clone();
+    assert_eq!(model.call_count(), 1, "no retry of the goal");
+    assert_eq!(swarm.agent(&id).unwrap().status, AgentStatus::Idle);
+    let saved = swarm.snapshot();
+    assert!(saved.agents[0].paused);
+    swarm.shutdown().await;
+
+    let resumed_scripts = scripts_of(vec![("a1", vec![say("resumed")])]);
+    let config = SwarmConfig::new(slow_tool_factory(&resumed_scripts), dir.path());
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let model = resumed_scripts.lock()[&id].clone();
+    assert_eq!(
+        model.call_count(),
+        0,
+        "a paused goal agent does not restart on its own"
+    );
+    resumed.send(USER, &id, "go on").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "resumed");
+    assert!(!resumed.snapshot().agents[0].paused);
+    resumed.shutdown().await;
+}
+
+/// A side model whose calls never finish, counting how many were started.
+struct Hanging(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Model for Hanging {
+    fn model_id(&self) -> Option<String> {
+        Some("hanging".into())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _options: &'a strands_agents::models::StreamOptions,
+    ) -> strands_agents::models::ModelEventStream<'a> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(futures::stream::pending())
+    }
+}
+
+#[tokio::test]
+async fn an_interrupt_also_stops_the_goal_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("done")])]);
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut config = SwarmConfig::new(goal_factory(&scripts), dir.path());
+    config.side_model = Some(Arc::new(Hanging(started.clone())));
+    let (swarm, mut events) = Swarm::new(config);
+    let id = spawn_with_goal(&swarm).await;
+    eventually("the judge is running", || {
+        started.load(std::sync::atomic::Ordering::SeqCst) == 1
+    })
+    .await;
+    swarm.interrupt(&id).unwrap();
+    mail_to(&mut events, USER, "interrupted").await;
+    assert_eq!(swarm.agent(&id).unwrap().status, AgentStatus::Idle);
+    swarm.shutdown().await;
+}

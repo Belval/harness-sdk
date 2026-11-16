@@ -49,8 +49,14 @@ output) the whole swarm may use: once spent, model calls fail with a "budget exh
 travels up to you, and `/budget N` in the TUI raises it (`/budget off` lifts it, `/budget` shows usage),
 which tells every stopped agent to continue. The budget is saved with the run.
 
-TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/cancel`, `/gc`,
-Ctrl-C quits.
+TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/stop`, `/cancel`,
+`/gc`, Ctrl-C quits.
+`/stop` (or Esc twice within a second on an empty input) interrupts the selected agent's turn without
+cancelling it, like Esc in Claude Code: an open tool call is closed as cancelled, the agent goes idle
+with its conversation intact, its parent gets an `interrupted` message, its children keep running,
+and a goal agent waits for its next message instead of resuming (restarts included). The next
+message continues the same conversation. Programmatically: `Swarm::interrupt`. `/cancel` stops the
+agent and its whole subtree for good.
 Typing `/` opens a popup of the commands with one-line help, filtered as you type; ↑/↓ and
 Tab or Enter pick one; F1 lists the keys. Each agent is one line in the tree: status, name, model,
 input/output tokens and how full its context window was on its last model call, e.g.
