@@ -125,7 +125,7 @@ async fn a_spawned_agents_reply_reaches_the_parent_through_wait() {
     assert_eq!(reply_to(&mut events, USER).await, "child said it");
     let root = scripts.lock()["a1"].clone();
     let third = sent_text(&root, 2);
-    assert!(third.contains("a2 (counter)"), "{third}");
+    assert!(third.contains("counter (a2)"), "{third}");
     assert!(third.contains("1 2 3"), "{third}");
     let child = scripts.lock()["a2"].clone();
     assert!(sent_text(&child, 0).contains("count to 3"));
@@ -195,7 +195,7 @@ async fn cancelling_an_agent_cancels_its_descendants() {
             (
                 "a1",
                 vec![
-                    tool_call("spawn_agent", "t1", json!({"task": "sub"})),
+                    tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
                     say("spawned"),
                 ],
             ),
@@ -231,6 +231,116 @@ async fn cancelling_an_agent_cancels_its_descendants() {
         .await
         .expect("agents still live");
     assert_eq!(swarm.agents().len(), 2);
+}
+
+#[tokio::test]
+async fn agents_get_unique_names_and_can_be_addressed_by_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", json!({"task": "x", "name": "Worker"})),
+                    tool_call(
+                        "spawn_agent",
+                        "t2",
+                        json!({"task": "Fix the flaky tests", "name": " "}),
+                    ),
+                    tool_call("spawn_agent", "t3", json!({"task": "y", "name": "worker"})),
+                    tool_call("send_message", "t4", json!({"to": "worker-2", "message": "ping"})),
+                    tool_call("wait", "t5", json!({"from": ["worker-2"], "timeout_seconds": 10})),
+                    tool_call("cancel_agent", "t6", json!({"id": "fix-flaky-tests"})),
+                    tool_call("send_message", "t7", json!({"to": "nobody", "message": "x"})),
+                    tool_call("list_agents", "t8", json!({})),
+                    say("done"),
+                    say("late mail"),
+                    say("late mail"),
+                ],
+            ),
+            ("a2", vec![say("w1")]),
+            (
+                "a3",
+                vec![
+                    tool_call("wait", "t1", json!({"timeout_seconds": 60})),
+                    say("unreachable"),
+                ],
+            ),
+            ("a4", vec![say("w2"), say("pong")]),
+        ],
+        dir.path(),
+    );
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "Coordinate the workers".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+
+    let names: Vec<(String, String)> = swarm.agents().into_iter().map(|a| (a.id, a.name)).collect();
+    let expected = [
+        ("a1", "coordinate-workers"),
+        ("a2", "worker"),
+        ("a3", "fix-flaky-tests"),
+        ("a4", "worker-2"),
+    ];
+    assert_eq!(names, expected.map(|(id, name)| (id.to_owned(), name.to_owned())));
+    assert_eq!(swarm.resolve("worker-2").unwrap(), "a4");
+    assert_eq!(swarm.resolve("a4").unwrap(), "a4");
+    assert!(swarm.resolve("nobody").is_err());
+    let cancelled = async {
+        while swarm.agent("a3").unwrap().status != AgentStatus::Cancelled {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), cancelled)
+        .await
+        .expect("fix-flaky-tests still live");
+
+    let pinged = sent_text(&scripts.lock()["a4"].clone(), 1);
+    assert!(
+        pinged.contains("coordinate-workers (a1)") && pinged.contains("ping"),
+        "{pinged}"
+    );
+    let root = scripts.lock()["a1"].clone();
+    let after_unknown = sent_text(&root, 7);
+    assert!(
+        after_unknown.contains("No agent with id or name `nobody`"),
+        "{after_unknown}"
+    );
+    let listed = sent_text(&root, 8);
+    assert!(
+        listed.contains("worker-2 (a4): ") && listed.contains("parent coordinate-workers (a1)"),
+        "{listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_saved_run_without_names_resumes_with_derived_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({
+        "run_id": "old",
+        "cwd": dir.path(),
+        "next_id": 3,
+        "agents": [
+            {"id": "a1", "parent": "user", "cwd": dir.path(), "branch": null, "task": "Review the parser",
+             "model": null, "goal": null, "status": "cancelled", "mailbox": []},
+            {"id": "a2", "name": "parser", "parent": "a1", "cwd": dir.path(), "branch": null, "task": "t",
+             "model": null, "goal": null, "status": "cancelled", "mailbox": []},
+        ],
+    }))
+    .unwrap();
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let config = SwarmConfig::new(mock_factory(&map), dir.path());
+    let (swarm, _events) = Swarm::resume(config, saved).await.unwrap();
+    let names: Vec<String> = swarm.agents().into_iter().map(|a| a.name).collect();
+    assert_eq!(names, ["review-parser", "parser"]);
+    assert_eq!(swarm.snapshot().agents[0].name.as_deref(), Some("review-parser"));
 }
 
 #[tokio::test]
@@ -420,7 +530,7 @@ async fn a_resumed_run_restores_conversations_and_wakes_interrupted_agents() {
     script(
         "a1",
         vec![
-            tool_call("spawn_agent", "t1", json!({"task": "sub"})),
+            tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
             say("spawned"),
         ],
     );

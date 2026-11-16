@@ -56,7 +56,7 @@ fn draw_agents(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let items: Vec<ListItem> = app
         .tree()
         .into_iter()
-        .map(|(depth, view)| ListItem::new(agent_line(depth, view, tick)))
+        .map(|(depth, view)| ListItem::new(agent_item(depth, view, tick)))
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" agents "))
@@ -65,12 +65,16 @@ fn draw_agents(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn agent_line(depth: usize, view: &AgentView, tick: usize) -> Line<'static> {
+/// Two lines per agent: `⠋ parser a2 ⎇ •`, then what it is doing, dimmed. Both are clipped by
+/// the list's width, so the name stays visible on narrow terminals.
+fn agent_item(depth: usize, view: &AgentView, tick: usize) -> Text<'static> {
     let (glyph, color) = status_glyph(&view.status, tick);
+    let indent = "  ".repeat(depth);
     let mut spans = vec![
-        Span::raw("  ".repeat(depth)),
+        Span::raw(indent.clone()),
         Span::styled(format!("{glyph} "), Style::new().fg(color)),
-        Span::raw(view.label()),
+        Span::styled(view.name.clone(), Style::new().bold()),
+        Span::styled(format!(" {}", view.id), Style::new().dim()),
     ];
     if view.branch.is_some() {
         spans.push(Span::styled(" ⎇", Style::new().fg(Color::Magenta)));
@@ -78,7 +82,11 @@ fn agent_line(depth: usize, view: &AgentView, tick: usize) -> Line<'static> {
     if view.unseen {
         spans.push(Span::styled(" •", Style::new().fg(Color::Yellow)));
     }
-    Line::from(spans)
+    let doing = Line::from(Span::styled(
+        format!("{indent}  {}", view.doing),
+        Style::new().dim(),
+    ));
+    Text::from(vec![Line::from(spans), doing])
 }
 
 fn status_glyph(status: &AgentStatus, tick: usize) -> (&'static str, Color) {

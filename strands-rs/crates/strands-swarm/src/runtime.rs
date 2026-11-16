@@ -23,6 +23,7 @@ use strands_agents::{Agent, Error, Result};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
+use crate::names;
 use crate::state::{AgentState, MailState, Persister, SwarmState, SESSIONS_DIR};
 use crate::tools::swarm_tools;
 use crate::worktree;
@@ -76,7 +77,7 @@ impl fmt::Display for AgentStatus {
 pub struct Mail {
     /// Sender id ([`USER`] for the human).
     pub from: String,
-    /// Sender label as rendered to the receiver, e.g. `a2 (parser)`.
+    /// Sender label as rendered to the receiver, e.g. `parser (a2)`.
     pub from_label: String,
     /// What kind of message this is: `message`, `reply` (a turn's final text) or `error`.
     pub kind: &'static str,
@@ -104,8 +105,8 @@ pub fn render_mail(mail: &[Mail]) -> String {
 pub struct AgentSpec {
     /// Swarm-unique id (`a1`, `a2`, …); also the agent's `id`.
     pub id: String,
-    /// Optional human-readable name chosen by the spawner.
-    pub name: Option<String>,
+    /// Swarm-unique human-readable name, chosen by the spawner or derived from the task.
+    pub name: String,
     /// Working directory for shell commands and the environment context.
     pub cwd: PathBuf,
     /// Model override chosen by the spawner (`provider/name` or a Bedrock id).
@@ -164,7 +165,7 @@ impl SwarmConfig {
 pub struct SpawnRequest {
     /// The task, sent as the agent's first user message.
     pub task: String,
-    /// Optional name.
+    /// Short human-readable name; derived from the task when `None`. Made unique with a suffix.
     pub name: Option<String>,
     /// Give the agent its own git worktree and branch, cut from the spawner's `HEAD`.
     pub worktree: bool,
@@ -179,8 +180,8 @@ pub struct SpawnRequest {
 pub struct AgentInfo {
     /// Id.
     pub id: String,
-    /// Name.
-    pub name: Option<String>,
+    /// Swarm-unique name.
+    pub name: String,
     /// Parent id ([`USER`] for the root).
     pub parent: String,
     /// Working directory.
@@ -202,8 +203,8 @@ pub enum SwarmEvent {
         id: String,
         /// Parent id.
         parent: String,
-        /// Name.
-        name: Option<String>,
+        /// Swarm-unique name.
+        name: String,
         /// Task.
         task: String,
         /// Working directory.
@@ -275,7 +276,7 @@ in flight was interrupted. Check the state of your work and continue.]";
 
 struct Node {
     id: String,
-    name: Option<String>,
+    name: String,
     parent: String,
     cwd: PathBuf,
     branch: Option<String>,
@@ -291,11 +292,9 @@ struct Node {
 }
 
 impl Node {
+    /// `parser (a2)`.
     fn label(&self) -> String {
-        match &self.name {
-            Some(name) => format!("{} ({name})", self.id),
-            None => self.id.clone(),
-        }
+        format!("{} ({})", self.name, self.id)
     }
 
     fn info(&self) -> AgentInfo {
@@ -409,28 +408,33 @@ impl Swarm {
             .map_or(&self.inner.root_cancel, |node| &node.cancel)
             .child_token();
 
-        let node = Arc::new(Node {
-            id: id.clone(),
-            name: request.name.clone(),
-            parent: parent.to_owned(),
-            cwd,
-            branch,
-            status: Mutex::new(AgentStatus::Starting),
-            mailbox: Mutex::new(VecDeque::new()),
-            notify: Notify::new(),
-            cancel,
-            agent: OnceLock::new(),
-            task: request.task.clone(),
-            model: request.model.clone(),
-            goal: request.goal.clone(),
-            env,
-        });
-        self.inner.agents.lock().insert(id.clone(), node.clone());
+        let node = {
+            let mut agents = self.inner.agents.lock();
+            let taken = agents.values().map(|node| node.name.as_str());
+            let node = Arc::new(Node {
+                id: id.clone(),
+                name: names::choose(request.name.as_deref(), &request.task, taken),
+                parent: parent.to_owned(),
+                cwd,
+                branch,
+                status: Mutex::new(AgentStatus::Starting),
+                mailbox: Mutex::new(VecDeque::new()),
+                notify: Notify::new(),
+                cancel,
+                agent: OnceLock::new(),
+                task: request.task.clone(),
+                model: request.model.clone(),
+                goal: request.goal.clone(),
+                env,
+            });
+            agents.insert(id.clone(), node.clone());
+            node
+        };
         self.persist();
         self.emit(SwarmEvent::Spawned {
             id: id.clone(),
             parent: parent.to_owned(),
-            name: request.name.clone(),
+            name: node.name.clone(),
             task: request.task.clone(),
             cwd: node.cwd.clone(),
             branch: node.branch.clone(),
@@ -569,9 +573,11 @@ impl Swarm {
             true => self.worktree_env(&saved.id),
             false => saved.env,
         };
+        let mut agents = self.inner.agents.lock();
+        let taken = agents.values().map(|node| node.name.as_str());
         let node = Arc::new(Node {
             id: saved.id.clone(),
-            name: saved.name,
+            name: names::choose(saved.name.as_deref(), &saved.task, taken),
             parent: saved.parent,
             cwd: saved.cwd,
             branch: saved.branch,
@@ -585,7 +591,8 @@ impl Swarm {
             goal: saved.goal,
             env,
         });
-        self.inner.agents.lock().insert(saved.id.clone(), node.clone());
+        agents.insert(saved.id.clone(), node.clone());
+        drop(agents);
         self.emit(SwarmEvent::Spawned {
             id: node.id.clone(),
             parent: node.parent.clone(),
@@ -669,6 +676,34 @@ impl Swarm {
         )])
     }
 
+    /// The id of the agent `who` names: an id, or else a unique agent name.
+    pub fn resolve(&self, who: &str) -> Result<String> {
+        let agents = self.inner.agents.lock();
+        if agents.contains_key(who) {
+            return Ok(who.to_owned());
+        }
+        let matches: Vec<&str> = agents
+            .values()
+            .filter(|node| node.name == who)
+            .map(|node| node.id.as_str())
+            .collect();
+        match matches.as_slice() {
+            [id] => Ok((*id).to_owned()),
+            [] => Err(Error::other(format!(
+                "No agent with id or name `{who}`; call list_agents to see who exists."
+            ))),
+            ids => Err(Error::other(format!(
+                "Several agents are named `{who}` ({}); use an id.",
+                ids.join(", ")
+            ))),
+        }
+    }
+
+    /// `parser (a2)` for an agent, `id` itself for anyone else (the user).
+    pub fn label(&self, id: &str) -> String {
+        self.node(id).map_or_else(|| id.to_owned(), |node| node.label())
+    }
+
     fn node(&self, id: &str) -> Option<Arc<Node>> {
         self.inner.agents.lock().get(id).cloned()
     }
@@ -704,10 +739,7 @@ impl Swarm {
     }
 
     fn post(&self, from: &str, to: &str, kind: &'static str, text: String) -> Result<()> {
-        let from_label = match self.node(from) {
-            Some(node) => node.label(),
-            None => from.to_owned(),
-        };
+        let from_label = self.label(from);
         let mail = Mail {
             from: from.to_owned(),
             from_label,
@@ -898,13 +930,10 @@ impl Swarm {
     }
 
     fn instructions(&self, node: &Node, goal: Option<&str>) -> String {
-        let who = match &node.name {
-            Some(name) => format!("agent {} (\"{name}\")", node.id),
-            None => format!("agent {}", node.id),
-        };
+        let who = format!("agent {} (\"{}\")", node.id, node.name);
         let reports_to = match node.parent.as_str() {
             USER => "the user".to_owned(),
-            parent => format!("agent {parent}, who spawned you"),
+            parent => format!("agent {}, who spawned you", self.label(parent)),
         };
         let branch = node
             .branch
@@ -1006,7 +1035,7 @@ fn status_name(status: &AgentStatus) -> &'static str {
 fn node_state(node: &Node) -> AgentState {
     AgentState {
         id: node.id.clone(),
-        name: node.name.clone(),
+        name: Some(node.name.clone()),
         parent: node.parent.clone(),
         cwd: node.cwd.clone(),
         branch: node.branch.clone(),

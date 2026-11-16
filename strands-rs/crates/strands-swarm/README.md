@@ -6,14 +6,15 @@ agent with six extra tools, and decides for itself whether and how to split the 
 | Tool | What it does |
 | --- | --- |
 | `spawn_agent` | Start an agent on a task (optionally in its own git worktree, with a model or a goal). Non-blocking. |
-| `send_message` | Message any agent, or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
+| `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents). |
 | `list_agents` | The agent tree with statuses, directories and branches. |
 | `cancel_agent` | Stop an agent and everything it spawned. |
 | `reload_swarm` | Restart the whole swarm into a newly built binary; every agent resumes. |
 | `find_tools` | Only with MCP servers: search the shared MCP tools by keyword and enable some for the calling agent. |
 
-Each agent's final reply per turn goes to its parent. A `goal` (TUI `/goal`, CLI `--goal`, or on
+Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else one derived
+from its task; ids and names work interchangeably. Each agent's final reply per turn goes to its parent. A `goal` (TUI `/goal`, CLI `--goal`, or on
 `spawn_agent`) puts a judge in the loop that sends the agent back to work until the goal is met.
 
 ## Run

@@ -151,7 +151,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         memory: MemoryOption::Off,
         context_manager: context_manager(),
         id: Some(spec.id),
-        name: spec.name,
+        name: Some(spec.name),
         ..Default::default()
     })
 }
@@ -209,7 +209,7 @@ mod tests {
     fn spec() -> AgentSpec {
         AgentSpec {
             id: "a1".into(),
-            name: None,
+            name: "t".into(),
             cwd: std::env::temp_dir(),
             model: None,
             instructions: String::new(),

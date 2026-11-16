@@ -33,7 +33,7 @@ const SPAWN_DESCRIPTION: &str = concat!(
 );
 
 const SEND_DESCRIPTION: &str = concat!(
-    "Send a message to another agent by id, or to `parent` (whoever spawned you; the user for the root ",
+    "Send a message to another agent by id or name, or to `parent` (whoever spawned you; the user for the root ",
     "agent). A busy agent sees it after its current tool call; an idle one starts a new turn."
 );
 
@@ -43,7 +43,7 @@ const WAIT_DESCRIPTION: &str = concat!(
 );
 
 const LIST_DESCRIPTION: &str =
-    "List every agent in the swarm with its parent, status, working directory and branch.";
+    "List every agent in the swarm with its name, id, parent, status, working directory and branch.";
 
 const CANCEL_DESCRIPTION: &str =
     "Stop an agent and every agent it spawned. Its worktree and branch are left in place.";
@@ -52,9 +52,9 @@ const CANCEL_DESCRIPTION: &str =
 struct SpawnInput {
     /// Everything the new agent needs to know: goal, context, constraints, what to report back.
     task: String,
-    /// Short name shown to other agents and the user, e.g. `parser`.
-    #[serde(default)]
-    name: Option<String>,
+    /// Short role name shown to the user and other agents, e.g. `lazy-mcp` or `tui-tests`. Agents can
+    /// be addressed by it; a suffix is added if it is taken.
+    name: String,
     /// Give the agent its own git worktree and branch.
     #[serde(default)]
     worktree: bool,
@@ -69,7 +69,7 @@ struct SpawnInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SendInput {
-    /// Receiver: an agent id, or `parent`.
+    /// Receiver: an agent id or name, or `parent`.
     to: String,
     /// Message text.
     message: String,
@@ -77,7 +77,7 @@ struct SendInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct WaitInput {
-    /// Only return once one of these agent ids has written. Omit to wait for anyone.
+    /// Only return once one of these agents (ids or names) has written. Omit to wait for anyone.
     #[serde(default)]
     from: Vec<String>,
     /// Give up after this many seconds (default 600, max 3600).
@@ -87,7 +87,7 @@ struct WaitInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct CancelInput {
-    /// Id of the agent to stop.
+    /// Id or name of the agent to stop.
     id: String,
 }
 
@@ -141,13 +141,16 @@ fn spawn_tool(swarm: Swarm, me: String) -> ToolRef {
             async move {
                 let request = SpawnRequest {
                     task: input.task,
-                    name: input.name,
+                    name: Some(input.name),
                     worktree: input.worktree,
                     model: input.model,
                     goal: input.goal,
                 };
                 let id = swarm.spawn(&me, request).await?;
-                let info = swarm.agent(&id).map(|info| describe(&info)).unwrap_or_default();
+                let info = swarm
+                    .agent(&id)
+                    .map(|info| describe(&swarm, &info))
+                    .unwrap_or_default();
                 Result::Ok(format!("Spawned {info}. Its replies will arrive as messages."))
             }
         });
@@ -161,9 +164,9 @@ fn send_tool(swarm: Swarm, me: String) -> ToolRef {
             let swarm = swarm.clone();
             let me = me.clone();
             async move {
-                let to = resolve_receiver(&swarm, &me, &input.to);
+                let to = resolve(&swarm, &me, &input.to)?;
                 swarm.send(&me, &to, input.message)?;
-                Result::Ok(format!("Sent to {to}."))
+                Result::Ok(format!("Sent to {}.", swarm.label(&to)))
             }
         });
     Arc::new(tool)
@@ -180,11 +183,16 @@ fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
                     .timeout_seconds
                     .unwrap_or(DEFAULT_WAIT_SECONDS)
                     .clamp(1, MAX_WAIT_SECONDS);
-                let wait = swarm.wait_for_mail(&me, &input.from, &ctx.cancel);
+                let from = input
+                    .from
+                    .iter()
+                    .map(|who| resolve(&swarm, &me, who))
+                    .collect::<Result<Vec<_>>>()?;
+                let wait = swarm.wait_for_mail(&me, &from, &ctx.cancel);
                 let text = match tokio::time::timeout(Duration::from_secs(seconds), wait).await {
                     Ok(Some(mail)) => render_mail(&mail),
                     Ok(None) => "Wait cancelled.".to_owned(),
-                    Err(_) => timeout_summary(&swarm, &input.from, seconds),
+                    Err(_) => timeout_summary(&swarm, &from, seconds),
                 };
                 Result::Ok(text)
             }
@@ -198,7 +206,7 @@ fn list_tool(swarm: Swarm) -> ToolRef {
         .typed_handler(move |_input: NoInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             async move {
-                let lines: Vec<String> = swarm.agents().iter().map(describe).collect();
+                let lines: Vec<String> = swarm.agents().iter().map(|info| describe(&swarm, info)).collect();
                 Result::Ok(lines.join("\n"))
             }
         });
@@ -212,41 +220,41 @@ fn cancel_tool(swarm: Swarm, me: String) -> ToolRef {
             let swarm = swarm.clone();
             let me = me.clone();
             async move {
-                if input.id == me {
+                let id = swarm.resolve(&input.id)?;
+                if id == me {
                     return Result::Ok("You cannot cancel yourself; end your turn instead.".to_owned());
                 }
-                swarm.cancel(&input.id)?;
-                Result::Ok(format!("Cancelled {} and its descendants.", input.id))
+                swarm.cancel(&id)?;
+                Result::Ok(format!("Cancelled {} and its descendants.", swarm.label(&id)))
             }
         });
     Arc::new(tool)
 }
 
-fn resolve_receiver(swarm: &Swarm, me: &str, to: &str) -> String {
-    match to {
-        "parent" => swarm
+/// The id `who` refers to: `parent`, the user, or an agent id or name.
+fn resolve(swarm: &Swarm, me: &str, who: &str) -> Result<String> {
+    match who {
+        "parent" => Ok(swarm
             .agent(me)
-            .map_or_else(|| USER.to_owned(), |info| info.parent),
-        other => other.to_owned(),
+            .map_or_else(|| USER.to_owned(), |info| info.parent)),
+        USER => Ok(USER.to_owned()),
+        other => swarm.resolve(other),
     }
 }
 
-fn describe(info: &AgentInfo) -> String {
-    let name = info
-        .name
-        .as_ref()
-        .map(|n| format!(" \"{n}\""))
-        .unwrap_or_default();
+/// `parser (a2): running, parent root (a1), cwd /repo, branch swarm/run/a2`.
+fn describe(swarm: &Swarm, info: &AgentInfo) -> String {
     let branch = info
         .branch
         .as_ref()
         .map(|b| format!(", branch {b}"))
         .unwrap_or_default();
     format!(
-        "{}{name}: {}, parent {}, cwd {}{branch}",
+        "{} ({}): {}, parent {}, cwd {}{branch}",
+        info.name,
         info.id,
         info.status,
-        info.parent,
+        swarm.label(&info.parent),
         info.cwd.display()
     )
 }
@@ -256,10 +264,31 @@ fn timeout_summary(swarm: &Swarm, from: &[String], seconds: u64) -> String {
         .agents()
         .iter()
         .filter(|info| from.is_empty() || from.contains(&info.id))
-        .map(describe)
+        .map(|info| describe(swarm, info))
         .collect();
     format!(
         "No messages within {seconds}s. Current status:\n{}",
         agents.join("\n")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_agent_requires_a_name() {
+        let schema = strands_agents::tools::input_schema_for::<SpawnInput>();
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            required.contains(&"name") && required.contains(&"task"),
+            "{schema}"
+        );
+        assert_eq!(schema["properties"]["name"]["type"], "string");
+    }
 }

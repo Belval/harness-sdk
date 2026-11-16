@@ -43,7 +43,9 @@ pub struct AgentView {
     /// Parent id.
     pub parent: String,
     /// Name.
-    pub name: Option<String>,
+    pub name: String,
+    /// One line on what the agent is up to: its latest tool call, else the first line of its task.
+    pub doing: String,
     /// Working directory.
     pub cwd: PathBuf,
     /// Own branch.
@@ -61,12 +63,9 @@ pub struct AgentView {
 }
 
 impl AgentView {
-    /// `a2 parser` or `a2`.
+    /// `parser (a2)`.
     pub fn label(&self) -> String {
-        match &self.name {
-            Some(name) => format!("{} {name}", self.id),
-            None => self.id.clone(),
-        }
+        format!("{} ({})", self.name, self.id)
     }
 
     fn push(&mut self, entry: LogEntry) {
@@ -126,10 +125,15 @@ impl App {
                 cwd,
                 branch,
             } => {
+                let doing = task
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or_default();
                 let view = AgentView {
                     id: id.clone(),
                     parent,
                     name,
+                    doing: doing.trim().to_owned(),
                     cwd,
                     branch,
                     status: AgentStatus::Starting,
@@ -143,6 +147,7 @@ impl App {
             SwarmEvent::Status { id, status } => self.apply_status(&id, status),
             SwarmEvent::Text { id, delta } => self.with(&id, |view| view.push_text(&delta)),
             SwarmEvent::ToolStarted { id, name, summary } => self.with(&id, |view| {
+                view.doing = format!("{name} {summary}");
                 view.push(LogEntry::Tool {
                     name,
                     summary,
@@ -292,8 +297,8 @@ mod tests {
         SwarmEvent::Spawned {
             id: id.into(),
             parent: parent.into(),
-            name: None,
-            task: format!("task {id}"),
+            name: format!("name-{id}"),
+            task: format!("\ntask {id}\nmore detail"),
             cwd: PathBuf::from("/w"),
             branch: None,
         }
@@ -313,6 +318,20 @@ mod tests {
         }
         let tree: Vec<(usize, &str)> = app.tree().iter().map(|(d, v)| (*d, v.id.as_str())).collect();
         assert_eq!(tree, vec![(0, "a1"), (1, "a2"), (2, "a5"), (1, "a4"), (0, "a3")]);
+    }
+
+    #[test]
+    fn tracks_what_an_agent_is_doing() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        assert_eq!(app.agents["a1"].label(), "name-a1 (a1)");
+        assert_eq!(app.agents["a1"].doing, "task a1");
+        app.apply(SwarmEvent::ToolStarted {
+            id: "a1".into(),
+            name: "shell".into(),
+            summary: "cargo test".into(),
+        });
+        assert_eq!(app.agents["a1"].doing, "shell cargo test");
     }
 
     #[test]

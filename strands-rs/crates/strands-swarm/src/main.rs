@@ -196,12 +196,13 @@ fn print_event(event: &SwarmEvent) {
         SwarmEvent::Spawned {
             id,
             parent,
+            name,
             task,
             cwd,
             ..
         } => {
             eprintln!(
-                "[{id}] spawned by {parent} in {}: {}",
+                "[{id}] {name}, spawned by {parent} in {}: {}",
                 cwd.display(),
                 first_line(task)
             )
