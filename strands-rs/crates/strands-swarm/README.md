@@ -18,15 +18,16 @@ agent with six extra tools, and decides for itself whether and how to split the 
 Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else one derived
 from its task; ids and names work interchangeably. Each agent's final reply per turn goes to its parent. A `goal` (TUI `/goal`, CLI `--goal`, or on
 `spawn_agent`) puts a judge in the loop that sends the agent back to work until the goal is met.
-The judge runs after every turn the agent ends, on the agent's model or `--judge-model ID`, and sees
-the goal, the task, and the latest ~40k characters of the conversation. Its calls count toward the
-agent's tokens and the budget and queue under `--max-concurrent-calls`, like the agent's own.
+The judge runs after every turn the agent ends and sees the goal, the task, and the latest ~40k
+characters of the conversation. Side calls (the judge, context summarization) run on the agent's
+model or `--side-model ID`, count toward the agent's tokens and the budget, and queue under
+`--max-concurrent-calls`, like the agent's own calls.
 
 ## Run
 
 ```sh
 cargo build --release -p strands-swarm
-strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--judge-model ID]
+strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--side-model ID]
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
               [--max-agents N] [--max-concurrent-calls N] [--compact-at TOKENS] [--memory FILE | --no-memory]

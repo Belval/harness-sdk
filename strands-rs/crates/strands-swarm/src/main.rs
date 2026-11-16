@@ -27,10 +27,10 @@ struct Cli {
     /// Default model for every agent (`provider/name` or a Bedrock model id).
     #[arg(long)]
     model: Option<String>,
-    /// Model for side calls such as the goal judge, e.g. a cheaper, faster one. Default: each
-    /// agent's own model.
-    #[arg(long)]
-    judge_model: Option<String>,
+    /// Model for side calls (the goal judge, context summarization), e.g. a cheaper, faster one.
+    /// Default: each agent's own model.
+    #[arg(long, alias = "judge-model")]
+    side_model: Option<String>,
     /// Reasoning effort.
     #[arg(long, default_value = "auto")]
     effort: Effort,
@@ -219,7 +219,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     let root = root_request(cli.task, cli.goal);
     let mut config = SwarmConfig::new(harness_factory(options.clone()), cwd);
     let models = harness_model_resolver(options);
-    if let Some(id) = cli.judge_model {
+    if let Some(id) = cli.side_model {
         config.side_model = Some(models(Some(id)).await?);
     }
     config.models = Some(models);

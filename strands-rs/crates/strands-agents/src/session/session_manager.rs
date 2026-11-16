@@ -357,6 +357,7 @@ mod tests {
             agent: agent.clone(),
             invocation_state: Default::default(),
             resume: None,
+            stop_reason: Some(crate::types::StopReason::EndTurn),
         };
         agent.hooks().invoke_callbacks(&mut event).await.unwrap();
     }
@@ -1056,6 +1057,7 @@ mod tests {
             agent: agent.clone(),
             invocation_state: Default::default(),
             resume: None,
+            stop_reason: Some(crate::types::StopReason::EndTurn),
         };
         let err = agent.hooks().invoke_callbacks(&mut event).await.unwrap_err();
 

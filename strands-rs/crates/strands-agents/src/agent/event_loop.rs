@@ -511,6 +511,7 @@ async fn run_invocation(
                     agent: agent.clone(),
                     invocation_state: state.clone(),
                     resume: None,
+                    stop_reason: Some(StopReason::EndTurn),
                 },
                 AgentStreamEvent::AfterInvocation,
             )
@@ -548,6 +549,7 @@ async fn run_invocation(
                 agent: agent.clone(),
                 invocation_state: state.clone(),
                 resume: None,
+                stop_reason: outcome.as_ref().ok().map(|result| result.stop_reason.clone()),
             },
             AgentStreamEvent::AfterInvocation,
         )

@@ -109,6 +109,8 @@ pub struct AfterInvocationEvent {
     pub invocation_state: InvocationState,
     /// Input for a follow-up invocation.
     pub resume: Option<InvokeInput>,
+    /// How the invocation ended; `None` when it failed or was cancelled (no follow-up runs then).
+    pub stop_reason: Option<StopReason>,
 }
 impl HookEvent for AfterInvocationEvent {
     fn reverse_callbacks() -> bool {

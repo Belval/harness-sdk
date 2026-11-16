@@ -2114,3 +2114,68 @@ async fn resuming_under_another_commit_reports_what_changed() {
         resumed.shutdown().await;
     }
 }
+
+/// [`windowed_factory`] with a context manager that summarizes everything but the latest message
+/// before every model call.
+fn summarizing_factory(scripts: &Scripts) -> AgentFactory {
+    use strands_agents::context_manager::strategies::{Offload, OffloadConditions, OffloadTarget};
+    use strands_agents::context_manager::{ContextManagerConfig, ContextManagerOption, StashOption};
+    let scripts = scripts.clone();
+    Arc::new(move |spec: AgentSpec| {
+        let model = Windowed(scripts.lock()[&spec.id].clone());
+        let summarize = Offload::summarize(OffloadTarget::All).when(OffloadConditions {
+            utilization: Some(0.0),
+            preserve_recent: Some(1.0),
+            ..Default::default()
+        });
+        let manager = ContextManagerOption::Config(ContextManagerConfig {
+            strategies: Some(vec![Arc::new(summarize)]),
+            stash: StashOption::Disabled,
+        });
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(spec.tools)
+                .context_manager(manager)
+                .no_sandbox()
+                .build()
+        })
+    })
+}
+
+#[tokio::test]
+async fn context_summarization_runs_on_the_side_model_and_counts_toward_the_agents_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let call = Message::new(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse(ToolUseBlock::new(
+            "list_agents",
+            "t1",
+            json!({}),
+        ))],
+    );
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            MockResponse::with_usage(call, usage(100, 0, 10)),
+            MockResponse::with_usage(Message::assistant("done"), usage(40, 0, 4)),
+        ],
+    )]);
+    let summarizer = MockMessageModel::shared(vec![MockResponse::with_usage(
+        Message::assistant("they listed agents"),
+        usage(30, 0, 3),
+    )]);
+    let mut config = SwarmConfig::new(summarizing_factory(&scripts), dir.path());
+    config.side_model = Some(summarizer.clone());
+    let (swarm, mut events) = Swarm::new(config);
+    let id = spawn_root(&swarm, "go").await;
+
+    let seen = usage_until_reply(&mut events, &id).await;
+    let summaries = summarizer.call_count() as u64;
+    assert!(summaries >= 1, "nothing was summarized");
+    let (input, output, _) = *seen.last().unwrap();
+    assert_eq!((input, output), (140 + 30 * summaries, 14 + 3 * summaries));
+    assert_eq!(swarm.tokens_used(), input + output);
+    swarm.shutdown().await;
+}

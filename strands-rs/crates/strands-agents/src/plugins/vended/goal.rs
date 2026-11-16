@@ -11,6 +11,8 @@
 //!   rather than by the constructor — the same validate-at-use point as [`crate::Limits`].
 //! - A validator is a closure in one of two forms: [`GoalLoop::validator`] (async) or
 //!   [`GoalLoop::sync_validator`]. A TS validator throw maps to `Err` from the validator.
+//! - A failed or cancelled invocation is not validated (TS validates the last assistant message
+//!   regardless), so no judge call is spent on a run that cannot continue.
 //! - The judge's structured-output schema is derived from [`JudgeOutcome`] with `schemars`, where
 //!   TS uses a zod schema ([`judge_outcome_schema`] is the equivalent of `JUDGE_OUTCOME_SCHEMA`).
 
@@ -626,6 +628,11 @@ impl GoalLoop {
     }
 
     async fn after_invocation(&self, event: &mut AfterInvocationEvent) -> Result<()> {
+        // A failed or cancelled invocation cannot be resumed and produced no response to judge;
+        // validating anyway would pay for a judge call and record a verdict on a stale reply.
+        if event.stop_reason.is_none() {
+            return Ok(());
+        }
         let agent = event.agent.clone();
 
         // `start` is wall-clock for the whole run, so the budget caps the agent invocations too.

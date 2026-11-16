@@ -200,8 +200,8 @@ pub struct SwarmConfig {
     /// The user's memory file, shown to every agent and written by `remember`/`forget`; `None`
     /// disables memory.
     pub memory: Option<Arc<Memory>>,
-    /// Model for every agent's side calls, such as the goal judge; `None` uses the agent's own
-    /// model. Side calls are gated and counted like the agent's own model calls either way.
+    /// Model for every agent's side calls (the goal judge, context summarization); `None` uses the
+    /// agent's own model. Side calls are gated and counted like the agent's own calls either way.
     pub side_model: Option<Arc<dyn Model>>,
     /// Input size (tokens) at which the factory summarizes older turns
     /// ([`crate::compaction::compaction_point`]); the context share in [`SwarmEvent::Usage`] is
@@ -531,9 +531,10 @@ struct Inner {
     over_budget: Mutex<Vec<String>>,
 }
 
-/// An agent's auxiliary model (what side calls such as the goal judge run on): gated by the
-/// budget and the concurrency cap like the agent's own calls, with its usage added to the agent's
-/// totals. Without a fixed model it follows the agent's current one, model switches included.
+/// An agent's auxiliary model (what side calls such as the goal judge and context summarization
+/// run on): gated by the budget and the concurrency cap like the agent's own calls, with its usage
+/// added to the agent's totals. Without a fixed model it follows the agent's current one, model
+/// switches included.
 struct SideModel {
     swarm: Swarm,
     node: Weak<Node>,
@@ -1766,7 +1767,11 @@ impl Swarm {
             node.cwd.display()
         );
         match goal {
-            Some(goal) => format!("{swarm}\n\n# Goal\nA judge checks this goal whenever you end a turn; until it is met you are sent back to work.\n{goal}"),
+            Some(goal) => format!(
+                "{swarm}\n\n# Goal\nA judge checks this goal whenever you end a turn; until it is met you are \
+                 sent back to work, and your final reply does not reach {reports_to}. To ask them something, \
+                 `send_message` to `parent` and `wait` for the answer.\n{goal}"
+            ),
             None => swarm,
         }
     }

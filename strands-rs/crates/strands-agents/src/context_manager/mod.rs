@@ -924,6 +924,7 @@ pub(crate) mod test_support {
             agent: agent.clone(),
             invocation_state: InvocationState::new(),
             resume: None,
+            stop_reason: Some(crate::types::StopReason::EndTurn),
         }
     }
 }

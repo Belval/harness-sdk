@@ -62,6 +62,7 @@ mod tests {
             agent: agent.clone(),
             invocation_state: InvocationState::new(),
             resume: None,
+            stop_reason: Some(crate::types::StopReason::EndTurn),
         }
     }
 

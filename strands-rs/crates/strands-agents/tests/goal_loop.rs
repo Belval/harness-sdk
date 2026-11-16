@@ -583,6 +583,31 @@ async fn a_failed_invocation_leaves_no_result_and_does_not_leak_into_the_next_ru
     assert_eq!(run.attempts.len(), 1);
 }
 
+#[tokio::test]
+async fn a_failed_invocation_is_not_judged() {
+    let model = MockMessageModel::shared(vec![
+        MockResponse::message(Message::assistant("answer")),
+        MockResponse::Error(Error::other("model down")),
+    ]);
+    let judge = MockMessageModel::shared(vec![verdict(true, None), verdict(false, Some("stale"))]);
+    let goal = GoalLoop::goal("Answer.").with_judge(JudgeConfig::default().with_model(judge.clone()));
+    let agent = Agent::builder()
+        .model(model)
+        .plugin(goal.clone())
+        .build()
+        .unwrap();
+
+    agent.invoke("go").await.unwrap();
+    agent.invoke("again").await.unwrap_err();
+
+    assert_eq!(
+        judge.call_count(),
+        1,
+        "the failed turn's stale reply is not judged"
+    );
+    assert!(goal.last_result(&agent).is_none());
+}
+
 // ---- mid-run observability ------------------------------------------------
 
 #[tokio::test]

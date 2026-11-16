@@ -619,6 +619,33 @@ mod strategy_tests {
     // --- Offload.summarize -----------------------------------------------------------------
 
     #[tokio::test]
+    async fn summarize_defaults_to_the_agents_aux_model() {
+        let agent = test_agent_with("t", None, Vec::new());
+        let aux = MockMessageModel::shared(vec![MockResponse::message(Message::assistant("gist"))]);
+        agent.set_aux_model(Some(Arc::clone(&aux) as Arc<dyn crate::models::Model>));
+        let strategy = Offload::summarize(OffloadTarget::All).when(OffloadConditions {
+            utilization: Some(0.0),
+            preserve_recent: Some(1.0),
+            ..Default::default()
+        });
+        let mut messages = vec![
+            Message::user("first thing"),
+            Message::assistant("second thing"),
+            Message::user("keep me"),
+        ];
+        let mut ctx = ContextState {
+            messages: &mut messages,
+            agent: &agent,
+            utilization: 0.9,
+            overflow: false,
+            stash: None,
+        };
+        assert!(strategy.apply(&mut ctx).await.unwrap());
+        assert_eq!(aux.call_count(), 1);
+        assert!(messages.iter().any(|message| message.text().contains("gist")));
+    }
+
+    #[tokio::test]
     async fn summarize_calls_the_model_with_the_verbatim_prompt_and_leaves_a_marker() {
         let agent = test_agent_with("t", None, Vec::new());
         let model = MockMessageModel::shared(vec![MockResponse::message(Message::assistant(

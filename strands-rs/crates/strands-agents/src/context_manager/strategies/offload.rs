@@ -200,7 +200,10 @@ impl OffloadStrategy {
         Self::new(self.name, self.kind.clone(), self.target.clone(), conditions)
     }
 
-    /// Summarize with an explicit model instead of the agent's.
+    /// Summarize with an explicit model instead of the agent's [`aux_model`], which falls back to
+    /// its model.
+    ///
+    /// [`aux_model`]: crate::agent::Agent::aux_model
     pub fn with_model(mut self, model: Arc<dyn Model>) -> Self {
         if let OffloadKind::Summarize { model: slot, .. } = &mut self.kind {
             *slot = Some(model);
@@ -368,7 +371,7 @@ impl OffloadStrategy {
 
     fn resolve_model(&self, ctx: &ContextState<'_>) -> Option<Arc<dyn Model>> {
         match &self.kind {
-            OffloadKind::Summarize { model, .. } => model.clone().or_else(|| Some(ctx.agent.model())),
+            OffloadKind::Summarize { model, .. } => model.clone().or_else(|| Some(ctx.agent.aux_model())),
             _ => None,
         }
     }
