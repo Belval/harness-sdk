@@ -71,6 +71,13 @@ in each agent's log title.
 returns it to `--model`; `/model` alone shows the current one). The id is resolved like `--model`
 (`provider/name` or a Bedrock id, same effort), an invalid one is rejected without touching the
 agent, and the choice is saved with the run. Programmatically: `Swarm::set_model`.
+Images show inline in the log: a tool result with an image (e.g. `read` on a png) and a message
+sent with `/image <path> [text]` (the selected agent gets the image as a multimodal input; the
+mailbox and journal keep only its path) appear as an `[image: path WxH]` line with a thumbnail of
+at most 12 rows below it, drawn with kitty, iTerm2 or sixel graphics when the terminal answers the
+query, and with unicode halfblocks otherwise and always inside tmux. Only the newest 4 thumbnails
+stay decoded; older images keep just their placeholder, which is also what F2 and mouse copies
+show.
 Ctrl-←/→ (or Alt-←/→) narrows or widens the agent tree; narrow it past its minimum to hide it.
 Cancelled agents are hidden from the tree (the header counts them); F3 shows them.
 F2 prints the selected agent's log as plain text into the terminal's own scrollback (native

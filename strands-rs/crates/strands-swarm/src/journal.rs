@@ -149,6 +149,7 @@ impl Journal {
             | SwarmEvent::Usage { .. }
             | SwarmEvent::Mail { .. }
             | SwarmEvent::MailRead { .. }
+            | SwarmEvent::Image { .. }
             | SwarmEvent::ModelQueued { .. }
             | SwarmEvent::Reclaimed { .. }
             | SwarmEvent::History { .. } => return,

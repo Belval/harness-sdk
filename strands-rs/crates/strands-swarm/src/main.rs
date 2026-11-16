@@ -343,6 +343,7 @@ fn print_event(event: &SwarmEvent) {
         SwarmEvent::Text { .. }
         | SwarmEvent::Usage { .. }
         | SwarmEvent::MailRead { .. }
+        | SwarmEvent::Image { .. }
         | SwarmEvent::ModelQueued { .. }
         | SwarmEvent::History { .. } => {}
         SwarmEvent::Model { id, model } => eprintln!("[{id}] model {model}"),

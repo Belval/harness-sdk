@@ -19,7 +19,8 @@ use strands_agents::models::streaming::{ContentBlockDelta, ModelStreamEvent};
 use strands_agents::models::{ModelEventStream, StreamOptions};
 use strands_agents::tools::ToolRef;
 use strands_agents::types::{
-    ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolResultStatus, Usage,
+    ContentBlock, ImageBlock, ImageSource, Message, Role, ToolResultBlock, ToolResultContent,
+    ToolResultStatus, Usage,
 };
 use strands_agents::{Agent, Error, Model, Result};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
@@ -27,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::budget;
 use crate::gc::{self, Collected};
+use crate::images;
 use crate::journal::Journal;
 use crate::memory::Memory;
 use crate::names;
@@ -93,13 +95,20 @@ pub struct Mail {
     pub kind: &'static str,
     /// Body.
     pub text: String,
+    /// Attached images, by path; read when the receiver takes the mail.
+    pub images: Vec<PathBuf>,
 }
 
 impl Mail {
-    /// The `<message>` block the receiving model sees.
+    /// The `<message>` block the receiving model sees (attached images follow as image blocks).
     pub fn render(&self) -> String {
+        let attached: String = self
+            .images
+            .iter()
+            .map(|path| format!("\n[attached image: {}]", path.display()))
+            .collect();
         format!(
-            "<message from=\"{}\" kind=\"{}\">\n{}\n</message>",
+            "<message from=\"{}\" kind=\"{}\">\n{}{attached}\n</message>",
             self.from_label, self.kind, self.text
         )
     }
@@ -331,6 +340,15 @@ pub enum SwarmEvent {
         id: String,
         /// `true` while it waits.
         queued: bool,
+    },
+    /// A tool result carried an image (e.g. `read` on a png).
+    Image {
+        /// Id of the agent whose tool returned it.
+        id: String,
+        /// What it came from: the tool input's summary, usually a path.
+        source: String,
+        /// Encoded image bytes.
+        bytes: Arc<Vec<u8>>,
     },
     /// An agent took all of its unread mail, as a new turn or appended to a tool result. Every
     /// [`SwarmEvent::Mail`] to it that came before has now been read.
@@ -677,6 +695,21 @@ impl Swarm {
                 node.label()
             ))),
         }
+    }
+
+    /// [`Swarm::send`] with images attached. Only their paths are queued (and saved); each must
+    /// pass [`images::check`] now, and is read when `to` takes the mail.
+    pub fn send_with_images(
+        &self,
+        from: &str,
+        to: &str,
+        text: impl Into<String>,
+        images: Vec<PathBuf>,
+    ) -> Result<()> {
+        for path in &images {
+            images::check(path).map_err(Error::other)?;
+        }
+        self.post_mail(from, to, "message", text.into(), images)
     }
 
     /// Cancel an agent and, through its token, every agent it spawned.
@@ -1226,7 +1259,13 @@ impl Swarm {
         };
         if mail.from == USER || to == USER {
             let to_label = self.label(to);
-            journal.mail(&mail.from, &mail.from_label, to, &to_label, mail.kind, &mail.text);
+            let attached: String = mail
+                .images
+                .iter()
+                .map(|path| format!("\n[attached image: {}]", path.display()))
+                .collect();
+            let text = format!("{}{attached}", mail.text);
+            journal.mail(&mail.from, &mail.from_label, to, &to_label, mail.kind, &text);
         }
     }
 
@@ -1247,12 +1286,24 @@ impl Swarm {
     }
 
     fn post(&self, from: &str, to: &str, kind: &'static str, text: String) -> Result<()> {
+        self.post_mail(from, to, kind, text, Vec::new())
+    }
+
+    fn post_mail(
+        &self,
+        from: &str,
+        to: &str,
+        kind: &'static str,
+        text: String,
+        images: Vec<PathBuf>,
+    ) -> Result<()> {
         let from_label = self.label(from);
         let mail = Mail {
             from: from.to_owned(),
             from_label,
             kind,
             text,
+            images,
         };
         let event = SwarmEvent::Mail {
             to: to.to_owned(),
@@ -1360,7 +1411,11 @@ impl Swarm {
         let mail = self
             .wait_for_mail(&node.id, &[], &CancellationToken::new())
             .await?;
-        Some(InvokeInput::Text(render_mail(&mail)))
+        let text = render_mail(&mail);
+        Some(match mail.iter().any(|m| !m.images.is_empty()) {
+            true => InvokeInput::Blocks(images::input_blocks(text, &mail)),
+            false => InvokeInput::Text(text),
+        })
     }
 
     /// `true` when the full delay elapsed, `false` when the agent was cancelled first.
@@ -1433,11 +1488,26 @@ impl Swarm {
                 name: call.tool_use.name.clone(),
                 summary: summarize_input(&call.tool_use.input),
             }),
-            AgentStreamEvent::AfterToolCall(call) => self.emit(SwarmEvent::ToolFinished {
-                id,
-                name: call.tool_use.name.clone(),
-                ok: call.result.status == ToolResultStatus::Success,
-            }),
+            AgentStreamEvent::AfterToolCall(call) => {
+                self.emit(SwarmEvent::ToolFinished {
+                    id: id.clone(),
+                    name: call.tool_use.name.clone(),
+                    ok: call.result.status == ToolResultStatus::Success,
+                });
+                for content in &call.result.content {
+                    if let ToolResultContent::Image(ImageBlock {
+                        source: ImageSource::Bytes(bytes),
+                        ..
+                    }) = content
+                    {
+                        self.emit(SwarmEvent::Image {
+                            id: id.clone(),
+                            source: summarize_input(&call.tool_use.input),
+                            bytes: Arc::new(bytes.clone()),
+                        });
+                    }
+                }
+            }
             AgentStreamEvent::AgentResult(result) => return Some(result.result.last_message.text()),
             _ => {}
         }
@@ -1549,6 +1619,7 @@ impl Swarm {
                         render_mail(&mail)
                     );
                     event.result.content.push(ToolResultContent::Text(text));
+                    event.result.content.extend(images::result_content(&mail));
                 }
                 Ok(())
             });
@@ -1686,6 +1757,7 @@ fn mail_state(mail: &Mail) -> MailState {
         from_label: mail.from_label.clone(),
         kind: mail.kind.to_owned(),
         text: mail.text.clone(),
+        images: mail.images.clone(),
     }
 }
 
@@ -1701,6 +1773,7 @@ fn mail_from_state(mail: MailState) -> Mail {
         from_label: mail.from_label,
         kind,
         text: mail.text,
+        images: mail.images,
     }
 }
 

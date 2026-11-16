@@ -35,6 +35,8 @@ uuid.workspace = true
 clap = { version = "4.6", features = ["derive"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui-image.workspace = true
+image.workspace = true
 
 [dev-dependencies]
 strands-agents = { path = "../strands-agents", features = ["test-support"] }

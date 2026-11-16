@@ -90,6 +90,9 @@ pub struct MailState {
     pub kind: String,
     /// Body.
     pub text: String,
+    /// Attached image paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<PathBuf>,
 }
 
 /// Where a named run lives: `$XDG_STATE_HOME/strands-swarm/<run>`, else

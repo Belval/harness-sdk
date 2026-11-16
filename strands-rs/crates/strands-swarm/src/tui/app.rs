@@ -49,6 +49,25 @@ pub enum LogEntry {
     Input(String),
     /// A quiet marker, such as where restored history begins.
     Note(String),
+    /// An image from a tool result or attached to a message: shown as a thumbnail while
+    /// [`App::images`] keeps it decoded, and always as its [`LogEntry::placeholder`] line.
+    Image {
+        /// Where it came from (a path or tool input).
+        source: String,
+        /// Pixel size and thumbnail key, once decoded; `None` when it could not be.
+        decoded: Option<super::images::Decoded>,
+    },
+}
+
+impl LogEntry {
+    /// `[image: shot.png 640x480]`, the text an image entry stands for (also in plain text and
+    /// copies, which never contain the thumbnail).
+    pub fn placeholder(source: &str, decoded: Option<&super::images::Decoded>) -> String {
+        match decoded {
+            Some(d) => format!("[image: {source} {}x{}]", d.width, d.height),
+            None => format!("[image: {source}, not decodable]"),
+        }
+    }
 }
 
 /// What the UI knows about one agent.
@@ -207,6 +226,8 @@ pub struct App {
     pub completion: usize,
     /// Swarm-wide token budget, if any.
     pub budget: Option<u64>,
+    /// Decoded image thumbnails for [`LogEntry::Image`].
+    pub images: super::images::Images,
     /// Set while the F1 key-binding popup is open.
     pub show_keys: bool,
     /// The mouse selection being made or last made, highlighted until the next click.
@@ -262,6 +283,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/stop",
         args: "",
         help: "interrupt the selected agent's turn; it stays alive (esc esc)",
+    },
+    SlashCommand {
+        name: "/image",
+        args: "<path> [text]",
+        help: "message the selected agent with an image attached",
     },
     SlashCommand {
         name: "/cancel",
@@ -335,6 +361,10 @@ impl App {
             SwarmEvent::Mail { to, mail } => self.apply_mail(&to, mail),
             SwarmEvent::Model { id, model } => self.with(&id, |view| view.model = Some(model)),
             SwarmEvent::MailRead { id } => self.with(&id, AgentView::mark_read),
+            SwarmEvent::Image { id, source, bytes } => {
+                let entry = self.image_entry(source, &bytes);
+                self.with(&id, |view| view.push(entry));
+            }
             SwarmEvent::ModelQueued { id, queued } => self.with(&id, |view| view.queued = queued),
             SwarmEvent::Budget { tokens } => self.budget = tokens,
             SwarmEvent::Reclaimed { collected, requested } => {
@@ -400,7 +430,25 @@ impl App {
             text: mail.text,
             read: (to != USER).then_some(false),
         };
-        self.with(&target, |view| view.push(entry));
+        let attached: Vec<LogEntry> = mail
+            .images
+            .iter()
+            .map(|path| {
+                let bytes = std::fs::read(path).unwrap_or_default();
+                self.image_entry(path.display().to_string(), &bytes)
+            })
+            .collect();
+        self.with(&target, |view| {
+            view.push(entry);
+            attached.into_iter().for_each(|image| view.push(image));
+        });
+    }
+
+    fn image_entry(&mut self, source: String, bytes: &[u8]) -> LogEntry {
+        LogEntry::Image {
+            source,
+            decoded: self.images.add(bytes).ok(),
+        }
     }
 
     fn with(&mut self, id: &str, f: impl FnOnce(&mut AgentView)) {
@@ -593,6 +641,13 @@ pub enum Command {
     Remember(Option<String>),
     /// Drop memory lines containing the text.
     Forget(String),
+    /// Send the selected agent a message with an image attached.
+    Image {
+        /// Image file.
+        path: std::path::PathBuf,
+        /// Message text (may be empty).
+        text: String,
+    },
     /// Reclaim the disk of cancelled worktree agents.
     Gc,
     /// Quit.
@@ -616,6 +671,14 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     }
     if let Some(text) = line.strip_prefix("/forget ") {
         return Some(Command::Forget(text.trim().to_owned()));
+    }
+    if let Some(rest) = line.strip_prefix("/image ") {
+        let rest = rest.trim();
+        let (path, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        return Some(Command::Image {
+            path: path.into(),
+            text: text.trim().to_owned(),
+        });
     }
     if let Some(budget) = line.strip_prefix("/budget ") {
         return Some(Command::Budget(Some(budget.trim().to_owned())));
@@ -656,6 +719,55 @@ mod tests {
             cwd: PathBuf::from("/w"),
             branch: None,
         }
+    }
+
+    #[test]
+    fn a_message_with_an_image_logs_the_image_after_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        std::fs::write(&path, super::super::images::png(8, 6)).unwrap();
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        app.apply(SwarmEvent::Mail {
+            to: "a1".into(),
+            mail: Mail {
+                from: USER.into(),
+                from_label: USER.into(),
+                kind: "message",
+                text: "what is this?".into(),
+                images: vec![path.clone()],
+            },
+        });
+        let log = &app.agents["a1"].log;
+        assert!(matches!(&log[log.len() - 2], LogEntry::MailIn { text, .. } if text == "what is this?"));
+        match log.back() {
+            Some(LogEntry::Image {
+                source,
+                decoded: Some(decoded),
+            }) => {
+                assert_eq!(source, &path.display().to_string());
+                assert_eq!((decoded.width, decoded.height), (8, 6));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_the_image_command() {
+        assert_eq!(
+            parse_command("/image shots/a.png what is wrong here?", true),
+            Some(Command::Image {
+                path: "shots/a.png".into(),
+                text: "what is wrong here?".into()
+            })
+        );
+        assert_eq!(
+            parse_command("/image a.png", true),
+            Some(Command::Image {
+                path: "a.png".into(),
+                text: String::new()
+            })
+        );
     }
 
     #[test]
@@ -729,6 +841,7 @@ mod tests {
             from_label: "a1".into(),
             kind,
             text: "hi".into(),
+            images: Vec::new(),
         };
         app.apply(SwarmEvent::Mail {
             to: USER.into(),
@@ -751,6 +864,7 @@ mod tests {
             from_label: USER.into(),
             kind: "message",
             text: "hi".into(),
+            images: Vec::new(),
         };
         let read = |app: &App| match app.agents["a1"].log.back() {
             Some(LogEntry::MailIn { read, .. }) => *read,

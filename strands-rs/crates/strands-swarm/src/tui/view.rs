@@ -277,25 +277,114 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         frame.render_widget(hint, area);
         return;
     };
-    let title = log_title(view);
-    let paragraph = Paragraph::new(Text::from(log_lines(view, tick)))
+    let (lines, thumbnails) = log_lines(view, app, tick);
+    let (paragraph, offset) = log_paragraph(app, view, lines.clone(), area);
+    frame.render_widget(paragraph, area);
+    if !thumbnails.is_empty() {
+        draw_thumbnails(frame, app, &lines, &thumbnails, offset, log_inner(area));
+    }
+}
+
+/// The scrolled log paragraph for `area` and its first visible row.
+fn log_paragraph(
+    app: &App,
+    view: &AgentView,
+    lines: Vec<Line<'static>>,
+    area: Rect,
+) -> (Paragraph<'static>, u16) {
+    let paragraph = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::TOP)
                 .padding(Padding::left(1))
-                .title(title),
+                .title(log_title(view)),
         );
     // `line_count` takes the inner width but counts the block's top border as a line.
     let count = paragraph
         .line_count(area.width.saturating_sub(1))
         .saturating_sub(1);
     let offset = log_offset(app, count, area.height.saturating_sub(1));
-    frame.render_widget(paragraph.scroll((offset, 0)), area);
+    (paragraph.scroll((offset, 0)), offset)
 }
 
-fn log_lines(view: &AgentView, tick: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line> = view.log.iter().flat_map(entry_lines).collect();
+/// The log's text area inside `area` (below the title border, after the left padding).
+fn log_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(1),
+        area.height.saturating_sub(1),
+    )
+}
+
+/// Draw each kept thumbnail over the blank rows reserved for it, when they are fully in view
+/// (a graphics protocol cannot be cut at the top).
+fn draw_thumbnails(
+    frame: &mut Frame,
+    app: &App,
+    lines: &[Line<'static>],
+    thumbnails: &[(usize, u64)],
+    offset: u16,
+    inner: Rect,
+) {
+    let mut row = 0usize;
+    let mut starts = Vec::with_capacity(lines.len());
+    for line in lines {
+        starts.push(row);
+        row += Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(inner.width)
+            .max(1);
+    }
+    for (line, id) in thumbnails {
+        let Some(protocol) = app.images.get(*id) else {
+            continue;
+        };
+        let size = protocol.size();
+        let Some(top) = starts[*line].checked_sub(usize::from(offset)) else {
+            continue;
+        };
+        if top + usize::from(size.height) > usize::from(inner.height) || size.width > inner.width {
+            continue;
+        }
+        let at = Rect::new(inner.x, inner.y + top as u16, size.width, size.height);
+        frame.render_widget(ratatui_image::Image::new(protocol), at);
+    }
+}
+
+/// The log pane of `area` as text only, the way a copy should see it: thumbnails left out (their
+/// placeholder line stays), so selecting over one never picks up graphics cells.
+pub fn log_text(app: &App, area: Rect) -> ratatui::buffer::Buffer {
+    let log = areas(app, area).log;
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    if let Some(view) = app.selected_id().and_then(|id| app.agents.get(&id)) {
+        let (lines, _) = log_lines(view, app, 0);
+        let (paragraph, _) = log_paragraph(app, view, lines, log);
+        ratatui::widgets::Widget::render(paragraph, log, &mut buffer);
+    }
+    buffer
+}
+
+/// The log's lines, with blank rows reserved under each kept thumbnail's placeholder, and the
+/// index of each reserved block's first row with its image.
+fn log_lines(view: &AgentView, app: &App, tick: usize) -> (Vec<Line<'static>>, Vec<(usize, u64)>) {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut thumbnails = Vec::new();
+    for entry in &view.log {
+        lines.extend(entry_lines(entry));
+        if let LogEntry::Image {
+            decoded: Some(decoded),
+            ..
+        } = entry
+        {
+            let rows = app.images.rows(decoded.id);
+            if rows > 0 {
+                thumbnails.push((lines.len(), decoded.id));
+                lines.extend(std::iter::repeat_n(Line::raw(""), usize::from(rows)));
+            }
+        }
+    }
     if let Some(activity) = view.activity() {
         let glyph = SPINNER[tick % SPINNER.len()];
         lines.push(Line::styled(
@@ -303,7 +392,7 @@ fn log_lines(view: &AgentView, tick: usize) -> Vec<Line<'static>> {
             Style::new().fg(Color::Cyan),
         ));
     }
-    lines
+    (lines, thumbnails)
 }
 
 /// First visible row of a log of `rows` wrapped rows in a pane `height` rows tall.
@@ -319,7 +408,7 @@ pub fn log_continuations(app: &App, inner: Rect) -> Vec<bool> {
         return Vec::new();
     };
     let mut rows = Vec::new();
-    for line in log_lines(view, 0) {
+    for line in log_lines(view, app, 0).0 {
         let wrapped = Paragraph::new(line)
             .wrap(Wrap { trim: false })
             .line_count(inner.width);
@@ -438,6 +527,10 @@ fn entry_lines(entry: &LogEntry) -> Vec<Line<'static>> {
         LogEntry::Status(note) => vec![Line::styled(format!("— {note}"), Style::new().fg(Color::Red))],
         LogEntry::Input(text) => block_lines("◀ input", text, Color::Gray),
         LogEntry::Note(note) => vec![Line::styled(format!("— {note} —"), Style::new().dim())],
+        LogEntry::Image { source, decoded } => vec![Line::styled(
+            LogEntry::placeholder(source, decoded.as_ref()),
+            Style::new().fg(Color::Magenta),
+        )],
     }
 }
 
@@ -516,6 +609,70 @@ mod tests {
             text: "hi".into(),
             read: Some(true),
         }
+    }
+
+    /// An app with agent `a1` whose log holds a 40x30 image from `read`, thumbnails on `picker`.
+    fn app_with_an_image(picker: Option<ratatui_image::picker::Picker>) -> App {
+        let mut app = App {
+            images: picker.map_or_else(Default::default, super::super::images::Images::with_picker),
+            ..Default::default()
+        };
+        app.apply(crate::runtime::SwarmEvent::Spawned {
+            id: "a1".into(),
+            parent: USER.into(),
+            name: "shots".into(),
+            task: "look".into(),
+            cwd: "/w".into(),
+            branch: None,
+        });
+        app.apply(crate::runtime::SwarmEvent::Image {
+            id: "a1".into(),
+            source: "/w/shot.png".into(),
+            bytes: std::sync::Arc::new(super::super::images::png(40, 30)),
+        });
+        app
+    }
+
+    fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area;
+        (area.top()..area.bottom())
+            .map(|y| {
+                (area.left()..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn an_image_shows_as_a_thumbnail_under_its_placeholder_but_copies_as_text() {
+        let app = app_with_an_image(Some(ratatui_image::picker::Picker::halfblocks()));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        assert!(screen.contains("[image: /w/shot.png 40x30]"), "{screen}");
+        let halfblock = |text: &str| text.contains('▀') || text.contains('▄');
+        assert!(halfblock(&screen), "no halfblock thumbnail:\n{screen}");
+
+        let copy = screen_text(&log_text(&app, Rect::new(0, 0, 100, 30)));
+        assert!(copy.contains("[image: /w/shot.png 40x30]"), "{copy}");
+        assert!(!halfblock(&copy), "{copy}");
+        assert!(plain_log(&app.agents["a1"]).contains("[image: /w/shot.png 40x30]\n"));
+    }
+
+    #[test]
+    fn without_a_picker_an_image_is_only_its_placeholder() {
+        let app = app_with_an_image(None);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        assert!(screen.contains("[image: /w/shot.png 40x30]"), "{screen}");
+        assert!(!screen.contains('▀') && !screen.contains('▄'), "{screen}");
+        assert_eq!(
+            LogEntry::placeholder("x.png", None),
+            "[image: x.png, not decodable]"
+        );
     }
 
     #[test]

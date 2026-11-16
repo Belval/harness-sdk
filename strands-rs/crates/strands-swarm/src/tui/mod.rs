@@ -2,6 +2,7 @@
 //! input line that messages the selected agent (or starts a root agent).
 
 pub mod app;
+pub mod images;
 pub mod select;
 pub mod view;
 
@@ -46,7 +47,11 @@ pub async fn run(
     }));
     // The last frame, for copying a mouse selection out of it.
     let mut screen = Buffer::empty(Rect::default());
-    let mut app = App::default();
+    // Ask the terminal which graphics protocol it speaks: after raw mode, before reading events.
+    let mut app = App {
+        images: images::Images::detect(),
+        ..Default::default()
+    };
     if let Some(request) = root {
         let outcome = swarm.spawn(USER, request).await;
         app.notice = outcome.err().map(|error| format!("error: {error}"));
@@ -197,7 +202,14 @@ fn on_mouse(app: &mut App, mouse: MouseEvent, screen: &Buffer) -> Option<String>
                 select::Pane::Log => view::log_continuations(app, inner),
                 select::Pane::Tree => Vec::new(),
             };
-            let text = select::selected_text(screen, inner, &selection, &continues);
+            // The log is copied from its text alone, without thumbnails.
+            let text = match selection.pane {
+                select::Pane::Log => {
+                    let log = view::log_text(app, screen.area);
+                    select::selected_text(&log, inner, &selection, &continues)
+                }
+                select::Pane::Tree => select::selected_text(screen, inner, &selection, &continues),
+            };
             return (!text.is_empty()).then_some(text);
         }
         _ => {}
@@ -332,6 +344,12 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
         (Command::Gc, _) => {
             swarm.gc_in_background();
             Ok("gc: measuring and reclaiming in the background…".to_owned())
+        }
+        (Command::Image { path, text }, Some(id)) => {
+            let path = std::path::absolute(&path).unwrap_or(path);
+            swarm
+                .send_with_images(USER, &id, text, vec![path.clone()])
+                .map(|()| format!("sent {} to {}", path.display(), swarm.label(&id)))
         }
         (_, None) => Ok("no agent selected".to_owned()),
     };
@@ -535,6 +553,7 @@ mod tests {
                 from_label: "a2".into(),
                 kind: "message",
                 text: "all green".into(),
+                images: Vec::new(),
             },
         });
         let shown = screen(&app);

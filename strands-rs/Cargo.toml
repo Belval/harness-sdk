@@ -42,6 +42,10 @@ aws-smithy-mocks = "0.3"
 regex = "1"
 http = "1"
 tempfile = "3"
+# Inline images in the strands-swarm TUI: kitty/iTerm2/sixel when the terminal supports them,
+# unicode halfblocks otherwise.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 tokio-stream = "0.1"
 rmcp = { version = "3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }

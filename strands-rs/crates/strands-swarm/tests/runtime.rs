@@ -1799,3 +1799,104 @@ async fn an_interrupt_also_stops_the_goal_judge() {
     assert_eq!(swarm.agent(&id).unwrap().status, AgentStatus::Idle);
     swarm.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_message_with_an_image_reaches_the_model_as_an_image_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let shot = dir.path().join("shot.png");
+    std::fs::write(&shot, b"\x89PNG fake").unwrap();
+    let (swarm, mut events, scripts) = swarm_with(vec![("a1", vec![say("first"), say("a cat")])], dir.path());
+    let request = SpawnRequest {
+        task: "hello".into(),
+        ..Default::default()
+    };
+    let id = swarm.spawn(USER, request).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "first");
+
+    let unsupported = swarm.send_with_images(USER, &id, "this?", vec![dir.path().join("notes.txt")]);
+    assert!(unsupported.unwrap_err().to_string().contains("not a png"));
+    swarm
+        .send_with_images(USER, &id, "what is this?", vec![shot.clone()])
+        .unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "a cat");
+
+    let root = scripts.lock()["a1"].clone();
+    let (messages, _) = &root.calls()[1];
+    let last = messages.last().unwrap();
+    assert!(last.text().contains("what is this?") && last.text().contains("[attached image: "));
+    let image = last.content.iter().find_map(|block| match block {
+        ContentBlock::Image(image) => Some(image),
+        _ => None,
+    });
+    let image = image.expect("no image block sent to the model");
+    assert!(matches!(&image.source, strands_agents::types::ImageSource::Bytes(b) if b == b"\x89PNG fake"));
+}
+
+#[tokio::test]
+async fn an_image_in_a_tool_result_is_published_for_the_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = MockMessageModel::shared(vec![
+        tool_call("screenshot", "t1", json!({"path": "/w/shot.png"})),
+        say("done"),
+    ]);
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let model = model.clone();
+        Box::pin(async move {
+            let screenshot = strands_agents::tools::FunctionTool::builder("screenshot")
+                .description("Take a screenshot.")
+                .handler(|_input: serde_json::Value, _ctx| async {
+                    let image =
+                        strands_agents::types::ToolResultContent::Image(strands_agents::types::ImageBlock {
+                            format: strands_agents::types::ImageFormat::Png,
+                            source: strands_agents::types::ImageSource::Bytes(b"\x89PNG pixels".to_vec()),
+                        });
+                    strands_agents::Result::Ok(serde_json::to_value(image)?)
+                });
+            let mut tools = spec.tools;
+            tools.push(Arc::new(screenshot));
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .system_prompt(spec.instructions)
+                .tools(tools)
+                .no_sandbox()
+                .build()
+        })
+    });
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, dir.path()));
+    let request = SpawnRequest {
+        task: "take one".into(),
+        ..Default::default()
+    };
+    swarm.spawn(USER, request).await.unwrap();
+    let image = async {
+        while let Some(event) = events.recv().await {
+            if let SwarmEvent::Image { id, source, bytes } = event {
+                return (id, source, bytes);
+            }
+        }
+        panic!("event stream closed");
+    };
+    let (id, source, bytes) = tokio::time::timeout(Duration::from_secs(10), image)
+        .await
+        .unwrap();
+    assert_eq!((id.as_str(), source.as_str()), ("a1", "/w/shot.png"));
+    assert_eq!(bytes.as_slice(), b"\x89PNG pixels");
+}
+
+#[test]
+fn saved_mail_keeps_attached_image_paths_and_old_mail_still_loads() {
+    let old: strands_swarm::state::MailState = serde_json::from_value(
+        json!({"from": "user", "from_label": "user", "kind": "message", "text": "hi"}),
+    )
+    .unwrap();
+    assert!(old.images.is_empty());
+    let with_image = strands_swarm::state::MailState {
+        images: vec!["/w/shot.png".into()],
+        ..old
+    };
+    let text = serde_json::to_string(&with_image).unwrap();
+    assert!(text.contains("/w/shot.png") && !text.contains("PNG"));
+    let back: strands_swarm::state::MailState = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, with_image);
+}

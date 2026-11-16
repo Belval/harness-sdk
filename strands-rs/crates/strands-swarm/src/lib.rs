@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod compaction;
 pub mod factory;
 pub mod gc;
+pub mod images;
 pub mod journal;
 pub mod mcp;
 pub mod memory;
