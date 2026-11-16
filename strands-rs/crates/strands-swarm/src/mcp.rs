@@ -1,11 +1,14 @@
-//! MCP servers shared by the whole swarm: connected once, their tools handed to every agent.
+//! MCP servers shared by the whole swarm: connected once, their tools offered to every agent.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use regex::Regex;
 use strands_agents::mcp::{ListOptions, LoadOptions, McpClient};
 use strands_agents::tools::ToolRef;
 use strands_agents::{Error, Result};
+
+use crate::catalog::ToolCatalog;
 
 /// Connected MCP servers and the tools that survived the deny filter. Keep this alive for as long
 /// as agents use the tools.
@@ -16,6 +19,15 @@ pub struct SharedMcp {
     pub tools: Vec<ToolRef>,
     /// Names removed by the deny filter.
     pub denied: Vec<String>,
+    /// Each connected server's name and how many of its tools survived the deny filter.
+    pub servers: Vec<(String, usize)>,
+}
+
+impl SharedMcp {
+    /// The tools as a catalog agents enable from on demand with `find_tools`.
+    pub fn catalog(&self) -> Arc<ToolCatalog> {
+        Arc::new(ToolCatalog::new(self.tools.clone(), self.servers.clone()))
+    }
 }
 
 /// Connect every server in each `mcp.json`-shaped file (a Claude Code `~/.claude.json` works too:
@@ -32,6 +44,7 @@ pub async fn load_shared_mcp(configs: &[impl AsRef<Path>], deny: &[String]) -> R
         clients: Vec::new(),
         tools: Vec::new(),
         denied: Vec::new(),
+        servers: Vec::new(),
     };
     for config in configs {
         let mut load = LoadOptions::default();
@@ -47,6 +60,7 @@ pub async fn load_shared_mcp(configs: &[impl AsRef<Path>], deny: &[String]) -> R
 }
 
 async fn add_client_tools(shared: &mut SharedMcp, client: McpClient, deny: &[Regex]) {
+    let before = shared.tools.len();
     match client.list_tools().await {
         Ok(tools) => {
             for tool in tools {
@@ -60,5 +74,7 @@ async fn add_client_tools(shared: &mut SharedMcp, client: McpClient, deny: &[Reg
             tracing::warn!(server = %client.name(), %error, "skipping MCP server | listing tools failed")
         }
     }
+    let count = shared.tools.len() - before;
+    shared.servers.push((client.name().to_owned(), count));
     shared.clients.push(client);
 }

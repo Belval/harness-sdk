@@ -22,6 +22,7 @@ use strands_harness::{
     HarnessAgentOptions, MemoryOption, ModelOption, SandboxOption, SessionOption,
 };
 
+use crate::catalog::ToolCatalog;
 use crate::runtime::{AgentFactory, AgentSpec};
 
 /// `subagent` is replaced by the swarm tools; `web_search` fails construction on models without
@@ -40,8 +41,11 @@ pub struct HarnessFactoryOptions {
     pub effort: Effort,
     /// Extra instructions given to every agent, before the swarm section.
     pub instructions: Option<String>,
-    /// Tools shared by every agent, e.g. MCP tools loaded once for the whole swarm.
+    /// Tools registered on every agent up front.
     pub tools: Vec<ToolRef>,
+    /// Tools every agent can enable on demand through `find_tools`, e.g. the shared MCP tools.
+    /// `find_tools` is registered only when the catalog has tools.
+    pub catalog: Option<Arc<ToolCatalog>>,
 }
 
 /// A factory that builds harness agents.
@@ -51,7 +55,14 @@ pub struct HarnessFactoryOptions {
 pub fn harness_factory(options: HarnessFactoryOptions) -> AgentFactory {
     Arc::new(move |spec: AgentSpec| {
         let options = options.clone();
-        Box::pin(async move { create_harness(harness_options(&options, spec)?).await })
+        Box::pin(async move {
+            let agent = create_harness(harness_options(&options, spec)?).await?;
+            // The harness has restored the session by now; give back the tools enabled before.
+            if let Some(catalog) = &options.catalog {
+                catalog.restore(&agent);
+            }
+            Ok(agent)
+        })
     })
 }
 
@@ -121,6 +132,9 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
     }
     let mut tools = spec.tools;
     tools.extend(options.tools.iter().cloned());
+    if let Some(catalog) = options.catalog.as_ref().filter(|catalog| !catalog.is_empty()) {
+        tools.push(catalog.find_tool());
+    }
     let instructions = match &options.instructions {
         Some(extra) => format!("{extra}\n\n{}", spec.instructions),
         None => spec.instructions,
@@ -188,5 +202,44 @@ mod tests {
 
         assert_eq!(result_len(&messages[2]), 16_000);
         assert!(result_len(&messages[4]) < 20_000);
+    }
+
+    use strands_agents::tools::FunctionTool;
+
+    fn spec() -> AgentSpec {
+        AgentSpec {
+            id: "a1".into(),
+            name: None,
+            cwd: std::env::temp_dir(),
+            model: None,
+            instructions: String::new(),
+            tools: Vec::new(),
+            goal: None,
+            session_dir: None,
+            env: Default::default(),
+        }
+    }
+
+    fn tool_names(catalog: Option<Arc<ToolCatalog>>) -> Vec<String> {
+        let options = HarnessFactoryOptions {
+            catalog,
+            ..Default::default()
+        };
+        let harness = harness_options(&options, spec()).unwrap();
+        harness.tools.iter().map(|t| t.name().to_owned()).collect()
+    }
+
+    #[test]
+    fn find_tools_is_registered_only_for_a_non_empty_catalog() {
+        let tool: ToolRef = Arc::new(
+            FunctionTool::builder("srv_echo")
+                .description("Echo.")
+                .handler(|input: serde_json::Value, _ctx| async move { Result::Ok(input) }),
+        );
+        let full = ToolCatalog::new(vec![tool], vec![("srv".into(), 1)]);
+        assert_eq!(tool_names(Some(Arc::new(full))), ["find_tools"]);
+        let empty = ToolCatalog::new(Vec::new(), vec![("srv".into(), 0)]);
+        assert!(tool_names(Some(Arc::new(empty))).is_empty());
+        assert!(tool_names(None).is_empty());
     }
 }

@@ -12,6 +12,7 @@
 //! The runtime enforces only resource limits (live agent count) and cancellation, which cascades
 //! down the spawn tree.
 
+pub mod catalog;
 pub mod factory;
 pub mod mcp;
 pub mod runtime;
@@ -20,6 +21,7 @@ pub mod tools;
 pub mod tui;
 pub mod worktree;
 
+pub use catalog::ToolCatalog;
 pub use factory::{agent_session_manager, harness_factory, HarnessFactoryOptions};
 pub use mcp::{load_shared_mcp, SharedMcp};
 pub use runtime::{

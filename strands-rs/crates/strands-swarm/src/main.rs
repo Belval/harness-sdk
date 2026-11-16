@@ -48,6 +48,9 @@ struct Cli {
     /// Regex over `<server>_<tool>` names to hide from agents. Repeatable.
     #[arg(long = "mcp-deny")]
     mcp_deny: Vec<String>,
+    /// Register every MCP tool on every agent up front instead of on demand through `find_tools`.
+    #[arg(long)]
+    mcp_eager: bool,
     /// Print the MCP tools agents would get (and those denied), then exit.
     #[arg(long)]
     list_tools: bool,
@@ -83,9 +86,14 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     let mcp = load_shared_mcp(&cli.mcp_configs, &cli.mcp_deny).await?;
     if !cli.mcp_configs.is_empty() {
         eprintln!(
-            "strands-swarm: {} MCP servers, {} tools shared, {} denied",
+            "strands-swarm: {} MCP servers, {} tools shared ({}), {} denied",
             mcp.clients.len(),
             mcp.tools.len(),
+            if cli.mcp_eager {
+                "eager"
+            } else {
+                "on demand via find_tools"
+            },
             mcp.denied.len()
         );
     }
@@ -96,11 +104,16 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         mcp.denied.iter().for_each(|name| println!("deny  {name}"));
         return Ok(Exit::Quit);
     }
+    let (tools, catalog) = match cli.mcp_eager {
+        true => (mcp.tools.clone(), None),
+        false => (Vec::new(), Some(mcp.catalog())),
+    };
     let factory = harness_factory(HarnessFactoryOptions {
         model: cli.model,
         effort: cli.effort,
         instructions,
-        tools: mcp.tools.clone(),
+        tools,
+        catalog,
     });
     let root = root_request(cli.task, cli.goal);
     let mut config = SwarmConfig::new(factory, cwd);
