@@ -33,6 +33,9 @@ pub struct SwarmState {
     /// Commit of the binary that saved it (`None` for older runs or builds outside git).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Pending scheduled messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedules: Vec<crate::schedule::Schedule>,
 }
 
 /// Persisted agent.

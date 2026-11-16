@@ -23,6 +23,7 @@ pub mod mcp;
 pub mod memory;
 pub mod names;
 pub mod runtime;
+pub mod schedule;
 pub mod selftest;
 pub mod skills;
 pub mod state;
@@ -37,7 +38,7 @@ pub use factory::{agent_session_manager, harness_factory, harness_model_resolver
 pub use mcp::{load_shared_mcp, SharedMcp};
 pub use memory::Memory;
 pub use runtime::{
-    AgentFactory, AgentInfo, AgentSpec, AgentStatus, Mail, ModelResolver, ReloadWhen, SpawnRequest, Swarm,
-    SwarmConfig, SwarmEvent, RELOAD_EXIT_CODE, USER,
+    AgentFactory, AgentInfo, AgentSpec, AgentStatus, Mail, ModelResolver, ReloadWhen, ScheduleRequest,
+    SpawnRequest, Swarm, SwarmConfig, SwarmEvent, RELOAD_EXIT_CODE, USER,
 };
 pub use skills::{discover_skills, Skills};

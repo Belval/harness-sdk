@@ -434,6 +434,7 @@ mod tests {
             agents: vec![agent("a1", "idle"), agent("a2", "cancelled")],
             budget_tokens: None,
             commit: None,
+            schedules: Vec::new(),
         };
         let collected = collect_run(&state).await;
         assert_eq!(collected.len(), 1);

@@ -367,6 +367,7 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             .forget(&text)
             .await
             .map(|removed| format!("forgot {} line(s): {}", removed.len(), removed.join(" | "))),
+        (Command::Schedules, _) => Ok(schedules_notice(swarm)),
         (Command::Gc, _) => {
             swarm.gc_in_background();
             Ok("gc: measuring and reclaiming in the background…".to_owned())
@@ -395,6 +396,19 @@ async fn memory_notice(swarm: &Swarm) -> String {
         ),
         Err(error) => format!("error: {error}"),
     }
+}
+
+/// Every pending schedule on one line, soonest first.
+fn schedules_notice(swarm: &Swarm) -> String {
+    let schedules = swarm.schedules();
+    if schedules.is_empty() {
+        return "no schedules".to_owned();
+    }
+    let all: Vec<String> = schedules
+        .iter()
+        .map(|s| crate::tools::describe_schedule(swarm, s))
+        .collect();
+    format!("schedules: {}", all.join(" | "))
 }
 
 fn budget_notice(swarm: &Swarm) -> String {

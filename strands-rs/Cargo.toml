@@ -47,6 +47,7 @@ tempfile = "3"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 tokio-stream = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std", "now", "serde"] }
 rmcp = { version = "3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }

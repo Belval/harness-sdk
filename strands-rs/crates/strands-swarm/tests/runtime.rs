@@ -2289,3 +2289,168 @@ async fn context_summarization_runs_on_the_side_model_and_counts_toward_the_agen
     assert_eq!(swarm.tokens_used(), input + output);
     swarm.shutdown().await;
 }
+
+fn every(minutes: u64, to: &str, message: &str) -> strands_swarm::ScheduleRequest {
+    strands_swarm::ScheduleRequest {
+        to: to.into(),
+        message: message.into(),
+        every: Some(Duration::from_secs(minutes * 60)),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recurring_schedule_wakes_its_agent_until_it_is_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("started"), say("tick 1"), say("tick 2")])]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(mock_factory(&scripts), dir.path()));
+    let root = spawn_root(&swarm, "monitor").await;
+    assert_eq!(reply_to(&mut events, USER).await, "started");
+
+    let schedule = swarm
+        .schedule(&root, every(30, &root, "check the queue"))
+        .unwrap();
+    assert_eq!(schedule.id, "s1");
+    tokio::time::sleep(Duration::from_secs(29 * 60)).await;
+    assert_eq!(scripts.lock()["a1"].call_count(), 1, "not before its time");
+    tokio::time::sleep(Duration::from_secs(2 * 60)).await;
+    assert_eq!(reply_to(&mut events, USER).await, "tick 1");
+    let woken = sent_text(&scripts.lock()["a1"].clone(), 1);
+    assert!(
+        woken.contains("kind=\\\"schedule\\\"") && woken.contains("[schedule s1] check the queue"),
+        "{woken}"
+    );
+
+    tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+    assert_eq!(reply_to(&mut events, USER).await, "tick 2");
+    swarm.unschedule("s1").unwrap();
+    assert!(swarm.schedules().is_empty());
+    tokio::time::sleep(Duration::from_secs(3 * 3600)).await;
+    assert_eq!(scripts.lock()["a1"].call_count(), 3);
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_idle_agent_waiting_on_a_schedule_holds_no_agent_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("idle now")]), ("a2", vec![say("hi")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.max_agents = 1;
+    let (swarm, mut events) = Swarm::new(config);
+    let root = spawn_root(&swarm, "monitor").await;
+    reply_to(&mut events, USER).await;
+    eventually("the root is idle", || {
+        swarm.agent(&root).unwrap().status == AgentStatus::Idle
+    })
+    .await;
+
+    let queued = spawn_root(&swarm, "more").await;
+    assert_eq!(swarm.agent(&queued).unwrap().status, AgentStatus::Queued);
+    swarm.schedule(&root, every(60, &root, "poll")).unwrap();
+    assert_eq!(
+        reply_to(&mut events, USER).await,
+        "hi",
+        "the queued agent started"
+    );
+
+    // Cancelling the receiver drops its schedules.
+    swarm.cancel(&root).unwrap();
+    assert!(swarm.schedules().is_empty());
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn schedules_persist_and_missed_fires_fire_once_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("started")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.state_dir = Some(dir.path().join("run"));
+    let (swarm, mut events) = Swarm::new(config.clone());
+    let root = spawn_root(&swarm, "monitor").await;
+    reply_to(&mut events, USER).await;
+    swarm.schedule(&root, every(30, &root, "repeating")).unwrap();
+    let once = strands_swarm::ScheduleRequest {
+        to: root.clone(),
+        message: "one-shot".into(),
+        at: Some(swarm.now() + chrono::Duration::hours(1)),
+        ..Default::default()
+    };
+    swarm.schedule(&root, once).unwrap();
+    swarm.shutdown().await;
+
+    let mut saved = strands_swarm::state::load(&dir.path().join("run"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.schedules.len(), 2, "saved with the run");
+    // As if the swarm had been down for five hours: ten repeats and the one-shot were missed.
+    let now = chrono::Utc::now();
+    for schedule in &mut saved.schedules {
+        schedule.next = now - chrono::Duration::hours(5);
+    }
+    let scripts = scripts_of(vec![("a1", vec![say("caught up"), say("again")])]);
+    let config = SwarmConfig {
+        factory: mock_factory(&scripts),
+        ..config
+    };
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    reply_to(&mut events, USER).await;
+    let fired: Vec<String> = scripts.lock()["a1"]
+        .calls()
+        .iter()
+        .flat_map(|(messages, _)| messages.last().map(|m| m.text()))
+        .collect();
+    let fired = fired.join("\n");
+    assert_eq!(fired.matches("[schedule s1] repeating").count(), 1, "{fired}");
+    assert_eq!(fired.matches("[schedule s2] one-shot").count(), 1, "{fired}");
+
+    let left = resumed.schedules();
+    assert_eq!(left.len(), 1, "the one-shot is done");
+    assert!(left[0].next > now && left[0].next <= now + chrono::Duration::minutes(30));
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
+async fn agents_schedule_list_and_cancel_through_their_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![(
+            "a1",
+            vec![
+                tool_call("schedule", "t1", json!({"message": "poll slack", "every": "30m"})),
+                tool_call("schedule", "t2", json!({"message": "x", "every": "5 minutes"})),
+                tool_call("list_agents", "t3", json!({})),
+                tool_call("schedule", "t4", json!({})),
+                tool_call("schedule", "t5", json!({"cancel": "s1"})),
+                say("done"),
+            ],
+        )],
+        dir.path(),
+    );
+    spawn_root(&swarm, "monitor slack").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let root = scripts.lock()["a1"].clone();
+    let result = |call: usize| {
+        let (messages, _) = &root.calls()[call];
+        format!("{:?}", messages.last().unwrap())
+    };
+    assert!(
+        result(1).contains("Scheduled s1 every 30m, next in 30m"),
+        "{}",
+        result(1)
+    );
+    assert!(
+        result(1).contains("→ monitor-slack (a1): poll slack"),
+        "{}",
+        result(1)
+    );
+    assert!(result(2).contains("Not a duration"), "{}", result(2));
+    assert!(
+        result(3).contains("  scheduled: s1 every 30m, next in "),
+        "{}",
+        result(3)
+    );
+    assert!(result(4).contains("s1 every 30m"), "{}", result(4));
+    assert!(result(5).contains("Removed s1"), "{}", result(5));
+    assert!(swarm.schedules().is_empty());
+}

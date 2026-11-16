@@ -311,6 +311,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "cancel the selected agent and its children",
     },
     SlashCommand {
+        name: "/schedules",
+        args: "",
+        help: "list scheduled messages",
+    },
+    SlashCommand {
         name: "/gc",
         args: "",
         help: "reclaim the disk of cancelled worktree agents",
@@ -678,6 +683,8 @@ pub enum Command {
     },
     /// Reclaim the disk of cancelled worktree agents.
     Gc,
+    /// List scheduled messages.
+    Schedules,
     /// Quit.
     Quit,
 }
@@ -732,6 +739,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         "/budget" => return Some(Command::Budget(None)),
         "/remember" => return Some(Command::Remember(None)),
         "/gc" => return Some(Command::Gc),
+        "/schedules" => return Some(Command::Schedules),
         "/quit" | "/q" => return Some(Command::Quit),
         _ => {}
     }
@@ -1157,6 +1165,7 @@ mod tests {
             })
         );
         assert_eq!(parse_command("/gc", false), Some(Command::Gc));
+        assert_eq!(parse_command("/schedules", false), Some(Command::Schedules));
         assert_eq!(
             parse_command("/model  anthropic/claude-x ", true),
             Some(Command::SetModel(Some("anthropic/claude-x".into())))

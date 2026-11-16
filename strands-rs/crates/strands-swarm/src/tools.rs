@@ -1,5 +1,5 @@
 //! The swarm tools every agent carries: `spawn_agent`, `send_message`, `wait`, `list_agents`,
-//! `cancel_agent`. Each instance is bound to the agent that owns it.
+//! `cancel_agent`, `reload_swarm`, `schedule`. Each instance is bound to the agent that owns it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,10 @@ use serde::Deserialize;
 use strands_agents::tools::{FunctionTool, ToolContext, ToolRef};
 use strands_agents::Result;
 
-use crate::runtime::{render_mail, AgentInfo, AgentStatus, ReloadWhen, SpawnRequest, Swarm, USER};
+use crate::runtime::{
+    render_mail, AgentInfo, AgentStatus, ReloadWhen, ScheduleRequest, SpawnRequest, Swarm, USER,
+};
+use crate::schedule::{self, Schedule};
 
 /// Tool names, in registration order.
 pub const SWARM_TOOL_NAMES: &[&str] = &[
@@ -18,6 +21,7 @@ pub const SWARM_TOOL_NAMES: &[&str] = &[
     "list_agents",
     "cancel_agent",
     "reload_swarm",
+    "schedule",
 ];
 
 const DEFAULT_WAIT_SECONDS: u64 = 600;
@@ -143,6 +147,103 @@ fn reload_tool(swarm: Swarm) -> ToolRef {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct ScheduleInput {
+    /// Text to post when it fires. Omit (and `cancel`) to list every schedule.
+    #[serde(default)]
+    message: Option<String>,
+    /// Receiver: an agent id or name, or `parent`. Default: yourself.
+    #[serde(default)]
+    to: Option<String>,
+    /// Repeat interval, e.g. `30m`, `2h`, `1d` (at least `1m`). Omit for a one-shot.
+    #[serde(default)]
+    every: Option<String>,
+    /// First (or only) time: `in 2h`, or ISO 8601 such as `2026-11-17T09:00Z` (UTC unless an offset
+    /// is given). Default: one `every` from now.
+    #[serde(default)]
+    at: Option<String>,
+    /// Id to create, or to replace an existing schedule. Default: a new `sN`.
+    #[serde(default)]
+    id: Option<String>,
+    /// Id of a schedule to remove.
+    #[serde(default)]
+    cancel: Option<String>,
+}
+
+const SCHEDULE_DESCRIPTION: &str = concat!(
+    "Post `message` to an agent's mailbox (default: your own) later, repeatedly, or both: e.g. ",
+    "`every: \"30m\"` to poll something, `at: \"in 2h\"` for a reminder. For periodic work, schedule ",
+    "yourself and end your turn instead of sitting in a long `wait`: each fire starts a new turn, and an ",
+    "idle agent waiting only on a schedule does not count toward the agent limit. Schedules survive ",
+    "restarts; a fire missed while the swarm was down is delivered once on resume. `cancel: id` removes ",
+    "one; no arguments lists them all. Schedules of a cancelled agent are dropped."
+);
+
+fn schedule_tool(swarm: Swarm, me: String) -> ToolRef {
+    let tool = FunctionTool::builder("schedule")
+        .description(SCHEDULE_DESCRIPTION)
+        .typed_handler(move |input: ScheduleInput, _ctx: ToolContext| {
+            let swarm = swarm.clone();
+            let me = me.clone();
+            async move {
+                if let Some(id) = input.cancel {
+                    let removed = swarm.unschedule(&id)?;
+                    return Result::Ok(format!("Removed {}.", describe_schedule(&swarm, &removed)));
+                }
+                let Some(message) = input.message else {
+                    return Result::Ok(list_schedules(&swarm));
+                };
+                let to = match &input.to {
+                    Some(who) => resolve(&swarm, &me, who)?,
+                    None => me.clone(),
+                };
+                let every = input
+                    .every
+                    .as_deref()
+                    .map(schedule::parse_duration)
+                    .transpose()
+                    .map_err(strands_agents::Error::other)?;
+                let now = swarm.now();
+                let at = input
+                    .at
+                    .as_deref()
+                    .map(|at| schedule::parse_at(at, now))
+                    .transpose()
+                    .map_err(strands_agents::Error::other)?;
+                let request = ScheduleRequest {
+                    id: input.id,
+                    to,
+                    message,
+                    every,
+                    at,
+                };
+                let created = swarm.schedule(&me, request)?;
+                Result::Ok(format!("Scheduled {}.", describe_schedule(&swarm, &created)))
+            }
+        });
+    Arc::new(tool)
+}
+
+/// `s1 every 30m, next in 12m (…) → monitor (a3): check the queue`.
+pub fn describe_schedule(swarm: &Swarm, schedule: &Schedule) -> String {
+    let line = schedule.describe(swarm.now());
+    let (head, message) = line.split_once(": ").unwrap_or((line.as_str(), ""));
+    format!("{head} → {}: {message}", swarm.label(&schedule.to))
+}
+
+/// Every pending schedule, soonest first, one per line.
+pub fn list_schedules(swarm: &Swarm) -> String {
+    let lines: Vec<String> = swarm
+        .schedules()
+        .iter()
+        .map(|s| describe_schedule(swarm, s))
+        .collect();
+    match lines.is_empty() {
+        true => "No schedules.".to_owned(),
+        false => lines.join("\n"),
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct RememberInput {
     /// The fact, preference or instruction to keep, as one self-contained sentence.
     text: String,
@@ -199,6 +300,7 @@ pub fn swarm_tools(swarm: Swarm, id: &str) -> Vec<ToolRef> {
         list_tool(swarm.clone()),
         cancel_tool(swarm.clone(), id.to_owned()),
         reload_tool(swarm.clone()),
+        schedule_tool(swarm.clone(), id.to_owned()),
     ];
     if swarm.memory().is_some() {
         tools.push(remember_tool(swarm.clone()));
@@ -331,7 +433,13 @@ fn list_agents(swarm: &Swarm, include_cancelled: bool) -> String {
     let (shown, hidden): (Vec<_>, Vec<_>) = agents
         .iter()
         .partition(|info| include_cancelled || info.status.is_live());
-    let mut lines: Vec<String> = shown.iter().map(|info| describe(swarm, info)).collect();
+    let schedules = swarm.schedules();
+    let mut lines = Vec::new();
+    for info in &shown {
+        lines.push(describe(swarm, info));
+        let upcoming = schedules.iter().filter(|s| s.to == info.id);
+        lines.extend(upcoming.map(|s| format!("  scheduled: {}", s.describe(swarm.now()))));
+    }
     if !hidden.is_empty() {
         lines.push(format!(
             "({} cancelled agents not shown; include_cancelled=true lists them)",

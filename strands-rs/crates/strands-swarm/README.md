@@ -11,6 +11,7 @@ agent with six extra tools, and decides for itself whether and how to split the 
 | `list_agents` | The agent tree with statuses, directories and branches. |
 | `cancel_agent` | Stop an agent and everything it spawned. |
 | `reload_swarm` | Restart the whole swarm into a newly built binary; every agent resumes. |
+| `schedule` | Post a message to an agent's mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
 | `find_tools` | Only with MCP servers: search the shared MCP tools by keyword and enable some for the calling agent. |
 | `skills` | Only with skills: load a skill's full `SKILL.md` instructions, its location and its bundled files. |
 | `remember` / `forget` | Only with memory: add a dated entry to the user's memory file, or drop the lines matching a text. |
@@ -51,8 +52,17 @@ output) the whole swarm may use: once spent, model calls fail with a "budget exh
 travels up to you, and `/budget N` in the TUI raises it (`/budget off` lifts it, `/budget` shows usage),
 which tells every stopped agent to continue. The budget is saved with the run.
 
+`schedule {message, to?, every?: "30m", at?: "in 2h" | "2026-11-17T09:00Z", id?}` posts
+`[schedule sN] message` (kind `schedule`) to the receiver at the given times; `{cancel: id}` removes
+one and `{}` lists them (`list_agents` shows each agent's, the TUI `/schedules` all). Repeats are at
+least a minute apart. An agent that polls something schedules itself and ends its turn instead of
+holding a long `wait`; while it is idle with a schedule pending it does not count toward
+`--max-agents`. Schedules are saved with the run and survive reloads; a schedule whose time passed
+while the swarm was down fires once on resume, then keeps its interval. Schedules of a cancelled
+agent (as receiver or creator) are dropped.
+
 TUI: ↑/↓ select an agent, type to message it, `/to <agent> <message>` (by name or id, without selecting it), `/new <task>`, `/goal <goal>`, `/stop`, `/cancel`,
-`/gc`, Ctrl-C quits.
+`/gc`, `/schedules`, Ctrl-C quits.
 `/stop` (or Esc twice within a second on an empty input) interrupts the selected agent's turn without
 cancelling it, like Esc in Claude Code: an open tool call is closed as cancelled, the agent goes idle
 with its conversation intact, its parent gets an `interrupted` message, its children keep running,

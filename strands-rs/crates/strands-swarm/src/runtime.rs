@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use futures::StreamExt;
 use indexmap::IndexMap;
@@ -32,6 +33,7 @@ use crate::images;
 use crate::journal::Journal;
 use crate::memory::Memory;
 use crate::names;
+use crate::schedule::{self as schedules, Schedule};
 use crate::selftest;
 use crate::state::{AgentState, MailState, Persister, SwarmState, SESSIONS_DIR};
 use crate::tools::swarm_tools;
@@ -113,7 +115,8 @@ pub struct Mail {
     pub from: String,
     /// Sender label as rendered to the receiver, e.g. `parser (a2)`.
     pub from_label: String,
-    /// What kind of message this is: `message`, `reply` (a turn's final text) or `error`.
+    /// What kind of message this is: `message`, `reply` (a turn's final text), `error`,
+    /// `interrupted` or `schedule` (posted by a [`Schedule`]).
     pub kind: &'static str,
     /// Body.
     pub text: String,
@@ -258,6 +261,21 @@ pub struct SpawnRequest {
     pub model: Option<String>,
     /// Optional completion criterion; the agent keeps working until it is met.
     pub goal: Option<String>,
+}
+
+/// What a `schedule` call (or the user) asks for; see [`Swarm::schedule`].
+#[derive(Debug, Clone, Default)]
+pub struct ScheduleRequest {
+    /// Id to create or replace; `None` picks the next free `sN`.
+    pub id: Option<String>,
+    /// Receiving agent id.
+    pub to: String,
+    /// Text to post.
+    pub message: String,
+    /// Repeat interval (at least [`schedules::MIN_EVERY`]).
+    pub every: Option<Duration>,
+    /// First (or only) fire; default one `every` from now.
+    pub at: Option<DateTime<Utc>>,
 }
 
 /// A snapshot of one agent, for `list_agents` and the UI.
@@ -534,6 +552,15 @@ struct Inner {
     budget: Mutex<Option<u64>>,
     /// Agents whose model call was refused for lack of budget, to wake when it is raised.
     over_budget: Mutex<Vec<String>>,
+    /// Pending scheduled messages, in creation order.
+    schedules: Mutex<Vec<Schedule>>,
+    /// Wakes the scheduler when schedules change.
+    schedules_changed: Notify,
+    /// The scheduler task has been started (on the first schedule).
+    scheduler: AtomicBool,
+    /// Wall clock and tokio instant at construction: [`Swarm::now`] follows tokio's clock from
+    /// here, so paused-time tests can fast-forward schedules.
+    epoch: (DateTime<Utc>, tokio::time::Instant),
 }
 
 /// An agent's auxiliary model (what side calls such as the goal judge and context summarization
@@ -613,6 +640,10 @@ impl Swarm {
                 .then(|| Arc::new(Semaphore::new(config.max_concurrent_calls))),
             budget: Mutex::new(config.budget_tokens),
             over_budget: Mutex::new(Vec::new()),
+            schedules: Mutex::new(Vec::new()),
+            schedules_changed: Notify::new(),
+            scheduler: AtomicBool::new(false),
+            epoch: (Utc::now(), tokio::time::Instant::now()),
             config,
         };
         let swarm = Self {
@@ -681,10 +712,11 @@ impl Swarm {
             .map_or(&self.inner.root_cancel, |node| &node.cancel)
             .child_token();
 
+        let scheduled = self.scheduled_targets();
         let node = {
             let mut agents = self.inner.agents.lock();
             // Decided under the lock, so concurrent spawns cannot overshoot the limit.
-            let queued = started(&agents) >= self.inner.config.max_agents;
+            let queued = started(&agents, &scheduled) >= self.inner.config.max_agents;
             let taken = agents.values().map(|node| node.name.as_str());
             let node = Arc::new(Node {
                 id: id.clone(),
@@ -745,9 +777,14 @@ impl Swarm {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return;
         }
+        let scheduled = self.scheduled_targets();
         let ready: Vec<Arc<Node>> = {
             let agents = self.inner.agents.lock();
-            let free = self.inner.config.max_agents.saturating_sub(started(&agents));
+            let free = self
+                .inner
+                .config
+                .max_agents
+                .saturating_sub(started(&agents, &scheduled));
             let mut ready = Vec::new();
             for node in agents.values() {
                 if ready.len() == free {
@@ -1007,6 +1044,169 @@ impl Swarm {
             .sum()
     }
 
+    /// The swarm's clock: wall time, but advancing with tokio's clock (paused in tests).
+    pub fn now(&self) -> DateTime<Utc> {
+        let (wall, instant) = self.inner.epoch;
+        let elapsed = chrono::Duration::from_std(instant.elapsed()).unwrap_or_default();
+        Utc::now().max(wall + elapsed)
+    }
+
+    /// Create (or, with a taken id, replace) a schedule from `owner` (an agent id or [`USER`]):
+    /// `message` is posted to agent `to` at `at` (default: one `every` from now), then every
+    /// `every` if set. Persisted with the run; fires missed while it was down fire once on resume.
+    pub fn schedule(&self, owner: &str, request: ScheduleRequest) -> Result<Schedule> {
+        let ScheduleRequest {
+            id,
+            to,
+            message,
+            every,
+            at,
+        } = request;
+        if owner != USER && self.node(owner).is_none() {
+            return Err(Error::other(format!("Unknown agent id {owner}.")));
+        }
+        let live = self.node(&to).is_some_and(|node| node.status.lock().is_live());
+        if !live {
+            return Err(Error::other(format!("{to} is not a live agent.")));
+        }
+        if every.is_some_and(|every| every < schedules::MIN_EVERY) {
+            return Err(Error::other(
+                "Schedules repeat at most once a minute (every >= 1m).",
+            ));
+        }
+        let now = self.now();
+        let next = match (at, every) {
+            (Some(at), _) => at,
+            (None, Some(every)) => now + chrono::Duration::from_std(every).map_err(Error::other)?,
+            (None, None) => return Err(Error::other("Give `at`, `every`, or both.")),
+        };
+        let id = id.map(|id| id.trim().to_owned()).filter(|id| !id.is_empty());
+        if id.as_ref().is_some_and(|id| id.len() > 40) {
+            return Err(Error::other("Schedule ids are at most 40 characters."));
+        }
+        let schedule = {
+            let mut list = self.inner.schedules.lock();
+            let id = id.unwrap_or_else(|| {
+                let taken = list
+                    .iter()
+                    .filter_map(|s| s.id.strip_prefix('s')?.parse::<u64>().ok());
+                format!("s{}", taken.max().unwrap_or(0) + 1)
+            });
+            let schedule = Schedule {
+                id,
+                owner: owner.to_owned(),
+                to,
+                message,
+                next,
+                every_secs: every.map(|every| every.as_secs()),
+            };
+            match list.iter_mut().find(|s| s.id == schedule.id) {
+                Some(old) => *old = schedule.clone(),
+                None => list.push(schedule.clone()),
+            }
+            schedule
+        };
+        if let Some(journal) = &self.inner.journal {
+            let fields = serde_json::to_value(&schedule).unwrap_or_default();
+            journal.event("schedule", fields);
+        }
+        self.persist();
+        self.start_scheduler();
+        // An idle receiver now sleeps on its schedule, which frees its slot.
+        self.start_queued();
+        Ok(schedule)
+    }
+
+    /// Receivers of pending schedules.
+    fn scheduled_targets(&self) -> Vec<String> {
+        self.inner.schedules.lock().iter().map(|s| s.to.clone()).collect()
+    }
+
+    /// Remove schedule `id`.
+    pub fn unschedule(&self, id: &str) -> Result<Schedule> {
+        let removed = {
+            let mut list = self.inner.schedules.lock();
+            let index = list.iter().position(|s| s.id == id);
+            index.map(|index| list.remove(index))
+        };
+        let removed = removed.ok_or_else(|| Error::other(format!("No schedule {id}.")))?;
+        if let Some(journal) = &self.inner.journal {
+            journal.event("unschedule", serde_json::json!({ "id": id }));
+        }
+        self.persist();
+        self.inner.schedules_changed.notify_one();
+        Ok(removed)
+    }
+
+    /// Pending schedules, soonest first; those of cancelled agents are dropped.
+    pub fn schedules(&self) -> Vec<Schedule> {
+        self.prune_schedules();
+        let mut list = self.inner.schedules.lock().clone();
+        list.sort_by_key(|s| s.next);
+        list
+    }
+
+    /// Drop schedules whose receiver or (agent) owner is gone or cancelled.
+    fn prune_schedules(&self) {
+        let alive = |id: &str| self.node(id).is_some_and(|node| node.status.lock().is_live());
+        let list = self.inner.schedules.lock().clone();
+        let dead: Vec<String> = list
+            .iter()
+            .filter(|s| !alive(&s.to) || (s.owner != USER && !alive(&s.owner)))
+            .map(|s| s.id.clone())
+            .collect();
+        if !dead.is_empty() {
+            self.inner.schedules.lock().retain(|s| !dead.contains(&s.id));
+            self.persist();
+        }
+    }
+
+    fn start_scheduler(&self) {
+        if self.inner.scheduler.swap(true, Ordering::SeqCst) {
+            self.inner.schedules_changed.notify_one();
+            return;
+        }
+        let swarm = self.clone();
+        tokio::spawn(async move { swarm.run_scheduler().await });
+    }
+
+    /// Post due schedules, then sleep until the next one (re-checking at least every minute, so
+    /// a suspended machine catches up), a change, or shutdown.
+    async fn run_scheduler(self) {
+        loop {
+            if self.inner.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+            self.prune_schedules();
+            let now = self.now();
+            let due: Vec<Schedule> = {
+                let mut list = self.inner.schedules.lock();
+                let due: Vec<Schedule> = list.iter().filter(|s| s.next <= now).cloned().collect();
+                list.retain_mut(|s| s.next > now || s.advance(now));
+                due
+            };
+            for schedule in &due {
+                let text = format!("[schedule {}] {}", schedule.id, schedule.message);
+                if let Err(error) = self.post(&schedule.owner, &schedule.to, "schedule", text) {
+                    tracing::warn!(%error, id = %schedule.id, "scheduled message not delivered");
+                }
+            }
+            if !due.is_empty() {
+                self.persist();
+            }
+            let next = self.inner.schedules.lock().iter().map(|s| s.next).min();
+            let wait = next
+                .map(|next| (next - self.now()).to_std().unwrap_or_default())
+                .unwrap_or(Duration::MAX)
+                .min(Duration::from_secs(60));
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = self.inner.schedules_changed.notified() => {}
+                _ = self.inner.root_cancel.cancelled() => return,
+            }
+        }
+    }
+
     /// Resolves once an agent has requested a reload; the host should then call
     /// [`Swarm::shutdown`] and exit with [`RELOAD_EXIT_CODE`].
     pub async fn reload_requested(&self) {
@@ -1163,6 +1363,11 @@ impl Swarm {
         for agent in state.agents {
             swarm.restore_agent(agent);
         }
+        // Fires missed while the run was down are due now: each fires once.
+        if !state.schedules.is_empty() {
+            *swarm.inner.schedules.lock() = state.schedules;
+            swarm.start_scheduler();
+        }
         swarm.start_queued();
         swarm.persist();
         swarm.collect_in_background();
@@ -1278,6 +1483,7 @@ impl Swarm {
             agents,
             budget_tokens: *self.inner.budget.lock(),
             commit: self.inner.config.commit.clone(),
+            schedules: self.inner.schedules.lock().clone(),
         }
     }
 
@@ -1882,11 +2088,16 @@ async fn install_binary(binary: &Path, bin_dir: &Path) -> Result<()> {
     tokio::fs::rename(&staged, &current).await.map_err(io)
 }
 
-/// Agents holding a slot under [`SwarmConfig::max_agents`]: live and not queued.
-fn started(agents: &IndexMap<String, Arc<Node>>) -> usize {
+/// Agents holding a slot under [`SwarmConfig::max_agents`]: live and not queued. An idle agent
+/// that a schedule will wake (`scheduled` lists their ids) holds none while it sleeps.
+fn started(agents: &IndexMap<String, Arc<Node>>, scheduled: &[String]) -> usize {
     agents
         .values()
-        .filter(|node| !matches!(*node.status.lock(), AgentStatus::Cancelled | AgentStatus::Queued))
+        .filter(|node| match *node.status.lock() {
+            AgentStatus::Cancelled | AgentStatus::Queued => false,
+            AgentStatus::Idle => !scheduled.contains(&node.id),
+            _ => true,
+        })
         .count()
 }
 
@@ -1939,6 +2150,7 @@ fn mail_from_state(mail: MailState) -> Mail {
         "reply" => "reply",
         "error" => "error",
         "interrupted" => "interrupted",
+        "schedule" => "schedule",
         _ => "message",
     };
     Mail {
