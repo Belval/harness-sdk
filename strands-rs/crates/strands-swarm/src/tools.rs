@@ -42,8 +42,10 @@ const WAIT_DESCRIPTION: &str = concat!(
     "of those agents has written. Returns early with a status summary on timeout."
 );
 
-const LIST_DESCRIPTION: &str =
-    "List every agent in the swarm with its name, id, parent, status, working directory and branch.";
+const LIST_DESCRIPTION: &str = concat!(
+    "List the agents in the swarm with name, id, parent, status, working directory and branch. ",
+    "Cancelled agents are only counted unless include_cancelled is set."
+);
 
 const CANCEL_DESCRIPTION: &str =
     "Stop an agent and every agent it spawned. Its worktree and branch are left in place.";
@@ -92,7 +94,11 @@ struct CancelInput {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
-struct NoInput {}
+struct ListInput {
+    /// Also list cancelled agents.
+    #[serde(default)]
+    include_cancelled: bool,
+}
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ReloadInput {
@@ -203,12 +209,9 @@ fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
 fn list_tool(swarm: Swarm) -> ToolRef {
     let tool = FunctionTool::builder("list_agents")
         .description(LIST_DESCRIPTION)
-        .typed_handler(move |_input: NoInput, _ctx: ToolContext| {
+        .typed_handler(move |input: ListInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
-            async move {
-                let lines: Vec<String> = swarm.agents().iter().map(|info| describe(&swarm, info)).collect();
-                Result::Ok(lines.join("\n"))
-            }
+            async move { Result::Ok(list_agents(&swarm, input.include_cancelled)) }
         });
     Arc::new(tool)
 }
@@ -243,6 +246,22 @@ fn resolve(swarm: &Swarm, me: &str, who: &str) -> Result<String> {
 }
 
 /// `parser (a2): running, parent root (a1), cwd /repo, branch swarm/run/a2`.
+/// One line per agent; cancelled ones are only counted unless `include_cancelled`.
+fn list_agents(swarm: &Swarm, include_cancelled: bool) -> String {
+    let agents = swarm.agents();
+    let (shown, hidden): (Vec<_>, Vec<_>) = agents
+        .iter()
+        .partition(|info| include_cancelled || info.status.is_live());
+    let mut lines: Vec<String> = shown.iter().map(|info| describe(swarm, info)).collect();
+    if !hidden.is_empty() {
+        lines.push(format!(
+            "({} cancelled agents not shown; include_cancelled=true lists them)",
+            hidden.len()
+        ));
+    }
+    lines.join("\n")
+}
+
 fn describe(swarm: &Swarm, info: &AgentInfo) -> String {
     let branch = info
         .branch

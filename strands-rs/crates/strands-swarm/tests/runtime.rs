@@ -408,7 +408,14 @@ async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
         ],
     );
     script("a2", vec![say("never")]);
-    script("a3", vec![say("three")]);
+    script(
+        "a3",
+        vec![
+            tool_call("list_agents", "l1", json!({})),
+            tool_call("list_agents", "l2", json!({"include_cancelled": true})),
+            say("three"),
+        ],
+    );
     // Every agent but a1 takes a while to build, so a2 is still starting when a1 is cancelled.
     let inner = mock_factory(&map);
     let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
@@ -438,6 +445,12 @@ async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
     }
     swarm.spawn(USER, task("three")).await.unwrap();
     assert_eq!(reply_to(&mut events, USER).await, "three");
+    let a3 = map.lock()["a3"].clone();
+    let listed = sent_text(&a3, 1);
+    assert!(listed.contains("2 cancelled agents not shown"), "{listed}");
+    assert!(!listed.contains("(a2)"), "{listed}");
+    let all = sent_text(&a3, 2);
+    assert!(all.contains("(a2): cancelled"), "{all}");
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(
         swarm.agent("a2").unwrap().status,
