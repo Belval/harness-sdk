@@ -1,10 +1,14 @@
 //! UI state: a fold over [`SwarmEvent`]s plus the input line. No terminal I/O here.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
 
 use crate::runtime::{AgentStatus, SwarmEvent, USER};
+
+/// Entries kept per agent log; the oldest are dropped beyond this.
+pub const MAX_LOG_ENTRIES: usize = 2000;
 
 /// One entry in an agent's log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,8 +64,8 @@ pub struct AgentView {
     pub output_tokens: u64,
     /// Model id, once known.
     pub model: Option<String>,
-    /// Log.
-    pub log: Vec<LogEntry>,
+    /// Log, oldest first, at most [`MAX_LOG_ENTRIES`] entries.
+    pub log: VecDeque<LogEntry>,
     /// Log entries the user has not looked at.
     pub unseen: bool,
 }
@@ -73,15 +77,17 @@ impl AgentView {
     }
 
     fn push(&mut self, entry: LogEntry) {
-        self.log.push(entry);
+        self.log.push_back(entry);
+        self.trim();
         self.unseen = true;
     }
 
     fn push_text(&mut self, delta: &str) {
-        match self.log.last_mut() {
+        match self.log.back_mut() {
             Some(LogEntry::Text(text)) => text.push_str(delta),
-            _ => self.log.push(LogEntry::Text(delta.to_owned())),
+            _ => self.log.push_back(LogEntry::Text(delta.to_owned())),
         }
+        self.trim();
         self.unseen = true;
     }
 
@@ -100,7 +106,7 @@ impl AgentView {
             AgentStatus::Running => {}
             _ => return None,
         }
-        Some(match self.log.last() {
+        Some(match self.log.back() {
             Some(LogEntry::Tool {
                 name,
                 summary,
@@ -109,6 +115,12 @@ impl AgentView {
             Some(LogEntry::Text(_)) => "writing…".to_owned(),
             _ => "thinking…".to_owned(),
         })
+    }
+
+    /// Drop the oldest entries beyond [`MAX_LOG_ENTRIES`].
+    fn trim(&mut self) {
+        let excess = self.log.len().saturating_sub(MAX_LOG_ENTRIES);
+        self.log.drain(..excess);
     }
 
     fn finish_tool(&mut self, name: &str, ok: bool) {
@@ -170,7 +182,7 @@ impl App {
                     input_tokens: 0,
                     output_tokens: 0,
                     model: None,
-                    log: vec![LogEntry::Task(task)],
+                    log: VecDeque::from([LogEntry::Task(task)]),
                     unseen: true,
                 };
                 self.agents.insert(id, view);
@@ -443,7 +455,7 @@ mod tests {
             kind: "message",
             text: "hi".into(),
         };
-        let read = |app: &App| match app.agents["a1"].log.last() {
+        let read = |app: &App| match app.agents["a1"].log.back() {
             Some(LogEntry::MailIn { read, .. }) => *read,
             other => panic!("{other:?}"),
         };
@@ -494,6 +506,32 @@ mod tests {
             status: AgentStatus::Idle,
         });
         assert_eq!(activity(&app), None);
+    }
+
+    #[test]
+    fn logs_keep_only_the_newest_entries() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        for i in 0..MAX_LOG_ENTRIES + 10 {
+            app.apply(SwarmEvent::ToolStarted {
+                id: "a1".into(),
+                name: "shell".into(),
+                summary: format!("cmd {i}"),
+            });
+        }
+        app.apply(SwarmEvent::Text {
+            id: "a1".into(),
+            delta: "done".into(),
+        });
+        let log = &app.agents["a1"].log;
+        assert_eq!(log.len(), MAX_LOG_ENTRIES);
+        assert_eq!(log.back(), Some(&LogEntry::Text("done".into())));
+        let first = LogEntry::Tool {
+            name: "shell".into(),
+            summary: "cmd 11".into(),
+            ok: None,
+        };
+        assert_eq!(log.front(), Some(&first));
     }
 
     #[test]
