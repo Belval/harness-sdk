@@ -38,7 +38,7 @@ start() {
   install -m 755 "$binary" "$dir/bin/current.new" && mv "$dir/bin/current.new" "$dir/bin/current"
   printf '%s\0' "$@" > "$dir/args"
   # Keep the environment the swarm needs (credentials config, PATH for MCP servers) across reboots.
-  { export -p | grep -E '^declare -x (PATH|HOME|USER|LANG|TERM|AWS_[A-Z_]*|QUICK_EVALS_[A-Z_]*|SSH_AUTH_SOCK)='; } > "$dir/env" || true
+  { export -p | grep -E '^declare -x (PATH|HOME|USER|LANG|TERM|AWS_[A-Z_]*|CARGO_[A-Z_]*|RUSTUP_[A-Z_]*|QUICK_EVALS_[A-Z_]*|SSH_AUTH_SOCK)='; } > "$dir/env" || true
   chmod 600 "$dir/env"
   resume "$run"
 }
