@@ -39,6 +39,9 @@ use crate::state::{AgentState, MailState, Persister, SwarmState, SESSIONS_DIR};
 use crate::tools::swarm_tools;
 use crate::worktree;
 
+/// Judge rejections in a row after which a goal agent's turn ends anyway, so a goal that cannot
+/// be met does not burn turns forever; its parent hears the last attempt and can step in.
+pub const GOAL_MAX_ATTEMPTS: usize = 8;
 const RETRY_INITIAL: Duration = Duration::from_secs(15);
 const RETRY_MAX: Duration = Duration::from_secs(600);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -2098,7 +2101,9 @@ impl Swarm {
             Some(goal) => format!(
                 "{swarm}\n\n# Goal\nA judge checks this goal whenever you end a turn; until it is met you are \
                  sent back to work, and your final reply does not reach {reports_to}. To ask them something, \
-                 `send_message` to `parent` and `wait` for the answer.\n{goal}"
+                 `send_message` to `parent` and `wait` for the answer. After {GOAL_MAX_ATTEMPTS} rejected attempts \
+                 in a row the turn ends anyway and your reply goes to {reports_to}, so then say plainly what is \
+                 still unmet and why; a new message starts a fresh round.\n{goal}"
             ),
             None => swarm,
         }

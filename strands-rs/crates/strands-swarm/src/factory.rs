@@ -26,7 +26,7 @@ use strands_harness::{
 use crate::catalog::ToolCatalog;
 use crate::compaction::{CompactAt, DEFAULT_COMPACT_AT};
 use crate::pruning::{DropOldReasoning, TrimOldResults};
-use crate::runtime::{AgentFactory, AgentSpec, ModelResolver};
+use crate::runtime::{AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
 use crate::skills::{skills_prompt, skills_tool};
 
 /// `subagent` is replaced by the swarm tools; `web_search` fails construction on models without
@@ -178,6 +178,11 @@ fn context_manager(compact_at: u64, stash_dir: Option<&std::path::Path>) -> Cont
     })
 }
 
+/// `goal` with the swarm's attempt cap ([`GOAL_MAX_ATTEMPTS`]).
+pub fn bounded_goal(goal: GoalLoop) -> GoalLoop {
+    goal.with_max_attempts(GOAL_MAX_ATTEMPTS)
+}
+
 fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<HarnessAgentOptions> {
     let session = match &spec.session_dir {
         Some(dir) => agent_session(dir, &spec.id)?,
@@ -195,7 +200,9 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
     let mut plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(environment)];
     if let Some(goal) = &spec.goal {
         let judge = JudgeConfig::default().with_max_transcript_chars(JUDGE_TRANSCRIPT_CHARS);
-        plugins.push(Arc::new(GoalLoop::goal(goal.clone()).with_judge(judge)));
+        plugins.push(Arc::new(bounded_goal(
+            GoalLoop::goal(goal.clone()).with_judge(judge),
+        )));
     }
     let mut sandbox = LocalSandbox::with_base_dir(spec.cwd);
     if !spec.env.is_empty() {

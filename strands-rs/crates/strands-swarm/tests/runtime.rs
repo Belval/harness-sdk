@@ -13,7 +13,7 @@ use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
 use strands_agents::{Agent, Model};
 use strands_swarm::{
     AgentFactory, AgentSpec, AgentStatus, ModelResolver, ReloadWhen, SpawnRequest, Swarm, SwarmConfig,
-    SwarmEvent, USER,
+    SwarmEvent, GOAL_MAX_ATTEMPTS, USER,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -741,6 +741,56 @@ async fn an_agent_cancelled_in_wait_stops_and_its_child_stays_quiet() {
         }
     }
     assert!(mail.is_empty(), "{mail:?}");
+}
+
+#[tokio::test]
+async fn a_goal_the_judge_keeps_rejecting_ends_the_turn_after_the_attempt_cap() {
+    use strands_agents::plugins::vended::{GoalLoop, ValidationOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let attempts: Vec<MockResponse> = (1..=GOAL_MAX_ATTEMPTS)
+        .map(|i| say(&format!("attempt {i}")))
+        .collect();
+    let model = MockMessageModel::shared(attempts);
+    let factory: AgentFactory = {
+        let model = model.clone();
+        Arc::new(move |spec: AgentSpec| {
+            let model = model.clone();
+            Box::pin(async move {
+                let never = GoalLoop::sync_validator(|_| Ok(ValidationOutcome::failed("not yet")));
+                Agent::builder()
+                    .id(spec.id)
+                    .model(model)
+                    .system_prompt(spec.instructions)
+                    .tools(spec.tools)
+                    .plugin(strands_swarm::bounded_goal(never))
+                    .no_sandbox()
+                    .build()
+            })
+        })
+    };
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, dir.path()));
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "impossible".into(),
+                goal: Some("impossible".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let last = format!("attempt {GOAL_MAX_ATTEMPTS}");
+    assert_eq!(reply_to(&mut events, USER).await, last);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(model.calls().len(), GOAL_MAX_ATTEMPTS);
+    assert_eq!(swarm.agent("a1").unwrap().status, AgentStatus::Idle);
+    let system = format!("{:?}", model.calls()[0].1.system_prompt);
+    assert!(
+        system.contains(&format!("After {GOAL_MAX_ATTEMPTS} rejected attempts")),
+        "{system}"
+    );
 }
 
 fn git(dir: &Path, args: &[&str]) {
