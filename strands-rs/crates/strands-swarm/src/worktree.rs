@@ -54,10 +54,28 @@ fn same_subdir(dir: &Path, toplevel: &Path, base: &Path) -> PathBuf {
     }
 }
 
+/// Variables that point git at a repository. Inherited (from a `git rebase --exec` or a hook,
+/// say), they would make `git -C <dir>` act on that repository instead of `<dir>`'s.
+pub const GIT_LOCATION_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+];
+
+/// `git -C <dir>`, blind to [`GIT_LOCATION_VARS`].
+pub(crate) fn git_in(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir);
+    for var in GIT_LOCATION_VARS {
+        command.env_remove(var);
+    }
+    command
+}
+
 async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let output = git_in(cwd)
         .args(args)
         .output()
         .await
@@ -76,6 +94,21 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_ignores_inherited_repository_variables() {
+        let command = git_in(Path::new("/repo"));
+        let removed: Vec<_> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(removed.len(), GIT_LOCATION_VARS.len());
+        assert!(GIT_LOCATION_VARS
+            .iter()
+            .all(|var| removed.iter().any(|r| r == var)));
+    }
 
     #[test]
     fn the_cwd_mirrors_the_subdirectory_without_a_trailing_slash() {

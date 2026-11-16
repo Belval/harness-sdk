@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
-use tokio::process::Command;
 
 /// What collecting one agent did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -238,9 +237,7 @@ pub fn human(bytes: u64) -> String {
 }
 
 async fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let output = crate::worktree::git_in(cwd)
         .args(args)
         .output()
         .await
@@ -260,10 +257,17 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn std_git(dir: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(dir);
+        for var in crate::worktree::GIT_LOCATION_VARS {
+            command.env_remove(var);
+        }
+        command
+    }
+
     fn run(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let status = std_git(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(args)
             .status()
@@ -301,9 +305,7 @@ mod tests {
     }
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
+        std_git(repo)
             .args(["rev-parse", "--verify", "--quiet", branch])
             .stdout(std::process::Stdio::null())
             .status()

@@ -864,13 +864,19 @@ async fn a_failing_goal_agent_backs_off_and_reports_a_streak_once() {
     );
 }
 
+/// `git -C dir`, blind to repository variables inherited from e.g. `git rebase --exec`, which
+/// would otherwise point these commands at the repository running the tests.
+fn git_in(dir: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(dir);
+    for var in strands_swarm::worktree::GIT_LOCATION_VARS {
+        command.env_remove(var);
+    }
+    command
+}
+
 fn git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .status()
-        .unwrap();
+    let status = git_in(dir).args(args).status().unwrap();
     assert!(status.success(), "git {args:?}");
 }
 
@@ -1732,9 +1738,7 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    git_in(repo)
         .args(["rev-parse", "--verify", "--quiet", branch])
         .stdout(std::process::Stdio::null())
         .status()
