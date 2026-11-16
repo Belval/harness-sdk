@@ -126,8 +126,18 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Char('c') if ctrl => app.quit = true,
-        KeyCode::Char(c) => app.input.push(c),
-        KeyCode::Backspace => drop(app.input.pop()),
+        KeyCode::Char(c) => {
+            app.input.push(c);
+            app.completion = 0;
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+            app.completion = 0;
+        }
+        KeyCode::Tab => drop(app.complete()),
+        KeyCode::Up | KeyCode::Down if !app.completions().is_empty() => {
+            app.move_completion(if key.code == KeyCode::Up { -1 } else { 1 })
+        }
         KeyCode::Up => app.select_by(-1),
         KeyCode::Down => app.select_by(1),
         KeyCode::PageUp => app.scroll = app.scroll.saturating_add(10),
@@ -138,6 +148,8 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
         KeyCode::F(3) => app.toggle_cancelled(),
         KeyCode::Left if ctrl || alt => app.resize_tree(-TREE_STEP),
         KeyCode::Right if ctrl || alt => app.resize_tree(TREE_STEP),
+        // Enter on a partly typed command picks it from the popup instead of sending it.
+        KeyCode::Enter if !app.input_is_command() && app.complete() => {}
         KeyCode::Enter => {
             let line = std::mem::take(&mut app.input);
             return parse_command(&line, app.selected_id().is_some());

@@ -192,7 +192,49 @@ pub struct App {
     pub tree_adjust: i16,
     /// Show cancelled agents in the tree (hidden by default).
     pub show_cancelled: bool,
+    /// Highlighted entry of the slash-command popup.
+    pub completion: usize,
 }
+
+/// A slash command, for the popup that opens when the input starts with `/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashCommand {
+    /// The command, e.g. `/new`.
+    pub name: &'static str,
+    /// Argument synopsis; empty when it takes none.
+    pub args: &'static str,
+    /// One-line help.
+    pub help: &'static str,
+}
+
+/// Every slash command, in popup order.
+pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/new",
+        args: "<task>",
+        help: "start a new root agent",
+    },
+    SlashCommand {
+        name: "/goal",
+        args: "<goal>",
+        help: "start a root agent that works until the goal is met",
+    },
+    SlashCommand {
+        name: "/model",
+        args: "[<id>|default]",
+        help: "show or switch the selected agent's model",
+    },
+    SlashCommand {
+        name: "/cancel",
+        args: "",
+        help: "cancel the selected agent and its children",
+    },
+    SlashCommand {
+        name: "/quit",
+        args: "",
+        help: "quit (the run is saved)",
+    },
+];
 
 impl App {
     /// Fold one swarm event into the state.
@@ -380,6 +422,48 @@ impl App {
         self.agents.values().fold((0, 0), |(i, o), view| {
             (i + view.input_tokens, o + view.output_tokens)
         })
+    }
+
+    /// Slash commands matching the input while the command word is being typed; empty (popup
+    /// closed) otherwise.
+    pub fn completions(&self) -> Vec<&'static SlashCommand> {
+        let word = self.input.as_str();
+        if !word.starts_with('/') || word.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.name.starts_with(word))
+            .collect()
+    }
+
+    /// Move the popup highlight, wrapping around.
+    pub fn move_completion(&mut self, delta: isize) {
+        let len = self.completions().len();
+        if len > 0 {
+            let current = self.completion.min(len - 1) as isize;
+            self.completion = (current + delta).rem_euclid(len as isize) as usize;
+        }
+    }
+
+    /// Replace the input with the highlighted command (plus a space when it takes arguments).
+    /// Returns `false` when the popup is closed.
+    pub fn complete(&mut self) -> bool {
+        let completions = self.completions();
+        let Some(command) = completions.get(self.completion.min(completions.len().saturating_sub(1))) else {
+            return false;
+        };
+        self.input = match command.args.is_empty() {
+            true => command.name.to_owned(),
+            false => format!("{} ", command.name),
+        };
+        self.completion = 0;
+        true
+    }
+
+    /// Whether the input is exactly a complete command name, so Enter should run it.
+    pub fn input_is_command(&self) -> bool {
+        SLASH_COMMANDS.iter().any(|command| command.name == self.input)
     }
 }
 
@@ -793,5 +877,31 @@ mod tests {
             Some(Command::SetModel(None))
         );
         assert_eq!(parse_command("  ", true), None);
+    }
+
+    #[test]
+    fn the_slash_popup_filters_moves_and_completes() {
+        let mut app = App {
+            input: "/".into(),
+            ..Default::default()
+        };
+        assert_eq!(app.completions().len(), SLASH_COMMANDS.len());
+        app.move_completion(-1);
+        assert_eq!(app.completions()[app.completion].name, "/quit");
+
+        app.input = "/mo".into();
+        app.completion = 0;
+        let names: Vec<_> = app.completions().iter().map(|c| c.name).collect();
+        assert_eq!(names, ["/model"]);
+        assert!(!app.input_is_command());
+        assert!(app.complete());
+        assert_eq!(app.input, "/model ");
+        assert!(app.completions().is_empty(), "closes once arguments start");
+        assert!(!app.complete());
+
+        app.input = "/cancel".into();
+        assert!(app.input_is_command());
+        app.input = "hello".into();
+        assert!(app.completions().is_empty());
     }
 }

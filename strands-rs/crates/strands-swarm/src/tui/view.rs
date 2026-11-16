@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::app::{AgentView, App, LogEntry};
@@ -12,8 +12,8 @@ use crate::runtime::{AgentStatus, USER};
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Narrowest agent tree; shrinking it further hides it.
 const MIN_TREE: usize = 10;
-const HELP: &str = "enter send · /new <task> · /goal <goal> · /model [<id>|default] · /cancel · ↑↓ select · \
-     pgup/pgdn scroll · ctrl-←→ tree width · f2 plain text · f3 cancelled · ctrl-c quit";
+const HELP: &str = "enter send · / commands · ↑↓ select · pgup/pgdn scroll · ctrl-←→ tree width · \
+     f2 plain text · f3 cancelled · ctrl-c quit";
 
 /// Draw the whole screen. `tick` animates spinners.
 pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
@@ -33,6 +33,7 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
     }
     draw_log(frame, log, app, tick);
     draw_input(frame, input, app);
+    draw_completions(frame, input, app);
     let footer_text = app.notice.clone().unwrap_or_else(|| HELP.to_owned());
     frame.render_widget(Paragraph::new(footer_text).dim(), footer);
 }
@@ -263,6 +264,37 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(1)), area.y + 1));
 }
 
+/// The slash-command popup, just above the input box.
+fn draw_completions(frame: &mut Frame, input: Rect, app: &App) {
+    let completions = app.completions();
+    if completions.is_empty() {
+        return;
+    }
+    let height = (completions.len() as u16 + 2).min(input.y);
+    let width = input.width.min(72);
+    let area = Rect::new(input.x, input.y - height, width, height);
+    let items: Vec<ListItem> = completions
+        .iter()
+        .map(|command| {
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{} ", command.name), Style::new().bold()),
+                Span::raw(format!("{:<16}", command.args)),
+                Span::styled(command.help, Style::new().dim()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" commands · tab/enter pick "),
+        )
+        .highlight_style(Style::new().reversed());
+    let mut state = ListState::default().with_selected(Some(app.completion.min(completions.len() - 1)));
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 fn compact(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
@@ -291,5 +323,24 @@ mod tests {
         assert_eq!(user[0].to_string(), "▶ you · read ✓");
         assert_eq!(user[0].style.fg, Some(Color::Cyan));
         assert_eq!(agent[0].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn typing_a_slash_shows_the_matching_commands_above_the_input() {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        let app = App {
+            input: "/c".into(),
+            ..Default::default()
+        };
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("/cancel"), "{screen}");
+        assert!(!screen.contains("/model"), "{screen}");
     }
 }
