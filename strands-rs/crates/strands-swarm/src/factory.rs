@@ -3,6 +3,13 @@
 
 use std::sync::Arc;
 
+use strands_agents::context_manager::strategies::{
+    Offload, OffloadConditions, OffloadTarget, TruncateConfig,
+};
+use strands_agents::context_manager::{
+    ContextManagerConfig, ContextManagerOption, StashOption, AGENTIC_TRUNCATE_THRESHOLD,
+    AUTO_SUMMARIZE_UTILIZATION,
+};
 use strands_agents::plugins::vended::GoalLoop;
 use strands_agents::sandbox::LocalSandbox;
 use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
@@ -20,6 +27,9 @@ use crate::runtime::{AgentFactory, AgentSpec};
 /// `subagent` is replaced by the swarm tools; `web_search` fails construction on models without
 /// native search (every Bedrock model), so it is opt-in through MCP instead.
 const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search"];
+
+/// Preview kept in context when a large tool result is offloaded to the stash.
+const TRUNCATE_PREVIEW_TOKENS: usize = 2_000;
 
 /// Settings shared by every agent the factory builds.
 #[derive(Clone, Default)]
@@ -61,6 +71,33 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
     )?)))
 }
 
+/// The `auto` pipeline with coding-sized limits: the preset offloads any tool result over 1,500
+/// tokens, which stashes most file reads and command outputs and costs a retrieval call each.
+/// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
+/// still summarize old turns near the context limit.
+fn context_manager() -> ContextManagerOption {
+    let truncate = Offload::truncate(
+        OffloadTarget::ToolResults,
+        TruncateConfig {
+            preview_tokens: Some(TRUNCATE_PREVIEW_TOKENS),
+            preview: None,
+        },
+    )
+    .when(OffloadConditions {
+        threshold: Some(AGENTIC_TRUNCATE_THRESHOLD),
+        ..Default::default()
+    });
+    let summarize = Offload::summarize(OffloadTarget::All).when(OffloadConditions {
+        utilization: Some(AUTO_SUMMARIZE_UTILIZATION),
+        preserve_recent: Some(4.0),
+        ..Default::default()
+    });
+    ContextManagerOption::Config(ContextManagerConfig {
+        strategies: Some(vec![Arc::new(truncate), Arc::new(summarize)]),
+        stash: StashOption::Enabled,
+    })
+}
+
 fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<HarnessAgentOptions> {
     let session = match &spec.session_dir {
         Some(dir) => agent_session(dir, &spec.id)?,
@@ -94,8 +131,58 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         sandbox: SandboxOption::Instance(Arc::new(LocalSandbox::with_base_dir(spec.cwd))),
         session,
         memory: MemoryOption::Off,
+        context_manager: context_manager(),
         id: Some(spec.id),
         name: spec.name,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use strands_agents::context_manager::ContextManager;
+    use strands_agents::testing::MockMessageModel;
+    use strands_agents::types::{
+        ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolUseBlock,
+    };
+    use strands_agents::Agent;
+
+    fn exchange(id: &str, chars: usize) -> [Message; 2] {
+        let call = ToolUseBlock {
+            tool_use_id: id.to_owned(),
+            name: "shell".to_owned(),
+            input: serde_json::json!({}),
+            reasoning_signature: None,
+        };
+        let result = ToolResultBlock::success(id, vec![ToolResultContent::Text("x".repeat(chars))]);
+        [
+            Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)]),
+            Message::new(Role::User, vec![ContentBlock::ToolResult(result)]),
+        ]
+    }
+
+    fn result_len(message: &Message) -> usize {
+        message.tool_results().next().unwrap().text().chars().count()
+    }
+
+    #[tokio::test]
+    async fn keeps_coding_sized_tool_results_inline_and_offloads_huge_ones() {
+        let agent = Agent::builder()
+            .model(Arc::new(MockMessageModel::new(Vec::new())))
+            .build()
+            .unwrap();
+        let manager = ContextManager::from(context_manager()).unwrap();
+        let mut messages = vec![Message::user("start")];
+        messages.extend(exchange("file-read", 16_000));
+        messages.extend(exchange("huge-log", 200_000));
+
+        manager
+            .run_strategies_on(&agent, &mut messages, Some(0), false)
+            .await
+            .unwrap();
+
+        assert_eq!(result_len(&messages[2]), 16_000);
+        assert!(result_len(&messages[4]) < 20_000);
+    }
 }
