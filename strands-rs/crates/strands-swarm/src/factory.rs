@@ -24,6 +24,7 @@ use strands_harness::{
 
 use crate::catalog::ToolCatalog;
 use crate::compaction::{CompactAt, DEFAULT_COMPACT_AT};
+use crate::pruning::DropOldReasoning;
 use crate::runtime::{AgentFactory, AgentSpec, ModelResolver};
 use crate::skills::{skills_prompt, skills_tool};
 
@@ -131,7 +132,8 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// The `auto` pipeline with coding-sized limits: the preset offloads any tool result over 1,500
 /// tokens, which stashes most file reads and command outputs and costs a retrieval call each.
 /// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
-/// summarize old turns at `compact_at` tokens (see [`CompactAt`]).
+/// summarize old turns at `compact_at` tokens (see [`CompactAt`]). Earlier turns' reasoning is
+/// dropped first (see [`DropOldReasoning`]).
 fn context_manager(compact_at: u64) -> ContextManagerOption {
     let truncate = Offload::truncate(
         OffloadTarget::ToolResults,
@@ -152,7 +154,11 @@ fn context_manager(compact_at: u64) -> ContextManagerOption {
     });
     let summarize = CompactAt::new(Arc::new(summarize), compact_at);
     ContextManagerOption::Config(ContextManagerConfig {
-        strategies: Some(vec![Arc::new(truncate), Arc::new(summarize)]),
+        strategies: Some(vec![
+            Arc::new(DropOldReasoning),
+            Arc::new(truncate),
+            Arc::new(summarize),
+        ]),
         stash: StashOption::Enabled,
     })
 }

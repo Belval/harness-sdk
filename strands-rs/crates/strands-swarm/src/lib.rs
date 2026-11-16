@@ -22,6 +22,7 @@ pub mod journal;
 pub mod mcp;
 pub mod memory;
 pub mod names;
+pub mod pruning;
 pub mod runtime;
 pub mod schedule;
 pub mod selftest;

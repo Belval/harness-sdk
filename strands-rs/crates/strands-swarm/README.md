@@ -76,6 +76,9 @@ input/output tokens and how close its last model call came to the compaction poi
 (the log notes it at 90%). The compaction point is `--compact-at` (default `200k`) or 85% of the
 model's context window, whichever is smaller, so agents on 1M-token models do not carry ~850k
 tokens per call; it follows the window on a `/model` switch.
+Reasoning (thinking text and signatures) is dropped from turns before the current one, which
+models that keep prior thinking would otherwise bill as input on every call; the turn in progress
+keeps it, as Anthropic requires within a tool-use loop.
 The header totals the swarm's tokens as `in 84.8M (97% cached) · out 291k`: input counts cache reads
 and writes (the budget does too), and the share read from the prompt cache is shown beside it, as
 in each agent's log title.
