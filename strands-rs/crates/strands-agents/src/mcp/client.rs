@@ -1,5 +1,6 @@
 //! [`McpClient`] — connect to an MCP server and expose its tools (`strands-ts/src/mcp/client.ts`).
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use indexmap::IndexMap;
@@ -36,6 +37,9 @@ pub enum McpConnectionState {
 pub struct LoadOptions {
     /// Swallow per-server connect/list failures instead of failing the whole load.
     pub continue_on_error: bool,
+    /// Append each stdio server's stderr to `<dir>/mcp-<name>.log` (the directory is created)
+    /// instead of inheriting this process's stderr. Useful when stderr is a terminal UI.
+    pub stderr_dir: Option<PathBuf>,
 }
 
 /// Tool naming/filtering options for [`McpClient::load_servers`] and
@@ -76,6 +80,19 @@ impl CompiledFilters {
     }
 }
 
+/// Open `path` for appending (creating it and its directory) as a child's stdio.
+fn open_log(path: &Path) -> std::io::Result<std::process::Stdio> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    Ok(file.into())
+}
+
 /// Patterns are matched from the start of the name, like TS `new RegExp(p)` + `^`-anchored test.
 fn compile_patterns(server: &str, key: &str, patterns: &[String]) -> Result<Vec<Regex>> {
     patterns
@@ -96,6 +113,8 @@ struct Inner {
     prefix: Option<String>,
     filters: Option<CompiledFilters>,
     continue_on_error: bool,
+    /// File a stdio server's stderr is appended to; `None` inherits ours.
+    stderr_log: Option<PathBuf>,
     state: RwLock<McpConnectionState>,
     service: AsyncMutex<Option<RunningService<RoleClient, Handler>>>,
     on_tools_changed: RwLock<Option<ToolsChangedCallback>>,
@@ -135,7 +154,15 @@ impl McpClient {
         config: McpServerConfig,
         prefix: Option<String>,
     ) -> Result<Self> {
-        let name = name.into();
+        Self::connect_inner(name.into(), config, prefix, None).await
+    }
+
+    async fn connect_inner(
+        name: String,
+        config: McpServerConfig,
+        prefix: Option<String>,
+        stderr_log: Option<PathBuf>,
+    ) -> Result<Self> {
         let config = config.interpolate_env()?;
         let transport = config.resolve()?;
         let filters = config
@@ -152,6 +179,7 @@ impl McpClient {
                 prefix: prefix.or(config.prefix),
                 filters,
                 continue_on_error,
+                stderr_log,
                 state: RwLock::new(McpConnectionState::Disconnected),
                 service: AsyncMutex::new(None),
                 on_tools_changed: RwLock::new(None),
@@ -195,7 +223,11 @@ impl McpClient {
             if config.tool_filters.is_none() {
                 config.tool_filters = list.tool_filters.clone();
             }
-            match Self::connect_named(name.clone(), config, prefix).await {
+            let stderr_log = load
+                .stderr_dir
+                .as_ref()
+                .map(|dir| dir.join(format!("mcp-{name}.log")));
+            match Self::connect_inner(name.clone(), config, prefix, stderr_log).await {
                 Ok(client) => clients.push(client),
                 Err(error) if load.continue_on_error => {
                     tracing::warn!(server = %name, %error, "skipping MCP server (continue_on_error)");
@@ -363,8 +395,14 @@ impl McpClient {
                 if let Some(cwd) = cwd {
                     cmd.current_dir(cwd);
                 }
-                let transport =
-                    rmcp::transport::TokioChildProcess::new(cmd).map_err(|e| self.connect_error(e))?;
+                let stderr = match &self.inner.stderr_log {
+                    Some(path) => open_log(path).map_err(|e| self.connect_error(e))?,
+                    None => std::process::Stdio::inherit(),
+                };
+                let (transport, _) = rmcp::transport::TokioChildProcess::builder(cmd)
+                    .stderr(stderr)
+                    .spawn()
+                    .map_err(|e| self.connect_error(e))?;
                 handler
                     .serve(transport)
                     .await
@@ -441,6 +479,7 @@ impl McpClient {
                 prefix: None,
                 filters: None,
                 continue_on_error: false,
+                stderr_log: None,
                 state: RwLock::new(McpConnectionState::Disconnected),
                 service: AsyncMutex::new(None),
                 on_tools_changed: RwLock::new(None),

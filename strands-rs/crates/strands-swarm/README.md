@@ -50,7 +50,9 @@ conversation.
 `--run NAME` makes the run persistent under `~/.local/state/strands-swarm/NAME`: the agent tree,
 unread messages and every conversation (saved after each message). Starting again with the same
 name resumes it. `--mcp-config` accepts any `mcp.json` (or `~/.claude.json`); the servers are
-connected once and shared by all agents. Agents start without MCP tools, so their specs are not sent
+connected once and shared by all agents. Under the TUI each server's stderr goes to
+`<run dir>/logs/mcp-<server>.log` (a temp directory without `--run`); `--headless` keeps it on the
+terminal. Agents start without MCP tools, so their specs are not sent
 on every model call: `find_tools` (whose description lists the servers and their tool counts)
 searches the catalog and enables tools by name for the calling agent, from its next model call on.
 Enabled tools are kept in the agent's session state and come back on resume. `--mcp-eager` registers

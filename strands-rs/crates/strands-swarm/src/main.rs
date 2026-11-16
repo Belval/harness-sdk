@@ -127,7 +127,14 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         skills.skills.len(),
         skills.shadowed.len()
     );
-    let mcp = load_shared_mcp(&cli.mcp_configs, &cli.mcp_deny).await?;
+    let run_dir = cli.run.as_deref().map(state::run_dir).transpose()?;
+    // Server logs would paint over the TUI; headless mode keeps them on our stderr.
+    let mcp_logs = match (&run_dir, cli.headless || cli.list_tools) {
+        (_, true) => None,
+        (Some(dir), false) => Some(dir.join("logs")),
+        (None, false) => Some(std::env::temp_dir().join(format!("strands-swarm-{}", std::process::id()))),
+    };
+    let mcp = load_shared_mcp(&cli.mcp_configs, &cli.mcp_deny, mcp_logs.as_deref()).await?;
     if !cli.mcp_configs.is_empty() {
         eprintln!(
             "strands-swarm: {} MCP servers, {} tools shared ({}), {} denied",
@@ -140,6 +147,9 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
             },
             mcp.denied.len()
         );
+        if let Some(dir) = &mcp_logs {
+            eprintln!("strands-swarm: MCP server logs in {}", dir.display());
+        }
     }
     if cli.list_tools {
         mcp.tools
@@ -167,14 +177,13 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.max_concurrent_calls = cli.max_concurrent_calls;
     config.budget_tokens = cli.budget_tokens;
     config.cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
-    let saved = match &cli.run {
-        Some(name) => {
-            let dir = state::run_dir(name)?;
+    let saved = match (&cli.run, run_dir) {
+        (Some(name), Some(dir)) => {
             config.run_id = name.clone();
             config.state_dir = Some(dir.clone());
             state::load(&dir).await?
         }
-        None => None,
+        _ => None,
     };
     let resumed = saved.is_some();
     let (swarm, events) = match saved {

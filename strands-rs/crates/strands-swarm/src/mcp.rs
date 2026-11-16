@@ -32,8 +32,13 @@ impl SharedMcp {
 
 /// Connect every server in each `mcp.json`-shaped file (a Claude Code `~/.claude.json` works too:
 /// only its `mcpServers` key is read). Servers that fail to connect are skipped with a warning.
-/// Tools whose prefixed name matches any `deny` pattern are dropped.
-pub async fn load_shared_mcp(configs: &[impl AsRef<Path>], deny: &[String]) -> Result<SharedMcp> {
+/// Tools whose prefixed name matches any `deny` pattern are dropped. With `stderr_dir`, each
+/// stdio server's stderr goes to `<stderr_dir>/mcp-<server>.log` instead of ours.
+pub async fn load_shared_mcp(
+    configs: &[impl AsRef<Path>],
+    deny: &[String],
+    stderr_dir: Option<&Path>,
+) -> Result<SharedMcp> {
     let deny = deny
         .iter()
         .map(|pattern| {
@@ -49,6 +54,7 @@ pub async fn load_shared_mcp(configs: &[impl AsRef<Path>], deny: &[String]) -> R
     for config in configs {
         let mut load = LoadOptions::default();
         load.continue_on_error = true;
+        load.stderr_dir = stderr_dir.map(Path::to_path_buf);
         let mut list = ListOptions::default();
         list.prefix_with_server_name = true;
         let clients = McpClient::load_servers(config.as_ref(), load, list).await?;

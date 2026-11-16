@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use strands_agents::mcp::{McpClient, McpServerConfig};
+use strands_agents::mcp::{IndexMap, ListOptions, LoadOptions, McpClient, McpServerConfig};
 use strands_agents::test_support::{MockMessageModel, MockResponse};
 use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
 use strands_agents::{Agent, StopReason};
@@ -32,6 +32,32 @@ async fn lists_and_calls_a_tool_on_a_real_stdio_server() {
     let text = serde_json::to_string(&result.content).unwrap();
     assert!(text.contains("hello mcp"), "{text}");
     client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn load_servers_appends_server_stderr_to_a_log_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let logs = dir.path().join("logs");
+    let mut servers = IndexMap::new();
+    servers.insert(
+        "echo".to_owned(),
+        McpServerConfig::stdio(
+            env!("CARGO_BIN_EXE_mcp_echo_server"),
+            ["--stderr", "hello from stderr"],
+        ),
+    );
+    let mut load = LoadOptions::default();
+    load.stderr_dir = Some(logs.clone());
+    for _ in 0..2 {
+        let clients = McpClient::load_servers(servers.clone(), load.clone(), ListOptions::default())
+            .await
+            .unwrap();
+        // A round trip proves the server got past its startup stderr write.
+        assert!(!clients[0].list_tools().await.unwrap().is_empty());
+        clients[0].disconnect().await.unwrap();
+    }
+    let log = std::fs::read_to_string(logs.join("mcp-echo.log")).unwrap();
+    assert_eq!(log, "hello from stderr\nhello from stderr\n");
 }
 
 #[tokio::test]
