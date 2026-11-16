@@ -74,6 +74,8 @@ pub struct AgentView {
     pub log: VecDeque<LogEntry>,
     /// Log entries the user has not looked at.
     pub unseen: bool,
+    /// Waiting for a free model-call slot.
+    pub queued: bool,
 }
 
 impl AgentView {
@@ -109,6 +111,7 @@ impl AgentView {
     pub fn activity(&self) -> Option<String> {
         match self.status {
             AgentStatus::Starting => return Some("starting…".to_owned()),
+            AgentStatus::Running if self.queued => return Some("queued for a model slot…".to_owned()),
             AgentStatus::Running => {}
             _ => return None,
         }
@@ -271,6 +274,7 @@ impl App {
                     model: None,
                     log: VecDeque::from([LogEntry::Task(task)]),
                     unseen: true,
+                    queued: false,
                 };
                 self.agents.insert(id, view);
             }
@@ -288,6 +292,7 @@ impl App {
             SwarmEvent::Mail { to, mail } => self.apply_mail(&to, mail),
             SwarmEvent::Model { id, model } => self.with(&id, |view| view.model = Some(model)),
             SwarmEvent::MailRead { id } => self.with(&id, AgentView::mark_read),
+            SwarmEvent::ModelQueued { id, queued } => self.with(&id, |view| view.queued = queued),
             SwarmEvent::History {
                 id,
                 messages,
@@ -708,6 +713,20 @@ mod tests {
             status: AgentStatus::Idle,
         });
         assert_eq!(activity(&app), None);
+        app.apply(SwarmEvent::Status {
+            id: "a1".into(),
+            status: AgentStatus::Running,
+        });
+        app.apply(SwarmEvent::ModelQueued {
+            id: "a1".into(),
+            queued: true,
+        });
+        assert_eq!(activity(&app).as_deref(), Some("queued for a model slot…"));
+        app.apply(SwarmEvent::ModelQueued {
+            id: "a1".into(),
+            queued: false,
+        });
+        assert_eq!(activity(&app).as_deref(), Some("thinking…"));
     }
 
     #[test]

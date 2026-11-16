@@ -1077,3 +1077,93 @@ async fn a_persistent_run_journals_user_traffic_and_lifecycle_events() {
     );
     assert!(names.iter().any(|n| n == "\"resume\""), "{names:?}");
 }
+
+/// Delegates to a mock after a delay, recording how many calls were in flight at once.
+struct SlowModel {
+    inner: MockMessageModel,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl strands_agents::models::Model for SlowModel {
+    fn model_id(&self) -> Option<String> {
+        Some("slow".into())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        options: &'a strands_agents::models::StreamOptions,
+    ) -> futures::stream::BoxStream<'a, strands_agents::Result<strands_agents::models::ModelStreamEvent>>
+    {
+        use futures::StreamExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        let start = futures::stream::once(async move {
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        let end = futures::stream::once(async move {
+            self.in_flight.fetch_sub(1, SeqCst);
+        });
+        let skip = |()| async { None };
+        Box::pin(
+            start
+                .filter_map(skip)
+                .chain(self.inner.stream(messages, options))
+                .chain(end.filter_map(skip)),
+        )
+    }
+}
+
+#[tokio::test]
+async fn model_calls_beyond_the_swarm_cap_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory: AgentFactory = {
+        let (in_flight, peak) = (in_flight.clone(), peak.clone());
+        Arc::new(move |spec: AgentSpec| {
+            let model = SlowModel {
+                inner: MockMessageModel::new(vec![say("hi")]),
+                in_flight: in_flight.clone(),
+                peak: peak.clone(),
+            };
+            Box::pin(async move {
+                let agent = Agent::builder()
+                    .id(spec.id)
+                    .model(model)
+                    .system_prompt(spec.instructions)
+                    .tools(spec.tools)
+                    .no_sandbox()
+                    .build()?;
+                Ok(agent)
+            })
+        })
+    };
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.max_concurrent_calls = 1;
+    let (swarm, mut events) = Swarm::new(config);
+    for task in ["one", "two", "three"] {
+        let request = SpawnRequest {
+            task: task.into(),
+            ..Default::default()
+        };
+        swarm.spawn(USER, request).await.unwrap();
+    }
+    let (mut replies, mut queued) = (0, 0);
+    let collect = async {
+        while replies < 3 {
+            match events.recv().await.expect("event stream closed") {
+                SwarmEvent::Mail { to, mail } if to == USER && mail.kind == "reply" => replies += 1,
+                SwarmEvent::ModelQueued { queued: true, .. } => queued += 1,
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), collect)
+        .await
+        .unwrap();
+    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(queued >= 1, "no agent was queued");
+}

@@ -14,13 +14,14 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use strands_agents::agent::{AgentStreamEvent, InvokeInput, InvokeOptions};
 use strands_agents::hooks::AfterToolCallEvent;
+use strands_agents::middleware::{wrap_fn, InvokeModelStage};
 use strands_agents::models::streaming::{ContentBlockDelta, ModelStreamEvent};
 use strands_agents::tools::ToolRef;
 use strands_agents::types::{
     ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolResultStatus, Usage,
 };
 use strands_agents::{Agent, Error, Model, Result};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::journal::Journal;
@@ -142,6 +143,9 @@ pub struct SwarmConfig {
     pub cwd: PathBuf,
     /// Upper bound on live (non-cancelled) agents, root included.
     pub max_agents: usize,
+    /// Upper bound on model calls in flight across the swarm; further calls queue. `0` means no
+    /// limit.
+    pub max_concurrent_calls: usize,
     /// Run id, used in worktree paths and branch names.
     pub run_id: String,
     /// Run directory for state and sessions; `None` keeps everything in memory.
@@ -155,12 +159,13 @@ pub struct SwarmConfig {
 }
 
 impl SwarmConfig {
-    /// Defaults: 16 live agents and a random 8-character run id.
+    /// Defaults: 16 live agents, 8 concurrent model calls and a random 8-character run id.
     pub fn new(factory: AgentFactory, cwd: impl Into<PathBuf>) -> Self {
         Self {
             factory,
             cwd: cwd.into(),
             max_agents: 16,
+            max_concurrent_calls: 8,
             run_id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
             state_dir: None,
             cargo_target_dir: None,
@@ -278,6 +283,14 @@ pub enum SwarmEvent {
         /// Output tokens so far.
         output_tokens: u64,
     },
+    /// An agent started or stopped waiting for a free model-call slot
+    /// ([`SwarmConfig::max_concurrent_calls`]).
+    ModelQueued {
+        /// Id.
+        id: String,
+        /// `true` while it waits.
+        queued: bool,
+    },
     /// An agent took all of its unread mail, as a new turn or appended to a tool result. Every
     /// [`SwarmEvent::Mail`] to it that came before has now been read.
     MailRead {
@@ -373,6 +386,7 @@ struct Inner {
     shutting_down: AtomicBool,
     actors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     reload: CancellationToken,
+    model_calls: Option<Arc<Semaphore>>,
 }
 
 /// Handle to a running swarm. Cheap to clone.
@@ -396,6 +410,8 @@ impl Swarm {
             shutting_down: AtomicBool::new(false),
             actors: Mutex::new(Vec::new()),
             reload: CancellationToken::new(),
+            model_calls: (config.max_concurrent_calls > 0)
+                .then(|| Arc::new(Semaphore::new(config.max_concurrent_calls))),
             config,
         };
         (
@@ -952,6 +968,7 @@ impl Swarm {
             Err(error) => return self.fail_construction(&node, error),
         };
         self.install_mail_hook(&agent, &node.id);
+        self.install_model_gate(&agent, &node);
         let _ = node.agent.set(agent.clone());
         self.emit_model(&node);
 
@@ -1086,6 +1103,38 @@ impl Swarm {
             input_tokens,
             output_tokens,
         });
+    }
+
+    /// Hold a swarm-wide permit for each model call, so a large swarm queues instead of tripping
+    /// provider throttling. Waiting is published as [`SwarmEvent::ModelQueued`].
+    fn install_model_gate(&self, agent: &Agent, node: &Node) {
+        let Some(permits) = self.inner.model_calls.clone() else {
+            return;
+        };
+        let swarm = self.clone();
+        let id = node.id.clone();
+        let cancel = node.cancel.clone();
+        agent.add_middleware::<InvokeModelStage>(wrap_fn(move |context, events, next| {
+            let (swarm, id, cancel, permits) = (swarm.clone(), id.clone(), cancel.clone(), permits.clone());
+            async move {
+                let _permit = match permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        swarm.emit(SwarmEvent::ModelQueued {
+                            id: id.clone(),
+                            queued: true,
+                        });
+                        let acquired = tokio::select! {
+                            permit = permits.acquire_owned() => permit.ok(),
+                            _ = cancel.cancelled() => None,
+                        };
+                        swarm.emit(SwarmEvent::ModelQueued { id, queued: false });
+                        acquired.ok_or(Error::Cancelled)?
+                    }
+                };
+                next.run(context, &events).await
+            }
+        }));
     }
 
     /// Deliver mail that arrives mid-turn by appending it to the agent's next tool result.

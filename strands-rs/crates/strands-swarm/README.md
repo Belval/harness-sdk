@@ -24,8 +24,12 @@ from its task; ids and names work interchangeably. Each agent's final reply per 
 cargo build --release -p strands-swarm
 strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--mcp-config mcp.json]... [--mcp-deny REGEX]...
               [--mcp-eager] [--list-tools] [--skills-dir DIR]... [--no-default-skills] [--list-skills]
-              [--headless] [TASK]
+              [--max-agents N] [--max-concurrent-calls N] [--headless] [TASK]
 ```
+
+`--max-agents` (16) caps live agents; `--max-concurrent-calls` (8, `0` = unlimited) caps model calls in
+flight across the whole swarm, so a large swarm queues ("queued for a model slot…" in the log)
+instead of tripping provider throttling.
 
 TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/cancel`, Ctrl-C quits.
 Typing `/` opens a popup of the commands with one-line help, filtered as you type; ↑/↓ and

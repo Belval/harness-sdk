@@ -35,6 +35,9 @@ struct Cli {
     /// Maximum number of live agents, root included.
     #[arg(long, default_value_t = 16)]
     max_agents: usize,
+    /// Maximum number of model calls in flight across the swarm; more queue. 0 means no limit.
+    #[arg(long, default_value_t = 8)]
+    max_concurrent_calls: usize,
     /// File with extra instructions given to every agent.
     #[arg(long)]
     instructions: Option<PathBuf>,
@@ -157,6 +160,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     let mut config = SwarmConfig::new(harness_factory(options.clone()), cwd);
     config.models = Some(harness_model_resolver(options));
     config.max_agents = cli.max_agents;
+    config.max_concurrent_calls = cli.max_concurrent_calls;
     config.cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
     let saved = match &cli.run {
         Some(name) => {
@@ -267,6 +271,7 @@ fn print_event(event: &SwarmEvent) {
         SwarmEvent::Text { .. }
         | SwarmEvent::Usage { .. }
         | SwarmEvent::MailRead { .. }
+        | SwarmEvent::ModelQueued { .. }
         | SwarmEvent::History { .. } => {}
         SwarmEvent::Model { id, model } => eprintln!("[{id}] model {model}"),
         SwarmEvent::ToolStarted { id, name, summary } => eprintln!("[{id}] {name} {summary}"),

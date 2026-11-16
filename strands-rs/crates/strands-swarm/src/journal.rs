@@ -142,6 +142,7 @@ impl Journal {
             | SwarmEvent::Usage { .. }
             | SwarmEvent::Mail { .. }
             | SwarmEvent::MailRead { .. }
+            | SwarmEvent::ModelQueued { .. }
             | SwarmEvent::History { .. } => return,
         };
         self.event(name, fields);
