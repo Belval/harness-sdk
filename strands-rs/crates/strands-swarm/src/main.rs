@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -11,8 +12,8 @@ use strands_swarm::state;
 use strands_swarm::tui::Exit;
 use strands_swarm::RELOAD_EXIT_CODE;
 use strands_swarm::{
-    discover_skills, harness_factory, harness_model_resolver, load_shared_mcp, HarnessFactoryOptions, Skills,
-    SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
+    discover_skills, harness_factory, harness_model_resolver, load_shared_mcp, HarnessFactoryOptions, Memory,
+    Skills, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -45,6 +46,13 @@ struct Cli {
     /// File with extra instructions given to every agent.
     #[arg(long)]
     instructions: Option<PathBuf>,
+    /// The user's memory file, shown to every agent and written by `remember` / `/remember`
+    /// (default `~/.config/strands-swarm/memory.md`).
+    #[arg(long, conflicts_with = "no_memory")]
+    memory: Option<PathBuf>,
+    /// Run without the memory file and the `remember`/`forget` tools.
+    #[arg(long)]
+    no_memory: bool,
     /// Give the root agent a goal: a judge re-checks it after every turn and sends the agent back
     /// to work until it is met. Without a task, the goal is also the task.
     #[arg(long)]
@@ -205,6 +213,13 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
     config.budget_tokens = cli.budget_tokens;
+    if !cli.no_memory {
+        config.memory = cli
+            .memory
+            .clone()
+            .or_else(Memory::default_path)
+            .map(|path| Arc::new(Memory::new(path)));
+    }
     config.cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
     let saved = match (&cli.run, run_dir) {
         (Some(name), Some(dir)) => {

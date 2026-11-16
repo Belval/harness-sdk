@@ -304,6 +304,15 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             budget_notice(swarm)
         })
         .map_err(strands_agents::Error::other),
+        (Command::Remember(Some(text)), _) => swarm
+            .remember(&text)
+            .await
+            .map(|line| format!("remembered {line}")),
+        (Command::Remember(None), _) => Ok(memory_notice(swarm).await),
+        (Command::Forget(text), _) => swarm
+            .forget(&text)
+            .await
+            .map(|removed| format!("forgot {} line(s): {}", removed.len(), removed.join(" | "))),
         (Command::Gc, _) => {
             swarm.gc_in_background();
             Ok("gc: measuring and reclaiming in the background…".to_owned())
@@ -311,6 +320,21 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
         (_, None) => Ok("no agent selected".to_owned()),
     };
     app.notice = Some(outcome.unwrap_or_else(|error| format!("error: {error}")));
+}
+
+/// Where the memory file is and how many entries it holds.
+async fn memory_notice(swarm: &Swarm) -> String {
+    let Some(memory) = swarm.memory() else {
+        return "memory is off (--no-memory)".to_owned();
+    };
+    match memory.read().await {
+        Ok(text) => format!(
+            "memory: {} entries in {}",
+            text.lines().filter(|line| !line.trim().is_empty()).count(),
+            memory.path().display()
+        ),
+        Err(error) => format!("error: {error}"),
+    }
 }
 
 fn budget_notice(swarm: &Swarm) -> String {

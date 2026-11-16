@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::budget;
 use crate::gc::{self, Collected};
 use crate::journal::Journal;
+use crate::memory::Memory;
 use crate::names;
 use crate::selftest;
 use crate::state::{AgentState, MailState, Persister, SwarmState, SESSIONS_DIR};
@@ -168,6 +169,9 @@ pub struct SwarmConfig {
     /// Reclaim the disk of cancelled worktree agents ([`Swarm::gc`]). Off for a swarm that does
     /// not own its agents' directories, such as a self-test of a copied run.
     pub reclaim_disk: bool,
+    /// The user's memory file, shown to every agent and written by `remember`/`forget`; `None`
+    /// disables memory.
+    pub memory: Option<Arc<Memory>>,
 }
 
 impl SwarmConfig {
@@ -184,6 +188,7 @@ impl SwarmConfig {
             cargo_target_dir: None,
             models: None,
             reclaim_disk: true,
+            memory: None,
         }
     }
 }
@@ -633,6 +638,42 @@ impl Swarm {
             model: model.clone(),
         });
         model
+    }
+
+    /// The user's memory, when enabled.
+    pub fn memory(&self) -> Option<&Arc<Memory>> {
+        self.inner.config.memory.as_ref()
+    }
+
+    /// Add `text` to the user's memory as a bullet dated today. Every agent sees it from its next
+    /// turn on. Returns the line written.
+    pub async fn remember(&self, text: &str) -> Result<String> {
+        self.require_memory()?
+            .remember(text, &crate::journal::today())
+            .await
+    }
+
+    /// Drop every memory line containing `text` (case-insensitive). Returns the removed lines.
+    pub async fn forget(&self, text: &str) -> Result<Vec<String>> {
+        self.require_memory()?.forget(text).await
+    }
+
+    fn require_memory(&self) -> Result<&Arc<Memory>> {
+        self.memory()
+            .ok_or_else(|| Error::other("Memory is off (the swarm was started with --no-memory)."))
+    }
+
+    /// Put the memory file's current contents at the end of `agent`'s system prompt.
+    async fn refresh_memory(&self, agent: &Agent) {
+        let Some(memory) = self.memory() else {
+            return;
+        };
+        let section = memory.section().await;
+        let current = agent.system_prompt();
+        let updated = crate::memory::with_section(current.clone(), section.as_deref());
+        if updated != current {
+            agent.set_system_prompt(updated);
+        }
     }
 
     /// Stop every agent without recording them as cancelled, after saving the final state, so
@@ -1214,6 +1255,7 @@ impl Swarm {
     /// Run one turn; returns the error message when it failed (not when it was cancelled).
     async fn run_turn(&self, node: &Node, agent: &Agent, input: InvokeInput) -> Option<String> {
         self.set_status(node, AgentStatus::Running);
+        self.refresh_memory(agent).await;
         let options = InvokeOptions::default().with_cancel(node.cancel.clone());
         let mut stream = agent.stream_with(input, options);
         let mut reply = None;

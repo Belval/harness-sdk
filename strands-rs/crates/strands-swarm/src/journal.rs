@@ -248,6 +248,11 @@ pub fn read(dir: &Path) -> std::io::Result<Vec<JournalEntry>> {
     Ok(entries)
 }
 
+/// Today's UTC date, `YYYY-MM-DD`.
+pub(crate) fn today() -> String {
+    now()[..10].to_owned()
+}
+
 /// Now as RFC 3339 UTC with milliseconds.
 fn now() -> String {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();

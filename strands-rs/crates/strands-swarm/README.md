@@ -13,6 +13,7 @@ agent with six extra tools, and decides for itself whether and how to split the 
 | `reload_swarm` | Restart the whole swarm into a newly built binary; every agent resumes. |
 | `find_tools` | Only with MCP servers: search the shared MCP tools by keyword and enable some for the calling agent. |
 | `skills` | Only with skills: load a skill's full `SKILL.md` instructions, its location and its bundled files. |
+| `remember` / `forget` | Only with memory: add a dated entry to the user's memory file, or drop the lines matching a text. |
 
 Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else one derived
 from its task; ids and names work interchangeably. Each agent's final reply per turn goes to its parent. A `goal` (TUI `/goal`, CLI `--goal`, or on
@@ -24,8 +25,18 @@ from its task; ids and names work interchangeably. Each agent's final reply per 
 cargo build --release -p strands-swarm
 strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--mcp-config mcp.json]... [--mcp-deny REGEX]...
               [--mcp-eager] [--list-tools] [--skills-dir DIR]... [--no-default-skills] [--list-skills]
-              [--max-agents N] [--max-concurrent-calls N] [--headless] [--journal | --gc] [TASK]
+              [--max-agents N] [--max-concurrent-calls N] [--memory FILE | --no-memory]
+              [--headless] [--journal | --gc] [TASK]
 ```
+
+Memory: one Markdown file shared by every agent and every run, for things you ask the swarm to
+remember (default `~/.config/strands-swarm/memory.md`, `--memory FILE` elsewhere, `--no-memory` to
+turn it off). Each entry is a dated bullet; edit the file by hand as you like. Its newest ~4k tokens
+are appended to every agent's system prompt under "# Memory (things the user asked to remember)",
+re-read from disk at the start of each turn, so a change reaches running agents on their next turn
+(not mid-turn). Agents add entries with `remember` and drop them with `forget`; you use
+`/remember <text>`, `/forget <text>` and `/remember` (where the file is). Writes are serialized
+across the swarm and replace the file atomically.
 
 `--max-agents` (16) caps live agents; `--max-concurrent-calls` (8, `0` = unlimited) caps model calls in
 flight across the whole swarm, so a large swarm queues ("queued for a model slot…" in the log)

@@ -126,16 +126,69 @@ fn reload_tool(swarm: Swarm) -> ToolRef {
     Arc::new(tool)
 }
 
-/// The swarm tools bound to agent `id`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RememberInput {
+    /// The fact, preference or instruction to keep, as one self-contained sentence.
+    text: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ForgetInput {
+    /// Text identifying the entries to drop; every memory line containing it (case-insensitive)
+    /// is removed.
+    text: String,
+}
+
+const REMEMBER_DESCRIPTION: &str = concat!(
+    "Save something the user asked you to remember to the user's memory file, shared by every agent ",
+    "and every future run (shown under \"# Memory\" in the system prompt from the next turn on). Use it ",
+    "only for things the user wants kept, not for your own notes."
+);
+
+const FORGET_DESCRIPTION: &str =
+    "Remove outdated or wrong entries from the user's memory file: every line containing the text.";
+
+fn remember_tool(swarm: Swarm) -> ToolRef {
+    let tool = FunctionTool::builder("remember")
+        .description(REMEMBER_DESCRIPTION)
+        .typed_handler(move |input: RememberInput, _ctx: ToolContext| {
+            let swarm = swarm.clone();
+            async move {
+                let line = swarm.remember(&input.text).await?;
+                Result::Ok(format!("Remembered: {line}"))
+            }
+        });
+    Arc::new(tool)
+}
+
+fn forget_tool(swarm: Swarm) -> ToolRef {
+    let tool = FunctionTool::builder("forget")
+        .description(FORGET_DESCRIPTION)
+        .typed_handler(move |input: ForgetInput, _ctx: ToolContext| {
+            let swarm = swarm.clone();
+            async move {
+                let removed = swarm.forget(&input.text).await?;
+                Result::Ok(format!("Forgot:\n{}", removed.join("\n")))
+            }
+        });
+    Arc::new(tool)
+}
+
+/// The swarm tools bound to agent `id`; `remember` and `forget` only when memory is on.
 pub fn swarm_tools(swarm: Swarm, id: &str) -> Vec<ToolRef> {
-    vec![
+    let mut tools = vec![
         spawn_tool(swarm.clone(), id.to_owned()),
         send_tool(swarm.clone(), id.to_owned()),
         wait_tool(swarm.clone(), id.to_owned()),
         list_tool(swarm.clone()),
         cancel_tool(swarm.clone(), id.to_owned()),
-        reload_tool(swarm),
-    ]
+        reload_tool(swarm.clone()),
+    ];
+    if swarm.memory().is_some() {
+        tools.push(remember_tool(swarm.clone()));
+        tools.push(forget_tool(swarm));
+    }
+    tools
 }
 
 fn spawn_tool(swarm: Swarm, me: String) -> ToolRef {

@@ -1442,3 +1442,68 @@ async fn a_dirty_worktree_is_kept_until_gc_finds_it_clean_and_resume_collects_ca
     assert!(resumed.gc().await.iter().all(|c| c.is_empty()), "nothing left");
     resumed.shutdown().await;
 }
+
+fn system_prompt(model: &MockMessageModel, call: usize) -> String {
+    let (_, options) = &model.calls()[call];
+    options
+        .system_prompt
+        .as_ref()
+        .map(|prompt| prompt.text())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn memory_reaches_every_agent_and_updates_on_the_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.md");
+    std::fs::write(&path, "- 2026-01-01: the user likes short replies\n").unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("remember", "t1", json!({"text": "deploys happen on Fridays"})),
+            say("noted"),
+            say("again"),
+        ],
+    )]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.memory = Some(Arc::new(strands_swarm::Memory::new(&path)));
+    let (swarm, mut events) = Swarm::new(config);
+    let id = spawn_root(&swarm, "hello").await;
+    assert_eq!(reply_to(&mut events, USER).await, "noted");
+
+    let a1 = scripts.lock()["a1"].clone();
+    let first = system_prompt(&a1, 0);
+    assert!(
+        first.contains("# Memory (things the user asked to remember)"),
+        "{first}"
+    );
+    assert!(
+        first.contains("likes short replies") && !first.contains("Fridays"),
+        "{first}"
+    );
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains(": deploys happen on Fridays\n"));
+
+    swarm.remember("tabs, not spaces").await.unwrap();
+    swarm.send(USER, &id, "next").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "again");
+    let next = system_prompt(&a1, 2);
+    assert!(
+        next.contains("Fridays") && next.contains("tabs, not spaces"),
+        "{next}"
+    );
+    assert_eq!(next.matches("# Memory").count(), 1, "{next}");
+}
+
+#[tokio::test]
+async fn without_memory_there_are_no_memory_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(vec![("a1", vec![say("hi")])], dir.path());
+    spawn_root(&swarm, "hello").await;
+    assert_eq!(reply_to(&mut events, USER).await, "hi");
+    let a1 = scripts.lock()["a1"].clone();
+    let (_, options) = &a1.calls()[0];
+    assert!(!options.tool_specs.iter().any(|spec| spec.name == "remember"));
+    assert!(swarm.remember("x").await.is_err());
+}

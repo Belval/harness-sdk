@@ -242,6 +242,16 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "show, set or remove the swarm-wide token budget",
     },
     SlashCommand {
+        name: "/remember",
+        args: "[<text>]",
+        help: "add to the memory every agent sees, or show where it is",
+    },
+    SlashCommand {
+        name: "/forget",
+        args: "<text>",
+        help: "drop memory lines containing the text",
+    },
+    SlashCommand {
         name: "/cancel",
         args: "",
         help: "cancel the selected agent and its children",
@@ -556,6 +566,10 @@ pub enum Command {
     SetModel(Option<String>),
     /// Show the token budget, or set it (`off` lifts it).
     Budget(Option<String>),
+    /// Add to the user's memory, or show it (`None`).
+    Remember(Option<String>),
+    /// Drop memory lines containing the text.
+    Forget(String),
     /// Reclaim the disk of cancelled worktree agents.
     Gc,
     /// Quit.
@@ -574,6 +588,12 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     if let Some(task) = line.strip_prefix("/new ") {
         return Some(Command::NewRoot(task.trim().to_owned()));
     }
+    if let Some(text) = line.strip_prefix("/remember ") {
+        return Some(Command::Remember(Some(text.trim().to_owned())));
+    }
+    if let Some(text) = line.strip_prefix("/forget ") {
+        return Some(Command::Forget(text.trim().to_owned()));
+    }
     if let Some(budget) = line.strip_prefix("/budget ") {
         return Some(Command::Budget(Some(budget.trim().to_owned())));
     }
@@ -587,6 +607,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         "/cancel" => return Some(Command::Cancel),
         "/model" => return Some(Command::ShowModel),
         "/budget" => return Some(Command::Budget(None)),
+        "/remember" => return Some(Command::Remember(None)),
         "/gc" => return Some(Command::Gc),
         "/quit" | "/q" => return Some(Command::Quit),
         _ => {}
@@ -928,6 +949,15 @@ mod tests {
         );
         assert_eq!(parse_command("/cancel", true), Some(Command::Cancel));
         assert_eq!(parse_command("/budget", true), Some(Command::Budget(None)));
+        assert_eq!(parse_command("/remember", true), Some(Command::Remember(None)));
+        assert_eq!(
+            parse_command("/remember use bun ", false),
+            Some(Command::Remember(Some("use bun".into())))
+        );
+        assert_eq!(
+            parse_command("/forget bun", true),
+            Some(Command::Forget("bun".into()))
+        );
         assert_eq!(
             parse_command("/budget 2M", false),
             Some(Command::Budget(Some("2M".into())))

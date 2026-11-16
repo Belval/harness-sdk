@@ -18,6 +18,7 @@ pub mod factory;
 pub mod gc;
 pub mod journal;
 pub mod mcp;
+pub mod memory;
 pub mod names;
 pub mod runtime;
 pub mod selftest;
@@ -31,6 +32,7 @@ pub mod worktree;
 pub use catalog::ToolCatalog;
 pub use factory::{agent_session_manager, harness_factory, harness_model_resolver, HarnessFactoryOptions};
 pub use mcp::{load_shared_mcp, SharedMcp};
+pub use memory::Memory;
 pub use runtime::{
     AgentFactory, AgentInfo, AgentSpec, AgentStatus, Mail, ModelResolver, SpawnRequest, Swarm, SwarmConfig,
     SwarmEvent, RELOAD_EXIT_CODE, USER,
