@@ -39,11 +39,19 @@ pub async fn create(base: &Path, run_id: &str, agent_id: &str) -> Result<Worktre
     let dir_arg = dir.to_string_lossy().into_owned();
     git(base, &["worktree", "add", "-b", &branch, &dir_arg, "HEAD"]).await?;
 
-    let subdir = base.strip_prefix(&toplevel).unwrap_or(Path::new(""));
     Ok(Worktree {
-        cwd: dir.join(subdir),
+        cwd: same_subdir(&dir, &toplevel, base),
         branch,
     })
+}
+
+/// `dir` plus the path of `base` below `toplevel`. Joining an empty subdirectory would append a
+/// trailing `/`, so the root case returns `dir` as is.
+fn same_subdir(dir: &Path, toplevel: &Path, base: &Path) -> PathBuf {
+    match base.strip_prefix(toplevel) {
+        Ok(subdir) if !subdir.as_os_str().is_empty() => dir.join(subdir),
+        _ => dir.to_path_buf(),
+    }
 }
 
 async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -63,4 +71,39 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cwd_mirrors_the_subdirectory_without_a_trailing_slash() {
+        let dir = Path::new("/w/repo.swarm/run/a2");
+        let top = Path::new("/w/repo");
+        let root = same_subdir(dir, top, top);
+        assert_eq!(root, dir);
+        assert!(!root.to_string_lossy().ends_with('/'), "{}", root.display());
+        assert_eq!(same_subdir(dir, top, Path::new("/w/repo/a/b")), dir.join("a/b"));
+        assert_eq!(same_subdir(dir, top, Path::new("/elsewhere")), dir);
+    }
+
+    #[tokio::test]
+    async fn a_worktree_from_the_repo_root_has_no_trailing_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ident = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        git(&repo, &["init", "-q"]).await.unwrap();
+        git(
+            &repo,
+            &[&ident[..], &["commit", "-q", "--allow-empty", "-m", "init"]].concat(),
+        )
+        .await
+        .unwrap();
+        let worktree = create(&repo, "run", "a2").await.unwrap();
+        let cwd = worktree.cwd.to_string_lossy().into_owned();
+        assert!(cwd.ends_with("repo.swarm/run/a2"), "{cwd}");
+        assert!(worktree.cwd.is_dir(), "{cwd}");
+    }
 }
