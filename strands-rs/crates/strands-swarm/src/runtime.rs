@@ -23,6 +23,7 @@ use strands_agents::{Agent, Error, Model, Result};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
+use crate::journal::Journal;
 use crate::names;
 use crate::state::{AgentState, MailState, Persister, SwarmState, SESSIONS_DIR};
 use crate::tools::swarm_tools;
@@ -367,6 +368,7 @@ struct Inner {
     events: mpsc::UnboundedSender<SwarmEvent>,
     root_cancel: CancellationToken,
     persister: Option<Arc<Persister>>,
+    journal: Option<Journal>,
     generation: AtomicU64,
     shutting_down: AtomicBool,
     actors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -389,6 +391,7 @@ impl Swarm {
             events,
             root_cancel: CancellationToken::new(),
             persister: config.state_dir.clone().map(|dir| Arc::new(Persister::new(dir))),
+            journal: config.state_dir.clone().map(Journal::open),
             generation: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             actors: Mutex::new(Vec::new()),
@@ -490,6 +493,9 @@ impl Swarm {
             cwd: node.cwd.clone(),
             branch: node.branch.clone(),
         });
+        if let (USER, Some(journal)) = (parent, &self.inner.journal) {
+            journal.mail(USER, USER, &id, &node.label(), "task", &request.task);
+        }
 
         let swarm = self.clone();
         let start = Start::Fresh(request.task);
@@ -567,6 +573,10 @@ impl Swarm {
         if tokio::time::timeout(SHUTDOWN_GRACE, stopped).await.is_err() {
             tracing::warn!("agents still running after the shutdown grace period");
         }
+        if let Some(journal) = &self.inner.journal {
+            journal.event("shutdown", serde_json::json!({}));
+            journal.flush().await;
+        }
     }
 
     /// Install `binary` as the run's next binary and ask the host process to restart into it.
@@ -579,6 +589,9 @@ impl Swarm {
         })?;
         check_binary(binary).await?;
         install_binary(binary, &dir.join("bin")).await?;
+        if let Some(journal) = &self.inner.journal {
+            journal.event("reload", serde_json::json!({ "binary": binary }));
+        }
         self.inner.reload.cancel();
         Ok(())
     }
@@ -638,6 +651,9 @@ impl Swarm {
     ) -> Result<(Self, mpsc::UnboundedReceiver<SwarmEvent>)> {
         let (swarm, events) = Self::new(config);
         swarm.inner.next_id.store(state.next_id, Ordering::SeqCst);
+        if let Some(journal) = &swarm.inner.journal {
+            journal.event("resume", serde_json::json!({ "agents": state.agents.len() }));
+        }
         for agent in state.agents {
             swarm.restore_agent(agent);
         }
@@ -683,7 +699,8 @@ impl Swarm {
         });
         agents.insert(saved.id.clone(), node.clone());
         drop(agents);
-        self.emit(SwarmEvent::Spawned {
+        // Replayed for the UI only: the journal recorded them when they happened.
+        let _ = self.inner.events.send(SwarmEvent::Spawned {
             id: node.id.clone(),
             parent: node.parent.clone(),
             name: node.name.clone(),
@@ -691,7 +708,7 @@ impl Swarm {
             cwd: node.cwd.clone(),
             branch: node.branch.clone(),
         });
-        self.emit(SwarmEvent::Status {
+        let _ = self.inner.events.send(SwarmEvent::Status {
             id: node.id.clone(),
             status: status.clone(),
         });
@@ -824,7 +841,21 @@ impl Swarm {
     }
 
     fn emit(&self, event: SwarmEvent) {
+        if let Some(journal) = &self.inner.journal {
+            journal.record(&event);
+        }
         let _ = self.inner.events.send(event);
+    }
+
+    /// Put a message to or from the user on record.
+    fn journal_mail(&self, mail: &Mail, to: &str) {
+        let Some(journal) = &self.inner.journal else {
+            return;
+        };
+        if mail.from == USER || to == USER {
+            let to_label = self.label(to);
+            journal.mail(&mail.from, &mail.from_label, to, &to_label, mail.kind, &mail.text);
+        }
     }
 
     fn set_status(&self, node: &Node, status: AgentStatus) {
@@ -849,6 +880,7 @@ impl Swarm {
             mail: mail.clone(),
         };
         if to == USER {
+            self.journal_mail(&mail, to);
             self.emit(event);
             return Ok(());
         }
@@ -858,6 +890,7 @@ impl Swarm {
         if !node.status.lock().is_live() {
             return Err(Error::other(format!("Agent {to} is cancelled.")));
         }
+        self.journal_mail(&mail, to);
         // Emitted under the mailbox lock, so it always precedes the `MailRead` of its drain.
         let mut mailbox = node.mailbox.lock();
         self.emit(event);

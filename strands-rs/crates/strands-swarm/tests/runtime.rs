@@ -924,3 +924,89 @@ async fn token_usage_is_reported_after_each_model_call_and_survives_a_restart() 
         .expect("no usage after resume");
     assert_eq!(restored, (1005, 11));
 }
+
+#[tokio::test]
+async fn a_persistent_run_journals_user_traffic_and_lifecycle_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    map.lock().insert(
+        "a1".into(),
+        MockMessageModel::shared(vec![
+            tool_call("list_agents", "t1", json!({})),
+            say("hello"),
+            say("bye"),
+        ]),
+    );
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config.clone());
+    let id = swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "go".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "hello");
+    swarm.send(USER, &id, "again").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "bye");
+    swarm.shutdown().await;
+
+    let journal = strands_swarm::journal::read(&state_dir).unwrap();
+    let lines: Vec<(&str, &str, &str, &str)> = journal
+        .iter()
+        .map(|e| {
+            (
+                e.from_label.as_str(),
+                e.to_label.as_str(),
+                e.kind.as_str(),
+                e.text.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("user", "go (a1)", "task", "go"),
+            ("go (a1)", "user", "reply", "hello"),
+            ("user", "go (a1)", "message", "again"),
+            ("go (a1)", "user", "reply", "bye"),
+        ]
+    );
+
+    let event_names = || -> Vec<String> {
+        std::fs::read_to_string(state_dir.join(strands_swarm::journal::EVENTS_FILE))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].to_string())
+            .collect()
+    };
+    let names = event_names();
+    for wanted in [
+        "\"spawned\"",
+        "\"status\"",
+        "\"tool\"",
+        "\"tool_done\"",
+        "\"shutdown\"",
+    ] {
+        assert!(
+            names.iter().any(|n| n == wanted),
+            "{wanted} missing from {names:?}"
+        );
+    }
+
+    let saved = strands_swarm::state::load(&state_dir).await.unwrap().unwrap();
+    let (resumed, _events) = Swarm::resume(config, saved).await.unwrap();
+    resumed.shutdown().await;
+    let names = event_names();
+    assert_eq!(
+        names.iter().filter(|n| *n == "\"spawned\"").count(),
+        1,
+        "{names:?}"
+    );
+    assert!(names.iter().any(|n| n == "\"resume\""), "{names:?}");
+}

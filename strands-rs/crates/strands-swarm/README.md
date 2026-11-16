@@ -45,6 +45,12 @@ Enabled tools are kept in the agent's session state and come back on resume. `--
 every MCP tool on every agent instead; `--mcp-deny` hides tools by name, and `--list-tools` prints
 what is allowed and denied.
 
+A persistent run also keeps an audit trail next to its state: `journal.jsonl` records every message
+to and from the user (tasks, messages, replies, errors) and `events.jsonl` compact lifecycle events
+(spawns, status changes, tool calls, model switches, resumes, reloads, shutdowns). Both are JSON
+lines with a UTC `ts`, written by a background thread and rotated to `<file>.1` at 8 MB.
+`strands-swarm --run NAME --journal` prints the journal and exits.
+
 ## Operate 24/7
 
 `scripts/swarmctl` keeps a run alive in tmux: restarts on exit, restarts into the new binary on

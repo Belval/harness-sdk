@@ -61,6 +61,9 @@ struct Cli {
     /// No TUI: stream events to stderr and exit when the swarm goes quiet.
     #[arg(long)]
     headless: bool,
+    /// Print the run's journal (every message to and from the user) and exit. Needs `--run`.
+    #[arg(long, requires = "run")]
+    journal: bool,
 }
 
 #[tokio::main]
@@ -82,6 +85,12 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
+    if let (true, Some(name)) = (cli.journal, &cli.run) {
+        for entry in strands_swarm::journal::read(&state::run_dir(name)?)? {
+            println!("{}", entry.render());
+        }
+        return Ok(Exit::Quit);
+    }
     let cwd = std::fs::canonicalize(&cli.cwd)?;
     let instructions = cli
         .instructions

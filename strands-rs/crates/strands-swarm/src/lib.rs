@@ -14,6 +14,7 @@
 
 pub mod catalog;
 pub mod factory;
+pub mod journal;
 pub mod mcp;
 pub mod names;
 pub mod runtime;
