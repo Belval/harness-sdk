@@ -964,6 +964,7 @@ async fn usage_until_reply(events: &mut UnboundedReceiver<SwarmEvent>, id: &str)
                     input_tokens,
                     output_tokens,
                     context,
+                    ..
                 } if agent == id => seen.push((input_tokens, output_tokens, context)),
                 SwarmEvent::Mail { to, mail } if to == USER && mail.kind == "reply" => return,
                 _ => {}
@@ -1021,6 +1022,14 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
         (1005, 11)
     );
     assert_eq!(saved.agents[0].context, Some(5.0 / 2000.0));
+    // 900 of the 1005 input tokens came from the prompt cache.
+    assert_eq!(
+        (
+            saved.agents[0].cache_read_tokens,
+            saved.agents[0].cache_write_tokens
+        ),
+        (900, 0)
+    );
     let (_resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
     let restored = async {
         loop {
@@ -1557,7 +1566,8 @@ async fn the_goal_judge_runs_on_the_side_model_and_counts_toward_the_agents_toke
             usage(100, 0, 10),
         )],
     )]);
-    let judge = MockMessageModel::shared(vec![verdict(true, usage(50, 0, 5))]);
+    // 30 of the judge's 50 input tokens come from the prompt cache.
+    let judge = MockMessageModel::shared(vec![verdict(true, usage(20, 30, 5))]);
     let mut config = SwarmConfig::new(goal_factory(&scripts), dir.path());
     config.side_model = Some(judge.clone());
     let (swarm, mut events) = Swarm::new(config);
@@ -1575,6 +1585,7 @@ async fn the_goal_judge_runs_on_the_side_model_and_counts_toward_the_agents_toke
     let fill = Some(100.0 / 3400.0);
     assert_eq!(seen, [(100, 10, fill), (150, 15, fill)]);
     assert_eq!(swarm.tokens_used(), 165);
+    assert_eq!(swarm.snapshot().agents[0].cache_read_tokens, 30);
     swarm.shutdown().await;
 }
 

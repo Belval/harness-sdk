@@ -307,10 +307,14 @@ pub enum SwarmEvent {
     Usage {
         /// Id.
         id: String,
-        /// Input tokens so far.
+        /// Input tokens so far, cache reads and writes included.
         input_tokens: u64,
         /// Output tokens so far.
         output_tokens: u64,
+        /// The part of `input_tokens` read from the prompt cache.
+        cache_read_tokens: u64,
+        /// The part of `input_tokens` written to the prompt cache.
+        cache_write_tokens: u64,
         /// The last model call's input as a share of the compaction point (`0..1+`; at 1.0 older
         /// turns are summarized before the next call); `None` before the first model call.
         context: Option<f64>,
@@ -402,7 +406,14 @@ struct Node {
 }
 
 /// Cumulative `(input, output)` tokens.
-type Tokens = (u64, u64);
+#[derive(Debug, Clone, Copy, Default)]
+struct Tokens {
+    /// All input, cache reads and writes included.
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
 
 impl Node {
     /// The current turn's token, else the agent's own (between turns).
@@ -614,7 +625,7 @@ impl Swarm {
                 model: Mutex::new(request.model.clone()),
                 goal: request.goal.clone(),
                 env,
-                usage: Mutex::new((0, 0)),
+                usage: Mutex::new(Tokens::default()),
                 finished: AtomicBool::new(false),
                 collected: AtomicBool::new(false),
                 context: Mutex::new(None),
@@ -1002,7 +1013,12 @@ impl Swarm {
             model: Mutex::new(saved.model),
             goal: saved.goal,
             env,
-            usage: Mutex::new((saved.input_tokens, saved.output_tokens)),
+            usage: Mutex::new(Tokens {
+                input: saved.input_tokens,
+                output: saved.output_tokens,
+                cache_read: saved.cache_read_tokens,
+                cache_write: saved.cache_write_tokens,
+            }),
             finished: AtomicBool::new(!status.is_live()),
             collected: AtomicBool::new(false),
             context: Mutex::new(saved.context),
@@ -1132,8 +1148,8 @@ impl Swarm {
         nodes
             .iter()
             .map(|node| {
-                let (input, output) = *node.usage.lock();
-                input + output
+                let usage = *node.usage.lock();
+                usage.input + usage.output
             })
             .sum()
     }
@@ -1431,13 +1447,15 @@ impl Swarm {
     /// Add one model call's usage (its trailing metadata) to the agent's totals and publish them;
     /// `own_call` says whether the call carried the agent's context (not a side call's).
     fn add_usage(&self, node: &Node, usage: &Usage, own_call: bool) {
-        let input = usage.input_tokens
-            + usage.cache_read_input_tokens.unwrap_or(0)
-            + usage.cache_write_input_tokens.unwrap_or(0);
+        let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+        let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
+        let input = usage.input_tokens + cache_read + cache_write;
         {
             let mut total = node.usage.lock();
-            total.0 += input;
-            total.1 += usage.output_tokens;
+            total.input += input;
+            total.output += usage.output_tokens;
+            total.cache_read += cache_read;
+            total.cache_write += cache_write;
         }
         // Relative to the compaction point, so 100% means older turns are summarized before the
         // next call; the window is the one the context manager assumes. A side call's input is
@@ -1451,12 +1469,14 @@ impl Swarm {
     }
 
     fn emit_usage(&self, node: &Node) {
-        let (input_tokens, output_tokens) = *node.usage.lock();
+        let usage = *node.usage.lock();
         let context = *node.context.lock();
         self.emit(SwarmEvent::Usage {
             id: node.id.clone(),
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input,
+            output_tokens: usage.output,
+            cache_read_tokens: usage.cache_read,
+            cache_write_tokens: usage.cache_write,
             context,
         });
     }
@@ -1638,7 +1658,7 @@ fn status_name(status: &AgentStatus) -> &'static str {
 }
 
 fn node_state(node: &Node) -> AgentState {
-    let (input_tokens, output_tokens) = *node.usage.lock();
+    let usage = *node.usage.lock();
     AgentState {
         id: node.id.clone(),
         name: Some(node.name.clone()),
@@ -1651,8 +1671,10 @@ fn node_state(node: &Node) -> AgentState {
         status: status_name(&node.status.lock()).to_owned(),
         mailbox: node.mailbox.lock().iter().map(mail_state).collect(),
         env: node.env.clone(),
-        input_tokens,
-        output_tokens,
+        input_tokens: usage.input,
+        output_tokens: usage.output,
+        cache_read_tokens: usage.cache_read,
+        cache_write_tokens: usage.cache_write,
         context: *node.context.lock(),
         paused: node.paused.load(Ordering::SeqCst),
     }

@@ -123,6 +123,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
         .filter(|v| v.status == AgentStatus::Running)
         .count();
     let (input, output) = app.total_tokens();
+    let cached = cached(app.total_cache_read(), input)
+        .map(|percent| format!(" ({percent} cached)"))
+        .unwrap_or_default();
     let hidden = match app.hidden() {
         0 => String::new(),
         n => format!(" · {n} cancelled hidden (f3)"),
@@ -134,7 +137,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
     let line = Line::from(vec![
         Span::styled(" strands-swarm ", Style::new().bold().reversed()),
         Span::raw(format!(
-            "  run {run_id} · {} agents · {running} running · {} in / {} out tokens{budget}{hidden}",
+            "  run {run_id} · {} agents · {running} running · in {}{cached} · out {}{budget}{hidden}",
             app.agents.len(),
             compact(input),
             compact(output)
@@ -209,6 +212,11 @@ fn agent_item(depth: usize, view: &AgentView, tick: usize) -> Text<'static> {
         spans.push(Span::styled(" •", Style::new().fg(Color::Yellow)));
     }
     Text::from(Line::from(spans))
+}
+
+/// The share of `input` read from the prompt cache, e.g. `97%`; `None` without input.
+fn cached(cache_read: u64, input: u64) -> Option<String> {
+    (input > 0).then(|| format!("{}%", (cache_read as f64 * 100.0 / input as f64).round() as u64))
 }
 
 /// `1.2M/34k`: cumulative input/output tokens.
@@ -334,7 +342,10 @@ fn log_title(view: &AgentView) -> String {
     let mut parts = vec![view.label(), status];
     parts.extend(view.model.as_deref().map(|model| short_model(model).to_owned()));
     if view.input_tokens + view.output_tokens > 0 {
-        parts.push(format!("{} tok", tokens(view)));
+        let cached = cached(view.cache_read_tokens, view.input_tokens)
+            .map(|percent| format!(" ({percent} cached)"))
+            .unwrap_or_default();
+        parts.push(format!("{} tok{cached}", tokens(view)));
     }
     parts.extend(context(view).map(|(percent, _)| percent));
     parts.push(short_path(&view.cwd));
@@ -568,6 +579,8 @@ mod tests {
             id: "a2".into(),
             input_tokens: 1_200_000,
             output_tokens: 34_000,
+            cache_read_tokens: 1_164_000,
+            cache_write_tokens: 0,
             context: Some(0.34),
         });
         let view = &app.agents["a2"];
@@ -582,7 +595,7 @@ mod tests {
         );
         assert_eq!(
             log_title(view),
-            " parser (a2) · starting · opus-5-5 · 1.2M/34.0k tok · 34% · …/a2/repo "
+            " parser (a2) · starting · opus-5-5 · 1.2M/34.0k tok (97% cached) · 34% · …/a2/repo "
         );
     }
 }

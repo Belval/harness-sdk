@@ -64,6 +64,13 @@ pub struct AgentState {
     /// Output tokens used so far, across restarts.
     #[serde(default)]
     pub output_tokens: u64,
+    /// The part of `input_tokens` read from the prompt cache (0 for runs saved before it was
+    /// tracked, whose input then counts as uncached).
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// The part of `input_tokens` written to the prompt cache.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     /// Context window utilization of the last model call (`0..1+`), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<f64>,

@@ -420,6 +420,8 @@ mod tests {
             env: env(&tmp.path().join(format!("target-worktrees/r1/{id}"))),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             context: None,
             paused: false,
         };

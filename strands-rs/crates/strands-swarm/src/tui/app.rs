@@ -68,13 +68,15 @@ pub struct AgentView {
     pub branch: Option<String>,
     /// Status.
     pub status: AgentStatus,
-    /// Cumulative input tokens.
+    /// Cumulative input tokens, cache reads and writes included.
     pub input_tokens: u64,
     /// Cumulative output tokens.
     pub output_tokens: u64,
+    /// The part of `input_tokens` read from the prompt cache.
+    pub cache_read_tokens: u64,
     /// Model id, once known.
     pub model: Option<String>,
-    /// Context window utilization of the last model call (`0..1+`), once known.
+    /// The last model call's input as a share of the compaction point (`0..1+`), once known.
     pub context: Option<f64>,
     /// Log, oldest first, at most [`MAX_LOG_ENTRIES`] entries.
     pub log: VecDeque<LogEntry>,
@@ -310,6 +312,7 @@ impl App {
                     status: AgentStatus::Starting,
                     input_tokens: 0,
                     output_tokens: 0,
+                    cache_read_tokens: 0,
                     model: None,
                     context: None,
                     log: VecDeque::from([LogEntry::Task(task)]),
@@ -348,10 +351,13 @@ impl App {
                 id,
                 input_tokens,
                 output_tokens,
+                cache_read_tokens,
                 context,
+                ..
             } => self.with(&id, |view| {
                 view.input_tokens = input_tokens;
                 view.output_tokens = output_tokens;
+                view.cache_read_tokens = cache_read_tokens;
                 // Note the crossing once, from a known lower value, so a restart does not repeat it.
                 let crossed = |c: Option<f64>| c.is_some_and(|c| c >= COMPACTION_NOTICE_AT);
                 if crossed(context) && view.context.is_some() && !crossed(view.context) {
@@ -476,6 +482,11 @@ impl App {
         if let Some(id) = self.selected_id() {
             self.with(&id, |view| view.unseen = false);
         }
+    }
+
+    /// Input tokens read from the prompt cache, across the swarm.
+    pub fn total_cache_read(&self) -> u64 {
+        self.agents.values().map(|view| view.cache_read_tokens).sum()
     }
 
     /// Total tokens across the swarm.
@@ -1057,6 +1068,8 @@ mod tests {
             id: "a1".into(),
             input_tokens: 1,
             output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             context,
         };
         let notes = |app: &App| {
