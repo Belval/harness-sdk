@@ -11,8 +11,8 @@ use strands_swarm::state;
 use strands_swarm::tui::Exit;
 use strands_swarm::RELOAD_EXIT_CODE;
 use strands_swarm::{
-    harness_factory, load_shared_mcp, HarnessFactoryOptions, SpawnRequest, Swarm, SwarmConfig, SwarmEvent,
-    USER,
+    harness_factory, harness_model_resolver, load_shared_mcp, HarnessFactoryOptions, SpawnRequest, Swarm,
+    SwarmConfig, SwarmEvent, USER,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -108,15 +108,16 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         true => (mcp.tools.clone(), None),
         false => (Vec::new(), Some(mcp.catalog())),
     };
-    let factory = harness_factory(HarnessFactoryOptions {
+    let options = HarnessFactoryOptions {
         model: cli.model,
         effort: cli.effort,
         instructions,
         tools,
         catalog,
-    });
+    };
     let root = root_request(cli.task, cli.goal);
-    let mut config = SwarmConfig::new(factory, cwd);
+    let mut config = SwarmConfig::new(harness_factory(options.clone()), cwd);
+    config.models = Some(harness_model_resolver(options));
     config.max_agents = cli.max_agents;
     config.cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
     let saved = match &cli.run {
@@ -209,6 +210,7 @@ fn print_event(event: &SwarmEvent) {
         }
         SwarmEvent::Status { id, status } => eprintln!("[{id}] {status}"),
         SwarmEvent::Text { .. } | SwarmEvent::Usage { .. } => {}
+        SwarmEvent::Model { id, model } => eprintln!("[{id}] model {model}"),
         SwarmEvent::ToolStarted { id, name, summary } => eprintln!("[{id}] {name} {summary}"),
         SwarmEvent::ToolFinished { id, name, ok: false } => eprintln!("[{id}] {name} failed"),
         SwarmEvent::ToolFinished { .. } => {}

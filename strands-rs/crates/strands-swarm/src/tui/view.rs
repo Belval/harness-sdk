@@ -11,7 +11,7 @@ use crate::runtime::AgentStatus;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const HELP: &str =
-    "enter send · /new <task> · /goal <goal> · /cancel · ↑↓ select · pgup/pgdn scroll · ctrl-c quit";
+    "enter send · /new <task> · /goal <goal> · /model [<id>|default] · /cancel · ↑↓ select · pgup/pgdn scroll · ctrl-c quit";
 
 /// Draw the whole screen. `tick` animates spinners.
 pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
@@ -125,8 +125,9 @@ fn log_title(view: &AgentView) -> String {
         .as_ref()
         .map(|b| format!(" · {b}"))
         .unwrap_or_default();
+    let model = view.model.as_ref().map(|m| format!(" · {m}")).unwrap_or_default();
     format!(
-        " {} · {} · {}{branch} · {}/{} tok ",
+        " {} · {} · {}{branch} · {}/{} tok{model} ",
         view.label(),
         view.status,
         view.cwd.display(),

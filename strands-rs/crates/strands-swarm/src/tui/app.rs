@@ -56,6 +56,8 @@ pub struct AgentView {
     pub input_tokens: u64,
     /// Cumulative output tokens.
     pub output_tokens: u64,
+    /// Model id, once known.
+    pub model: Option<String>,
     /// Log.
     pub log: Vec<LogEntry>,
     /// Log entries the user has not looked at.
@@ -139,6 +141,7 @@ impl App {
                     status: AgentStatus::Starting,
                     input_tokens: 0,
                     output_tokens: 0,
+                    model: None,
                     log: vec![LogEntry::Task(task)],
                     unseen: true,
                 };
@@ -156,6 +159,7 @@ impl App {
             }),
             SwarmEvent::ToolFinished { id, name, ok } => self.with(&id, |view| view.finish_tool(&name, ok)),
             SwarmEvent::Mail { to, mail } => self.apply_mail(&to, mail),
+            SwarmEvent::Model { id, model } => self.with(&id, |view| view.model = Some(model)),
             SwarmEvent::Usage {
                 id,
                 input_tokens,
@@ -261,6 +265,10 @@ pub enum Command {
     Message(String),
     /// Cancel the selected agent.
     Cancel,
+    /// Show the selected agent's model.
+    ShowModel,
+    /// Switch the selected agent's model; `None` returns it to the default.
+    SetModel(Option<String>),
     /// Quit.
     Quit,
 }
@@ -277,8 +285,15 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     if let Some(task) = line.strip_prefix("/new ") {
         return Some(Command::NewRoot(task.trim().to_owned()));
     }
+    if let Some(model) = line.strip_prefix("/model ") {
+        return Some(Command::SetModel(match model.trim() {
+            "default" => None,
+            id => Some(id.to_owned()),
+        }));
+    }
     match line {
         "/cancel" => return Some(Command::Cancel),
+        "/model" => return Some(Command::ShowModel),
         "/quit" | "/q" => return Some(Command::Quit),
         _ => {}
     }
@@ -406,6 +421,15 @@ mod tests {
         assert_eq!(
             parse_command("/goal ship it", true),
             Some(Command::Goal("ship it".into()))
+        );
+        assert_eq!(parse_command("/model", true), Some(Command::ShowModel));
+        assert_eq!(
+            parse_command("/model  anthropic/claude-x ", true),
+            Some(Command::SetModel(Some("anthropic/claude-x".into())))
+        );
+        assert_eq!(
+            parse_command("/model default", true),
+            Some(Command::SetModel(None))
         );
         assert_eq!(parse_command("  ", true), None);
     }

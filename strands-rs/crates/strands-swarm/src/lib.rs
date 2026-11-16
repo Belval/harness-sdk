@@ -23,9 +23,9 @@ pub mod tui;
 pub mod worktree;
 
 pub use catalog::ToolCatalog;
-pub use factory::{agent_session_manager, harness_factory, HarnessFactoryOptions};
+pub use factory::{agent_session_manager, harness_factory, harness_model_resolver, HarnessFactoryOptions};
 pub use mcp::{load_shared_mcp, SharedMcp};
 pub use runtime::{
-    AgentFactory, AgentInfo, AgentSpec, AgentStatus, Mail, SpawnRequest, Swarm, SwarmConfig, SwarmEvent,
-    RELOAD_EXIT_CODE, USER,
+    AgentFactory, AgentInfo, AgentSpec, AgentStatus, Mail, ModelResolver, SpawnRequest, Swarm, SwarmConfig,
+    SwarmEvent, RELOAD_EXIT_CODE, USER,
 };

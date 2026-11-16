@@ -16,14 +16,14 @@ use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
 use strands_agents::tools::ToolRef;
 use strands_agents::Plugin;
 use strands_agents::{FileStorage, Result, SessionManager};
-use strands_harness::defaults::DEFAULT_BUILTIN_TOOLS;
+use strands_harness::defaults::{DEFAULT_BUILTIN_TOOLS, DEFAULT_MODEL};
 use strands_harness::{
-    create_harness, BuiltinToolsConfig, Effort, EnvironmentContext, EnvironmentContextConfig,
-    HarnessAgentOptions, MemoryOption, ModelOption, SandboxOption, SessionOption,
+    create_harness, resolve_model, BuiltinToolsConfig, Effort, EnvironmentContext, EnvironmentContextConfig,
+    HarnessAgentOptions, MemoryOption, ModelOption, ResolveModelOptions, SandboxOption, SessionOption,
 };
 
 use crate::catalog::ToolCatalog;
-use crate::runtime::{AgentFactory, AgentSpec};
+use crate::runtime::{AgentFactory, AgentSpec, ModelResolver};
 
 /// `subagent` is replaced by the swarm tools; `web_search` fails construction on models without
 /// native search (every Bedrock model), so it is opt-in through MCP instead.
@@ -64,6 +64,31 @@ pub fn harness_factory(options: HarnessFactoryOptions) -> AgentFactory {
             Ok(agent)
         })
     })
+}
+
+/// The [`ModelResolver`] matching [`harness_factory`]: resolves an id (`None`: the factory's
+/// default) exactly as `create_harness` does, with the same effort and caching, so a switched
+/// agent runs as if it had been built with that model.
+pub fn harness_model_resolver(options: HarnessFactoryOptions) -> ModelResolver {
+    Arc::new(move |model: Option<String>| {
+        let model = model_option(&options, model);
+        let effort = options.effort;
+        Box::pin(async move {
+            resolve_model(ResolveModelOptions {
+                model,
+                default: DEFAULT_MODEL.to_owned(),
+                effort,
+                // `web_search` is excluded from the builtins, so the harness never asks for it.
+                web_search: false,
+                ..Default::default()
+            })
+            .await
+        })
+    })
+}
+
+fn model_option(options: &HarnessFactoryOptions, model: Option<String>) -> Option<ModelOption> {
+    model.or_else(|| options.model.clone()).map(ModelOption::Id)
 }
 
 /// A session manager for `agent_id` under `dir`, saved after every message so a crash loses at
@@ -140,7 +165,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         None => spec.instructions,
     };
     Ok(HarnessAgentOptions {
-        model: spec.model.or_else(|| options.model.clone()).map(ModelOption::Id),
+        model: model_option(options, spec.model),
         effort: options.effort,
         instructions: Some(instructions),
         tools,
@@ -241,5 +266,22 @@ mod tests {
         let empty = ToolCatalog::new(Vec::new(), vec![("srv".into(), 0)]);
         assert!(tool_names(Some(Arc::new(empty))).is_empty());
         assert!(tool_names(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_resolver_rejects_an_unknown_provider_and_falls_back_to_the_default() {
+        let resolve = harness_model_resolver(HarnessFactoryOptions::default());
+        let error = resolve(Some("nope/some-model".into()))
+            .await
+            .err()
+            .expect("rejected");
+        assert!(error.to_string().contains("nope"), "{error}");
+
+        let resolve = harness_model_resolver(HarnessFactoryOptions {
+            model: Some("nope/default".into()),
+            ..Default::default()
+        });
+        let error = resolve(None).await.err().expect("default used");
+        assert!(error.to_string().contains("nope"), "{error}");
     }
 }

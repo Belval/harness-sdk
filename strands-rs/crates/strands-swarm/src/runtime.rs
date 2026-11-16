@@ -19,7 +19,7 @@ use strands_agents::tools::ToolRef;
 use strands_agents::types::{
     ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolResultStatus,
 };
-use strands_agents::{Agent, Error, Result};
+use strands_agents::{Agent, Error, Model, Result};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
@@ -127,6 +127,11 @@ pub struct AgentSpec {
 /// Builds the [`Agent`] for an [`AgentSpec`].
 pub type AgentFactory = Arc<dyn Fn(AgentSpec) -> BoxFuture<'static, Result<Agent>> + Send + Sync>;
 
+/// Resolves a model id (`None`: the swarm default) into a model, configured the way the factory
+/// would configure it; used by [`Swarm::set_model`] to switch a live agent.
+pub type ModelResolver =
+    Arc<dyn Fn(Option<String>) -> BoxFuture<'static, Result<Arc<dyn Model>>> + Send + Sync>;
+
 /// Swarm-wide settings.
 #[derive(Clone)]
 pub struct SwarmConfig {
@@ -144,6 +149,8 @@ pub struct SwarmConfig {
     /// one beside it: cargo would otherwise take another worktree's build as fresh (artifact
     /// hashes do not depend on the checkout path) and test the wrong code.
     pub cargo_target_dir: Option<PathBuf>,
+    /// Resolves model ids for [`Swarm::set_model`]; `None` disables model switching.
+    pub models: Option<ModelResolver>,
 }
 
 impl SwarmConfig {
@@ -156,6 +163,7 @@ impl SwarmConfig {
             run_id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
             state_dir: None,
             cargo_target_dir: None,
+            models: None,
         }
     }
 }
@@ -192,6 +200,8 @@ pub struct AgentInfo {
     pub status: AgentStatus,
     /// Unread messages.
     pub unread: usize,
+    /// Model in use: the live agent's model id, else its override (`None`: the default).
+    pub model: Option<String>,
 }
 
 /// Everything observable that happens in the swarm, in order.
@@ -251,6 +261,13 @@ pub enum SwarmEvent {
         /// The message.
         mail: Mail,
     },
+    /// An agent's model was set: at construction and on every [`Swarm::set_model`].
+    Model {
+        /// Id.
+        id: String,
+        /// Model id.
+        model: String,
+    },
     /// Cumulative token usage of an agent.
     Usage {
         /// Id.
@@ -286,7 +303,8 @@ struct Node {
     cancel: CancellationToken,
     agent: OnceLock<Agent>,
     task: String,
-    model: Option<String>,
+    /// Model override; `None` follows the swarm default.
+    model: Mutex<Option<String>>,
     goal: Option<String>,
     env: BTreeMap<String, String>,
 }
@@ -306,7 +324,16 @@ impl Node {
             branch: self.branch.clone(),
             status: self.status.lock().clone(),
             unread: self.mailbox.lock().len(),
+            model: self.model_id(),
         }
+    }
+
+    /// The live agent's model id, else the override.
+    fn model_id(&self) -> Option<String> {
+        self.agent
+            .get()
+            .and_then(|agent| agent.model().model_id())
+            .or_else(|| self.model.lock().clone())
     }
 }
 
@@ -423,7 +450,7 @@ impl Swarm {
                 cancel,
                 agent: OnceLock::new(),
                 task: request.task.clone(),
-                model: request.model.clone(),
+                model: Mutex::new(request.model.clone()),
                 goal: request.goal.clone(),
                 env,
             });
@@ -461,6 +488,43 @@ impl Swarm {
             agent.cancel();
         }
         Ok(())
+    }
+
+    /// Switch agent `id` to `model` (`None`: the swarm default), effective from its next model
+    /// call, mid-turn included. The model is resolved first, so an invalid id is rejected and the
+    /// agent keeps its current model. The choice is persisted, so a resumed run keeps it. Returns
+    /// the new model id.
+    pub async fn set_model(&self, id: &str, model: Option<String>) -> Result<String> {
+        let node = self
+            .node(id)
+            .ok_or_else(|| Error::other(format!("Unknown agent id {id}.")))?;
+        let resolver = self.inner.config.models.clone().ok_or_else(|| {
+            Error::other("Model switching is not available: no model resolver is configured.")
+        })?;
+        if !node.status.lock().is_live() {
+            return Err(Error::other(format!("Agent {id} is cancelled.")));
+        }
+        let agent =
+            node.agent.get().cloned().ok_or_else(|| {
+                Error::other(format!("Agent {id} is still starting; try again in a moment."))
+            })?;
+        let wanted = model.as_deref().unwrap_or("the default model");
+        let resolved = resolver(model.clone())
+            .await
+            .map_err(|error| Error::other(format!("Cannot switch {id} to {wanted}: {error}")))?;
+        agent.set_model(resolved);
+        *node.model.lock() = model;
+        self.persist();
+        Ok(self.emit_model(&node))
+    }
+
+    fn emit_model(&self, node: &Node) -> String {
+        let model = node.model_id().unwrap_or_else(|| "default".to_owned());
+        self.emit(SwarmEvent::Model {
+            id: node.id.clone(),
+            model: model.clone(),
+        });
+        model
     }
 
     /// Stop every agent without recording them as cancelled, after saving the final state, so
@@ -587,7 +651,7 @@ impl Swarm {
             cancel,
             agent: OnceLock::new(),
             task: saved.task,
-            model: saved.model,
+            model: Mutex::new(saved.model),
             goal: saved.goal,
             env,
         });
@@ -771,7 +835,7 @@ impl Swarm {
             id: node.id.clone(),
             name: node.name.clone(),
             cwd: node.cwd.clone(),
-            model: node.model.clone(),
+            model: node.model.lock().clone(),
             instructions: self.instructions(&node, node.goal.as_deref()),
             tools: swarm_tools(self.clone(), &node.id),
             goal: node.goal.clone(),
@@ -789,6 +853,7 @@ impl Swarm {
         };
         self.install_mail_hook(&agent, &node.id);
         let _ = node.agent.set(agent.clone());
+        self.emit_model(&node);
 
         let mut input = match start {
             Start::Fresh(task) => Some(InvokeInput::Text(task)),
@@ -1040,7 +1105,7 @@ fn node_state(node: &Node) -> AgentState {
         cwd: node.cwd.clone(),
         branch: node.branch.clone(),
         task: node.task.clone(),
-        model: node.model.clone(),
+        model: node.model.lock().clone(),
         goal: node.goal.clone(),
         status: status_name(&node.status.lock()).to_owned(),
         mailbox: node.mailbox.lock().iter().map(mail_state).collect(),

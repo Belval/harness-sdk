@@ -126,6 +126,14 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
         }
         (Command::Message(text), Some(id)) => swarm.send(USER, &id, text).map(|()| format!("sent to {id}")),
         (Command::Cancel, Some(id)) => swarm.cancel(&id).map(|()| format!("cancelled {id}")),
+        (Command::ShowModel, Some(id)) => Ok(match swarm.agent(&id).and_then(|info| info.model) {
+            Some(model) => format!("{id} uses {model}"),
+            None => format!("{id} uses the default model"),
+        }),
+        (Command::SetModel(model), Some(id)) => swarm
+            .set_model(&id, model)
+            .await
+            .map(|model| format!("{id} now uses {model}")),
         (_, None) => Ok("no agent selected".to_owned()),
     };
     app.notice = Some(outcome.unwrap_or_else(|error| format!("error: {error}")));

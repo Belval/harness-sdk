@@ -10,9 +10,9 @@ use parking_lot::Mutex;
 use serde_json::json;
 use strands_agents::testing::{MockMessageModel, MockResponse};
 use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
-use strands_agents::Agent;
+use strands_agents::{Agent, Model};
 use strands_swarm::{
-    AgentFactory, AgentSpec, AgentStatus, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
+    AgentFactory, AgentSpec, AgentStatus, ModelResolver, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -620,4 +620,116 @@ async fn reload_needs_a_persistent_run() {
     let (swarm, _events, _scripts) = swarm_with(vec![], dir.path());
     let error = swarm.reload(Path::new("/bin/true")).await.unwrap_err();
     assert!(error.to_string().contains("--run"), "{error}");
+}
+
+/// Resolves model `id` to the mock registered under `model:<id>`; anything else is rejected.
+fn mock_resolver(scripts: &Scripts) -> ModelResolver {
+    let scripts = scripts.clone();
+    Arc::new(move |model: Option<String>| {
+        let found = model
+            .as_ref()
+            .and_then(|id| scripts.lock().get(&format!("model:{id}")).cloned());
+        Box::pin(async move {
+            found
+                .map(|mock| mock as Arc<dyn Model>)
+                .ok_or_else(|| strands_agents::Error::other(format!("unknown model {model:?}")))
+        })
+    })
+}
+
+fn scripts_of(scripts: Vec<(&str, Vec<MockResponse>)>) -> Scripts {
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    for (id, responses) in scripts {
+        map.lock()
+            .insert(id.to_owned(), MockMessageModel::shared(responses));
+    }
+    map
+}
+
+async fn spawn_root(swarm: &Swarm, task: &str) -> String {
+    let request = SpawnRequest {
+        task: task.into(),
+        ..Default::default()
+    };
+    swarm.spawn(USER, request).await.unwrap()
+}
+
+#[tokio::test]
+async fn switching_a_model_takes_effect_on_the_next_turn_and_rejects_unknown_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![
+        ("a1", vec![say("first"), say("still a")]),
+        ("model:b", vec![say("from b")]),
+    ]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.models = Some(mock_resolver(&scripts));
+    let (swarm, mut events) = Swarm::new(config);
+    let id = spawn_root(&swarm, "hello").await;
+    assert_eq!(reply_to(&mut events, USER).await, "first");
+
+    let error = swarm.set_model(&id, Some("bogus".into())).await.unwrap_err();
+    assert!(error.to_string().contains("bogus"), "{error}");
+    swarm.send(USER, &id, "and now").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "still a");
+    assert_eq!(swarm.snapshot().agents[0].model, None);
+
+    let model = swarm.set_model(&id, Some("b".into())).await.unwrap();
+    assert_eq!(model, "test-model");
+    swarm.send(USER, &id, "switched").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "from b");
+    let b = scripts.lock()["model:b"].clone();
+    let call = sent_text(&b, 0);
+    assert!(call.contains("still a") && call.contains("switched"), "{call}");
+    assert_eq!(swarm.snapshot().agents[0].model.as_deref(), Some("b"));
+}
+
+#[tokio::test]
+async fn switching_needs_a_resolver_and_a_known_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, _scripts) = swarm_with(vec![("a1", vec![say("hi")])], dir.path());
+    let id = spawn_root(&swarm, "hello").await;
+    assert_eq!(reply_to(&mut events, USER).await, "hi");
+    let error = swarm.set_model(&id, Some("b".into())).await.unwrap_err();
+    assert!(error.to_string().contains("not available"), "{error}");
+    let error = swarm.set_model("a9", None).await.unwrap_err();
+    assert!(error.to_string().contains("Unknown agent"), "{error}");
+}
+
+#[tokio::test]
+async fn a_switched_model_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let scripts = scripts_of(vec![("a1", vec![say("first")]), ("model:b", vec![])]);
+    let built: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let inner = mock_factory(&scripts);
+    let recorded = built.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        recorded.lock().push(spec.model.clone());
+        inner(spec)
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.state_dir = Some(state_dir.clone());
+    config.models = Some(mock_resolver(&scripts));
+    let (swarm, mut events) = Swarm::new(config.clone());
+    let id = spawn_root(&swarm, "hello").await;
+    assert_eq!(reply_to(&mut events, USER).await, "first");
+    swarm.set_model(&id, Some("b".into())).await.unwrap();
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&state_dir)
+        .await
+        .unwrap()
+        .expect("state saved");
+    assert_eq!(saved.agents[0].model.as_deref(), Some("b"));
+    let (resumed, _events) = Swarm::resume(config, saved).await.unwrap();
+    let rebuilt = async {
+        while built.lock().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), rebuilt)
+        .await
+        .expect("agent not rebuilt");
+    assert_eq!(*built.lock(), vec![None, Some("b".to_owned())]);
+    assert_eq!(resumed.snapshot().agents[0].model.as_deref(), Some("b"));
 }

@@ -26,6 +26,10 @@ strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--mcp-config mcp.json]...
 ```
 
 TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/cancel`, Ctrl-C quits.
+`/model <id>` switches the selected agent's model from its next model call on (`/model default`
+returns it to `--model`; `/model` alone shows the current one). The id is resolved like `--model`
+(`provider/name` or a Bedrock id, same effort), an invalid one is rejected without touching the
+agent, and the choice is saved with the run. Programmatically: `Swarm::set_model`.
 
 `--run NAME` makes the run persistent under `~/.local/state/strands-swarm/NAME`: the agent tree,
 unread messages and every conversation (saved after each message). Starting again with the same
