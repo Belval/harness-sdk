@@ -115,6 +115,10 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
     if let Some(goal) = &spec.goal {
         plugins.push(Arc::new(GoalLoop::goal(goal.clone())));
     }
+    let mut sandbox = LocalSandbox::with_base_dir(spec.cwd);
+    if !spec.env.is_empty() {
+        sandbox = sandbox.with_env(spec.env.into_iter().collect());
+    }
     let mut tools = spec.tools;
     tools.extend(options.tools.iter().cloned());
     let instructions = match &options.instructions {
@@ -128,7 +132,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         tools,
         plugins,
         builtin_tools: Some(BuiltinToolsConfig::list(builtins)),
-        sandbox: SandboxOption::Instance(Arc::new(LocalSandbox::with_base_dir(spec.cwd))),
+        sandbox: SandboxOption::Instance(Arc::new(sandbox)),
         session,
         memory: MemoryOption::Off,
         context_manager: context_manager(),

@@ -105,6 +105,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     let root = root_request(cli.task, cli.goal);
     let mut config = SwarmConfig::new(factory, cwd);
     config.max_agents = cli.max_agents;
+    config.cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
     let saved = match &cli.run {
         Some(name) => {
             let dir = state::run_dir(name)?;

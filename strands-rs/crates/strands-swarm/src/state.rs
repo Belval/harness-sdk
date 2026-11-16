@@ -5,6 +5,7 @@
 //! atomically; writes carry a generation number so a slow, older write never lands after a newer
 //! one.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,9 @@ pub struct AgentState {
     pub status: String,
     /// Unread mail.
     pub mailbox: Vec<MailState>,
+    /// Environment variables for the agent's commands.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// Persisted mail.

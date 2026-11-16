@@ -1,7 +1,7 @@
 //! The swarm runtime: an agent registry, per-agent mailboxes, and the actor loop that drives each
 //! agent turn by turn.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -119,6 +119,8 @@ pub struct AgentSpec {
     /// Where the factory should persist this agent's conversation (session id = agent id), so
     /// it survives restarts. `None` for an unsaved run.
     pub session_dir: Option<PathBuf>,
+    /// Environment variables for the agent's commands, on top of the swarm's own.
+    pub env: BTreeMap<String, String>,
 }
 
 /// Builds the [`Agent`] for an [`AgentSpec`].
@@ -137,6 +139,10 @@ pub struct SwarmConfig {
     pub run_id: String,
     /// Run directory for state and sessions; `None` keeps everything in memory.
     pub state_dir: Option<PathBuf>,
+    /// The swarm's shared `CARGO_TARGET_DIR`, if any. Agents in their own worktree get a private
+    /// one beside it: cargo would otherwise take another worktree's build as fresh (artifact
+    /// hashes do not depend on the checkout path) and test the wrong code.
+    pub cargo_target_dir: Option<PathBuf>,
 }
 
 impl SwarmConfig {
@@ -148,6 +154,7 @@ impl SwarmConfig {
             max_agents: 16,
             run_id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
             state_dir: None,
+            cargo_target_dir: None,
         }
     }
 }
@@ -280,6 +287,7 @@ struct Node {
     task: String,
     model: Option<String>,
     goal: Option<String>,
+    env: BTreeMap<String, String>,
 }
 
 impl Node {
@@ -386,12 +394,15 @@ impl Swarm {
         let base_cwd = parent_node
             .as_ref()
             .map_or_else(|| self.inner.config.cwd.clone(), |node| node.cwd.clone());
-        let (cwd, branch) = match request.worktree {
+        let (cwd, branch, env) = match request.worktree {
             true => {
                 let created = worktree::create(&base_cwd, &self.inner.config.run_id, &id).await?;
-                (created.cwd, Some(created.branch))
+                (created.cwd, Some(created.branch), self.worktree_env(&id))
             }
-            false => (base_cwd, None),
+            false => {
+                let env = parent_node.as_ref().map(|node| node.env.clone());
+                (base_cwd, None, env.unwrap_or_default())
+            }
         };
         let cancel = parent_node
             .as_ref()
@@ -412,6 +423,7 @@ impl Swarm {
             task: request.task.clone(),
             model: request.model.clone(),
             goal: request.goal.clone(),
+            env,
         });
         self.inner.agents.lock().insert(id.clone(), node.clone());
         self.persist();
@@ -552,6 +564,11 @@ impl Swarm {
         };
         let interrupted = matches!(saved.status.as_str(), "running" | "starting");
         let mailbox = saved.mailbox.into_iter().map(mail_from_state).collect();
+        // Runs saved before private target dirs existed get one on resume.
+        let env = match saved.branch.is_some() && saved.env.is_empty() {
+            true => self.worktree_env(&saved.id),
+            false => saved.env,
+        };
         let node = Arc::new(Node {
             id: saved.id.clone(),
             name: saved.name,
@@ -566,6 +583,7 @@ impl Swarm {
             task: saved.task,
             model: saved.model,
             goal: saved.goal,
+            env,
         });
         self.inner.agents.lock().insert(saved.id.clone(), node.clone());
         self.emit(SwarmEvent::Spawned {
@@ -634,6 +652,21 @@ impl Swarm {
                 tracing::warn!(%error, "state save failed");
             }
         });
+    }
+
+    /// Environment for a new worktree agent: a private `CARGO_TARGET_DIR` when the swarm has a
+    /// shared one.
+    fn worktree_env(&self, id: &str) -> BTreeMap<String, String> {
+        let Some(shared) = &self.inner.config.cargo_target_dir else {
+            return BTreeMap::new();
+        };
+        let private = PathBuf::from(format!("{}-worktrees", shared.display()))
+            .join(&self.inner.config.run_id)
+            .join(id);
+        BTreeMap::from([(
+            "CARGO_TARGET_DIR".to_owned(),
+            private.to_string_lossy().into_owned(),
+        )])
     }
 
     fn node(&self, id: &str) -> Option<Arc<Node>> {
@@ -716,6 +749,7 @@ impl Swarm {
                 .state_dir
                 .as_ref()
                 .map(|dir| dir.join(SESSIONS_DIR)),
+            env: node.env.clone(),
         };
         let agent = match (self.inner.config.factory)(spec).await {
             Ok(agent) => agent,
@@ -877,9 +911,14 @@ impl Swarm {
             .as_ref()
             .map(|b| format!(" It is your own git worktree on branch `{b}`."))
             .unwrap_or_default();
+        let env = node
+            .env
+            .get("CARGO_TARGET_DIR")
+            .map(|dir| format!(" Your commands run with `CARGO_TARGET_DIR={dir}`, private to this worktree (the first build starts from scratch)."))
+            .unwrap_or_default();
         let swarm = format!(
             "# Swarm\n\
-             You are {who}, one of a group of cooperating agents. Your working directory is `{}`.{branch}\n\
+             You are {who}, one of a group of cooperating agents. Your working directory is `{}`.{branch}{env}\n\
              You can start other agents to work in parallel (`spawn_agent`), message any agent \
              (`send_message`), wait for messages (`wait`), see who exists (`list_agents`) and stop agents \
              (`cancel_agent`). Whether and how to split the work is your call.\n\
@@ -976,6 +1015,7 @@ fn node_state(node: &Node) -> AgentState {
         goal: node.goal.clone(),
         status: status_name(&node.status.lock()).to_owned(),
         mailbox: node.mailbox.lock().iter().map(mail_state).collect(),
+        env: node.env.clone(),
     }
 }
 

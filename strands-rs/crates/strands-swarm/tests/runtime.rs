@@ -323,6 +323,66 @@ async fn a_worktree_agent_gets_its_own_checkout_and_branch() {
     assert!(expected.join("file.txt").exists());
 }
 
+#[tokio::test]
+async fn worktree_agents_get_a_private_cargo_target_dir_that_their_children_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    for id in ["a1", "a2"] {
+        map.lock()
+            .insert(id.to_owned(), MockMessageModel::shared(vec![say("ok")]));
+    }
+    let envs: Arc<Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>> = Arc::default();
+    let inner = mock_factory(&map);
+    let recorded = envs.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        recorded.lock().insert(spec.id.clone(), spec.env.clone());
+        inner(spec)
+    });
+    let mut config = SwarmConfig::new(factory, &repo);
+    config.cargo_target_dir = Some(dir.path().join("target"));
+    let (swarm, mut events) = Swarm::new(config);
+
+    let worktree = SpawnRequest {
+        task: "t".into(),
+        worktree: true,
+        ..Default::default()
+    };
+    let parent = swarm.spawn(USER, worktree).await.unwrap();
+    let child = SpawnRequest {
+        task: "t".into(),
+        ..Default::default()
+    };
+    let child = swarm.spawn(&parent, child).await.unwrap();
+    reply_to(&mut events, USER).await;
+    reply_to(&mut events, &parent).await;
+
+    let private = format!(
+        "{}-worktrees/{}/{parent}",
+        dir.path().join("target").display(),
+        swarm.run_id()
+    );
+    let envs = envs.lock();
+    assert_eq!(envs[&parent]["CARGO_TARGET_DIR"], private);
+    assert_eq!(envs[&child]["CARGO_TARGET_DIR"], private);
+}
+
 /// A factory like [`mock_factory`] whose agents persist their conversation under `sessions`.
 fn session_factory(scripts: &Scripts, sessions: std::path::PathBuf) -> AgentFactory {
     let scripts = scripts.clone();
