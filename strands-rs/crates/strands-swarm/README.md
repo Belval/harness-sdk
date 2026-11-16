@@ -1,20 +1,30 @@
 # strands-swarm
 
 A model-driven agent swarm on `strands-harness`. No planner, no scheduler: every agent is a harness
-agent with six extra tools, and decides for itself whether and how to split the work.
+agent with nine extra tools, and decides for itself whether and how to split the work.
 
 | Tool | What it does |
 | --- | --- |
 | `spawn_agent` | Start an agent on a task (optionally in its own git worktree, with a model or a goal). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents). |
-| `list_agents` | The agent tree with statuses, directories and branches. |
-| `cancel_agent` | Stop an agent and everything it spawned. |
+| `list_agents` | The agent tree with statuses, directories, branches and running background jobs. |
+| `cancel_agent` | Stop an agent and everything it spawned, background jobs included. |
 | `reload_swarm` | Restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to an agent's mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
+| `run_background` | Start a shell command as a background job and return its id at once; the agent gets a message with the exit code and the output's last 40 lines when it ends. |
+| `jobs` | List background jobs (status, log path), or kill one with everything it started. |
 | `find_tools` | Only with MCP servers: search the shared MCP tools by keyword and enable some for the calling agent. |
 | `skills` | Only with skills: load a skill's full `SKILL.md` instructions, its location and its bundled files. |
 | `remember` / `forget` | Only with memory: add a dated entry to the user's memory file, or drop the lines matching a text. |
+
+Background jobs run with `sh -c` in the agent's directory and environment (its private
+`CARGO_TARGET_DIR` included), in their own process group, so neither a reload nor a Ctrl-C stops
+them. Each one is a few files in `<run>/jobs` (a temp directory without `--run`): `<id>.json`,
+the output in `<id>.log` and, from a small `sh` wrapper, the exit code in `<id>.exit`. The swarm
+polls them and mails the owner when one ends, also for jobs started before a restart; a job
+whose process vanished without an exit code (a reboot) is reported as such. A killed job is not
+reported, and cancelling an agent kills the jobs of its whole subtree.
 
 Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else one derived
 from its task; ids and names work interchangeably. Each agent's final reply per turn goes to its parent. A `goal` (TUI `/goal`, CLI `--goal`, or on

@@ -2872,3 +2872,143 @@ async fn status_reports_todos_and_branch_commits_without_a_model_call() {
         "cancelled agents are left out"
     );
 }
+
+fn persistent_swarm(scripts: &Scripts, dir: &Path) -> SwarmConfig {
+    let mut config = SwarmConfig::new(mock_factory(scripts), dir);
+    config.state_dir = Some(dir.join("run"));
+    config
+}
+
+#[tokio::test]
+async fn a_background_job_mails_its_exit_code_and_output_tail_to_the_idle_agent_that_started_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call(
+                "run_background",
+                "r1",
+                json!({ "command": "echo built; echo $PWD; exit 2", "name": "gates" }),
+            ),
+            say("started"),
+            say("saw it"),
+        ],
+    )]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    spawn_root(&swarm, "build it").await;
+    assert_eq!(reply_to(&mut events, USER).await, "started");
+    let started = sent_text(&scripts.lock()["a1"].clone(), 1);
+    assert!(started.contains("Started job j1 (gates)"), "{started}");
+
+    let report = mail_to(&mut events, "a1", "job").await;
+    assert!(report.contains("Job j1 (gates) exited 2 after"), "{report}");
+    assert!(report.contains("built"), "{report}");
+    assert!(
+        report.contains(&dir.path().display().to_string()),
+        "runs in the agent's cwd: {report}"
+    );
+    assert_eq!(reply_to(&mut events, USER).await, "saw it");
+    let woken = sent_text(&scripts.lock()["a1"].clone(), 2);
+    assert!(woken.contains("kind=\\\"job\\\""), "{woken}");
+    let jobs = swarm.jobs().await;
+    assert!(jobs[0].reported, "reported once");
+}
+
+#[tokio::test]
+async fn running_jobs_show_in_list_agents_and_a_killed_job_does_not_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call(
+                "run_background",
+                "r1",
+                json!({ "command": "sleep 30", "name": "long" }),
+            ),
+            tool_call("list_agents", "l1", json!({})),
+            tool_call("jobs", "j1", json!({})),
+            tool_call("jobs", "j2", json!({ "kill": "j1" })),
+            say("done"),
+        ],
+    )]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let model = scripts.lock()["a1"].clone();
+    let listed = sent_text(&model, 2);
+    assert!(listed.contains(", jobs j1 (long)"), "{listed}");
+    let jobs = sent_text(&model, 3);
+    assert!(jobs.contains("j1 (long): running"), "{jobs}");
+    let killed = sent_text(&model, 4);
+    assert!(killed.contains("Job j1 (long): killed after"), "{killed}");
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    while let Ok(event) = events.try_recv() {
+        if let SwarmEvent::Mail { mail, .. } = event {
+            assert_ne!(mail.kind, "job", "a killed job is not reported: {}", mail.text);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_job_started_before_a_restart_reports_to_the_resumed_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call(
+                "run_background",
+                "r1",
+                json!({ "command": "sleep 1; echo finished" }),
+            ),
+            say("started"),
+        ],
+    )]);
+    let config = persistent_swarm(&scripts, dir.path());
+    let (swarm, mut events) = Swarm::new(config.clone());
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "started");
+    swarm.shutdown().await;
+    let jobs = swarm.jobs().await;
+    assert_eq!(
+        jobs[0].state,
+        strands_swarm::jobs::JobState::Running,
+        "outlives the swarm"
+    );
+
+    let saved = strands_swarm::state::load(&dir.path().join("run"))
+        .await
+        .unwrap()
+        .expect("state saved");
+    scripts
+        .lock()
+        .insert("a1".into(), MockMessageModel::shared(vec![say("noted")]));
+    let (_resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    let report = mail_to(&mut events, "a1", "job").await;
+    assert!(report.contains("Job j1 exited 0"), "{report}");
+    assert!(report.contains("finished"), "{report}");
+    assert_eq!(reply_to(&mut events, USER).await, "noted");
+}
+
+#[tokio::test]
+async fn cancelling_an_agent_kills_its_background_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("run_background", "r1", json!({ "command": "sleep 30" })),
+            say("started"),
+        ],
+    )]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "started");
+    swarm.cancel("a1").unwrap();
+    for _ in 0..100 {
+        if swarm.jobs().await[0].state == strands_swarm::jobs::JobState::Killed {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the job outlived its agent");
+}

@@ -1,5 +1,6 @@
 //! The swarm tools every agent carries: `spawn_agent`, `send_message`, `wait`, `list_agents`,
-//! `cancel_agent`, `reload_swarm`, `schedule`. Each instance is bound to the agent that owns it.
+//! `cancel_agent`, `reload_swarm`, `schedule`, `run_background`, `jobs`. Each instance is bound to
+//! the agent that owns it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +9,7 @@ use serde::Deserialize;
 use strands_agents::tools::{FunctionTool, ToolContext, ToolRef};
 use strands_agents::Result;
 
+use crate::jobs::{Job, JobState};
 use crate::runtime::{
     render_mail, AgentInfo, AgentStatus, ReloadWhen, ScheduleRequest, SpawnRequest, Swarm, WaitOutcome, USER,
 };
@@ -22,6 +24,8 @@ pub const SWARM_TOOL_NAMES: &[&str] = &[
     "cancel_agent",
     "reload_swarm",
     "schedule",
+    "run_background",
+    "jobs",
 ];
 
 const DEFAULT_WAIT_SECONDS: u64 = 600;
@@ -49,12 +53,13 @@ const WAIT_DESCRIPTION: &str = concat!(
 );
 
 const LIST_DESCRIPTION: &str = concat!(
-    "List the agents in the swarm with name, id, parent, status, working directory and branch. ",
+    "List the agents in the swarm with name, id, parent, status, working directory, branch and running ",
+    "background jobs. ",
     "Cancelled agents are only counted unless include_cancelled is set."
 );
 
 const CANCEL_DESCRIPTION: &str =
-    "Stop an agent and every agent it spawned. Its worktree and branch are left in place.";
+    "Stop an agent and every agent it spawned, and kill their background jobs. Its worktree and branch are left in place.";
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SpawnInput {
@@ -144,6 +149,91 @@ fn reload_tool(swarm: Swarm) -> ToolRef {
             }
         });
     Arc::new(tool)
+}
+
+const RUN_BACKGROUND_DESCRIPTION: &str = concat!(
+    "Run a shell command in the background, in your working directory and environment, and return its ",
+    "job id at once. It runs detached from the swarm, so it survives swarm restarts. When it ends you get ",
+    "a message with its exit code and the last lines of its output (an idle agent wakes up for it): ",
+    "use it for builds, test suites and anything slow instead of polling with sleep. Output goes to a log ",
+    "file you can read meanwhile; `jobs` lists or kills jobs."
+);
+
+const JOBS_DESCRIPTION: &str =
+    "List the background jobs of the swarm (yours first) with status and log path, or kill one by id.";
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RunBackgroundInput {
+    /// Shell command (run with `sh -c`).
+    command: String,
+    /// Short label, e.g. `gates`.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct JobsInput {
+    /// Id of a job to kill (with everything it started); omit to list jobs.
+    #[serde(default)]
+    kill: Option<String>,
+}
+
+fn run_background_tool(swarm: Swarm, me: String) -> ToolRef {
+    let tool = FunctionTool::builder("run_background")
+        .description(RUN_BACKGROUND_DESCRIPTION)
+        .typed_handler(move |input: RunBackgroundInput, _ctx: ToolContext| {
+            let swarm = swarm.clone();
+            let me = me.clone();
+            async move {
+                let job = swarm.start_job(&me, &input.command, input.name).await?;
+                Result::Ok(format!(
+                    "Started job {} in {}; output: {}. You will get a message when it ends.",
+                    job.label(),
+                    job.meta.cwd.display(),
+                    swarm.job_log(&job.meta.id).display()
+                ))
+            }
+        });
+    Arc::new(tool)
+}
+
+fn jobs_tool(swarm: Swarm, me: String) -> ToolRef {
+    let tool = FunctionTool::builder("jobs")
+        .description(JOBS_DESCRIPTION)
+        .typed_handler(move |input: JobsInput, _ctx: ToolContext| {
+            let swarm = swarm.clone();
+            let me = me.clone();
+            async move {
+                if let Some(id) = input.kill {
+                    let job = swarm.kill_job(&id).await?;
+                    return Result::Ok(format!("Job {}: {}.", job.label(), job.status()));
+                }
+                Result::Ok(list_jobs(&swarm, &me, swarm.jobs().await))
+            }
+        });
+    Arc::new(tool)
+}
+
+/// One line per job, the caller's first, then the newest first within each group.
+fn list_jobs(swarm: &Swarm, me: &str, mut jobs: Vec<Job>) -> String {
+    if jobs.is_empty() {
+        return "No background jobs.".to_owned();
+    }
+    jobs.reverse();
+    jobs.sort_by_key(|job| job.meta.owner != me);
+    jobs.iter()
+        .map(|job| {
+            format!(
+                "{}: {}, agent {}, `{}`, log {}",
+                job.label(),
+                job.status(),
+                swarm.label(&job.meta.owner),
+                job.meta.command,
+                swarm.job_log(&job.meta.id).display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -301,6 +391,8 @@ pub fn swarm_tools(swarm: Swarm, id: &str) -> Vec<ToolRef> {
         cancel_tool(swarm.clone(), id.to_owned()),
         reload_tool(swarm.clone()),
         schedule_tool(swarm.clone(), id.to_owned()),
+        run_background_tool(swarm.clone(), id.to_owned()),
+        jobs_tool(swarm.clone(), id.to_owned()),
     ];
     if swarm.memory().is_some() {
         tools.push(remember_tool(swarm.clone()));
@@ -393,7 +485,10 @@ fn list_tool(swarm: Swarm) -> ToolRef {
         .description(LIST_DESCRIPTION)
         .typed_handler(move |input: ListInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
-            async move { Result::Ok(list_agents(&swarm, input.include_cancelled)) }
+            async move {
+                let jobs = swarm.jobs().await;
+                Result::Ok(list_agents(&swarm, input.include_cancelled, &jobs))
+            }
         });
     Arc::new(tool)
 }
@@ -427,17 +522,28 @@ fn resolve(swarm: &Swarm, me: &str, who: &str) -> Result<String> {
     }
 }
 
-/// `parser (a2): running, parent root (a1), cwd /repo, branch swarm/run/a2`.
+/// `parser (a2): running, parent root (a1), cwd /repo, branch swarm/run/a2, jobs j3 (gates)`.
 /// One line per agent; cancelled ones are only counted unless `include_cancelled`.
-fn list_agents(swarm: &Swarm, include_cancelled: bool) -> String {
+fn list_agents(swarm: &Swarm, include_cancelled: bool, jobs: &[Job]) -> String {
     let agents = swarm.agents();
     let (shown, hidden): (Vec<_>, Vec<_>) = agents
         .iter()
         .partition(|info| include_cancelled || info.status.is_live());
+    let running = |id: &str| -> String {
+        let labels: Vec<String> = jobs
+            .iter()
+            .filter(|job| job.meta.owner == id && job.state == JobState::Running)
+            .map(Job::label)
+            .collect();
+        match labels.is_empty() {
+            true => String::new(),
+            false => format!(", jobs {}", labels.join(", ")),
+        }
+    };
     let schedules = swarm.schedules();
     let mut lines = Vec::new();
     for info in &shown {
-        lines.push(describe(swarm, info));
+        lines.push(describe(swarm, info) + &running(&info.id));
         let upcoming = schedules.iter().filter(|s| s.to == info.id);
         lines.extend(upcoming.map(|s| format!("  scheduled: {}", s.describe(swarm.now()))));
     }

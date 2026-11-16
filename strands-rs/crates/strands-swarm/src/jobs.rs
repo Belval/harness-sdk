@@ -1,0 +1,459 @@
+//! Background shell jobs: commands that run detached from the swarm process, so a restart does
+//! not kill them, and report back to the agent that started them when they end.
+//!
+//! Everything lives on disk under one directory (`<run>/jobs`): `<id>.json` describes the job,
+//! `<id>.log` takes its output, a small `sh` wrapper writes the exit code to `<id>.exit`, and
+//! `<id>.reported` marks a job whose end was told to its owner. A restarted swarm reads the same
+//! files, so jobs started before a reload still report.
+
+use std::collections::BTreeMap;
+use std::io::SeekFrom;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use strands_agents::{Error, Result};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+/// Lines of output a job's end report carries.
+pub const TAIL_LINES: usize = 40;
+
+/// Bytes read from the end of a log for its tail.
+const TAIL_BYTES: u64 = 16 * 1024;
+
+/// Runs `$1` with output to `$2`, then writes its exit code to `$3` (renamed into place, so a
+/// reader never sees it half-written).
+const WRAPPER: &str = r#"sh -c "$1" >"$2" 2>&1 </dev/null; echo $? >"$3.tmp"; mv "$3.tmp" "$3""#;
+
+/// What `<id>.json` holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobMeta {
+    /// `j1`, `j2`, … unique within the run.
+    pub id: String,
+    /// Agent that started it and is told when it ends.
+    pub owner: String,
+    /// Optional short label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The shell command.
+    pub command: String,
+    /// Working directory.
+    pub cwd: PathBuf,
+    /// Process id of the wrapper, which leads the job's process group.
+    pub pid: u32,
+    /// Start time, seconds since the Unix epoch.
+    pub started: u64,
+}
+
+/// Where a job is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobState {
+    /// Still running.
+    Running,
+    /// Exited with this code.
+    Exited(i32),
+    /// Killed through [`Jobs::kill`].
+    Killed,
+    /// Its process is gone without an exit code (e.g. the machine rebooted).
+    Lost,
+}
+
+/// A job as read from disk.
+#[derive(Debug, Clone)]
+pub struct Job {
+    /// Its description.
+    pub meta: JobMeta,
+    /// Its state.
+    pub state: JobState,
+    /// Its owner has been told it ended.
+    pub reported: bool,
+    /// Seconds it ran (so far, while running).
+    pub seconds: u64,
+}
+
+impl Job {
+    /// `j3 (gates)`.
+    pub fn label(&self) -> String {
+        match &self.meta.name {
+            Some(name) => format!("{} ({name})", self.meta.id),
+            None => self.meta.id.clone(),
+        }
+    }
+
+    /// `running 2m05s`, `exited 0 after 41s`, `killed after 3s`.
+    pub fn status(&self) -> String {
+        let time = duration(self.seconds);
+        match self.state {
+            JobState::Running => format!("running {time}"),
+            JobState::Exited(code) => format!("exited {code} after {time}"),
+            JobState::Killed => format!("killed after {time}"),
+            JobState::Lost => "ended without an exit code".to_owned(),
+        }
+    }
+}
+
+/// `41s`, `2m05s`, `1h03m`.
+fn duration(seconds: u64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The jobs of one run, kept in a directory.
+#[derive(Debug)]
+pub struct Jobs {
+    dir: PathBuf,
+    /// Serializes id allocation within this process.
+    start: tokio::sync::Mutex<()>,
+}
+
+impl Jobs {
+    /// Jobs kept in `dir` (created on the first start).
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            start: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Where job `id` writes its output.
+    pub fn log_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.log"))
+    }
+
+    fn file(&self, id: &str, ext: &str) -> PathBuf {
+        self.dir.join(format!("{id}.{ext}"))
+    }
+
+    /// Start `command` with `sh` in `cwd`, with `env` on top of this process's environment, in
+    /// its own process group so that neither the swarm exiting nor a Ctrl-C in its terminal
+    /// stops it.
+    pub async fn start(
+        &self,
+        owner: &str,
+        name: Option<String>,
+        command: &str,
+        cwd: &Path,
+        env: &BTreeMap<String, String>,
+    ) -> Result<Job> {
+        let _guard = self.start.lock().await;
+        tokio::fs::create_dir_all(&self.dir).await?;
+        let id = self.next_id().await?;
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(WRAPPER)
+            .arg("job")
+            .arg(command)
+            .arg(self.log_path(&id))
+            .arg(self.file(&id, "exit"))
+            .current_dir(cwd)
+            .envs(env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|e| Error::other(format!("Could not start the job: {e}")))?;
+        let meta = JobMeta {
+            id: id.clone(),
+            owner: owner.to_owned(),
+            name: name.filter(|n| !n.trim().is_empty()),
+            command: command.to_owned(),
+            cwd: cwd.to_path_buf(),
+            pid: child.id().unwrap_or_default(),
+            started: now(),
+        };
+        // Reap the wrapper once it ends; the job reports through its files, not this handle.
+        tokio::spawn(async move { child.wait().await });
+        tokio::fs::write(self.file(&id, "json"), serde_json::to_vec_pretty(&meta)?).await?;
+        Ok(Job {
+            meta,
+            state: JobState::Running,
+            reported: false,
+            seconds: 0,
+        })
+    }
+
+    /// One more than the highest job number on disk.
+    async fn next_id(&self) -> Result<String> {
+        let highest = self
+            .metas()
+            .await
+            .iter()
+            .filter_map(|meta| meta.id.strip_prefix('j')?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        Ok(format!("j{}", highest + 1))
+    }
+
+    async fn metas(&self) -> Vec<JobMeta> {
+        let Ok(mut entries) = tokio::fs::read_dir(&self.dir).await else {
+            return Vec::new();
+        };
+        let mut metas = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let parsed = tokio::fs::read(&path)
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<JobMeta>(&bytes).ok());
+                metas.extend(parsed);
+            }
+        }
+        metas.sort_by_key(|meta| {
+            let number = meta.id.strip_prefix('j').and_then(|n| n.parse::<u64>().ok());
+            (number, meta.id.clone())
+        });
+        metas
+    }
+
+    /// Every job, oldest first.
+    pub async fn list(&self) -> Vec<Job> {
+        let mut jobs = Vec::new();
+        for meta in self.metas().await {
+            jobs.push(self.read(meta).await);
+        }
+        jobs
+    }
+
+    /// One job.
+    pub async fn get(&self, id: &str) -> Result<Job> {
+        let bytes = tokio::fs::read(self.file(id, "json"))
+            .await
+            .map_err(|_| Error::other(format!("No job `{id}`; call jobs to list them.")))?;
+        Ok(self.read(serde_json::from_slice(&bytes)?).await)
+    }
+
+    async fn read(&self, meta: JobMeta) -> Job {
+        let exit = self.file(&meta.id, "exit");
+        let state = match tokio::fs::read_to_string(&exit).await {
+            Ok(text) => match text.trim() {
+                "killed" => JobState::Killed,
+                "lost" => JobState::Lost,
+                code => code.parse().map_or(JobState::Lost, JobState::Exited),
+            },
+            Err(_) => JobState::Running,
+        };
+        let end = match state {
+            JobState::Running => now(),
+            _ => modified(&exit).await.unwrap_or_else(now),
+        };
+        let reported = tokio::fs::try_exists(self.file(&meta.id, "reported"))
+            .await
+            .unwrap_or(false);
+        Job {
+            seconds: end.saturating_sub(meta.started),
+            meta,
+            state,
+            reported,
+        }
+    }
+
+    /// Record that job `id`'s owner was told it ended.
+    pub async fn mark_reported(&self, id: &str) -> Result<()> {
+        tokio::fs::write(self.file(id, "reported"), b"").await?;
+        Ok(())
+    }
+
+    /// Ended jobs whose owner has not been told yet. Running jobs whose process has disappeared
+    /// are recorded as lost first when `check_alive`.
+    pub async fn unreported(&self, check_alive: bool) -> Vec<Job> {
+        let mut ended = Vec::new();
+        for job in self.list().await {
+            if job.reported {
+                continue;
+            }
+            if job.state != JobState::Running {
+                ended.push(job);
+            } else if check_alive && !alive(job.meta.pid).await {
+                // The wrapper may have written its exit code just before it went.
+                let exit = self.file(&job.meta.id, "exit");
+                if !tokio::fs::try_exists(&exit).await.unwrap_or(false) {
+                    let _ = tokio::fs::write(&exit, "lost").await;
+                }
+                // Re-read: it may also have been killed meanwhile, which needs no report.
+                let job = self.read(job.meta).await;
+                if !job.reported {
+                    ended.push(job);
+                }
+            }
+        }
+        ended
+    }
+
+    /// Kill job `id`'s process group, mark it killed and reported (whoever kills it knows).
+    pub async fn kill(&self, id: &str) -> Result<Job> {
+        let job = self.get(id).await?;
+        if job.state != JobState::Running {
+            return Ok(job);
+        }
+        self.mark_reported(id).await?;
+        let group = format!("-{}", job.meta.pid);
+        let _ = tokio::process::Command::new("kill")
+            .args(["-TERM", "--", &group])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        tokio::fs::write(self.file(id, "exit"), "killed").await?;
+        self.get(id).await
+    }
+
+    /// The last `lines` lines of job `id`'s output.
+    pub async fn tail(&self, id: &str, lines: usize) -> String {
+        let Ok(mut file) = tokio::fs::File::open(self.log_path(id)).await else {
+            return String::new();
+        };
+        let len = file.metadata().await.map_or(0, |m| m.len());
+        let from = len.saturating_sub(TAIL_BYTES);
+        if file.seek(SeekFrom::Start(from)).await.is_err() {
+            return String::new();
+        }
+        let mut bytes = Vec::new();
+        let _ = file.read_to_end(&mut bytes).await;
+        let text = String::from_utf8_lossy(&bytes);
+        let all: Vec<&str> = text.trim_end().lines().collect();
+        // A tail cut mid-file starts mid-line; drop that partial line.
+        let partial = usize::from(from > 0 && all.len() > 1);
+        let keep = all.len().saturating_sub(lines).max(partial);
+        all[keep..].join("\n")
+    }
+}
+
+async fn modified(path: &Path) -> Option<u64> {
+    let time = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+    time.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+/// Whether process `pid` still exists (`kill -0`).
+async fn alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let probe = tokio::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match tokio::time::timeout(Duration::from_secs(5), probe).await {
+        Ok(Ok(status)) => status.success(),
+        // Unsure: treat as alive rather than declare a running job lost.
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn until_ended(jobs: &Jobs, id: &str) -> Job {
+        for _ in 0..200 {
+            let job = jobs.get(id).await.unwrap();
+            if job.state != JobState::Running {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("job {id} did not end");
+    }
+
+    #[tokio::test]
+    async fn a_job_runs_in_its_cwd_and_env_and_records_its_output_and_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path().join("jobs"));
+        let env = BTreeMap::from([("JOB_TEST_VAR".to_owned(), "hello".to_owned())]);
+        let job = jobs
+            .start(
+                "a1",
+                Some("probe".into()),
+                "pwd; echo $JOB_TEST_VAR; seq 1 100; exit 3",
+                dir.path(),
+                &env,
+            )
+            .await
+            .unwrap();
+        assert_eq!(job.meta.id, "j1");
+        assert_eq!(job.label(), "j1 (probe)");
+        let ended = until_ended(&jobs, "j1").await;
+        assert_eq!(ended.state, JobState::Exited(3));
+        assert!(!ended.reported);
+        let log = tokio::fs::read_to_string(jobs.log_path("j1")).await.unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        assert!(
+            log.starts_with(&format!("{}\nhello\n1\n", cwd.display())),
+            "{log}"
+        );
+        let tail = jobs.tail("j1", 3).await;
+        assert_eq!(tail, "98\n99\n100");
+
+        assert_eq!(jobs.unreported(false).await.len(), 1);
+        jobs.mark_reported("j1").await.unwrap();
+        assert!(jobs.unreported(true).await.is_empty());
+
+        let next = jobs.start("a2", None, "true", dir.path(), &BTreeMap::new()).await;
+        assert_eq!(next.unwrap().meta.id, "j2", "ids continue after those on disk");
+    }
+
+    #[tokio::test]
+    async fn killing_a_job_stops_its_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path());
+        let marker = dir.path().join("late");
+        let command = format!("sleep 2 && touch {}", marker.display());
+        jobs.start("a1", None, &command, dir.path(), &BTreeMap::new())
+            .await
+            .unwrap();
+        let killed = jobs.kill("j1").await.unwrap();
+        assert_eq!(killed.state, JobState::Killed);
+        assert!(killed.reported, "the killer already knows");
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!marker.exists(), "the command's children were killed too");
+        assert!(jobs.unreported(true).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_running_job_whose_process_is_gone_is_reported_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path());
+        let meta = JobMeta {
+            id: "j7".into(),
+            owner: "a1".into(),
+            name: None,
+            command: "make".into(),
+            cwd: dir.path().into(),
+            pid: u32::MAX / 2,
+            started: now(),
+        };
+        tokio::fs::write(dir.path().join("j7.json"), serde_json::to_vec(&meta).unwrap())
+            .await
+            .unwrap();
+        assert!(jobs.unreported(false).await.is_empty(), "running, not checked");
+        let lost = jobs.unreported(true).await;
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].state, JobState::Lost);
+        assert_eq!(lost[0].status(), "ended without an exit code");
+    }
+
+    #[test]
+    fn durations_are_short() {
+        assert_eq!(duration(41), "41s");
+        assert_eq!(duration(125), "2m05s");
+        assert_eq!(duration(3780), "1h03m");
+    }
+}

@@ -1,8 +1,9 @@
 //! Strands swarm: a model-driven agent swarm on top of [`strands_harness`].
 //!
 //! There is no planner, scheduler or fixed topology. Every agent is a harness agent that also
-//! carries five tools — `spawn_agent`, `send_message`, `wait`, `list_agents`, `cancel_agent` — and
-//! decides for itself whether to split work, how deep to go, and how to coordinate.
+//! carries the swarm tools — `spawn_agent`, `send_message`, `wait`, `list_agents`, `cancel_agent`,
+//! `reload_swarm`, `schedule`, `run_background`, `jobs` — and decides for itself whether to split work, how
+//! deep to go, and how to coordinate.
 //!
 //! Each agent is an actor: it runs a turn, reports its final reply to its parent, then sleeps until
 //! a message arrives. Messages that arrive mid-turn are appended to the agent's next tool result,
@@ -18,6 +19,7 @@ pub mod compaction;
 pub mod factory;
 pub mod gc;
 pub mod images;
+pub mod jobs;
 pub mod journal;
 pub mod mcp;
 pub mod memory;
