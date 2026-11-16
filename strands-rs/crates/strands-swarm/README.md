@@ -36,7 +36,9 @@ which tells every stopped agent to continue. The budget is saved with the run.
 
 TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/cancel`, Ctrl-C quits.
 Typing `/` opens a popup of the commands with one-line help, filtered as you type; ↑/↓ and
-Tab or Enter pick one.
+Tab or Enter pick one; F1 lists the keys. Each agent is one line in the tree: status, name, model,
+input/output tokens and how full its context window was on its last model call, e.g.
+`● parser opus-5-5 1.2M/34.0k 34% a3`.
 `/model <id>` switches the selected agent's model from its next model call on (`/model default`
 returns it to `--model`; `/model` alone shows the current one). The id is resolved like `--model`
 (`provider/name` or a Bedrock id, same effort), an invalid one is rejected without touching the

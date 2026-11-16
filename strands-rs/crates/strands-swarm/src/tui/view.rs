@@ -12,8 +12,19 @@ use crate::runtime::{AgentStatus, USER};
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Narrowest agent tree; shrinking it further hides it.
 const MIN_TREE: usize = 10;
-const HELP: &str = "enter send · / commands · ↑↓ select · pgup/pgdn scroll · ctrl-←→ tree width · \
-     f2 plain text · f3 cancelled · ctrl-c quit";
+const HINT: &str = "/ commands · f1 keys";
+/// Key bindings, for the F1 popup.
+const KEYS: &[(&str, &str)] = &[
+    ("enter", "send to the selected agent"),
+    ("/", "commands"),
+    ("↑ ↓", "select an agent (or a command)"),
+    ("pgup pgdn end", "scroll the log"),
+    ("ctrl-← →", "tree width (hides when narrow)"),
+    ("f2", "plain-text log, for native scroll and copy"),
+    ("f3", "show or hide cancelled agents"),
+    ("esc", "clear the input, close this"),
+    ("ctrl-c", "quit"),
+];
 
 /// Draw the whole screen. `tick` animates spinners.
 pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
@@ -34,7 +45,10 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
     draw_log(frame, log, app, tick);
     draw_input(frame, input, app);
     draw_completions(frame, input, app);
-    let footer_text = app.notice.clone().unwrap_or_else(|| HELP.to_owned());
+    if app.show_keys {
+        draw_keys(frame, body);
+    }
+    let footer_text = app.notice.clone().unwrap_or_else(|| HINT.to_owned());
     frame.render_widget(Paragraph::new(footer_text).dim(), footer);
 }
 
@@ -102,28 +116,75 @@ fn tree_width(app: &App, total: u16) -> u16 {
     }
 }
 
-/// Two lines per agent: `⠋ parser a2 ⎇ •`, then what it is doing, dimmed. Both are clipped by
-/// the list's width, so the name stays visible on narrow terminals.
+/// One line per agent: `⠋ parser opus-5-5 1.2M/34k 34% a2 ⎇ •`. The list clips it at its
+/// width, so the trailing id goes first on narrow terminals.
 fn agent_item(depth: usize, view: &AgentView, tick: usize) -> Text<'static> {
     let (glyph, color) = status_glyph(&view.status, tick);
-    let indent = "  ".repeat(depth);
     let mut spans = vec![
-        Span::raw(indent.clone()),
+        Span::raw("  ".repeat(depth)),
         Span::styled(format!("{glyph} "), Style::new().fg(color)),
         Span::styled(view.name.clone(), Style::new().bold()),
-        Span::styled(format!(" {}", view.id), Style::new().dim()),
     ];
+    if let Some(model) = &view.model {
+        spans.push(Span::styled(
+            format!(" {}", short_model(model)),
+            Style::new().dim(),
+        ));
+    }
+    if view.input_tokens + view.output_tokens > 0 {
+        spans.push(Span::styled(format!(" {}", tokens(view)), Style::new().dim()));
+    }
+    if let Some((percent, color)) = context(view) {
+        spans.push(Span::styled(format!(" {percent}"), Style::new().fg(color)));
+    }
+    spans.push(Span::styled(format!(" {}", view.id), Style::new().dim()));
     if view.branch.is_some() {
         spans.push(Span::styled(" ⎇", Style::new().fg(Color::Magenta)));
     }
     if view.unseen {
         spans.push(Span::styled(" •", Style::new().fg(Color::Yellow)));
     }
-    let doing = Line::from(Span::styled(
-        format!("{indent}  {}", view.doing),
-        Style::new().dim(),
-    ));
-    Text::from(vec![Line::from(spans), doing])
+    Text::from(Line::from(spans))
+}
+
+/// `1.2M/34k`: cumulative input/output tokens.
+fn tokens(view: &AgentView) -> String {
+    format!("{}/{}", compact(view.input_tokens), compact(view.output_tokens))
+}
+
+/// The last model call's context window use, e.g. `34%`, colored green/yellow/red at 50%/80%.
+fn context(view: &AgentView) -> Option<(String, Color)> {
+    let context = view.context?;
+    let color = match context {
+        c if c >= 0.8 => Color::Red,
+        c if c >= 0.5 => Color::Yellow,
+        _ => Color::Green,
+    };
+    Some((format!("{}%", (context * 100.0).round() as u64), color))
+}
+
+/// A model id without provider, region, vendor and version noise:
+/// `bedrock/global.anthropic.claude-opus-5-5` → `opus-5-5`, `amazon.nova-pro-v1:0` → `nova-pro`.
+fn short_model(id: &str) -> &str {
+    let mut name = id.rsplit('/').next().unwrap_or(id);
+    while let Some((head, rest)) = name.split_once('.') {
+        match !head.is_empty() && head.chars().all(|c| c.is_ascii_lowercase()) {
+            true => name = rest,
+            false => break,
+        }
+    }
+    name = name.split(':').next().unwrap_or(name);
+    name = name.strip_prefix("claude-").unwrap_or(name);
+    while let Some((rest, tail)) = name.rsplit_once('-') {
+        let version =
+            tail.len() > 1 && tail.starts_with('v') && tail[1..].chars().all(|c| c.is_ascii_digit());
+        let date = tail.len() == 8 && tail.chars().all(|c| c.is_ascii_digit());
+        match version || date {
+            true => name = rest,
+            false => break,
+        }
+    }
+    name
 }
 
 fn status_glyph(status: &AgentStatus, tick: usize) -> (&'static str, Color) {
@@ -171,21 +232,54 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     frame.render_widget(paragraph.scroll((offset, 0)), area);
 }
 
+/// `parser a2 · running · opus-5-5 · 1.2M/34k tok · 34% · …/a2/repo`.
 fn log_title(view: &AgentView) -> String {
-    let branch = view
-        .branch
-        .as_ref()
-        .map(|b| format!(" · {b}"))
-        .unwrap_or_default();
-    let model = view.model.as_ref().map(|m| format!(" · {m}")).unwrap_or_default();
-    format!(
-        " {} · {} · {}{branch} · {}/{} tok{model} ",
-        view.label(),
-        view.status,
-        view.cwd.display(),
-        compact(view.input_tokens),
-        compact(view.output_tokens)
-    )
+    let status = match &view.status {
+        AgentStatus::Errored(_) => "errored".to_owned(),
+        status => status.to_string(),
+    };
+    let mut parts = vec![view.label(), status];
+    parts.extend(view.model.as_deref().map(|model| short_model(model).to_owned()));
+    if view.input_tokens + view.output_tokens > 0 {
+        parts.push(format!("{} tok", tokens(view)));
+    }
+    parts.extend(context(view).map(|(percent, _)| percent));
+    parts.push(short_path(&view.cwd));
+    format!(" {} ", parts.join(" · "))
+}
+
+/// The last two components of `path`, e.g. `…/a2/repo`.
+fn short_path(path: &std::path::Path) -> String {
+    let parts: Vec<_> = path.iter().map(|part| part.to_string_lossy()).collect();
+    match parts.len() {
+        0..=3 => path.display().to_string(),
+        n => format!("…/{}/{}", parts[n - 2], parts[n - 1]),
+    }
+}
+
+/// The F1 key-binding popup, centered over the body.
+fn draw_keys(frame: &mut Frame, body: Rect) {
+    let lines: Vec<Line> = KEYS
+        .iter()
+        .map(|(key, help)| {
+            Line::from(vec![
+                Span::styled(format!(" {key:<14}"), Style::new().bold()),
+                Span::styled(*help, Style::new().dim()),
+            ])
+        })
+        .collect();
+    let width = 60.min(body.width);
+    let height = (KEYS.len() as u16 + 2).min(body.height);
+    let area = Rect::new(
+        body.x + (body.width - width) / 2,
+        body.y + (body.height - height) / 2,
+        width,
+        height,
+    );
+    let popup =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" keys · esc close "));
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
 }
 
 /// An agent's log as plain text: the same lines the log pane shows, without styling, borders or
@@ -346,5 +440,56 @@ mod tests {
             .collect();
         assert!(screen.contains("/cancel"), "{screen}");
         assert!(!screen.contains("/model"), "{screen}");
+    }
+
+    #[test]
+    fn model_ids_are_shortened_for_the_agent_tree() {
+        for (id, short) in [
+            ("bedrock/global.anthropic.claude-opus-5-5", "opus-5-5"),
+            ("us.anthropic.claude-3-5-sonnet-20240620-v1:0", "3-5-sonnet"),
+            ("amazon.nova-pro-v1:0", "nova-pro"),
+            ("openai/gpt-4.1", "gpt-4.1"),
+            ("test-model", "test-model"),
+        ] {
+            assert_eq!(short_model(id), short, "{id}");
+        }
+    }
+
+    #[test]
+    fn an_agent_is_one_compact_line_with_model_tokens_and_context() {
+        use crate::runtime::SwarmEvent;
+        let mut app = App::default();
+        app.apply(SwarmEvent::Spawned {
+            id: "a2".into(),
+            parent: USER.into(),
+            name: "parser".into(),
+            task: "parse".into(),
+            cwd: "/home/me/work/a2/repo".into(),
+            branch: None,
+        });
+        app.apply(SwarmEvent::Model {
+            id: "a2".into(),
+            model: "global.anthropic.claude-opus-5-5".into(),
+        });
+        app.apply(SwarmEvent::Usage {
+            id: "a2".into(),
+            input_tokens: 1_200_000,
+            output_tokens: 34_000,
+            context: Some(0.34),
+        });
+        let view = &app.agents["a2"];
+        let item = agent_item(0, view, 0);
+        assert_eq!(item.lines.len(), 1);
+        assert!(
+            item.lines[0]
+                .to_string()
+                .contains("parser opus-5-5 1.2M/34.0k 34% a2"),
+            "{}",
+            item.lines[0]
+        );
+        assert_eq!(
+            log_title(view),
+            " parser (a2) · starting · opus-5-5 · 1.2M/34.0k tok · 34% · …/a2/repo "
+        );
     }
 }

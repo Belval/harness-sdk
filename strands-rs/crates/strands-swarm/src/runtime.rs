@@ -287,6 +287,9 @@ pub enum SwarmEvent {
         input_tokens: u64,
         /// Output tokens so far.
         output_tokens: u64,
+        /// Share of the model's context window the last model call's input filled (`0..1+`);
+        /// `None` when unknown.
+        context: Option<f64>,
     },
     /// The token budget was set or lifted (`None`).
     Budget {
@@ -766,7 +769,7 @@ impl Swarm {
             id: node.id.clone(),
             status: status.clone(),
         });
-        self.emit_usage(&node);
+        self.emit_usage(&node, None);
         if status.is_live() {
             let swarm = self.clone();
             let start = Start::Resume { interrupted };
@@ -1162,15 +1165,21 @@ impl Swarm {
             total.0 += input;
             total.1 += usage.output_tokens;
         }
-        self.emit_usage(node);
+        let window = node
+            .agent
+            .get()
+            .and_then(|agent| agent.model().context_window_limit())
+            .filter(|window| *window > 0);
+        self.emit_usage(node, window.map(|window| input as f64 / window as f64));
     }
 
-    fn emit_usage(&self, node: &Node) {
+    fn emit_usage(&self, node: &Node, context: Option<f64>) {
         let (input_tokens, output_tokens) = *node.usage.lock();
         self.emit(SwarmEvent::Usage {
             id: node.id.clone(),
             input_tokens,
             output_tokens,
+            context,
         });
     }
 

@@ -914,8 +914,47 @@ fn usage(input: u64, cache_read: u64, output: u64) -> strands_agents::types::Usa
     }
 }
 
+/// A mock with a known context window, so utilization can be reported.
+struct Windowed(Arc<MockMessageModel>);
+
+impl Model for Windowed {
+    fn model_id(&self) -> Option<String> {
+        self.0.model_id()
+    }
+
+    fn context_window_limit(&self) -> Option<u64> {
+        Some(4000)
+    }
+
+    fn stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        options: &'a strands_agents::models::StreamOptions,
+    ) -> strands_agents::models::ModelEventStream<'a> {
+        self.0.stream(messages, options)
+    }
+}
+
+/// [`mock_factory`] with every model given a 4000-token context window.
+fn windowed_factory(scripts: &Scripts) -> AgentFactory {
+    let scripts = scripts.clone();
+    Arc::new(move |spec: AgentSpec| {
+        let model = Windowed(scripts.lock()[&spec.id].clone());
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(spec.tools)
+                .no_sandbox()
+                .build()
+        })
+    })
+}
+
+type Report = (u64, u64, Option<f64>);
+
 /// Every `Usage` event for `id` until `id` replies to the user.
-async fn usage_until_reply(events: &mut UnboundedReceiver<SwarmEvent>, id: &str) -> Vec<(u64, u64)> {
+async fn usage_until_reply(events: &mut UnboundedReceiver<SwarmEvent>, id: &str) -> Vec<Report> {
     let mut seen = Vec::new();
     let wait = async {
         while let Some(event) = events.recv().await {
@@ -924,7 +963,8 @@ async fn usage_until_reply(events: &mut UnboundedReceiver<SwarmEvent>, id: &str)
                     id: agent,
                     input_tokens,
                     output_tokens,
-                } if agent == id => seen.push((input_tokens, output_tokens)),
+                    context,
+                } if agent == id => seen.push((input_tokens, output_tokens, context)),
                 SwarmEvent::Mail { to, mail } if to == USER && mail.kind == "reply" => return,
                 _ => {}
             }
@@ -937,7 +977,7 @@ async fn usage_until_reply(events: &mut UnboundedReceiver<SwarmEvent>, id: &str)
 }
 
 #[tokio::test]
-async fn token_usage_is_reported_after_each_model_call_and_survives_a_restart() {
+async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("run");
     let call = Message::new(
@@ -955,14 +995,19 @@ async fn token_usage_is_reported_after_each_model_call_and_survives_a_restart() 
             MockResponse::with_usage(Message::assistant("done"), usage(5, 0, 1)),
         ],
     )]);
-    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    let mut config = SwarmConfig::new(windowed_factory(&scripts), dir.path());
     config.state_dir = Some(state_dir.clone());
     let (swarm, mut events) = Swarm::new(config.clone());
     let id = spawn_root(&swarm, "count").await;
 
     let seen = usage_until_reply(&mut events, &id).await;
-    assert_eq!(seen.first(), Some(&(1000, 10)), "mid-turn report: {seen:?}");
-    assert_eq!(seen.last(), Some(&(1005, 11)), "{seen:?}");
+    // Context is the last call's input over the 4000-token window.
+    assert_eq!(
+        seen.first(),
+        Some(&(1000, 10, Some(0.25))),
+        "mid-turn report: {seen:?}"
+    );
+    assert_eq!(seen.last(), Some(&(1005, 11, Some(5.0 / 4000.0))), "{seen:?}");
     swarm.shutdown().await;
 
     let saved = strands_swarm::state::load(&state_dir)

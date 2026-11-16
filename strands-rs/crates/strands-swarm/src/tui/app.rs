@@ -70,6 +70,8 @@ pub struct AgentView {
     pub output_tokens: u64,
     /// Model id, once known.
     pub model: Option<String>,
+    /// Context window utilization of the last model call (`0..1+`), once known.
+    pub context: Option<f64>,
     /// Log, oldest first, at most [`MAX_LOG_ENTRIES`] entries.
     pub log: VecDeque<LogEntry>,
     /// Log entries the user has not looked at.
@@ -199,6 +201,8 @@ pub struct App {
     pub completion: usize,
     /// Swarm-wide token budget, if any.
     pub budget: Option<u64>,
+    /// Set while the F1 key-binding popup is open.
+    pub show_keys: bool,
 }
 
 /// A slash command, for the popup that opens when the input starts with `/`.
@@ -279,6 +283,7 @@ impl App {
                     input_tokens: 0,
                     output_tokens: 0,
                     model: None,
+                    context: None,
                     log: VecDeque::from([LogEntry::Task(task)]),
                     unseen: true,
                     queued: false,
@@ -310,9 +315,11 @@ impl App {
                 id,
                 input_tokens,
                 output_tokens,
+                context,
             } => self.with(&id, |view| {
                 view.input_tokens = input_tokens;
                 view.output_tokens = output_tokens;
+                view.context = context.or(view.context);
             }),
         }
     }
