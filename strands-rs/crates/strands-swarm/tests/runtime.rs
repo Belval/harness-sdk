@@ -793,6 +793,77 @@ async fn a_goal_the_judge_keeps_rejecting_ends_the_turn_after_the_attempt_cap() 
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_failing_goal_agent_backs_off_and_reports_a_streak_once() {
+    use strands_agents::plugins::vended::{GoalLoop, ValidationOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let fail = || MockResponse::Error(strands_agents::Error::other("throttled"));
+    map.lock().insert(
+        "a1".into(),
+        MockMessageModel::shared(
+            [tool_call(
+                "spawn_agent",
+                "t1",
+                json!({"task": "sub", "name": "sub", "goal": "work"}),
+            )]
+            .into_iter()
+            .chain((0..6).map(|_| say("noted")))
+            .collect(),
+        ),
+    );
+    map.lock().insert(
+        "a2".into(),
+        MockMessageModel::shared(vec![fail(), fail(), fail(), say("recovered")]),
+    );
+    let scripts = map.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let model = scripts.lock()[&spec.id].clone();
+        Box::pin(async move {
+            let mut builder = Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .system_prompt(spec.instructions)
+                .tools(spec.tools)
+                .no_sandbox();
+            if spec.goal.is_some() {
+                let pass = GoalLoop::sync_validator(|_| Ok(ValidationOutcome::passed()));
+                builder = builder.plugin(strands_swarm::bounded_goal(pass));
+            }
+            builder.build()
+        })
+    });
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, dir.path()));
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "go".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let started = tokio::time::Instant::now();
+    let mut errors = 0;
+    let reply = loop {
+        match events.recv().await.expect("events") {
+            SwarmEvent::Mail { to, mail } if to == "a1" && mail.kind == "error" => errors += 1,
+            SwarmEvent::Mail { to, mail } if to == "a1" && mail.kind == "reply" => break mail.text,
+            _ => {}
+        }
+    };
+    assert_eq!(reply, "recovered");
+    assert_eq!(errors, 1, "one error mail for the whole streak");
+    // Backoff before retries 1, 2 and 3: 15 s + 30 s + 60 s.
+    assert!(
+        started.elapsed() >= Duration::from_secs(105),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")

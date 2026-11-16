@@ -1809,7 +1809,9 @@ impl Swarm {
         };
         let mut backoff = RETRY_INITIAL;
         while let Some(text) = self.next_input(&node, input.take()).await {
-            let Some(error) = self.run_turn(&node, &agent, text).await else {
+            // Only the first failure of a retry streak reaches the parent: each one would wake it.
+            let retrying = backoff > RETRY_INITIAL;
+            let Some(error) = self.run_turn(&node, &agent, text, !retrying).await else {
                 backoff = RETRY_INITIAL;
                 continue;
             };
@@ -1863,8 +1865,9 @@ impl Swarm {
         }
     }
 
-    /// Run one turn; returns the error message when it failed (not when it was cancelled).
-    async fn run_turn(&self, node: &Node, agent: &Agent, input: InvokeInput) -> Option<String> {
+    /// Run one turn; returns the error message when it failed (not when it was cancelled). A
+    /// failure is posted to the parent when `report` is set.
+    async fn run_turn(&self, node: &Node, agent: &Agent, input: InvokeInput, report: bool) -> Option<String> {
         let turn = node.cancel.child_token();
         *node.turn.lock() = Some(turn.clone());
         node.paused.store(false, Ordering::SeqCst);
@@ -1896,7 +1899,9 @@ impl Swarm {
         if let Some(error) = failure {
             let message = error.to_string();
             self.set_status(node, AgentStatus::Errored(message.clone()));
-            let _ = self.post(&node.id, &node.parent, "error", message.clone());
+            if report {
+                let _ = self.post(&node.id, &node.parent, "error", message.clone());
+            }
             return Some(message);
         }
         self.set_status(node, AgentStatus::Idle);
