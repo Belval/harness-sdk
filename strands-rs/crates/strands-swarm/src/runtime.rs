@@ -827,6 +827,12 @@ impl Swarm {
 
     /// Post `text` from `from` to `to`'s mailbox. `to` may be [`USER`].
     pub fn send(&self, from: &str, to: &str, text: impl Into<String>) -> Result<()> {
+        if from == to {
+            // It would only come back as the agent's own next input, an extra turn for nothing.
+            return Err(Error::other(
+                "You cannot message yourself; keep notes in your reply or in a file instead.",
+            ));
+        }
         self.post(from, to, "message", text.into())
     }
 

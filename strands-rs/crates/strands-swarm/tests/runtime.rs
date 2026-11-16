@@ -652,6 +652,41 @@ async fn wait_without_from_returns_once_every_child_is_cancelled() {
     assert!(sent_text(&a1, 2).contains("Every agent you spawned is cancelled"));
 }
 
+#[tokio::test]
+async fn an_agent_cannot_message_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![(
+            "a1",
+            vec![
+                tool_call(
+                    "send_message",
+                    "s1",
+                    json!({"to": "a1", "message": "note to self"}),
+                ),
+                say("done"),
+            ],
+        )],
+        dir.path(),
+    );
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "go".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let a1 = scripts.lock()["a1"].clone();
+    assert!(sent_text(&a1, 1).contains("You cannot message yourself"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(a1.calls().len(), 2, "no extra turn for its own message");
+    assert_eq!(swarm.agent("a1").unwrap().unread, 0);
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")
