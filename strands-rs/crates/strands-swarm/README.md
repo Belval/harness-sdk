@@ -79,6 +79,9 @@ tokens per call; it follows the window on a `/model` switch.
 Reasoning (thinking text and signatures) is dropped from turns before the current one, which
 models that keep prior thinking would otherwise bill as input on every call; the turn in progress
 keeps it, as Anthropic requires within a tool-use loop.
+`shell` and `read` results over 2,000 characters are cut to their head and tail (~800 characters)
+once six newer ones exist, in batches to spare the prompt cache; `retrieve_context` with the
+reference at the end returns the full output.
 The header totals the swarm's tokens as `in 84.8M (97% cached) · out 291k`: input counts cache reads
 and writes (the budget does too), and the share read from the prompt cache is shown beside it, as
 in each agent's log title.

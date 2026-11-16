@@ -24,7 +24,7 @@ use strands_harness::{
 
 use crate::catalog::ToolCatalog;
 use crate::compaction::{CompactAt, DEFAULT_COMPACT_AT};
-use crate::pruning::DropOldReasoning;
+use crate::pruning::{DropOldReasoning, TrimOldResults};
 use crate::runtime::{AgentFactory, AgentSpec, ModelResolver};
 use crate::skills::{skills_prompt, skills_tool};
 
@@ -133,7 +133,8 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// tokens, which stashes most file reads and command outputs and costs a retrieval call each.
 /// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
 /// summarize old turns at `compact_at` tokens (see [`CompactAt`]). Earlier turns' reasoning is
-/// dropped first (see [`DropOldReasoning`]).
+/// dropped first (see [`DropOldReasoning`]) and older large `shell`/`read` results are cut to a
+/// preview (see [`TrimOldResults`]).
 fn context_manager(compact_at: u64) -> ContextManagerOption {
     let truncate = Offload::truncate(
         OffloadTarget::ToolResults,
@@ -157,6 +158,7 @@ fn context_manager(compact_at: u64) -> ContextManagerOption {
         strategies: Some(vec![
             Arc::new(DropOldReasoning),
             Arc::new(truncate),
+            Arc::new(TrimOldResults::default()),
             Arc::new(summarize),
         ]),
         stash: StashOption::Enabled,
