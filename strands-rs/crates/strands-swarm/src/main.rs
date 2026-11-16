@@ -346,6 +346,9 @@ fn print_event(event: &SwarmEvent) {
         | SwarmEvent::Image { .. }
         | SwarmEvent::ModelQueued { .. }
         | SwarmEvent::History { .. } => {}
+        SwarmEvent::ReloadPending { tool_calls } => {
+            eprintln!("reload pending (waiting for {tool_calls} tool calls)")
+        }
         SwarmEvent::Model { id, model } => eprintln!("[{id}] model {model}"),
         SwarmEvent::Reclaimed { collected, .. } => collected
             .iter()

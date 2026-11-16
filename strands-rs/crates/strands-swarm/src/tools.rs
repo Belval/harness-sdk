@@ -8,7 +8,7 @@ use serde::Deserialize;
 use strands_agents::tools::{FunctionTool, ToolContext, ToolRef};
 use strands_agents::Result;
 
-use crate::runtime::{render_mail, AgentInfo, SpawnRequest, Swarm, USER};
+use crate::runtime::{render_mail, AgentInfo, ReloadWhen, SpawnRequest, Swarm, USER};
 
 /// Tool names, in registration order.
 pub const SWARM_TOOL_NAMES: &[&str] = &[
@@ -104,13 +104,18 @@ struct ListInput {
 struct ReloadInput {
     /// Absolute path of the freshly built `strands-swarm` binary.
     binary: String,
+    /// `idle` (default): restart once no agent has a tool call in flight (`wait` does not count),
+    /// at most 10 minutes later. `now`: restart right away, interrupting in-flight tool calls.
+    #[serde(default)]
+    when: ReloadWhen,
 }
 
 const RELOAD_DESCRIPTION: &str = concat!(
     "Restart the whole swarm into a new strands-swarm binary (hot reload). The binary must already be ",
-    "built and must answer --version. Every agent is stopped, saved, and resumed under the new binary with ",
-    "its conversation and unread messages; agents that were mid-turn get a restart notice. If the new ",
-    "binary crashes on startup the supervisor rolls back to the previous one."
+    "built; it is checked (--version, --self-test) and installed right away, and the restart follows ",
+    "per `when`. A newer reload supersedes a pending one. Every agent is stopped, saved, and resumed ",
+    "under the new binary with its conversation and unread messages; agents that were mid-turn get a ",
+    "restart notice. If the new binary crashes on startup the supervisor rolls back to the previous one."
 );
 
 fn reload_tool(swarm: Swarm) -> ToolRef {
@@ -119,8 +124,17 @@ fn reload_tool(swarm: Swarm) -> ToolRef {
         .typed_handler(move |input: ReloadInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             async move {
-                swarm.reload(std::path::Path::new(&input.binary)).await?;
-                Result::Ok("Reload scheduled; the swarm is restarting now.".to_owned())
+                swarm
+                    .reload(std::path::Path::new(&input.binary), input.when)
+                    .await?;
+                Result::Ok(match input.when {
+                    ReloadWhen::Now => "Reload scheduled; the swarm is restarting now.".to_owned(),
+                    ReloadWhen::Idle => concat!(
+                        "Installed and self-tested. The swarm restarts once no agent has a tool call ",
+                        "in flight (at most 10 minutes from now); carry on until then."
+                    )
+                    .to_owned(),
+                })
             }
         });
     Arc::new(tool)

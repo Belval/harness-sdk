@@ -11,7 +11,9 @@ use serde_json::json;
 use strands_agents::testing::{MockMessageModel, MockResponse};
 use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
 use strands_agents::Agent;
-use strands_swarm::{selftest, AgentFactory, AgentSpec, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER};
+use strands_swarm::{
+    selftest, AgentFactory, AgentSpec, ReloadWhen, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
+};
 
 type Scripts = Arc<Mutex<HashMap<String, Arc<MockMessageModel>>>>;
 
@@ -154,7 +156,7 @@ async fn reload_installs_a_binary_that_passes_its_self_test() {
 
     // The real binary, which resumes the copy on its stub model.
     let binary = Path::new(env!("CARGO_BIN_EXE_strands-swarm"));
-    swarm.reload(binary).await.unwrap();
+    swarm.reload(binary, ReloadWhen::Now).await.unwrap();
     let installed = std::fs::read(state_dir.join("bin/current")).unwrap();
     assert_eq!(installed, std::fs::read(binary).unwrap());
     assert_eq!(
@@ -167,7 +169,7 @@ async fn reload_installs_a_binary_that_passes_its_self_test() {
         dir.path(),
         "[ \"$1\" = --version ] && exit 0\n[ -f \"$2/swarm.json\" ] && [ -d \"$2/sessions\" ] && [ ! -e \"$2/bin\" ]",
     );
-    swarm.reload(&checks).await.unwrap();
+    swarm.reload(&checks, ReloadWhen::Now).await.unwrap();
     swarm.shutdown().await;
 }
 
@@ -186,7 +188,11 @@ async fn reload_refuses_a_binary_that_fails_its_self_test() {
         ),
     );
 
-    let error = swarm.reload(&failing).await.unwrap_err().to_string();
+    let error = swarm
+        .reload(&failing, ReloadWhen::Now)
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("boom: cannot restore a1"), "{error}");
     assert!(error.contains("keeps its current binary"), "{error}");
     assert_eq!(

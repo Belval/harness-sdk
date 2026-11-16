@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use futures::StreamExt;
@@ -43,6 +43,24 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a new binary's `--self-test` may take before a reload gives up on it.
 pub const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long an idle-mode reload ([`ReloadWhen::Idle`]) waits for tool calls to finish before it
+/// restarts anyway (the default of [`SwarmConfig::reload_idle_timeout`]).
+pub const RELOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Tool calls that only wait, so a reload does not wait for them ([`Swarm::tool_calls_in_flight`]).
+const WAITING_TOOLS: &[&str] = &["wait"];
+
+/// When [`Swarm::reload`] restarts the swarm into the installed binary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ReloadWhen {
+    /// Once no agent has a tool call in flight, or after [`SwarmConfig::reload_idle_timeout`].
+    #[default]
+    Idle,
+    /// Right away, interrupting whatever is in flight.
+    Now,
+}
 
 /// Exit code that tells the supervisor to restart immediately into `<run>/bin/current`.
 pub const RELOAD_EXIT_CODE: u8 = 75;
@@ -189,6 +207,8 @@ pub struct SwarmConfig {
     /// ([`crate::compaction::compaction_point`]); the context share in [`SwarmEvent::Usage`] is
     /// relative to it.
     pub compact_at: u64,
+    /// Longest an idle-mode reload waits for in-flight tool calls before it restarts anyway.
+    pub reload_idle_timeout: Duration,
 }
 
 impl SwarmConfig {
@@ -208,6 +228,7 @@ impl SwarmConfig {
             memory: None,
             side_model: None,
             compact_at: crate::compaction::DEFAULT_COMPACT_AT,
+            reload_idle_timeout: RELOAD_IDLE_TIMEOUT,
         }
     }
 }
@@ -364,6 +385,11 @@ pub enum SwarmEvent {
         /// From [`Swarm::gc`] rather than the automatic pass.
         requested: bool,
     },
+    /// An idle-mode reload is installed and waits for this many tool calls to finish.
+    ReloadPending {
+        /// Tool calls in flight ([`Swarm::tool_calls_in_flight`]).
+        tool_calls: usize,
+    },
     /// The tail of a resumed agent's restored conversation, so a viewer can show its past.
     History {
         /// Id.
@@ -421,6 +447,8 @@ struct Node {
     turn: Mutex<Option<CancellationToken>>,
     /// Interrupted by the user and not messaged since: a goal agent does not resume on restart.
     paused: AtomicBool,
+    /// Tool calls of the current turn in flight, waiting tools ([`WAITING_TOOLS`]) left out.
+    tool_calls: Mutex<usize>,
 }
 
 /// Cumulative `(input, output)` tokens.
@@ -478,6 +506,8 @@ struct Inner {
     shutting_down: AtomicBool,
     actors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     reload: CancellationToken,
+    /// Bumped by every installed reload; a pending idle-mode reload yields to a newer one.
+    reload_generation: AtomicU64,
     model_calls: Option<Arc<Semaphore>>,
     budget: Mutex<Option<u64>>,
     /// Agents whose model call was refused for lack of budget, to wake when it is raised.
@@ -555,6 +585,7 @@ impl Swarm {
             shutting_down: AtomicBool::new(false),
             actors: Mutex::new(Vec::new()),
             reload: CancellationToken::new(),
+            reload_generation: AtomicU64::new(0),
             model_calls: (config.max_concurrent_calls > 0)
                 .then(|| Arc::new(Semaphore::new(config.max_concurrent_calls))),
             budget: Mutex::new(config.budget_tokens),
@@ -649,6 +680,7 @@ impl Swarm {
                 context: Mutex::new(None),
                 turn: Mutex::new(None),
                 paused: AtomicBool::new(false),
+                tool_calls: Mutex::new(0),
             });
             agents.insert(id.clone(), node.clone());
             node
@@ -837,13 +869,15 @@ impl Swarm {
         }
     }
 
-    /// Install `binary` as the run's next binary and ask the host process to restart into it.
+    /// Install `binary` as the run's next binary and ask the host process to restart into it:
+    /// right away, or with [`ReloadWhen::Idle`] once no agent has a tool call in flight (at most
+    /// [`SwarmConfig::reload_idle_timeout`] later). A newer reload supersedes a pending one.
     ///
     /// The binary must answer `--version` within 30 s and pass its own `--self-test` on a
     /// temporary copy of the run within [`SELF_TEST_TIMEOUT`] (see [`crate::selftest`]); otherwise
     /// the reload fails and the swarm keeps its binary. It is copied to `<run>/bin/current`, the
     /// old one kept as `<run>/bin/previous` for the supervisor's crash rollback.
-    pub async fn reload(&self, binary: &Path) -> Result<()> {
+    pub async fn reload(&self, binary: &Path, when: ReloadWhen) -> Result<()> {
         let dir = self.inner.config.state_dir.as_ref().ok_or_else(|| {
             Error::other("Hot reload needs a persistent run (start the swarm with --run <name>).")
         })?;
@@ -851,10 +885,52 @@ impl Swarm {
         selftest::check_binary(binary, dir, SELF_TEST_TIMEOUT).await?;
         install_binary(binary, &dir.join("bin")).await?;
         if let Some(journal) = &self.inner.journal {
-            journal.event("reload", serde_json::json!({ "binary": binary }));
+            journal.event(
+                "reload",
+                serde_json::json!({ "binary": binary, "when": format!("{when:?}") }),
+            );
         }
-        self.inner.reload.cancel();
+        let generation = self.inner.reload_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        match when {
+            ReloadWhen::Now => self.inner.reload.cancel(),
+            ReloadWhen::Idle => self.reload_when_idle(generation),
+        }
         Ok(())
+    }
+
+    /// Signal the reload once nothing is in flight, unless a newer reload took over first.
+    fn reload_when_idle(&self, generation: u64) {
+        let swarm = self.clone();
+        let deadline = Instant::now() + self.inner.config.reload_idle_timeout;
+        tokio::spawn(async move {
+            let mut shown = None;
+            loop {
+                let current = swarm.inner.reload_generation.load(Ordering::SeqCst) == generation;
+                if !current || swarm.inner.shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
+                let busy = swarm.tool_calls_in_flight();
+                if busy == 0 || Instant::now() >= deadline {
+                    break;
+                }
+                if shown != Some(busy) {
+                    swarm.emit(SwarmEvent::ReloadPending { tool_calls: busy });
+                    shown = Some(busy);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            swarm.inner.reload.cancel();
+        });
+    }
+
+    /// Tool calls in flight across running agents, not counting tools that only wait (`wait`).
+    pub fn tool_calls_in_flight(&self) -> usize {
+        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        nodes
+            .iter()
+            .filter(|node| *node.status.lock() == AgentStatus::Running)
+            .map(|node| *node.tool_calls.lock())
+            .sum()
     }
 
     /// Resolves once an agent has requested a reload; the host should then call
@@ -1057,6 +1133,7 @@ impl Swarm {
             context: Mutex::new(saved.context),
             turn: Mutex::new(None),
             paused: AtomicBool::new(saved.paused),
+            tool_calls: Mutex::new(0),
         });
         agents.insert(saved.id.clone(), node.clone());
         drop(agents);
@@ -1278,6 +1355,10 @@ impl Swarm {
             }
             *current = status.clone();
         }
+        // A turn that ended or was cancelled has nothing in flight, finished events or not.
+        if status != AgentStatus::Running {
+            *node.tool_calls.lock() = 0;
+        }
         self.persist();
         self.emit(SwarmEvent::Status {
             id: node.id.clone(),
@@ -1483,12 +1564,21 @@ impl Swarm {
                 } => self.add_usage(node, usage, true),
                 _ => {}
             },
-            AgentStreamEvent::BeforeToolCall(call) => self.emit(SwarmEvent::ToolStarted {
-                id,
-                name: call.tool_use.name.clone(),
-                summary: summarize_input(&call.tool_use.input),
-            }),
+            AgentStreamEvent::BeforeToolCall(call) => {
+                if !WAITING_TOOLS.contains(&call.tool_use.name.as_str()) {
+                    *node.tool_calls.lock() += 1;
+                }
+                self.emit(SwarmEvent::ToolStarted {
+                    id,
+                    name: call.tool_use.name.clone(),
+                    summary: summarize_input(&call.tool_use.input),
+                })
+            }
             AgentStreamEvent::AfterToolCall(call) => {
+                if !WAITING_TOOLS.contains(&call.tool_use.name.as_str()) {
+                    let mut calls = node.tool_calls.lock();
+                    *calls = calls.saturating_sub(1);
+                }
                 self.emit(SwarmEvent::ToolFinished {
                     id: id.clone(),
                     name: call.tool_use.name.clone(),

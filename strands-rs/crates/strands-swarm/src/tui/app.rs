@@ -234,6 +234,8 @@ pub struct App {
     pub completion: usize,
     /// Swarm-wide token budget, if any.
     pub budget: Option<u64>,
+    /// Tool calls an installed reload waits for ([`SwarmEvent::ReloadPending`]).
+    pub reload_pending: Option<usize>,
     /// Decoded image thumbnails for [`LogEntry::Image`].
     pub images: super::images::Images,
     /// Set while the F1 key-binding popup is open.
@@ -375,6 +377,7 @@ impl App {
             }
             SwarmEvent::ModelQueued { id, queued } => self.with(&id, |view| view.queued = queued),
             SwarmEvent::Budget { tokens } => self.budget = tokens,
+            SwarmEvent::ReloadPending { tool_calls } => self.reload_pending = Some(tool_calls),
             SwarmEvent::Reclaimed { collected, requested } => {
                 if requested || collected.iter().any(|agent| !agent.is_empty()) {
                     self.notice = Some(crate::gc::notice(&collected));

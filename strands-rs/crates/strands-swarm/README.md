@@ -147,6 +147,12 @@ its agents lose their branches, private env and working directories, disk reclam
 (`SwarmConfig::reclaim_disk`), the stub never calls tools and agents get no sandbox: the real run,
 its worktrees, target dirs and sessions are never touched. The copy is deleted after.
 
+The new binary is installed as soon as it passes; `reload_swarm` restarts into it right away with
+`when: "now"`, or by default (`"idle"`) once no agent has a tool call in flight, so a running test
+or build is not cut short. `wait` calls do not count, and after 10 minutes
+(`SwarmConfig::reload_idle_timeout`) it restarts anyway. Meanwhile the TUI header shows
+`reload pending (waiting for N tool calls)`; a newer reload replaces the pending one.
+
 ```sh
 swarmctl start NAME ./target/release/strands-swarm --cwd REPO --goal "..."   # start or resume
 swarmctl attach NAME        # open the TUI (detach: C-b d)

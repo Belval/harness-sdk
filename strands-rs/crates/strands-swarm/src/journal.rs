@@ -152,6 +152,7 @@ impl Journal {
             | SwarmEvent::Image { .. }
             | SwarmEvent::ModelQueued { .. }
             | SwarmEvent::Reclaimed { .. }
+            | SwarmEvent::ReloadPending { .. }
             | SwarmEvent::History { .. } => return,
         };
         self.event(name, fields);

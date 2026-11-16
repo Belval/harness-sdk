@@ -12,7 +12,8 @@ use strands_agents::testing::{MockMessageModel, MockResponse};
 use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
 use strands_agents::{Agent, Model};
 use strands_swarm::{
-    AgentFactory, AgentSpec, AgentStatus, ModelResolver, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
+    AgentFactory, AgentSpec, AgentStatus, ModelResolver, ReloadWhen, SpawnRequest, Swarm, SwarmConfig,
+    SwarmEvent, USER,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -714,16 +715,25 @@ async fn reload_installs_the_binary_keeps_the_previous_one_and_signals_the_host(
     let (swarm, _events) = Swarm::new(config);
     let bin = dir.path().join("run/bin");
 
-    swarm.reload(Path::new("/bin/true")).await.unwrap();
+    swarm
+        .reload(Path::new("/bin/true"), ReloadWhen::Idle)
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(1), swarm.reload_requested())
         .await
         .expect("reload not signalled");
     assert!(bin.join("current").exists());
 
-    swarm.reload(Path::new("/bin/true")).await.unwrap();
+    swarm
+        .reload(Path::new("/bin/true"), ReloadWhen::Now)
+        .await
+        .unwrap();
     assert!(bin.join("previous").exists());
 
-    let error = swarm.reload(Path::new("/bin/false")).await.unwrap_err();
+    let error = swarm
+        .reload(Path::new("/bin/false"), ReloadWhen::Now)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("--version failed"), "{error}");
 }
 
@@ -731,7 +741,10 @@ async fn reload_installs_the_binary_keeps_the_previous_one_and_signals_the_host(
 async fn reload_needs_a_persistent_run() {
     let dir = tempfile::tempdir().unwrap();
     let (swarm, _events, _scripts) = swarm_with(vec![], dir.path());
-    let error = swarm.reload(Path::new("/bin/true")).await.unwrap_err();
+    let error = swarm
+        .reload(Path::new("/bin/true"), ReloadWhen::Now)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("--run"), "{error}");
 }
 
@@ -1899,4 +1912,141 @@ fn saved_mail_keeps_attached_image_paths_and_old_mail_still_loads() {
     assert!(text.contains("/w/shot.png") && !text.contains("PNG"));
     let back: strands_swarm::state::MailState = serde_json::from_str(&text).unwrap();
     assert_eq!(back, with_image);
+}
+
+/// A persistent swarm with the `slow` tool whose idle-mode reloads wait at most `timeout`.
+fn reloadable_swarm(
+    scripts: &Scripts,
+    dir: &Path,
+    timeout: Duration,
+) -> (Swarm, UnboundedReceiver<SwarmEvent>) {
+    let mut config = SwarmConfig::new(slow_tool_factory(scripts), dir);
+    config.state_dir = Some(dir.join("run"));
+    config.reload_idle_timeout = timeout;
+    Swarm::new(config)
+}
+
+async fn reload_pending(events: &mut UnboundedReceiver<SwarmEvent>) -> usize {
+    let wait = async {
+        loop {
+            if let Some(SwarmEvent::ReloadPending { tool_calls }) = events.recv().await {
+                return tool_calls;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap()
+}
+
+async fn reloads_within(swarm: &Swarm, within: Duration) -> bool {
+    tokio::time::timeout(within, swarm.reload_requested())
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn an_idle_reload_waits_for_tool_calls_in_flight_but_not_for_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![
+        (
+            "a1",
+            vec![
+                tool_call("spawn_agent", "s1", json!({ "task": "help", "name": "helper" })),
+                tool_call("wait", "w1", json!({ "from": ["a2"] })),
+                say("done"),
+            ],
+        ),
+        ("a2", vec![tool_call("slow", "t1", json!({})), say("helper done")]),
+    ]);
+    let (swarm, mut events) = reloadable_swarm(&scripts, dir.path(), Duration::from_secs(600));
+    spawn_root(&swarm, "work").await;
+    tool_started(&mut events, "slow").await;
+
+    swarm
+        .reload(Path::new("/bin/true"), ReloadWhen::Idle)
+        .await
+        .unwrap();
+    assert_eq!(
+        reload_pending(&mut events).await,
+        1,
+        "the root's wait does not count"
+    );
+    assert!(!reloads_within(&swarm, Duration::from_millis(500)).await);
+    assert!(
+        dir.path().join("run/bin/current").exists(),
+        "installed right away"
+    );
+
+    swarm.interrupt("a2").unwrap();
+    assert!(reloads_within(&swarm, Duration::from_secs(5)).await);
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_idle_reload_gives_up_waiting_after_its_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![tool_call("slow", "t1", json!({})), say("done")],
+    )]);
+    let (swarm, mut events) = reloadable_swarm(&scripts, dir.path(), Duration::from_millis(300));
+    spawn_root(&swarm, "work").await;
+    tool_started(&mut events, "slow").await;
+
+    swarm
+        .reload(Path::new("/bin/true"), ReloadWhen::Idle)
+        .await
+        .unwrap();
+    assert!(reloads_within(&swarm, Duration::from_secs(5)).await);
+    assert_eq!(
+        swarm.tool_calls_in_flight(),
+        1,
+        "restarted with the call still running"
+    );
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_newer_reload_supersedes_a_pending_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![tool_call("slow", "t1", json!({})), say("done")],
+    )]);
+    let (swarm, mut events) = reloadable_swarm(&scripts, dir.path(), Duration::from_secs(1));
+    spawn_root(&swarm, "work").await;
+    tool_started(&mut events, "slow").await;
+
+    swarm
+        .reload(Path::new("/bin/true"), ReloadWhen::Idle)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    swarm
+        .reload(Path::new("/bin/true"), ReloadWhen::Idle)
+        .await
+        .unwrap();
+    // The first request's deadline passes; only the second one's counts.
+    assert!(!reloads_within(&swarm, Duration::from_millis(600)).await);
+    assert!(reloads_within(&swarm, Duration::from_secs(5)).await);
+
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reload_now_does_not_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![tool_call("slow", "t1", json!({})), say("done")],
+    )]);
+    let (swarm, mut events) = reloadable_swarm(&scripts, dir.path(), Duration::from_secs(600));
+    spawn_root(&swarm, "work").await;
+    tool_started(&mut events, "slow").await;
+
+    swarm
+        .reload(Path::new("/bin/true"), ReloadWhen::Now)
+        .await
+        .unwrap();
+    assert!(reloads_within(&swarm, Duration::from_millis(100)).await);
+    swarm.shutdown().await;
 }

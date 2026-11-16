@@ -149,7 +149,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
         .budget
         .map(|budget| format!(" · budget {}", compact(budget)))
         .unwrap_or_default();
-    let line = Line::from(vec![
+    let mut line = Line::from(vec![
         Span::styled(" strands-swarm ", Style::new().bold().reversed()),
         Span::raw(format!(
             "  run {run_id} · {} agents · {running} running · in {}{cached} · out {}{budget}{hidden}",
@@ -158,6 +158,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
             compact(output)
         )),
     ]);
+    if let Some(calls) = app.reload_pending {
+        let text = format!(" · reload pending (waiting for {calls} tool calls)");
+        line.push_span(Span::styled(text, Style::new().yellow()));
+    }
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -700,6 +704,19 @@ mod tests {
         assert_eq!(
             LogEntry::placeholder("x.png", None),
             "[image: x.png, not decodable]"
+        );
+    }
+
+    #[test]
+    fn a_pending_reload_shows_in_the_header() {
+        let mut app = App::default();
+        app.apply(crate::runtime::SwarmEvent::ReloadPending { tool_calls: 2 });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("reload pending (waiting for 2 tool calls)"),
+            "{screen}"
         );
     }
 
