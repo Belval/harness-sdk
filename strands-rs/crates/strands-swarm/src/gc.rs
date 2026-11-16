@@ -433,6 +433,7 @@ mod tests {
             next_id: 3,
             agents: vec![agent("a1", "idle"), agent("a2", "cancelled")],
             budget_tokens: None,
+            commit: None,
         };
         let collected = collect_run(&state).await;
         assert_eq!(collected.len(), 1);

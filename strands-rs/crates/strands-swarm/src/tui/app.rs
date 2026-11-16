@@ -378,6 +378,9 @@ impl App {
             SwarmEvent::ModelQueued { id, queued } => self.with(&id, |view| view.queued = queued),
             SwarmEvent::Budget { tokens } => self.budget = tokens,
             SwarmEvent::ReloadPending { tool_calls } => self.reload_pending = Some(tool_calls),
+            SwarmEvent::Reloaded { from, to, changes } => {
+                self.notice = Some(crate::version::notice(&from, &to, &changes));
+            }
             SwarmEvent::Reclaimed { collected, requested } => {
                 if requested || collected.iter().any(|agent| !agent.is_empty()) {
                     self.notice = Some(crate::gc::notice(&collected));

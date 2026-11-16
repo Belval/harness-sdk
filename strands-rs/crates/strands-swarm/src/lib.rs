@@ -28,6 +28,7 @@ pub mod skills;
 pub mod state;
 pub mod tools;
 pub mod tui;
+pub mod version;
 pub mod watchdog;
 pub mod worktree;
 

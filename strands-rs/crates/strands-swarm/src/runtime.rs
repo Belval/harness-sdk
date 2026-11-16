@@ -209,6 +209,11 @@ pub struct SwarmConfig {
     pub compact_at: u64,
     /// Longest an idle-mode reload waits for in-flight tool calls before it restarts anyway.
     pub reload_idle_timeout: Duration,
+    /// The commit this binary was built from ([`crate::version::COMMIT`]), saved with the state;
+    /// on resume under another commit the swarm reports what changed ([`SwarmEvent::Reloaded`]).
+    pub commit: Option<String>,
+    /// The git checkout where the commits between two builds are looked up.
+    pub source: PathBuf,
 }
 
 impl SwarmConfig {
@@ -229,6 +234,8 @@ impl SwarmConfig {
             side_model: None,
             compact_at: crate::compaction::DEFAULT_COMPACT_AT,
             reload_idle_timeout: RELOAD_IDLE_TIMEOUT,
+            commit: crate::version::COMMIT.map(str::to_owned),
+            source: PathBuf::from(crate::version::SOURCE),
         }
     }
 }
@@ -389,6 +396,16 @@ pub enum SwarmEvent {
     ReloadPending {
         /// Tool calls in flight ([`Swarm::tool_calls_in_flight`]).
         tool_calls: usize,
+    },
+    /// The run was resumed under a binary built from another commit than the one that saved it.
+    Reloaded {
+        /// The commit that saved the run.
+        from: String,
+        /// This binary's commit.
+        to: String,
+        /// `<short hash> <subject>` of the commits in `to` but not `from`, newest first
+        /// ([`crate::version::changes`]); empty when unknown.
+        changes: Vec<String>,
     },
     /// The tail of a resumed agent's restored conversation, so a viewer can show its past.
     History {
@@ -1080,6 +1097,12 @@ impl Swarm {
         if let Some(journal) = &swarm.inner.journal {
             journal.event("resume", serde_json::json!({ "agents": state.agents.len() }));
         }
+        if let (Some(from), Some(to)) = (state.commit.clone(), swarm.inner.config.commit.clone()) {
+            if from != to {
+                let changes = crate::version::changes(&swarm.inner.config.source, &from, &to).await;
+                swarm.emit(SwarmEvent::Reloaded { from, to, changes });
+            }
+        }
         for agent in state.agents {
             swarm.restore_agent(agent);
         }
@@ -1195,6 +1218,7 @@ impl Swarm {
             next_id: self.inner.next_id.load(Ordering::SeqCst),
             agents,
             budget_tokens: *self.inner.budget.lock(),
+            commit: self.inner.config.commit.clone(),
         }
     }
 

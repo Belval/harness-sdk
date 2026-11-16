@@ -145,6 +145,9 @@ impl Journal {
             }
             SwarmEvent::Model { id, model } => ("model", json!({"id": id, "model": model})),
             SwarmEvent::Budget { tokens } => ("budget", json!({"tokens": tokens})),
+            SwarmEvent::Reloaded { from, to, changes } => {
+                ("changes", json!({"from": from, "to": to, "commits": changes}))
+            }
             SwarmEvent::Text { .. }
             | SwarmEvent::Usage { .. }
             | SwarmEvent::Mail { .. }

@@ -346,6 +346,9 @@ fn print_event(event: &SwarmEvent) {
         | SwarmEvent::Image { .. }
         | SwarmEvent::ModelQueued { .. }
         | SwarmEvent::History { .. } => {}
+        SwarmEvent::Reloaded { from, to, changes } => {
+            eprintln!("{}", strands_swarm::version::notice(from, to, changes));
+        }
         SwarmEvent::ReloadPending { tool_calls } => {
             eprintln!("reload pending (waiting for {tool_calls} tool calls)")
         }

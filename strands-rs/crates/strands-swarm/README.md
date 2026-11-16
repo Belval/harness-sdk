@@ -153,6 +153,11 @@ or build is not cut short. `wait` calls do not count, and after 10 minutes
 (`SwarmConfig::reload_idle_timeout`) it restarts anyway. Meanwhile the TUI header shows
 `reload pending (waiting for N tool calls)`; a newer reload replaces the pending one.
 
+Each binary embeds the git commit it was built from (`build.rs`) and saves it with the run. When
+a run resumes under another commit, the TUI shows a notice with the subjects of the commits in
+between (`git log old..new` in the checkout the binary was built from) and `events.jsonl` gets a
+`changes` entry with the full list.
+
 ```sh
 swarmctl start NAME ./target/release/strands-swarm --cwd REPO --goal "..."   # start or resume
 swarmctl attach NAME        # open the TUI (detach: C-b d)

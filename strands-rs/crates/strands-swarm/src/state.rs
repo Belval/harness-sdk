@@ -30,6 +30,9 @@ pub struct SwarmState {
     /// Swarm-wide token budget (input + output), as last set; `None` for no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u64>,
+    /// Commit of the binary that saved it (`None` for older runs or builds outside git).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 /// Persisted agent.

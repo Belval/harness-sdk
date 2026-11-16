@@ -2050,3 +2050,67 @@ async fn a_reload_now_does_not_wait() {
     assert!(reloads_within(&swarm, Duration::from_millis(100)).await);
     swarm.shutdown().await;
 }
+
+#[tokio::test]
+async fn resuming_under_another_commit_reports_what_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let commit = |subject: &str| {
+        let author = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        git(
+            &repo,
+            &[&author[..], &["commit", "-q", "--allow-empty", "-m", subject]].concat(),
+        );
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(head.stdout).unwrap().trim().to_owned()
+    };
+    let old = commit("feat: before");
+    let new = commit("fix: after");
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.state_dir = Some(dir.path().join("run"));
+    config.source = repo.clone();
+    config.commit = Some(old.clone());
+    let (swarm, _events) = Swarm::new(config.clone());
+    swarm.shutdown().await;
+    let saved = strands_swarm::state::load(&dir.path().join("run"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.commit.as_deref(),
+        Some(old.as_str()),
+        "saved with its commit"
+    );
+
+    config.commit = Some(new.clone());
+    let (resumed, mut events) = Swarm::resume(config.clone(), saved.clone()).await.unwrap();
+    let Ok(SwarmEvent::Reloaded { from, to, changes }) = events.try_recv() else {
+        panic!("no Reloaded event");
+    };
+    assert_eq!((from, to), (old.clone(), new.clone()));
+    assert_eq!(changes, [format!("{} fix: after", &new[..7])]);
+    resumed.shutdown().await;
+    let journal = std::fs::read_to_string(dir.path().join("run/events.jsonl")).unwrap();
+    assert!(
+        journal.contains("\"event\":\"changes\"") && journal.contains("fix: after"),
+        "{journal}"
+    );
+
+    // Same commit, or a run saved before commits were recorded: nothing to report.
+    for commit in [Some(old.clone()), None] {
+        let mut saved = saved.clone();
+        saved.commit = commit;
+        config.commit = Some(old.clone());
+        let (resumed, mut events) = Swarm::resume(config.clone(), saved).await.unwrap();
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, SwarmEvent::Reloaded { .. }), "{event:?}");
+        }
+        resumed.shutdown().await;
+    }
+}
