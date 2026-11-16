@@ -433,6 +433,38 @@ async fn judge_model_overrides_the_aux_model() {
 }
 
 #[tokio::test]
+async fn the_judge_sees_a_capped_transcript_on_a_swapped_aux_model() {
+    let judge = MockMessageModel::shared(vec![verdict(true, None)]);
+    let goal = GoalLoop::goal("Answer in one word.")
+        .with_judge(JudgeConfig::default().with_max_transcript_chars(160));
+    let agent = Agent::builder()
+        .model(replies(&["final"]))
+        .plugin(goal.clone())
+        .build()
+        .unwrap();
+    agent.set_aux_model(Some(judge.clone()));
+    let history: Vec<Message> = (0..20)
+        .flat_map(|i| {
+            [
+                Message::user(format!("old question {i}")),
+                Message::assistant("y".repeat(100)),
+            ]
+        })
+        .collect();
+    agent.set_messages(history);
+
+    agent.invoke("go").await.unwrap();
+
+    assert_eq!(judge.call_count(), 1);
+    let prompt = judge.calls()[0].0[0].text();
+    assert!(prompt.contains("old question 0"), "the task is kept: {prompt}");
+    assert!(!prompt.contains("old question 19"), "{prompt}");
+    assert!(prompt.contains("earlier messages omitted"), "{prompt}");
+    assert!(prompt.ends_with("[assistant]\nfinal"), "{prompt}");
+    assert!(goal.last_result(&agent).unwrap().passed);
+}
+
+#[tokio::test]
 async fn the_judge_system_prompt_can_be_overridden() {
     let judge = MockMessageModel::shared(vec![verdict(true, None)]);
     let goal = GoalLoop::goal("Answer in one word.").with_judge(

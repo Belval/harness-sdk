@@ -88,12 +88,62 @@ pub fn judge_outcome_schema() -> JsonValue {
 /// Tool calls and results are summarised inline so the judge can grade goals that depend on tool
 /// behaviour; long inputs and outputs are trimmed so one tool call cannot dominate the prompt.
 pub fn build_judge_prompt(description: &str, transcript: &[Message]) -> String {
-    let rendered = transcript
-        .iter()
-        .map(render_message)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("Goal:\n{description}\n\nConversation transcript:\n{rendered}")
+    build_capped_judge_prompt(description, transcript, None)
+}
+
+/// [`build_judge_prompt`] with the rendered transcript capped at `max_chars` (see
+/// [`JudgeConfig::with_max_transcript_chars`]): the last message — the response under judgement —
+/// is always kept, then the first message (the task) if it fits, then as many of the most recent
+/// messages as fit. Omitted messages are replaced by a marker that says how many there were.
+pub fn build_capped_judge_prompt(
+    description: &str,
+    transcript: &[Message],
+    max_chars: Option<usize>,
+) -> String {
+    let rendered: Vec<String> = transcript.iter().map(render_message).collect();
+    let rendered = match max_chars {
+        Some(max_chars) => cap_transcript(rendered, max_chars),
+        None => rendered,
+    };
+    format!(
+        "Goal:\n{description}\n\nConversation transcript:\n{}",
+        rendered.join("\n\n")
+    )
+}
+
+fn cap_transcript(mut rendered: Vec<String>, max_chars: usize) -> Vec<String> {
+    let total: usize = rendered.iter().map(|message| message.chars().count()).sum();
+    if total <= max_chars || rendered.len() < 2 {
+        return rendered;
+    }
+    let last = rendered.pop().unwrap_or_default();
+    let mut budget = max_chars.saturating_sub(last.chars().count());
+    let first = rendered.remove(0);
+    let first = match first.chars().count() <= budget {
+        true => {
+            budget -= first.chars().count();
+            Some(first)
+        }
+        false => None,
+    };
+    let mut recent = Vec::new();
+    while let Some(message) = rendered.pop() {
+        let len = message.chars().count();
+        if len > budget {
+            rendered.push(message);
+            break;
+        }
+        budget -= len;
+        recent.push(message);
+    }
+    let omitted = rendered.len() + usize::from(first.is_none());
+    let mut out: Vec<String> = first.into_iter().collect();
+    if omitted > 0 {
+        out.push(format!("[… {omitted} earlier messages omitted …]"));
+    }
+    out.extend(recent.into_iter().rev());
+    out.push(last);
+    out
 }
 
 fn render_message(message: &Message) -> String {
@@ -239,6 +289,9 @@ pub struct JudgeConfig {
     pub model: Option<Arc<dyn Model>>,
     /// System prompt for the judge agent; defaults to [`JUDGE_SYSTEM_PROMPT`].
     pub system_prompt: Option<String>,
+    /// Cap on the rendered transcript sent to the judge, in characters; unbounded by default.
+    /// See [`build_capped_judge_prompt`] for what is kept.
+    pub max_transcript_chars: Option<usize>,
 }
 
 impl JudgeConfig {
@@ -246,6 +299,14 @@ impl JudgeConfig {
     #[must_use]
     pub fn with_model(mut self, model: impl Model + 'static) -> Self {
         self.model = Some(Arc::new(model));
+        self
+    }
+
+    /// Cap the transcript the judge sees (long-running agents would otherwise send their whole
+    /// conversation on every judgement).
+    #[must_use]
+    pub fn with_max_transcript_chars(mut self, max_chars: usize) -> Self {
+        self.max_transcript_chars = Some(max_chars);
         self
     }
 
@@ -547,7 +608,8 @@ impl GoalLoop {
             .model(model)
             .system_prompt(system_prompt)
             .build()?;
-        let prompt = build_judge_prompt(description, &host.messages());
+        let prompt =
+            build_capped_judge_prompt(description, &host.messages(), self.judge.max_transcript_chars);
         let result = judge
             .invoke_with(
                 prompt,
@@ -716,6 +778,45 @@ mod tests {
             Role::Assistant,
             vec![ContentBlock::ToolUse(ToolUseBlock::new(name, id, input))],
         )
+    }
+
+    #[test]
+    fn a_capped_judge_prompt_keeps_the_task_and_the_latest_messages() {
+        let mut transcript = vec![Message::user("the task")];
+        for i in 0..50 {
+            transcript.push(Message::assistant(format!("step {i} {}", "x".repeat(100))));
+        }
+        transcript.push(Message::assistant("final answer"));
+        let full = build_judge_prompt("g", &transcript);
+        assert_eq!(
+            full,
+            build_capped_judge_prompt("g", &transcript, Some(usize::MAX))
+        );
+
+        let capped = build_capped_judge_prompt("g", &transcript, Some(1_000));
+        assert!(capped.len() < 1_200, "{}", capped.len());
+        assert!(capped.starts_with("Goal:\ng\n\nConversation transcript:\n[user]\nthe task\n\n"));
+        assert!(capped.ends_with("[assistant]\nfinal answer"), "{capped}");
+        assert!(capped.contains("step 49 "), "{capped}");
+        assert!(!capped.contains("step 0 "), "{capped}");
+        let kept = (0..50).filter(|i| capped.contains(&format!("step {i} "))).count();
+        assert!(
+            capped.contains(&format!("[… {} earlier messages omitted …]", 50 - kept)),
+            "{capped}"
+        );
+    }
+
+    #[test]
+    fn a_capped_judge_prompt_always_keeps_the_response() {
+        let transcript = vec![
+            Message::user("t".repeat(50)),
+            Message::assistant("a".repeat(50)),
+            Message::assistant("r".repeat(100)),
+        ];
+        let capped = build_capped_judge_prompt("g", &transcript, Some(10));
+        assert!(capped.ends_with(&"r".repeat(100)), "{capped}");
+        assert!(capped.contains("[… 2 earlier messages omitted …]"), "{capped}");
+        assert!(!capped.contains("ttt") && !capped.contains("aaa"), "{capped}");
     }
 
     #[test]

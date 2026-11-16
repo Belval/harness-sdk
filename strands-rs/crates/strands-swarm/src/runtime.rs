@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -16,12 +16,13 @@ use strands_agents::agent::{AgentStreamEvent, InvokeInput, InvokeOptions};
 use strands_agents::hooks::AfterToolCallEvent;
 use strands_agents::middleware::{wrap_fn, InvokeModelStage};
 use strands_agents::models::streaming::{ContentBlockDelta, ModelStreamEvent};
+use strands_agents::models::{ModelEventStream, StreamOptions};
 use strands_agents::tools::ToolRef;
 use strands_agents::types::{
     ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolResultStatus, Usage,
 };
 use strands_agents::{Agent, Error, Model, Result};
-use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::budget;
@@ -172,6 +173,9 @@ pub struct SwarmConfig {
     /// The user's memory file, shown to every agent and written by `remember`/`forget`; `None`
     /// disables memory.
     pub memory: Option<Arc<Memory>>,
+    /// Model for every agent's side calls, such as the goal judge; `None` uses the agent's own
+    /// model. Side calls are gated and counted like the agent's own model calls either way.
+    pub side_model: Option<Arc<dyn Model>>,
 }
 
 impl SwarmConfig {
@@ -189,6 +193,7 @@ impl SwarmConfig {
             models: None,
             reclaim_disk: true,
             memory: None,
+            side_model: None,
         }
     }
 }
@@ -431,6 +436,49 @@ struct Inner {
     budget: Mutex<Option<u64>>,
     /// Agents whose model call was refused for lack of budget, to wake when it is raised.
     over_budget: Mutex<Vec<String>>,
+}
+
+/// An agent's auxiliary model (what side calls such as the goal judge run on): gated by the
+/// budget and the concurrency cap like the agent's own calls, with its usage added to the agent's
+/// totals. Without a fixed model it follows the agent's current one, model switches included.
+struct SideModel {
+    swarm: Swarm,
+    node: Weak<Node>,
+    model: Option<Arc<dyn Model>>,
+}
+
+impl SideModel {
+    fn current(&self) -> Option<Arc<dyn Model>> {
+        let host = || self.node.upgrade()?.agent.get().map(Agent::model);
+        self.model.clone().or_else(host)
+    }
+}
+
+impl Model for SideModel {
+    fn model_id(&self) -> Option<String> {
+        self.current()?.model_id()
+    }
+
+    fn context_window_limit(&self) -> Option<u64> {
+        self.current()?.context_window_limit()
+    }
+
+    fn stream<'a>(&'a self, messages: &'a [Message], options: &'a StreamOptions) -> ModelEventStream<'a> {
+        Box::pin(async_stream::try_stream! {
+            let gone = || Error::other("The agent of this side call is gone.");
+            let node = self.node.upgrade().ok_or_else(gone)?;
+            let model = self.current().ok_or_else(gone)?;
+            let _permit = self.swarm.admit_model_call(&node.id, &node.cancel).await?;
+            let mut events = model.stream(messages, options);
+            while let Some(event) = events.next().await {
+                let event = event?;
+                if let ModelStreamEvent::Metadata { usage: Some(usage), .. } = &event {
+                    self.swarm.add_usage(&node, usage, false);
+                }
+                yield event;
+            }
+        })
+    }
 }
 
 /// Handle to a running swarm. Cheap to clone.
@@ -1193,6 +1241,11 @@ impl Swarm {
         };
         self.install_mail_hook(&agent, &node.id);
         self.install_model_gate(&agent, &node);
+        agent.set_aux_model(Some(Arc::new(SideModel {
+            swarm: self.clone(),
+            node: Arc::downgrade(&node),
+            model: self.inner.config.side_model.clone(),
+        })));
         let _ = node.agent.set(agent.clone());
         self.emit_model(&node);
 
@@ -1293,7 +1346,7 @@ impl Swarm {
                 }),
                 ModelStreamEvent::Metadata {
                     usage: Some(usage), ..
-                } => self.add_usage(node, usage),
+                } => self.add_usage(node, usage, true),
                 _ => {}
             },
             AgentStreamEvent::BeforeToolCall(call) => self.emit(SwarmEvent::ToolStarted {
@@ -1312,8 +1365,9 @@ impl Swarm {
         None
     }
 
-    /// Add one model call's usage (its trailing metadata) to the agent's totals and publish them.
-    fn add_usage(&self, node: &Node, usage: &Usage) {
+    /// Add one model call's usage (its trailing metadata) to the agent's totals and publish them;
+    /// `own_call` says whether the call carried the agent's context (not a side call's).
+    fn add_usage(&self, node: &Node, usage: &Usage, own_call: bool) {
         let input = usage.input_tokens
             + usage.cache_read_input_tokens.unwrap_or(0)
             + usage.cache_write_input_tokens.unwrap_or(0);
@@ -1323,8 +1377,8 @@ impl Swarm {
             total.1 += usage.output_tokens;
         }
         // The same estimate the context manager gates summarization on, including its default
-        // window for models whose window is unknown.
-        if let Some(agent) = node.agent.get() {
+        // window for models whose window is unknown. A side call's input is not the agent's context.
+        if let Some(agent) = node.agent.get().filter(|_| own_call) {
             *node.context.lock() = Some(agent.model().estimate_utilization(input));
         }
         self.emit_usage(node);
@@ -1351,34 +1405,45 @@ impl Swarm {
         agent.add_middleware::<InvokeModelStage>(wrap_fn(move |context, events, next| {
             let (swarm, id, cancel) = (swarm.clone(), id.clone(), cancel.clone());
             async move {
-                if let Some(message) = swarm.budget_exhausted() {
-                    let mut stopped = swarm.inner.over_budget.lock();
-                    if !stopped.contains(&id) {
-                        stopped.push(id);
-                    }
-                    return Err(Error::other(message));
-                }
-                let Some(permits) = swarm.inner.model_calls.clone() else {
-                    return next.run(context, &events).await;
-                };
-                let _permit = match permits.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        swarm.emit(SwarmEvent::ModelQueued {
-                            id: id.clone(),
-                            queued: true,
-                        });
-                        let acquired = tokio::select! {
-                            permit = permits.acquire_owned() => permit.ok(),
-                            _ = cancel.cancelled() => None,
-                        };
-                        swarm.emit(SwarmEvent::ModelQueued { id, queued: false });
-                        acquired.ok_or(Error::Cancelled)?
-                    }
-                };
+                let _permit = swarm.admit_model_call(&id, &cancel).await?;
                 next.run(context, &events).await
             }
         }));
+    }
+
+    /// Refuse a model call of agent `id` once the budget is spent, else wait for a swarm-wide
+    /// permit (if calls are capped), to be held for the call's duration.
+    async fn admit_model_call(
+        &self,
+        id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<OwnedSemaphorePermit>> {
+        if let Some(message) = self.budget_exhausted() {
+            let mut stopped = self.inner.over_budget.lock();
+            if !stopped.iter().any(|stopped| stopped == id) {
+                stopped.push(id.to_owned());
+            }
+            return Err(Error::other(message));
+        }
+        let Some(permits) = self.inner.model_calls.clone() else {
+            return Ok(None);
+        };
+        if let Ok(permit) = permits.clone().try_acquire_owned() {
+            return Ok(Some(permit));
+        }
+        self.emit(SwarmEvent::ModelQueued {
+            id: id.to_owned(),
+            queued: true,
+        });
+        let acquired = tokio::select! {
+            permit = permits.acquire_owned() => permit.ok(),
+            _ = cancel.cancelled() => None,
+        };
+        self.emit(SwarmEvent::ModelQueued {
+            id: id.to_owned(),
+            queued: false,
+        });
+        acquired.map(Some).ok_or(Error::Cancelled)
     }
 
     /// Deliver mail that arrives mid-turn by appending it to the agent's next tool result.

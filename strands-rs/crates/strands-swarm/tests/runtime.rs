@@ -1507,3 +1507,104 @@ async fn without_memory_there_are_no_memory_tools() {
     assert!(!options.tool_specs.iter().any(|spec| spec.name == "remember"));
     assert!(swarm.remember("x").await.is_err());
 }
+
+/// [`windowed_factory`] plus a [`GoalLoop`] judge for agents spawned with a goal.
+fn goal_factory(scripts: &Scripts) -> AgentFactory {
+    let scripts = scripts.clone();
+    Arc::new(move |spec: AgentSpec| {
+        let model = Windowed(scripts.lock()[&spec.id].clone());
+        Box::pin(async move {
+            let mut builder = Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(spec.tools)
+                .no_sandbox();
+            if let Some(goal) = spec.goal {
+                builder = builder.plugin(strands_agents::plugins::vended::GoalLoop::goal(goal));
+            }
+            builder.build()
+        })
+    })
+}
+
+fn verdict(passed: bool, usage: strands_agents::types::Usage) -> MockResponse {
+    let input = json!({ "passed": passed, "feedback": "not yet" });
+    let call = ToolUseBlock::new("strands_structured_output", "verdict", input);
+    MockResponse::with_usage(
+        Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)]),
+        usage,
+    )
+}
+
+async fn spawn_with_goal(swarm: &Swarm) -> String {
+    let request = SpawnRequest {
+        task: "go".into(),
+        goal: Some("say done".into()),
+        ..Default::default()
+    };
+    swarm.spawn(USER, request).await.unwrap()
+}
+
+#[tokio::test]
+async fn the_goal_judge_runs_on_the_side_model_and_counts_toward_the_agents_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![MockResponse::with_usage(
+            Message::assistant("done"),
+            usage(100, 0, 10),
+        )],
+    )]);
+    let judge = MockMessageModel::shared(vec![verdict(true, usage(50, 0, 5))]);
+    let mut config = SwarmConfig::new(goal_factory(&scripts), dir.path());
+    config.side_model = Some(judge.clone());
+    let (swarm, mut events) = Swarm::new(config);
+    let id = spawn_with_goal(&swarm).await;
+
+    let seen = usage_until_reply(&mut events, &id).await;
+    assert_eq!(judge.call_count(), 1);
+    assert_eq!(
+        scripts.lock()["a1"].call_count(),
+        1,
+        "the judge is not the agent's model"
+    );
+    // The judge's call adds to the totals without touching the agent's context fill.
+    assert_eq!(seen, [(100, 10, Some(0.025)), (150, 15, Some(0.025))]);
+    assert_eq!(swarm.tokens_used(), 165);
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_spent_budget_also_stops_the_goal_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![MockResponse::with_usage(
+            Message::assistant("done"),
+            usage(100, 0, 10),
+        )],
+    )]);
+    let judge = MockMessageModel::shared(vec![verdict(true, usage(50, 0, 5))]);
+    let mut config = SwarmConfig::new(goal_factory(&scripts), dir.path());
+    config.side_model = Some(judge.clone());
+    config.budget_tokens = Some(50);
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_with_goal(&swarm).await;
+
+    let failed = async {
+        loop {
+            if let Some(SwarmEvent::Mail { to, mail }) = events.recv().await {
+                if to == USER && mail.kind == "error" {
+                    return mail.text;
+                }
+            }
+        }
+    };
+    let failed = tokio::time::timeout(Duration::from_secs(10), failed)
+        .await
+        .expect("no error after the budget ran out");
+    assert!(failed.contains("Token budget exhausted"), "{failed}");
+    assert_eq!(judge.call_count(), 0);
+    assert_eq!(swarm.tokens_used(), 110);
+    swarm.shutdown().await;
+}

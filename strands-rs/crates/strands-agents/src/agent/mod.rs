@@ -211,6 +211,11 @@ impl Agent {
             .unwrap_or_else(|| self.model())
     }
 
+    /// Replace the auxiliary model; `None` falls back to [`Agent::model`] again.
+    pub fn set_aux_model(&self, model: Option<Arc<dyn Model>>) {
+        *self.inner.aux_model.write() = model;
+    }
+
     /// Replace the model; takes a value or an already shared `Arc<dyn Model>`.
     pub fn set_model(&self, model: impl Model + 'static) {
         *self.inner.model.write() = Arc::new(model);

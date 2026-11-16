@@ -10,7 +10,7 @@ use strands_agents::context_manager::{
     ContextManagerConfig, ContextManagerOption, StashOption, AGENTIC_TRUNCATE_THRESHOLD,
     AUTO_SUMMARIZE_UTILIZATION,
 };
-use strands_agents::plugins::vended::{GoalLoop, Skill};
+use strands_agents::plugins::vended::{GoalLoop, JudgeConfig, Skill};
 use strands_agents::sandbox::LocalSandbox;
 use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
 use strands_agents::tools::ToolRef;
@@ -33,6 +33,11 @@ const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search"];
 
 /// Preview kept in context when a large tool result is offloaded to the stash.
 const TRUNCATE_PREVIEW_TOKENS: usize = 2_000;
+
+/// Transcript the goal judge sees, in characters (about 10k tokens): the task, the latest
+/// messages and the reply under judgement. A long-running agent's whole conversation would be
+/// resent on every turn it ends.
+const JUDGE_TRANSCRIPT_CHARS: usize = 40_000;
 
 /// Settings shared by every agent the factory builds.
 #[derive(Clone, Default)]
@@ -154,7 +159,8 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
     });
     let mut plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(environment)];
     if let Some(goal) = &spec.goal {
-        plugins.push(Arc::new(GoalLoop::goal(goal.clone())));
+        let judge = JudgeConfig::default().with_max_transcript_chars(JUDGE_TRANSCRIPT_CHARS);
+        plugins.push(Arc::new(GoalLoop::goal(goal.clone()).with_judge(judge)));
     }
     let mut sandbox = LocalSandbox::with_base_dir(spec.cwd);
     if !spec.env.is_empty() {

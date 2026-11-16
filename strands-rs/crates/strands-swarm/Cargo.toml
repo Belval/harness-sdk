@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 strands-agents = { path = "../strands-agents", default-features = false, features = ["macros", "mcp"] }
 strands-harness = { path = "../strands-harness" }
+async-stream.workspace = true
 futures.workspace = true
 indexmap.workspace = true
 parking_lot = { workspace = true, features = ["deadlock_detection"] }
