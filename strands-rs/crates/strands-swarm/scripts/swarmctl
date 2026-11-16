@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# swarmctl: keep a named strands-swarm run alive in tmux.
+#
+# The supervisor restarts the run whenever it exits (it resumes from its saved state), restarts
+# immediately into a new binary on a hot reload (exit 75), and rolls back to the previous binary
+# when a new one crashes within 30 seconds. Only `swarmctl stop` ends it.
+set -euo pipefail
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/strands-swarm"
+SELF="$(readlink -f "$0")"
+RELOAD_EXIT=75
+CRASH_WINDOW=30
+
+usage() {
+  cat <<'EOF'
+usage:
+  swarmctl start <run> <binary> [strands-swarm args...]  start or resume <run> in tmux session swarm-<run>
+  swarmctl resume <run>                                  start again with the saved binary and args
+  swarmctl stop <run>                                    stop gracefully (state is kept)
+  swarmctl attach <run>                                  open the TUI (detach with C-b d)
+  swarmctl status                                        list runs
+  swarmctl boot <run> | unboot <run>                     resume <run> after every reboot (crontab @reboot)
+Environment for the swarm (credentials, PATH) is captured at `start` into <state>/<run>/env.
+EOF
+}
+
+die() { echo "swarmctl: $*" >&2; exit 1; }
+run_dir() { echo "$STATE/$1"; }
+session() { echo "swarm-$1"; }
+running() { tmux has-session -t "$(session "$1")" 2>/dev/null; }
+
+start() {
+  local run="$1" binary="$2"; shift 2
+  local dir; dir="$(run_dir "$run")"
+  running "$run" && die "run $run is already running (swarmctl attach $run)"
+  [[ -x "$binary" ]] || die "$binary is not executable"
+  mkdir -p "$dir/bin"
+  install -m 755 "$binary" "$dir/bin/current.new" && mv "$dir/bin/current.new" "$dir/bin/current"
+  printf '%s\0' "$@" > "$dir/args"
+  # Keep the environment the swarm needs (credentials config, PATH for MCP servers) across reboots.
+  { export -p | grep -E '^declare -x (PATH|HOME|USER|LANG|TERM|AWS_[A-Z_]*|QUICK_EVALS_[A-Z_]*|SSH_AUTH_SOCK)='; } > "$dir/env" || true
+  chmod 600 "$dir/env"
+  resume "$run"
+}
+
+resume() {
+  local run="$1" dir; dir="$(run_dir "$run")"
+  [[ -x "$dir/bin/current" ]] || die "no binary for run $run; use swarmctl start"
+  running "$run" && die "run $run is already running"
+  rm -f "$dir/stop"
+  tmux new-session -d -s "$(session "$run")" -x 220 -y 60 "$SELF supervise $run"
+  echo "run $run started: swarmctl attach $run"
+}
+
+supervise() {
+  local run="$1" dir; dir="$(run_dir "$run")"
+  local args=()
+  mapfile -d '' args < "$dir/args"
+  # shellcheck disable=SC1091
+  source "$dir/env"
+  cd "$HOME"
+  while [[ ! -f "$dir/stop" ]]; do
+    local started code=0
+    started=$(date +%s)
+    "$dir/bin/current" --run "$run" "${args[@]}" 2>>"$dir/stderr.log" || code=$?
+    [[ -f "$dir/stop" ]] && break
+    if [[ $code -eq $RELOAD_EXIT ]]; then
+      echo "$(date -Is) reload" >> "$dir/supervisor.log"
+      continue
+    fi
+    echo "$(date -Is) exited code=$code" >> "$dir/supervisor.log"
+    if (( code != 0 && $(date +%s) - started < CRASH_WINDOW )) && [[ -x "$dir/bin/previous" ]]; then
+      mv "$dir/bin/current" "$dir/bin/failed"
+      mv "$dir/bin/previous" "$dir/bin/current"
+      echo "$(date -Is) rolled back to the previous binary" >> "$dir/supervisor.log"
+    fi
+    sleep 5
+  done
+}
+
+stop() {
+  local run="$1" dir; dir="$(run_dir "$run")"
+  touch "$dir/stop"
+  running "$run" || { echo "run $run is not running"; return; }
+  # Ctrl-C quits the TUI (and headless mode) cleanly: state is saved and agents stop.
+  tmux send-keys -t "$(session "$run")" C-c
+  for _ in $(seq 30); do running "$run" || { echo "run $run stopped"; return; }; sleep 1; done
+  tmux kill-session -t "$(session "$run")"
+  echo "run $run killed after 30s (state is saved continuously)"
+}
+
+status() {
+  [[ -d "$STATE" ]] || { echo "no runs"; return; }
+  for dir in "$STATE"/*/; do
+    local run; run="$(basename "$dir")"
+    [[ -f "$dir/swarm.json" ]] || continue
+    local state="stopped"; running "$run" && state="running"
+    local agents; agents=$(python3 -I -c 'import json,sys; a=json.load(open(sys.argv[1]))["agents"]; print(len([x for x in a if x["status"]!="cancelled"]), "live /", len(a))' "$dir/swarm.json")
+    echo "$run: $state, agents $agents"
+  done
+}
+
+boot() {
+  local line="@reboot $SELF resume $1"
+  (crontab -l 2>/dev/null | grep -vF "$line"; echo "$line") | crontab -
+  echo "run $1 will resume after reboot"
+}
+
+unboot() {
+  local line="@reboot $SELF resume $1"
+  crontab -l 2>/dev/null | grep -vF "$line" | crontab -
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  start) (( $# >= 2 )) || { usage; exit 1; }; start "$@" ;;
+  resume) resume "$1" ;;
+  supervise) supervise "$1" ;;
+  stop) stop "$1" ;;
+  attach) tmux attach -t "$(session "$1")" ;;
+  status) status ;;
+  boot) boot "$1" ;;
+  unboot) unboot "$1" ;;
+  *) usage; exit 1 ;;
+esac
