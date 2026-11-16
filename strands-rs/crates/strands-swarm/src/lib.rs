@@ -15,6 +15,7 @@
 pub mod budget;
 pub mod catalog;
 pub mod factory;
+pub mod gc;
 pub mod journal;
 pub mod mcp;
 pub mod names;

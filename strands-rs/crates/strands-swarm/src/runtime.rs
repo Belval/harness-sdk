@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::budget;
+use crate::gc::{self, Collected};
 use crate::journal::Journal;
 use crate::names;
 use crate::state::{AgentState, MailState, Persister, SwarmState, SESSIONS_DIR};
@@ -310,6 +311,14 @@ pub enum SwarmEvent {
         /// Id.
         id: String,
     },
+    /// Disk of cancelled worktree agents was reclaimed (or kept, with the reason): after an agent
+    /// stopped, on resume, or for [`Swarm::gc`] (`requested`, sent even when nothing was found).
+    Reclaimed {
+        /// One entry per agent looked at.
+        collected: Vec<Collected>,
+        /// From [`Swarm::gc`] rather than the automatic pass.
+        requested: bool,
+    },
     /// The tail of a resumed agent's restored conversation, so a viewer can show its past.
     History {
         /// Id.
@@ -354,6 +363,10 @@ struct Node {
     env: BTreeMap<String, String>,
     /// Tokens used so far, across restarts.
     usage: Mutex<Tokens>,
+    /// The actor has exited (or never ran: restored cancelled).
+    finished: AtomicBool,
+    /// Background disk reclamation has been started for this agent.
+    collected: AtomicBool,
 }
 
 /// Cumulative `(input, output)` tokens.
@@ -515,6 +528,8 @@ impl Swarm {
                 goal: request.goal.clone(),
                 env,
                 usage: Mutex::new((0, 0)),
+                finished: AtomicBool::new(false),
+                collected: AtomicBool::new(false),
             });
             agents.insert(id.clone(), node.clone());
             node
@@ -532,9 +547,8 @@ impl Swarm {
             journal.mail(USER, USER, &id, &node.label(), "task", &request.task);
         }
 
-        let swarm = self.clone();
         let start = Start::Fresh(request.task);
-        self.track(tokio::spawn(async move { swarm.run_actor(node, start).await }));
+        self.start_actor(node, start);
         Ok(id)
     }
 
@@ -655,6 +669,85 @@ impl Swarm {
         self.inner.reload.cancelled().await;
     }
 
+    /// Run `node`'s actor; once it exits, reclaim the disk of agents that are now fully stopped.
+    fn start_actor(&self, node: Arc<Node>, start: Start) {
+        let swarm = self.clone();
+        self.track(tokio::spawn(async move {
+            swarm.clone().run_actor(node.clone(), start).await;
+            node.finished.store(true, Ordering::SeqCst);
+            swarm.collect_in_background();
+        }));
+    }
+
+    /// Cancelled worktree agents whose own actor and every descendant's have exited, so nothing
+    /// still runs in their worktree or target dir. With `claim`, only those not claimed before.
+    fn collectable(&self, claim: bool) -> Vec<Arc<Node>> {
+        let owners: Vec<Arc<Node>> = {
+            let agents = self.inner.agents.lock();
+            agents
+                .values()
+                .filter(|node| node.branch.is_some() && *node.status.lock() == AgentStatus::Cancelled)
+                .cloned()
+                .collect()
+        };
+        owners
+            .into_iter()
+            .filter(|node| {
+                self.subtree(&node.id)
+                    .iter()
+                    .all(|n| n.finished.load(Ordering::SeqCst))
+            })
+            .filter(|node| !claim || !node.collected.swap(true, Ordering::SeqCst))
+            .collect()
+    }
+
+    /// Reclaim the disk of newly collectable agents without waiting (see [`Swarm::gc`]).
+    fn collect_in_background(&self) {
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        for node in self.collectable(true) {
+            let swarm = self.clone();
+            tokio::spawn(async move {
+                let collected = swarm.collect_node(&node).await;
+                if !collected.is_empty() {
+                    swarm.emit(SwarmEvent::Reclaimed {
+                        collected: vec![collected],
+                        requested: false,
+                    });
+                }
+            });
+        }
+    }
+
+    /// Reclaim the disk of every cancelled worktree agent that has stopped: delete its private
+    /// `CARGO_TARGET_DIR`, and remove its worktree if it is clean. Branches are never deleted.
+    /// Runs on its own whenever an agent stops and on resume; call it to retry (e.g. after
+    /// committing in a kept worktree). The outcome is also published as
+    /// [`SwarmEvent::Reclaimed`], which the journal records.
+    pub async fn gc(&self) -> Vec<Collected> {
+        let mut collected = Vec::new();
+        for node in self.collectable(false) {
+            collected.push(self.collect_node(&node).await);
+        }
+        self.emit(SwarmEvent::Reclaimed {
+            collected: collected.clone(),
+            requested: true,
+        });
+        collected
+    }
+
+    /// [`Swarm::gc`] without waiting; the outcome arrives as [`SwarmEvent::Reclaimed`].
+    pub fn gc_in_background(&self) {
+        let swarm = self.clone();
+        tokio::spawn(async move { swarm.gc().await });
+    }
+
+    async fn collect_node(&self, node: &Node) -> Collected {
+        let run_id = &self.inner.config.run_id;
+        gc::collect(run_id, &node.id, node.branch.as_deref(), &node.cwd, &node.env).await
+    }
+
     fn track(&self, handle: tokio::task::JoinHandle<()>) {
         let mut actors = self.inner.actors.lock();
         actors.retain(|actor| !actor.is_finished());
@@ -715,6 +808,7 @@ impl Swarm {
             swarm.restore_agent(agent);
         }
         swarm.persist();
+        swarm.collect_in_background();
         Ok((swarm, events))
     }
 
@@ -753,6 +847,8 @@ impl Swarm {
             goal: saved.goal,
             env,
             usage: Mutex::new((saved.input_tokens, saved.output_tokens)),
+            finished: AtomicBool::new(!status.is_live()),
+            collected: AtomicBool::new(false),
         });
         agents.insert(saved.id.clone(), node.clone());
         drop(agents);
@@ -771,9 +867,7 @@ impl Swarm {
         });
         self.emit_usage(&node, None);
         if status.is_live() {
-            let swarm = self.clone();
-            let start = Start::Resume { interrupted };
-            self.track(tokio::spawn(async move { swarm.run_actor(node, start).await }));
+            self.start_actor(node, Start::Resume { interrupted });
         }
     }
 

@@ -1268,3 +1268,175 @@ async fn a_spent_token_budget_stops_model_calls_until_it_is_raised() {
     assert!(sent_text(&root, 1).contains("The token budget was raised to 1.0k"));
     assert_eq!(swarm.snapshot().budget_tokens, Some(1_000));
 }
+
+/// A repo with one commit at `<dir>/repo`, ignoring `target/`.
+fn init_repo(dir: &Path) -> std::path::PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    repo
+}
+
+async fn eventually(what: &str, check: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting until {what}");
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", branch])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[tokio::test]
+async fn cancelling_a_worktree_agent_reclaims_its_target_dir_and_clean_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let scripts = scripts_of(vec![("a1", vec![say("ok")]), ("a2", vec![say("ok")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
+    config.cargo_target_dir = Some(dir.path().join("target"));
+    config.state_dir = Some(dir.path().join("run"));
+    let (swarm, mut events) = Swarm::new(config);
+    let worktree = SpawnRequest {
+        task: "t".into(),
+        worktree: true,
+        ..Default::default()
+    };
+    let owner = swarm.spawn(USER, worktree).await.unwrap();
+    let child = SpawnRequest {
+        task: "t".into(),
+        ..Default::default()
+    };
+    let child = swarm.spawn(&owner, child).await.unwrap();
+    reply_to(&mut events, USER).await;
+    reply_to(&mut events, &owner).await;
+    let checkout = swarm.agent(&owner).unwrap().cwd;
+    let target = dir
+        .path()
+        .join(format!("target-worktrees/{}/{owner}", swarm.run_id()));
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("debug/lib.rlib"), "x").unwrap();
+
+    // The child shares the owner's directories and owns none: cancelling it removes nothing.
+    swarm.cancel(&child).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(target.exists() && checkout.exists());
+
+    swarm.cancel(&owner).unwrap();
+    eventually("the target dir and worktree are gone", || {
+        !target.exists() && !checkout.exists()
+    })
+    .await;
+    let branch = format!("swarm/{}/{owner}", swarm.run_id());
+    assert!(branch_exists(&repo, &branch), "the branch stays");
+    // `/gc` runs in the background and reports through an event, even when nothing is left.
+    swarm.gc_in_background();
+    let report = async {
+        loop {
+            if let SwarmEvent::Reclaimed {
+                collected,
+                requested: true,
+            } = events.recv().await.expect("event stream closed")
+            {
+                return collected;
+            }
+        }
+    };
+    let collected = tokio::time::timeout(Duration::from_secs(10), report)
+        .await
+        .unwrap();
+    assert!(collected.iter().all(|agent| agent.is_empty()), "{collected:?}");
+    swarm.shutdown().await;
+    let events = std::fs::read_to_string(dir.path().join("run/events.jsonl")).unwrap();
+    let gc: Vec<&str> = events
+        .lines()
+        .filter(|l| l.contains("\"event\":\"gc\""))
+        .collect();
+    assert_eq!(gc.len(), 1, "{events}");
+    assert!(gc[0].contains(&target.display().to_string()), "{}", gc[0]);
+    let root = checkout.display().to_string();
+    assert!(gc[0].contains(root.trim_end_matches('/')), "{}", gc[0]);
+}
+
+#[tokio::test]
+async fn a_dirty_worktree_is_kept_until_gc_finds_it_clean_and_resume_collects_cancelled_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let scripts = scripts_of(vec![("a1", vec![say("ok")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
+    config.cargo_target_dir = Some(dir.path().join("target"));
+    config.state_dir = Some(dir.path().join("run"));
+    let (swarm, mut events) = Swarm::new(config.clone());
+    let worktree = SpawnRequest {
+        task: "t".into(),
+        worktree: true,
+        ..Default::default()
+    };
+    let owner = swarm.spawn(USER, worktree).await.unwrap();
+    reply_to(&mut events, USER).await;
+    let checkout = swarm.agent(&owner).unwrap().cwd;
+    std::fs::write(checkout.join("wip.txt"), "unsaved work").unwrap();
+
+    swarm.cancel(&owner).unwrap();
+    eventually("the background pass has run", || {
+        std::fs::read_to_string(dir.path().join("run/events.jsonl"))
+            .is_ok_and(|events| events.contains("uncommitted changes"))
+    })
+    .await;
+    assert!(checkout.join("wip.txt").exists(), "dirty worktrees are kept");
+    let collected = swarm.gc().await;
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected[0].kept[0].1, "uncommitted changes");
+    swarm.shutdown().await;
+
+    // Committed later: resuming the run reclaims the worktree of the already-cancelled agent.
+    git(&checkout, &["add", "."]);
+    git(
+        &checkout,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "wip",
+        ],
+    );
+    let saved = strands_swarm::state::load(&dir.path().join("run"))
+        .await
+        .unwrap()
+        .unwrap();
+    let (resumed, _events) = Swarm::resume(config, saved).await.unwrap();
+    eventually("the worktree is removed on resume", || !checkout.exists()).await;
+    assert!(branch_exists(
+        &repo,
+        &format!("swarm/{}/{owner}", resumed.run_id())
+    ));
+    assert!(resumed.gc().await.iter().all(|c| c.is_empty()), "nothing left");
+    resumed.shutdown().await;
+}

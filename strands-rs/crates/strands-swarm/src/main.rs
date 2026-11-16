@@ -83,6 +83,11 @@ struct Cli {
     /// Print the run's journal (every message to and from the user) and exit. Needs `--run`.
     #[arg(long, requires = "run")]
     journal: bool,
+    /// Reclaim the disk of the run's cancelled worktree agents (their private `CARGO_TARGET_DIR`,
+    /// and their worktree when it has no uncommitted changes; branches stay), report, and exit.
+    /// Needs `--run`. A live swarm does this by itself; the TUI's `/gc` retries.
+    #[arg(long, requires = "run")]
+    gc: bool,
 }
 
 #[tokio::main]
@@ -104,6 +109,22 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
+    if cli.gc {
+        let name = cli.run.as_deref().unwrap_or_default();
+        let dir = state::run_dir(name)?;
+        let saved = state::load(&dir)
+            .await?
+            .ok_or_else(|| format!("no saved run {name}"))?;
+        let collected = strands_swarm::gc::collect_run(&saved).await;
+        let journal = strands_swarm::journal::Journal::open(&dir);
+        for agent in collected.iter().filter(|c| !c.is_empty()) {
+            journal.event("gc", agent.journal_fields());
+            agent.lines().iter().for_each(|line| println!("{line}"));
+        }
+        journal.flush().await;
+        println!("{}", strands_swarm::gc::summary(&collected));
+        return Ok(Exit::Quit);
+    }
     if let (true, Some(name)) = (cli.journal, &cli.run) {
         for entry in strands_swarm::journal::read(&state::run_dir(name)?)? {
             println!("{}", entry.render());
@@ -288,6 +309,10 @@ fn print_event(event: &SwarmEvent) {
         | SwarmEvent::ModelQueued { .. }
         | SwarmEvent::History { .. } => {}
         SwarmEvent::Model { id, model } => eprintln!("[{id}] model {model}"),
+        SwarmEvent::Reclaimed { collected, .. } => collected
+            .iter()
+            .flat_map(|agent| agent.lines())
+            .for_each(|line| eprintln!("gc {line}")),
         SwarmEvent::Budget { tokens } => match tokens {
             Some(tokens) => eprintln!("token budget {tokens}"),
             None => eprintln!("no token budget"),

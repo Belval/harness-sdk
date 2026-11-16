@@ -118,6 +118,12 @@ impl Journal {
 
     /// Record the lifecycle part of a swarm event; streaming text, usage and mail are skipped.
     pub fn record(&self, event: &SwarmEvent) {
+        if let SwarmEvent::Reclaimed { collected, .. } = event {
+            for agent in collected.iter().filter(|agent| !agent.is_empty()) {
+                self.event("gc", agent.journal_fields());
+            }
+            return;
+        }
         let (name, fields) = match event {
             SwarmEvent::Spawned {
                 id,
@@ -144,6 +150,7 @@ impl Journal {
             | SwarmEvent::Mail { .. }
             | SwarmEvent::MailRead { .. }
             | SwarmEvent::ModelQueued { .. }
+            | SwarmEvent::Reclaimed { .. }
             | SwarmEvent::History { .. } => return,
         };
         self.event(name, fields);

@@ -246,6 +246,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "cancel the selected agent and its children",
     },
     SlashCommand {
+        name: "/gc",
+        args: "",
+        help: "reclaim the disk of cancelled worktree agents",
+    },
+    SlashCommand {
         name: "/quit",
         args: "",
         help: "quit (the run is saved)",
@@ -308,6 +313,11 @@ impl App {
             SwarmEvent::MailRead { id } => self.with(&id, AgentView::mark_read),
             SwarmEvent::ModelQueued { id, queued } => self.with(&id, |view| view.queued = queued),
             SwarmEvent::Budget { tokens } => self.budget = tokens,
+            SwarmEvent::Reclaimed { collected, requested } => {
+                if requested || collected.iter().any(|agent| !agent.is_empty()) {
+                    self.notice = Some(crate::gc::notice(&collected));
+                }
+            }
             SwarmEvent::History {
                 id,
                 messages,
@@ -537,6 +547,8 @@ pub enum Command {
     SetModel(Option<String>),
     /// Show the token budget, or set it (`off` lifts it).
     Budget(Option<String>),
+    /// Reclaim the disk of cancelled worktree agents.
+    Gc,
     /// Quit.
     Quit,
 }
@@ -566,6 +578,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         "/cancel" => return Some(Command::Cancel),
         "/model" => return Some(Command::ShowModel),
         "/budget" => return Some(Command::Budget(None)),
+        "/gc" => return Some(Command::Gc),
         "/quit" | "/q" => return Some(Command::Quit),
         _ => {}
     }
@@ -915,6 +928,7 @@ mod tests {
             Some(Command::Goal("ship it".into()))
         );
         assert_eq!(parse_command("/model", true), Some(Command::ShowModel));
+        assert_eq!(parse_command("/gc", false), Some(Command::Gc));
         assert_eq!(
             parse_command("/model  anthropic/claude-x ", true),
             Some(Command::SetModel(Some("anthropic/claude-x".into())))
@@ -950,5 +964,35 @@ mod tests {
         assert!(app.input_is_command());
         app.input = "hello".into();
         assert!(app.completions().is_empty());
+    }
+
+    #[test]
+    fn reclaimed_disk_shows_as_a_notice_and_an_empty_requested_pass_says_so() {
+        let mut app = App::default();
+        let reclaimed = crate::gc::Collected {
+            id: "a3".into(),
+            removed: vec![(PathBuf::from("/t-worktrees/r/a3"), 3 << 30)],
+            kept: Vec::new(),
+        };
+        app.apply(SwarmEvent::Reclaimed {
+            collected: vec![crate::gc::Collected::default()],
+            requested: false,
+        });
+        assert_eq!(app.notice, None, "a quiet automatic pass stays quiet");
+        app.apply(SwarmEvent::Reclaimed {
+            collected: vec![reclaimed],
+            requested: false,
+        });
+        let notice = app.notice.clone().unwrap();
+        assert!(
+            notice.starts_with("gc: reclaimed 3.0 GB from 1 cancelled agents"),
+            "{notice}"
+        );
+        app.apply(SwarmEvent::Reclaimed {
+            collected: Vec::new(),
+            requested: true,
+        });
+        assert_eq!(app.notice.as_deref(), Some("gc: nothing to reclaim"));
+        assert!(SLASH_COMMANDS.iter().any(|command| command.name == "/gc"));
     }
 }

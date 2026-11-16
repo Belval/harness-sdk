@@ -24,7 +24,7 @@ from its task; ids and names work interchangeably. Each agent's final reply per 
 cargo build --release -p strands-swarm
 strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--mcp-config mcp.json]... [--mcp-deny REGEX]...
               [--mcp-eager] [--list-tools] [--skills-dir DIR]... [--no-default-skills] [--list-skills]
-              [--max-agents N] [--max-concurrent-calls N] [--headless] [TASK]
+              [--max-agents N] [--max-concurrent-calls N] [--headless] [--journal | --gc] [TASK]
 ```
 
 `--max-agents` (16) caps live agents; `--max-concurrent-calls` (8, `0` = unlimited) caps model calls in
@@ -34,7 +34,8 @@ output) the whole swarm may use: once spent, model calls fail with a "budget exh
 travels up to you, and `/budget N` in the TUI raises it (`/budget off` lifts it, `/budget` shows usage),
 which tells every stopped agent to continue. The budget is saved with the run.
 
-TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/cancel`, Ctrl-C quits.
+TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`, `/cancel`, `/gc`,
+Ctrl-C quits.
 Typing `/` opens a popup of the commands with one-line help, filtered as you type; ↑/↓ and
 Tab or Enter pick one; F1 lists the keys. Each agent is one line in the tree: status, name, model,
 input/output tokens and how full its context window was on its last model call, e.g.
@@ -69,9 +70,18 @@ what is allowed and denied.
 
 A persistent run also keeps an audit trail next to its state: `journal.jsonl` records every message
 to and from the user (tasks, messages, replies, errors) and `events.jsonl` compact lifecycle events
-(spawns, status changes, tool calls, model switches, resumes, reloads, shutdowns). Both are JSON
+(spawns, status changes, tool calls, model switches, resumes, reloads, shutdowns, disk reclaimed). Both are JSON
 lines with a UTC `ts`, written by a background thread and rotated to `<file>.1` at 8 MB.
 `strands-swarm --run NAME --journal` prints the journal and exits.
+
+A worktree agent owns its worktree at `<repo>.swarm/<run>/<agent>` and, when `CARGO_TARGET_DIR` is
+set, a private target dir at `$CARGO_TARGET_DIR-worktrees/<run>/<agent>` (several GB). Once it and
+everything it spawned have stopped after a cancel (or on resume, for agents cancelled earlier), the
+target dir is deleted and the worktree removed with `git worktree remove` if it has no uncommitted
+changes; its branch is never deleted. Nothing outside those two exact paths is touched, and each
+removal or kept directory is logged as a `gc` event. `/gc` in the TUI retries (e.g. after you commit
+in a kept worktree) and reports the space reclaimed; `strands-swarm --run NAME --gc` does the same
+for a saved run and exits.
 
 Skills (`<name>/SKILL.md` with `name` and `description` frontmatter, as in Claude Code and Codex)
 are discovered once at startup and offered to every agent with progressive disclosure: the system

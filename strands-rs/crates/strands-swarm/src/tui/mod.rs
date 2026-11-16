@@ -304,6 +304,10 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             budget_notice(swarm)
         })
         .map_err(strands_agents::Error::other),
+        (Command::Gc, _) => {
+            swarm.gc_in_background();
+            Ok("gc: measuring and reclaiming in the background…".to_owned())
+        }
         (_, None) => Ok("no agent selected".to_owned()),
     };
     app.notice = Some(outcome.unwrap_or_else(|error| format!("error: {error}")));
