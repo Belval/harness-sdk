@@ -137,6 +137,7 @@ impl AgentView {
     /// What a starting or running agent is doing right now, for the log's live indicator.
     pub fn activity(&self) -> Option<String> {
         match self.status {
+            AgentStatus::Queued => return Some("queued until an agent slot frees…".to_owned()),
             AgentStatus::Starting => return Some("starting…".to_owned()),
             AgentStatus::Running if self.queued => return Some("queued for a model slot…".to_owned()),
             AgentStatus::Running => {}

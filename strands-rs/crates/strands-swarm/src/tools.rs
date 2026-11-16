@@ -8,7 +8,7 @@ use serde::Deserialize;
 use strands_agents::tools::{FunctionTool, ToolContext, ToolRef};
 use strands_agents::Result;
 
-use crate::runtime::{render_mail, AgentInfo, ReloadWhen, SpawnRequest, Swarm, USER};
+use crate::runtime::{render_mail, AgentInfo, AgentStatus, ReloadWhen, SpawnRequest, Swarm, USER};
 
 /// Tool names, in registration order.
 pub const SWARM_TOOL_NAMES: &[&str] = &[
@@ -29,7 +29,9 @@ const SPAWN_DESCRIPTION: &str = concat!(
     "turn is sent to you as a message; you can message it at any time with send_message and it continues ",
     "with its full context. The task is its only context, so include what it needs to know. ",
     "Set worktree=true to give it its own git worktree and branch, cut from your HEAD (uncommitted changes ",
-    "are not included), so parallel edits do not collide; integrate its branch yourself with git."
+    "are not included), so parallel edits do not collide; integrate its branch yourself with git. ",
+    "At the agent limit the agent is queued (status `queued`; it can already be messaged or cancelled) and ",
+    "starts when a slot frees."
 );
 
 const SEND_DESCRIPTION: &str = concat!(
@@ -220,11 +222,21 @@ fn spawn_tool(swarm: Swarm, me: String) -> ToolRef {
                     goal: input.goal,
                 };
                 let id = swarm.spawn(&me, request).await?;
-                let info = swarm
-                    .agent(&id)
-                    .map(|info| describe(&swarm, &info))
-                    .unwrap_or_default();
-                Result::Ok(format!("Spawned {info}. Its replies will arrive as messages."))
+                let Some(info) = swarm.agent(&id) else {
+                    return Result::Ok(format!("Spawned {id}."));
+                };
+                let described = describe(&swarm, &info);
+                if info.status != AgentStatus::Queued {
+                    return Result::Ok(format!(
+                        "Spawned {described}. Its replies will arrive as messages."
+                    ));
+                }
+                Result::Ok(format!(
+                    "Queued {described}: the agent limit is reached, so it starts (and its replies \
+                     arrive as messages) once a slot frees. To free one, cancel an agent you no \
+                     longer need, or cancel this one to drop it. {}",
+                    idle_agents(&swarm)
+                ))
             }
         });
     Arc::new(tool)
@@ -327,6 +339,27 @@ fn list_agents(swarm: &Swarm, include_cancelled: bool) -> String {
         ));
     }
     lines.join("\n")
+}
+
+/// The idle agents (cancellation candidates), for a queued spawn's reply.
+fn idle_agents(swarm: &Swarm) -> String {
+    let idle: Vec<String> = swarm
+        .agents()
+        .iter()
+        .filter(|info| matches!(info.status, AgentStatus::Idle | AgentStatus::Errored(_)))
+        .map(|info| {
+            format!(
+                "{} ({}, parent {})",
+                info.name,
+                info.id,
+                swarm.label(&info.parent)
+            )
+        })
+        .collect();
+    match idle.is_empty() {
+        true => "No agent is idle right now.".to_owned(),
+        false => format!("Idle agents: {}.", idle.join(", ")),
+    }
 }
 
 fn describe(swarm: &Swarm, info: &AgentInfo) -> String {

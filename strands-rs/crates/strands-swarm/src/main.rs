@@ -37,7 +37,7 @@ struct Cli {
     /// Working directory of the root agent.
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
-    /// Maximum number of live agents, root included.
+    /// Maximum number of live agents, root included; further spawns queue until a slot frees.
     #[arg(long, default_value_t = 16)]
     max_agents: usize,
     /// Maximum number of model calls in flight across the swarm; more queue. 0 means no limit.

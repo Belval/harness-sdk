@@ -360,15 +360,47 @@ async fn a_saved_run_without_names_resumes_with_derived_ones() {
     assert_eq!(swarm.snapshot().agents[0].name.as_deref(), Some("review-parser"));
 }
 
+async fn wait_for_status(swarm: &Swarm, id: &str, wanted: AgentStatus) {
+    let reached = async {
+        while swarm.agent(id).unwrap().status != wanted {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), reached)
+        .await
+        .unwrap_or_else(|_| panic!("{id} never became {wanted}"));
+}
+
+fn status_saved(swarm: &Swarm, id: &str) -> String {
+    let state = swarm.snapshot();
+    state.agents.iter().find(|a| a.id == id).unwrap().status.clone()
+}
+
 #[tokio::test]
-async fn spawning_beyond_the_live_agent_limit_fails() {
+async fn spawns_beyond_the_agent_limit_queue_and_start_when_a_slot_frees() {
     let dir = tempfile::tempdir().unwrap();
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    map.lock()
-        .insert("a1".into(), MockMessageModel::shared(vec![say("hi")]));
-    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
-    config.max_agents = 1;
-    let (swarm, _events) = Swarm::new(config);
+    let scripts: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let script = |id: &str, responses| {
+        scripts
+            .lock()
+            .insert(id.to_owned(), MockMessageModel::shared(responses))
+    };
+    script(
+        "a1",
+        vec![
+            tool_call("spawn_agent", "t1", json!({"task": "two", "name": "two"})),
+            tool_call("spawn_agent", "t2", json!({"task": "three", "name": "three"})),
+            say("spawned"),
+            say("ok"),
+            say("ok"),
+            say("ok"),
+        ],
+    );
+    script("a2", vec![say("two done")]);
+    script("a3", vec![say("three done"), say("got mail")]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.max_agents = 2;
+    let (swarm, mut events) = Swarm::new(config);
 
     swarm
         .spawn(
@@ -380,17 +412,95 @@ async fn spawning_beyond_the_live_agent_limit_fails() {
         )
         .await
         .unwrap();
-    let error = swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "two".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("Agent limit reached"), "{error}");
+    assert_eq!(reply_to(&mut events, USER).await, "spawned");
+    assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Queued);
+    assert_eq!(status_saved(&swarm, "a3"), "queued");
+    let a1 = scripts.lock()["a1"].clone();
+    let queued = sent_text(&a1, 2);
+    assert!(
+        queued.contains("Queued three (a3): queued") && queued.contains("agent limit"),
+        "{queued}"
+    );
+    swarm.send(USER, "a3", "hello").unwrap();
+
+    swarm.cancel("a2").unwrap();
+    // a2's own reply ("two done") may land in between.
+    let mut replies = Vec::new();
+    while replies.last().map(String::as_str) != Some("got mail") {
+        replies.push(reply_to(&mut events, "a1").await);
+    }
+    replies.retain(|reply| reply != "two done");
+    assert_eq!(replies, ["three done", "got mail"]);
+    let a3 = scripts.lock()["a3"].clone();
+    assert!(sent_text(&a3, 0).contains("three"));
+    assert!(sent_text(&a3, 1).contains("hello"));
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_agent_drops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    map.lock()
+        .insert("a1".into(), MockMessageModel::shared(vec![say("one")]));
+    map.lock()
+        .insert("a3".into(), MockMessageModel::shared(vec![say("three")]));
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.max_agents = 1;
+    let (swarm, mut events) = Swarm::new(config);
+    let task = |task: &str| SpawnRequest {
+        task: task.into(),
+        ..Default::default()
+    };
+
+    swarm.spawn(USER, task("one")).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "one");
+    swarm.spawn(USER, task("two")).await.unwrap();
+    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
+    swarm.cancel("a2").unwrap();
+    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Cancelled);
+
+    // a2 has no script: it is never built, even once a slot frees.
+    swarm.cancel("a1").unwrap();
+    swarm.spawn(USER, task("three")).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "three");
+    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn a_queued_agent_stays_queued_across_a_resume_until_there_is_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved = || -> strands_swarm::state::SwarmState {
+        serde_json::from_value(json!({
+            "run_id": "old",
+            "cwd": dir.path(),
+            "next_id": 3,
+            "agents": [
+                {"id": "a1", "parent": "user", "cwd": dir.path(), "branch": null, "task": "one",
+                 "model": null, "goal": null, "status": "idle", "mailbox": []},
+                {"id": "a2", "parent": "a1", "cwd": dir.path(), "branch": null, "task": "late",
+                 "model": null, "goal": null, "status": "queued", "mailbox": []},
+            ],
+        }))
+        .unwrap()
+    };
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    map.lock()
+        .insert("a1".into(), MockMessageModel::shared(vec![say("ok")]));
+    map.lock()
+        .insert("a2".into(), MockMessageModel::shared(vec![say("late start")]));
+
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.max_agents = 1;
+    let (swarm, _events) = Swarm::resume(config.clone(), saved()).await.unwrap();
+    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
+    assert_eq!(status_saved(&swarm, "a2"), "queued");
+    swarm.shutdown().await;
+
+    config.max_agents = 2;
+    let (swarm, mut events) = Swarm::resume(config, saved()).await.unwrap();
+    assert_eq!(reply_to(&mut events, "a1").await, "late start");
+    wait_for_status(&swarm, "a2", AgentStatus::Idle).await;
+    assert!(sent_text(&map.lock()["a2"].clone(), 0).contains("late"));
 }
 
 #[tokio::test]

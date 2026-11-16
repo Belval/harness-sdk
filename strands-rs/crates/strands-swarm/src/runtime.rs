@@ -71,6 +71,9 @@ pub const USER: &str = "user";
 /// Lifecycle of one agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStatus {
+    /// Spawned while the agent limit was reached; it starts when a slot frees. It can already
+    /// receive messages.
+    Queued,
     /// The agent is being built.
     Starting,
     /// A turn is in progress.
@@ -93,6 +96,7 @@ impl AgentStatus {
 impl fmt::Display for AgentStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Queued => f.write_str("queued"),
             Self::Starting => f.write_str("starting"),
             Self::Running => f.write_str("running"),
             Self::Idle => f.write_str("idle"),
@@ -176,7 +180,8 @@ pub struct SwarmConfig {
     pub factory: AgentFactory,
     /// Working directory of the root agent.
     pub cwd: PathBuf,
-    /// Upper bound on live (non-cancelled) agents, root included.
+    /// Upper bound on live (non-cancelled) agents that have started, root included; spawns
+    /// beyond it are queued and start, in spawn order, as agents are cancelled.
     pub max_agents: usize,
     /// Upper bound on model calls in flight across the swarm; further calls queue. `0` means no
     /// limit.
@@ -639,21 +644,23 @@ impl Swarm {
         self.node(id).map(|node| node.info())
     }
 
-    /// Whether any agent is mid-turn, starting, or has unread mail.
+    /// Whether any agent is mid-turn, starting, or has unread mail. Queued agents are not busy:
+    /// they only start once something else frees a slot.
     pub fn is_busy(&self) -> bool {
-        self.agents().iter().any(|info| {
-            matches!(info.status, AgentStatus::Running | AgentStatus::Starting)
-                || (info.status.is_live() && info.unread > 0)
+        self.agents().iter().any(|info| match info.status {
+            AgentStatus::Running | AgentStatus::Starting => true,
+            AgentStatus::Queued | AgentStatus::Cancelled => false,
+            AgentStatus::Idle | AgentStatus::Errored(_) => info.unread > 0,
         })
     }
 
-    /// Spawn an agent under `parent` ([`USER`] for a root agent). Returns its id.
+    /// Spawn an agent under `parent` ([`USER`] for a root agent). Returns its id. At the agent
+    /// limit the agent is [`AgentStatus::Queued`] instead, and starts once a slot frees.
     pub async fn spawn(&self, parent: &str, request: SpawnRequest) -> Result<String> {
         let parent_node = self.node(parent);
         if parent != USER && parent_node.is_none() {
             return Err(Error::other(format!("Unknown agent id {parent}.")));
         }
-        self.check_capacity()?;
 
         let id = format!("a{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let base_cwd = parent_node
@@ -676,6 +683,8 @@ impl Swarm {
 
         let node = {
             let mut agents = self.inner.agents.lock();
+            // Decided under the lock, so concurrent spawns cannot overshoot the limit.
+            let queued = started(&agents) >= self.inner.config.max_agents;
             let taken = agents.values().map(|node| node.name.as_str());
             let node = Arc::new(Node {
                 id: id.clone(),
@@ -683,7 +692,10 @@ impl Swarm {
                 parent: parent.to_owned(),
                 cwd,
                 branch,
-                status: Mutex::new(AgentStatus::Starting),
+                status: Mutex::new(match queued {
+                    true => AgentStatus::Queued,
+                    false => AgentStatus::Starting,
+                }),
                 mailbox: Mutex::new(VecDeque::new()),
                 notify: Notify::new(),
                 cancel,
@@ -693,7 +705,8 @@ impl Swarm {
                 goal: request.goal.clone(),
                 env,
                 usage: Mutex::new(Tokens::default()),
-                finished: AtomicBool::new(false),
+                // No actor runs until a queued agent starts.
+                finished: AtomicBool::new(queued),
                 collected: AtomicBool::new(false),
                 context: Mutex::new(None),
                 turn: Mutex::new(None),
@@ -716,9 +729,52 @@ impl Swarm {
             journal.mail(USER, USER, &id, &node.label(), "task", &request.task);
         }
 
-        let start = Start::Fresh(request.task);
-        self.start_actor(node, start);
+        let status = node.status.lock().clone();
+        match status {
+            AgentStatus::Queued => self.emit(SwarmEvent::Status {
+                id: id.clone(),
+                status,
+            }),
+            _ => self.start_actor(node, Start::Fresh(request.task)),
+        }
         Ok(id)
+    }
+
+    /// Start queued agents, oldest first, while there are free slots.
+    fn start_queued(&self) {
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let ready: Vec<Arc<Node>> = {
+            let agents = self.inner.agents.lock();
+            let free = self.inner.config.max_agents.saturating_sub(started(&agents));
+            let mut ready = Vec::new();
+            for node in agents.values() {
+                if ready.len() == free {
+                    break;
+                }
+                // Checked and claimed under the status lock, so a concurrent cancel wins.
+                let mut status = node.status.lock();
+                if *status == AgentStatus::Queued && !node.cancel.is_cancelled() {
+                    *status = AgentStatus::Starting;
+                    node.finished.store(false, Ordering::SeqCst);
+                    ready.push(node.clone());
+                }
+            }
+            ready
+        };
+        if ready.is_empty() {
+            return;
+        }
+        self.persist();
+        for node in ready {
+            self.emit(SwarmEvent::Status {
+                id: node.id.clone(),
+                status: AgentStatus::Starting,
+            });
+            let task = node.task.clone();
+            self.start_actor(node, Start::Fresh(task));
+        }
     }
 
     /// Post `text` from `from` to `to`'s mailbox. `to` may be [`USER`].
@@ -1107,6 +1163,7 @@ impl Swarm {
         for agent in state.agents {
             swarm.restore_agent(agent);
         }
+        swarm.start_queued();
         swarm.persist();
         swarm.collect_in_background();
         Ok((swarm, events))
@@ -1120,6 +1177,7 @@ impl Swarm {
             .child_token();
         let status = match saved.status.as_str() {
             "cancelled" => AgentStatus::Cancelled,
+            "queued" => AgentStatus::Queued,
             _ => AgentStatus::Starting,
         };
         let interrupted = matches!(saved.status.as_str(), "running" | "starting");
@@ -1152,7 +1210,7 @@ impl Swarm {
                 cache_read: saved.cache_read_tokens,
                 cache_write: saved.cache_write_tokens,
             }),
-            finished: AtomicBool::new(!status.is_live()),
+            finished: AtomicBool::new(matches!(status, AgentStatus::Cancelled | AgentStatus::Queued)),
             collected: AtomicBool::new(false),
             context: Mutex::new(saved.context),
             turn: Mutex::new(None),
@@ -1175,7 +1233,7 @@ impl Swarm {
             status: status.clone(),
         });
         self.emit_usage(&node);
-        if status.is_live() {
+        if status.is_live() && status != AgentStatus::Queued {
             self.start_actor(node, Start::Resume { interrupted });
         }
     }
@@ -1330,23 +1388,6 @@ impl Swarm {
         self.inner.agents.lock().get(id).cloned()
     }
 
-    fn check_capacity(&self) -> Result<()> {
-        let live = self
-            .inner
-            .agents
-            .lock()
-            .values()
-            .filter(|n| n.status.lock().is_live())
-            .count();
-        if live >= self.inner.config.max_agents {
-            return Err(Error::other(format!(
-                "Agent limit reached ({live} live agents, max {}). Cancel or reuse an existing agent.",
-                self.inner.config.max_agents
-            )));
-        }
-        Ok(())
-    }
-
     fn emit(&self, event: SwarmEvent) {
         if let Some(journal) = &self.inner.journal {
             journal.record(&event);
@@ -1385,10 +1426,14 @@ impl Swarm {
             *node.tool_calls.lock() = 0;
         }
         self.persist();
+        let freed = status == AgentStatus::Cancelled;
         self.emit(SwarmEvent::Status {
             id: node.id.clone(),
             status,
         });
+        if freed {
+            self.start_queued();
+        }
     }
 
     fn post(&self, from: &str, to: &str, kind: &'static str, text: String) -> Result<()> {
@@ -1837,8 +1882,17 @@ async fn install_binary(binary: &Path, bin_dir: &Path) -> Result<()> {
     tokio::fs::rename(&staged, &current).await.map_err(io)
 }
 
+/// Agents holding a slot under [`SwarmConfig::max_agents`]: live and not queued.
+fn started(agents: &IndexMap<String, Arc<Node>>) -> usize {
+    agents
+        .values()
+        .filter(|node| !matches!(*node.status.lock(), AgentStatus::Cancelled | AgentStatus::Queued))
+        .count()
+}
+
 fn status_name(status: &AgentStatus) -> &'static str {
     match status {
+        AgentStatus::Queued => "queued",
         AgentStatus::Starting => "starting",
         AgentStatus::Running => "running",
         AgentStatus::Idle => "idle",

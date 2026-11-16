@@ -43,7 +43,8 @@ re-read from disk at the start of each turn, so a change reaches running agents 
 `/remember <text>`, `/forget <text>` and `/remember` (where the file is). Writes are serialized
 across the swarm and replace the file atomically.
 
-`--max-agents` (16) caps live agents; `--max-concurrent-calls` (8, `0` = unlimited) caps model calls in
+`--max-agents` (16) caps live agents (spawns beyond it are `queued` and start, oldest first, as agents
+are cancelled; a queued agent can already be messaged, and cancelling it drops it); `--max-concurrent-calls` (8, `0` = unlimited) caps model calls in
 flight across the whole swarm, so a large swarm queues ("queued for a model slot…" in the log)
 instead of tripping provider throttling. `--budget-tokens N` (e.g. `5M`) caps the tokens (input +
 output) the whole swarm may use: once spent, model calls fail with a "budget exhausted" error that

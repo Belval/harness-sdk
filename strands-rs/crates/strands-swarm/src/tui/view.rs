@@ -280,6 +280,7 @@ fn short_model(id: &str) -> &str {
 
 fn status_glyph(status: &AgentStatus, tick: usize) -> (&'static str, Color) {
     match status {
+        AgentStatus::Queued => ("◌", Color::DarkGray),
         AgentStatus::Starting => ("…", Color::Gray),
         AgentStatus::Running => (SPINNER[tick % SPINNER.len()], Color::Cyan),
         AgentStatus::Idle => ("●", Color::Green),
