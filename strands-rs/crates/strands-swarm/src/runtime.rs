@@ -283,7 +283,19 @@ pub enum SwarmEvent {
         /// Id.
         id: String,
     },
+    /// The tail of a resumed agent's restored conversation, so a viewer can show its past.
+    History {
+        /// Id.
+        id: String,
+        /// The last [`HISTORY_MESSAGES`] messages, oldest first.
+        messages: Vec<Message>,
+        /// Earlier messages left out.
+        omitted: usize,
+    },
 }
+
+/// How many restored messages [`SwarmEvent::History`] carries at most.
+pub const HISTORY_MESSAGES: usize = 100;
 
 /// How an actor begins.
 enum Start {
@@ -688,6 +700,17 @@ impl Swarm {
     async fn resume_input(&self, node: &Node, agent: &Agent, interrupted: bool) -> Option<InvokeInput> {
         if let Err(error) = agent.initialize().await {
             tracing::warn!(agent = %node.id, %error, "session restore failed");
+        }
+        let (messages, omitted) = agent.with_messages(|messages| {
+            let omitted = messages.len().saturating_sub(HISTORY_MESSAGES);
+            (messages[omitted..].to_vec(), omitted)
+        });
+        if !messages.is_empty() {
+            self.emit(SwarmEvent::History {
+                id: node.id.clone(),
+                messages,
+                omitted,
+            });
         }
         if !interrupted && node.goal.is_none() {
             return None;
@@ -1156,7 +1179,7 @@ fn has_matching_mail(node: &Node, filter: &[String]) -> bool {
 }
 
 /// One-line summary of a tool input: the most telling string field, else compact JSON.
-fn summarize_input(input: &serde_json::Value) -> String {
+pub(crate) fn summarize_input(input: &serde_json::Value) -> String {
     const KEYS: &[&str] = &["command", "path", "task", "to", "url", "query"];
     let text = KEYS
         .iter()

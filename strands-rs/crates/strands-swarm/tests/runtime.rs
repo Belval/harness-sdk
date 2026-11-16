@@ -597,7 +597,37 @@ async fn a_resumed_run_restores_conversations_and_wakes_interrupted_agents() {
     script("a2", vec![say("resumed")]);
     let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
 
-    assert_eq!(reply_to(&mut events, USER).await, "got it");
+    let mut history = HashMap::new();
+    let reply = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                SwarmEvent::History {
+                    id,
+                    messages,
+                    omitted,
+                } => {
+                    assert_eq!(omitted, 0);
+                    history.insert(id, messages);
+                }
+                SwarmEvent::Mail { to, mail } if to == USER && mail.kind == "reply" => return mail.text,
+                _ => {}
+            }
+        }
+        panic!("event stream closed");
+    })
+    .await
+    .expect("timed out waiting for a reply");
+    assert_eq!(reply, "got it");
+    let a1_history = &history["a1"];
+    assert_eq!(a1_history.first().map(|m| m.role), Some(Role::User));
+    assert!(a1_history.iter().any(|m| m
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse(call) if call.name == "spawn_agent"))));
+    assert!(
+        history.contains_key("a2"),
+        "interrupted agents report their history too"
+    );
     let a2_call = sent_text(&scripts.lock()["a2"].clone(), 0);
     assert!(a2_call.contains("The swarm was restarted"), "{a2_call}");
     let a1_call = sent_text(&scripts.lock()["a1"].clone(), 0);

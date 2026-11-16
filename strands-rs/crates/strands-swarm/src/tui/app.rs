@@ -1,11 +1,13 @@
 //! UI state: a fold over [`SwarmEvent`]s plus the input line. No terminal I/O here.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
 
-use crate::runtime::{AgentStatus, SwarmEvent, USER};
+use strands_agents::types::{ContentBlock, Message, Role, ToolResultStatus};
+
+use crate::runtime::{summarize_input, AgentStatus, SwarmEvent, USER};
 
 /// Entries kept per agent log; the oldest are dropped beyond this.
 pub const MAX_LOG_ENTRIES: usize = 2000;
@@ -39,6 +41,10 @@ pub enum LogEntry {
     },
     /// A status change worth showing (errors, cancellation).
     Status(String),
+    /// User-side text restored from a resumed conversation (the task or received mail).
+    Input(String),
+    /// A quiet marker, such as where restored history begins.
+    Note(String),
 }
 
 /// What the UI knows about one agent.
@@ -115,6 +121,31 @@ impl AgentView {
             Some(LogEntry::Text(_)) => "writing…".to_owned(),
             _ => "thinking…".to_owned(),
         })
+    }
+
+    /// Insert a resumed agent's restored conversation before everything logged since the restart
+    /// (after the task entry, which the conversation repeats as its first input).
+    fn backfill(&mut self, mut entries: Vec<LogEntry>, omitted: usize) {
+        let keep_task = matches!(self.log.front(), Some(LogEntry::Task(_)));
+        let task = self.log.front().cloned().filter(|_| keep_task);
+        if omitted == 0 {
+            if let (Some(LogEntry::Task(task)), Some(LogEntry::Input(first))) = (&task, entries.first()) {
+                if task.trim() == first.trim() {
+                    entries.remove(0);
+                }
+            }
+        }
+        let note = match omitted {
+            0 => "restored conversation".to_owned(),
+            n => format!("restored conversation ({n} earlier messages not shown)"),
+        };
+        let since = self.log.drain(usize::from(keep_task)..).collect::<Vec<_>>();
+        self.log.push_back(LogEntry::Note(note));
+        self.log.extend(entries);
+        self.log.push_back(LogEntry::Note("restarted".to_owned()));
+        self.log.extend(since);
+        self.trim();
+        self.unseen = true;
     }
 
     /// Drop the oldest entries beyond [`MAX_LOG_ENTRIES`].
@@ -201,6 +232,11 @@ impl App {
             SwarmEvent::Mail { to, mail } => self.apply_mail(&to, mail),
             SwarmEvent::Model { id, model } => self.with(&id, |view| view.model = Some(model)),
             SwarmEvent::MailRead { id } => self.with(&id, AgentView::mark_read),
+            SwarmEvent::History {
+                id,
+                messages,
+                omitted,
+            } => self.with(&id, |view| view.backfill(history_entries(&messages), omitted)),
             SwarmEvent::Usage {
                 id,
                 input_tokens,
@@ -294,6 +330,37 @@ impl App {
             (i + view.input_tokens, o + view.output_tokens)
         })
     }
+}
+
+/// Log entries for restored messages: text from either side and tool calls (tool results only
+/// decide whether a call failed).
+pub fn history_entries(messages: &[Message]) -> Vec<LogEntry> {
+    let blocks = || {
+        messages
+            .iter()
+            .flat_map(|m| m.content.iter().map(move |b| (m.role, b)))
+    };
+    let failed: HashSet<&str> = blocks()
+        .filter_map(|(_, block)| match block {
+            ContentBlock::ToolResult(result) if result.status == ToolResultStatus::Error => {
+                Some(result.tool_use_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    blocks()
+        .filter_map(|(role, block)| match block {
+            ContentBlock::Text(text) if text.trim().is_empty() => None,
+            ContentBlock::Text(text) if role == Role::User => Some(LogEntry::Input(text.clone())),
+            ContentBlock::Text(text) => Some(LogEntry::Text(text.clone())),
+            ContentBlock::ToolUse(call) => Some(LogEntry::Tool {
+                name: call.name.clone(),
+                summary: summarize_input(&call.input),
+                ok: Some(!failed.contains(call.tool_use_id.as_str())),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// What the input line asks for.
@@ -532,6 +599,63 @@ mod tests {
             ok: None,
         };
         assert_eq!(log.front(), Some(&first));
+    }
+
+    #[test]
+    fn backfills_a_resumed_agents_conversation_after_its_task() {
+        use strands_agents::types::{ToolResultBlock, ToolUseBlock};
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        app.apply(SwarmEvent::Status {
+            id: "a1".into(),
+            status: AgentStatus::Errored("boom".into()),
+        });
+        let call = |id: &str, command: &str| {
+            ContentBlock::ToolUse(ToolUseBlock::new(
+                "shell",
+                id,
+                serde_json::json!({"command": command}),
+            ))
+        };
+        let messages = vec![
+            Message::new(Role::User, vec!["\ntask a1\nmore detail".into()]),
+            Message::new(
+                Role::Assistant,
+                vec!["looking".into(), call("t1", "ls"), call("t2", "false")],
+            ),
+            Message::new(
+                Role::User,
+                vec![
+                    ContentBlock::ToolResult(ToolResultBlock::success("t1", vec![])),
+                    ContentBlock::ToolResult(ToolResultBlock::error("t2", "exit 1")),
+                ],
+            ),
+            Message::new(Role::User, vec!["[message from a2] hi".into()]),
+        ];
+        app.apply(SwarmEvent::History {
+            id: "a1".into(),
+            messages,
+            omitted: 0,
+        });
+        let tool = |summary: &str, ok| LogEntry::Tool {
+            name: "shell".into(),
+            summary: summary.into(),
+            ok: Some(ok),
+        };
+        let log: Vec<_> = app.agents["a1"].log.iter().cloned().collect();
+        assert_eq!(
+            log,
+            vec![
+                LogEntry::Task("\ntask a1\nmore detail".into()),
+                LogEntry::Note("restored conversation".into()),
+                LogEntry::Text("looking".into()),
+                tool("ls", true),
+                tool("false", false),
+                LogEntry::Input("[message from a2] hi".into()),
+                LogEntry::Note("restarted".into()),
+                LogEntry::Status("error: boom".into()),
+            ]
+        );
     }
 
     #[test]

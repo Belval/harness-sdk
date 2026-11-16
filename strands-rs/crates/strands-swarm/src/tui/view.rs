@@ -183,6 +183,8 @@ fn entry_lines(entry: &LogEntry) -> Vec<Line<'static>> {
             lines
         }
         LogEntry::Status(note) => vec![Line::styled(format!("— {note}"), Style::new().fg(Color::Red))],
+        LogEntry::Input(text) => block_lines("◀ input", text, Color::Gray),
+        LogEntry::Note(note) => vec![Line::styled(format!("— {note} —"), Style::new().dim())],
     }
 }
 
