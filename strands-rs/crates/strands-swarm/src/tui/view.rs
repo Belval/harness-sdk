@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use ratatui::Frame;
 
 use super::app::{AgentView, App, LogEntry};
-use crate::runtime::AgentStatus;
+use crate::runtime::{AgentStatus, USER};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const HELP: &str =
@@ -169,12 +169,12 @@ fn entry_lines(entry: &LogEntry) -> Vec<Line<'static>> {
             text,
             read,
         } => {
-            let color = if kind == "error" {
-                Color::Red
-            } else {
-                Color::Yellow
+            // The user's own messages stand apart from agent traffic.
+            let mut lines = match (from.as_str(), kind.as_str()) {
+                (USER, _) => block_lines("▶ you", text, Color::Cyan),
+                (_, "error") => block_lines(&format!("✉ {from} ({kind})"), text, Color::Red),
+                _ => block_lines(&format!("✉ {from} ({kind})"), text, Color::Yellow),
             };
-            let mut lines = block_lines(&format!("✉ {from} ({kind})"), text, color);
             match read {
                 Some(false) => lines[0].push_span(Span::styled(" · queued", Style::new().dim())),
                 Some(true) => lines[0].push_span(Span::styled(" · read ✓", Style::new().fg(Color::Green))),
@@ -216,5 +216,28 @@ fn compact(n: u64) -> String {
         0..=999 => n.to_string(),
         1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
         _ => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mail(from: &str) -> LogEntry {
+        LogEntry::MailIn {
+            from: from.into(),
+            kind: "message".into(),
+            text: "hi".into(),
+            read: Some(true),
+        }
+    }
+
+    #[test]
+    fn the_users_messages_have_their_own_color() {
+        let user = entry_lines(&mail(USER));
+        let agent = entry_lines(&mail("a2 (parser)"));
+        assert_eq!(user[0].to_string(), "▶ you · read ✓");
+        assert_eq!(user[0].style.fg, Some(Color::Cyan));
+        assert_eq!(agent[0].style.fg, Some(Color::Yellow));
     }
 }
