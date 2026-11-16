@@ -749,3 +749,60 @@ async fn a_switched_model_survives_a_restart() {
     assert_eq!(*built.lock(), vec![None, Some("b".to_owned())]);
     assert_eq!(resumed.snapshot().agents[0].model.as_deref(), Some("b"));
 }
+
+/// Many agents resuming at once while the swarm is snapshotted and listed concurrently: a lock
+/// order inversion between agent startup and `snapshot` would hang here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_run_resumes_without_deadlocking_under_concurrent_snapshots() {
+    const AGENTS: usize = 24;
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let scripts: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let mut agents = Vec::new();
+    for n in 1..=AGENTS {
+        let id = format!("a{n}");
+        let parent = match n {
+            1 => USER.to_owned(),
+            n => format!("a{}", n / 2),
+        };
+        scripts.lock().insert(
+            id.clone(),
+            MockMessageModel::shared((0..50).map(|_| say("ok")).collect()),
+        );
+        agents.push(json!({
+            "id": id, "name": format!("agent-{n}"), "parent": parent, "cwd": dir.path(),
+            "branch": null, "task": "t", "model": null, "goal": null,
+            "status": if n % 2 == 0 { "running" } else { "idle" },
+            "mailbox": [{"from": "user", "from_label": "user", "kind": "message", "text": "hi"}],
+        }));
+    }
+    let saved = json!({"run_id": "r", "cwd": dir.path(), "next_id": AGENTS + 1, "agents": agents});
+    let saved = serde_json::from_value(saved).unwrap();
+    let mut config = SwarmConfig::new(session_factory(&scripts, state_dir.join("sessions")), dir.path());
+    config.state_dir = Some(state_dir);
+
+    let (swarm, _events) = Swarm::resume(config, saved).await.unwrap();
+    let hammer = {
+        let swarm = swarm.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = swarm.snapshot();
+                let _ = swarm.agents();
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let all_ran = async {
+        while scripts.lock().values().any(|model| model.call_count() == 0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(30), all_ran).await;
+    hammer.abort();
+    assert!(
+        ran.is_ok(),
+        "agents did not all run: {:?}",
+        strands_swarm::watchdog::check()
+    );
+    swarm.shutdown().await;
+}

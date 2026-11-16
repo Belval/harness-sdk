@@ -20,7 +20,7 @@ strands-agents = { path = "../strands-agents", default-features = false, feature
 strands-harness = { path = "../strands-harness" }
 futures.workspace = true
 indexmap.workspace = true
-parking_lot.workspace = true
+parking_lot = { workspace = true, features = ["deadlock_detection"] }
 regex.workspace = true
 schemars.workspace = true
 serde.workspace = true

@@ -66,6 +66,11 @@ struct Cli {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    strands_swarm::watchdog::spawn(Duration::from_secs(10), |report| {
+        // The TUI may own the screen; under swarmctl stderr goes to the run's stderr.log.
+        eprintln!("strands-swarm: {report}");
+        std::process::exit(strands_swarm::watchdog::DEADLOCK_EXIT_CODE);
+    });
     match run(cli).await {
         Ok(Exit::Quit) => ExitCode::SUCCESS,
         Ok(Exit::Reload) => ExitCode::from(RELOAD_EXIT_CODE),

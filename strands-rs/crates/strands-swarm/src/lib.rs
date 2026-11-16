@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod state;
 pub mod tools;
 pub mod tui;
+pub mod watchdog;
 pub mod worktree;
 
 pub use catalog::ToolCatalog;
