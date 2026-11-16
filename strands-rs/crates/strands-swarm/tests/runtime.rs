@@ -687,6 +687,62 @@ async fn an_agent_cannot_message_itself() {
     assert_eq!(swarm.agent("a1").unwrap().unread, 0);
 }
 
+#[tokio::test]
+async fn an_agent_cancelled_in_wait_stops_and_its_child_stays_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
+                    tool_call("wait", "w1", json!({"from": ["user"], "timeout_seconds": 600})),
+                    say("unreachable"),
+                ],
+            ),
+            (
+                "a2",
+                vec![
+                    tool_call("wait", "w1", json!({"from": ["parent"], "timeout_seconds": 600})),
+                    say("late reply"),
+                ],
+            ),
+        ],
+        dir.path(),
+    );
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "go".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (a1, a2) = {
+        let scripts = scripts.lock();
+        (scripts["a1"].clone(), scripts["a2"].clone())
+    };
+    eventually("both wait", || a1.calls().len() >= 2 && !a2.calls().is_empty()).await;
+    swarm.cancel("a1").unwrap();
+
+    eventually("the actors finish", || !swarm.is_busy()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        (a1.calls().len(), a2.calls().len()),
+        (2, 1),
+        "no turn after the cancel"
+    );
+    let mut mail = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let SwarmEvent::Mail { to, mail: m } = event {
+            mail.push((to, m.text));
+        }
+    }
+    assert!(mail.is_empty(), "{mail:?}");
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")
