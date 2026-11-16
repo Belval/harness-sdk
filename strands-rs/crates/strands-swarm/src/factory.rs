@@ -374,6 +374,37 @@ mod tests {
         assert!(loaded.contains("review/SKILL.md"), "{loaded}");
     }
 
+    /// The swarm prompt tells agents not to `cd` into their working directory; that only holds
+    /// while the shell tool runs in the agent's sandbox.
+    #[tokio::test]
+    async fn shell_commands_start_in_the_agents_working_directory() {
+        use strands_agents::testing::MockResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut harness = harness_options(
+            &HarnessFactoryOptions::default(),
+            AgentSpec {
+                cwd: cwd.clone(),
+                ..spec()
+            },
+        )
+        .unwrap();
+        let call = ToolUseBlock::new("shell", "s1", serde_json::json!({ "command": "pwd" }));
+        let model = MockMessageModel::shared(vec![
+            MockResponse::message(Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)])),
+            MockResponse::message(Message::assistant("done")),
+        ]);
+        harness.model = Some(ModelOption::Instance(model.clone()));
+        let agent = create_harness(harness).await.unwrap();
+        agent.invoke("where am I").await.unwrap();
+
+        let calls = model.calls();
+        // The shell result is a JSON block (`{"output": ..., "exit_code": ...}`), not text.
+        let result = calls[1].0.last().unwrap().tool_results().next().unwrap();
+        let output = format!("{:?}", result.content);
+        assert!(output.contains(&cwd.display().to_string()), "{output}");
+    }
+
     #[test]
     fn no_skills_means_no_skills_tool_or_instructions() {
         let harness = harness_options(&HarnessFactoryOptions::default(), spec()).unwrap();

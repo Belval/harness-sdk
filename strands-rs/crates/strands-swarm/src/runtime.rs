@@ -1758,7 +1758,7 @@ impl Swarm {
             .unwrap_or_default();
         let swarm = format!(
             "# Swarm\n\
-             You are {who}, one of a group of cooperating agents. Your working directory is `{}`.{branch}{env}\n\
+             You are {who}, one of a group of cooperating agents. Your working directory is `{}`; every `shell` call starts there, so there is no need to `cd` into it.{branch}{env}\n\
              You can start other agents to work in parallel (`spawn_agent`), message any agent \
              (`send_message`), wait for messages (`wait`), see who exists (`list_agents`) and stop agents \
              (`cancel_agent`). Whether and how to split the work is your call.\n\
