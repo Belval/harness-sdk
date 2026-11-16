@@ -61,6 +61,10 @@ struct Cli {
     /// Print the MCP tools agents would get (and those denied), then exit.
     #[arg(long)]
     list_tools: bool,
+    /// Resume a throwaway copy of a run directory on a stub model, check that every agent replies
+    /// and the TUI renders, then exit (0 on success). Used by `reload_swarm` on a new binary.
+    #[arg(long, value_name = "RUN_DIR_COPY")]
+    self_test: Option<PathBuf>,
     /// Directory of skills (`<name>/SKILL.md`), or one skill directory, offered to every agent
     /// ahead of the default locations. Repeatable.
     #[arg(long = "skills-dir")]
@@ -109,6 +113,10 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
+    if let Some(dir) = &cli.self_test {
+        eprintln!("strands-swarm: {}", strands_swarm::selftest::run(dir).await?);
+        return Ok(Exit::Quit);
+    }
     if cli.gc {
         let name = cli.run.as_deref().unwrap_or_default();
         let dir = state::run_dir(name)?;

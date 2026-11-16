@@ -1,0 +1,306 @@
+//! Reload self-test: before a run restarts into a new binary, that binary resumes a throwaway
+//! copy of the run with a stub model and proves it can restore every agent, deliver mail, get
+//! replies, drive the TUI and stay free of deadlocks. A binary that fails is never installed.
+//!
+//! Nothing outside the copy may be touched: its saved paths (worktrees, private target dirs) are
+//! the live run's. So the copy's agents lose their branch and env and work in the copy itself,
+//! disk reclamation is off, state, sessions and journal live in the copy, the stub model answers
+//! every call with a plain `ok` and never calls a tool, and agents get no sandbox.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::stream::BoxStream;
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+use strands_agents::models::{ContentBlockDelta, Model, ModelStreamEvent, StreamOptions};
+use strands_agents::types::{Message, Role, StopReason};
+use strands_agents::{Agent, Error, Result};
+
+use crate::factory::agent_session_manager;
+use crate::runtime::{AgentFactory, AgentSpec, AgentStatus, Swarm, SwarmConfig, SwarmEvent, USER};
+use crate::state::{self, SwarmState, SESSIONS_DIR};
+use crate::tui::{view, App};
+use crate::watchdog;
+
+/// How long every live agent has to reply.
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Top-level entries of a run directory the copy leaves out: binaries, logs and the audit trail.
+const SKIPPED: &[&str] = &[
+    "bin",
+    "stderr.log",
+    "supervisor.log",
+    "journal.jsonl",
+    "journal.jsonl.1",
+    "events.jsonl",
+    "events.jsonl.1",
+];
+
+const PROBE: &str = "[Self-test of a new strands-swarm binary: reply with a short acknowledgement.]";
+
+/// A model that answers `ok` without network access.
+struct StubModel;
+
+impl Model for StubModel {
+    fn model_id(&self) -> Option<String> {
+        Some("self-test-stub".into())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _options: &'a StreamOptions,
+    ) -> BoxStream<'a, Result<ModelStreamEvent>> {
+        let events = vec![
+            ModelStreamEvent::MessageStart {
+                role: Role::Assistant,
+            },
+            ModelStreamEvent::ContentBlockStart { start: None },
+            ModelStreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::Text { text: "ok".into() },
+            },
+            ModelStreamEvent::ContentBlockStop {},
+            ModelStreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                additional_model_response_fields: None,
+            },
+        ];
+        Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+    }
+}
+
+/// Agents on the stub model, restoring their conversations from `sessions`.
+fn stub_factory(sessions: PathBuf) -> AgentFactory {
+    Arc::new(move |spec: AgentSpec| {
+        let sessions = sessions.clone();
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id.clone())
+                .model(StubModel)
+                .system_prompt(spec.instructions)
+                .tools(spec.tools)
+                .session_manager(agent_session_manager(&sessions, &spec.id)?)
+                .no_sandbox()
+                .build()
+        })
+    })
+}
+
+/// Resume the run copy in `dir` on a stub model, message every live agent and check that each
+/// replies within [`REPLY_TIMEOUT`], that the TUI renders the result, and that no lock deadlocked.
+/// Returns a one-line summary. `dir` is modified (it is a copy); a run that was never saved
+/// resumes as an empty swarm.
+pub async fn run(dir: &Path) -> Result<String> {
+    let saved = state::load(dir).await?.map(|saved| detach(saved, dir));
+    let mut config = SwarmConfig::new(stub_factory(dir.join(SESSIONS_DIR)), dir);
+    if let Some(saved) = &saved {
+        config.run_id = saved.run_id.clone();
+    }
+    config.state_dir = Some(dir.to_path_buf());
+    config.max_agents = usize::MAX;
+    config.reclaim_disk = false;
+    config.cargo_target_dir = None;
+    let run_id = config.run_id.clone();
+    let (swarm, mut events) = match saved {
+        Some(saved) => Swarm::resume(config, saved).await?,
+        None => Swarm::new(config),
+    };
+    // The stub spends no tokens, but a spent budget would refuse its calls.
+    swarm.set_budget(None);
+
+    let mut pending: BTreeSet<String> = swarm
+        .agents()
+        .into_iter()
+        .filter(|info| info.status.is_live())
+        .map(|info| info.id)
+        .collect();
+    let total = pending.len();
+    // Agents with a saved conversation must get it back (a resumed agent publishes it as History).
+    let mut unrestored: BTreeSet<String> = pending
+        .iter()
+        .filter(|id| dir.join(SESSIONS_DIR).join(id).is_dir())
+        .cloned()
+        .collect();
+    let mut failure = None;
+    for id in &pending {
+        if let Err(error) = swarm.send(USER, id, PROBE) {
+            failure = Some(format!("cannot message {}: {error}", swarm.label(id)));
+        }
+    }
+
+    let mut app = App::default();
+    let deadline = tokio::time::sleep(REPLY_TIMEOUT);
+    tokio::pin!(deadline);
+    while !pending.is_empty() && failure.is_none() {
+        let event = tokio::select! {
+            event = events.recv() => event,
+            _ = &mut deadline => break,
+        };
+        let Some(event) = event else { break };
+        match &event {
+            SwarmEvent::Mail { mail, .. } if mail.kind == "reply" => {
+                pending.remove(&mail.from);
+            }
+            SwarmEvent::Mail { mail, .. } if mail.kind == "error" => {
+                failure = Some(format!("{} reported: {}", mail.from_label, mail.text));
+            }
+            SwarmEvent::Status {
+                id,
+                status: AgentStatus::Errored(error),
+            } => failure = Some(format!("{} errored: {error}", swarm.label(id))),
+            SwarmEvent::History { id, .. } => {
+                unrestored.remove(id);
+            }
+            _ => {}
+        }
+        app.apply(event);
+    }
+    while let Ok(event) = events.try_recv() {
+        app.apply(event);
+    }
+    draw_every_agent(&mut app, &run_id);
+    let deadlock = watchdog::check();
+    swarm.shutdown().await;
+
+    if let Some(report) = deadlock {
+        return Err(Error::other(format!("deadlock: {report}")));
+    }
+    if let Some(failure) = failure {
+        return Err(Error::other(failure));
+    }
+    if !unrestored.is_empty() {
+        let lost: Vec<String> = unrestored.iter().map(|id| swarm.label(id)).collect();
+        return Err(Error::other(format!(
+            "saved conversations were not restored for {}",
+            lost.join(", ")
+        )));
+    }
+    if !pending.is_empty() {
+        let missing: Vec<String> = pending.iter().map(|id| swarm.label(id)).collect();
+        return Err(Error::other(format!(
+            "no reply within {}s from {}",
+            REPLY_TIMEOUT.as_secs(),
+            missing.join(", ")
+        )));
+    }
+    Ok(format!("self-test passed: {total} live agents replied"))
+}
+
+/// Cut a copied run loose from the live run's directories: no agent keeps a branch (which marks
+/// a worktree it owns), a private env, or a working directory outside `dir`.
+fn detach(mut saved: SwarmState, dir: &Path) -> SwarmState {
+    saved.cwd = dir.to_path_buf();
+    for agent in &mut saved.agents {
+        agent.branch = None;
+        agent.env.clear();
+        agent.cwd = dir.to_path_buf();
+    }
+    saved
+}
+
+/// Render the TUI with each agent selected in turn. A rendering bug panics, which fails the
+/// self-test process.
+fn draw_every_agent(app: &mut App, run_id: &str) {
+    let Ok(mut terminal) = Terminal::new(TestBackend::new(120, 40));
+    for tick in 0..app.tree().len().max(1) {
+        let Ok(_) = terminal.draw(|frame| view::draw(frame, app, run_id, tick));
+        app.select_by(1);
+    }
+}
+
+/// Copy run directory `from` to `to`, leaving out [`SKIPPED`] entries. A run that has not
+/// written its directory yet copies as an empty one.
+pub fn copy_run(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    if !from.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        if SKIPPED.iter().any(|skip| entry.file_name() == *skip) {
+            continue;
+        }
+        copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+/// Files that vanish mid-copy (temporaries renamed away by a concurrent atomic write) are skipped.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+    let kind = match std::fs::symlink_metadata(from) {
+        Ok(metadata) => metadata.file_type(),
+        Err(error) if gone(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if kind.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else if kind.is_file() {
+        match std::fs::copy(from, to) {
+            Err(error) if gone(&error) => {}
+            other => {
+                other?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run `binary --self-test` on a temporary copy of the run in `state_dir`, and remove the copy.
+/// Fails with the tail of the binary's stderr unless it exits successfully within `timeout`.
+pub async fn check_binary(binary: &Path, state_dir: &Path, timeout: Duration) -> Result<()> {
+    let copy = std::env::temp_dir().join(format!(
+        "strands-swarm-self-test-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let (from, to) = (state_dir.to_path_buf(), copy.clone());
+    let copied = tokio::task::spawn_blocking(move || copy_run(&from, &to))
+        .await
+        .map_err(|e| Error::other(format!("copying the run for the self-test failed: {e}")))?;
+    let outcome = match copied {
+        Ok(()) => run_self_test(binary, &copy, timeout).await,
+        Err(e) => Err(Error::other(format!(
+            "copying the run for the self-test failed: {e}"
+        ))),
+    };
+    let _ = tokio::fs::remove_dir_all(&copy).await;
+    outcome
+}
+
+async fn run_self_test(binary: &Path, copy: &Path, timeout: Duration) -> Result<()> {
+    let child = tokio::process::Command::new(binary)
+        .arg("--self-test")
+        .arg(copy)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(timeout, child)
+        .await
+        .map_err(|_| {
+            Error::other(format!(
+                "{} --self-test timed out after {}s; the swarm keeps its current binary.",
+                binary.display(),
+                timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| Error::other(format!("Cannot run {}: {e}", binary.display())))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
+    let tail: Vec<&str> = tail.into_iter().rev().collect();
+    Err(Error::other(format!(
+        "{} --self-test failed ({}); the swarm keeps its current binary.\n{}",
+        binary.display(),
+        output.status,
+        tail.join("\n")
+    )))
+}

@@ -20,6 +20,7 @@ pub mod journal;
 pub mod mcp;
 pub mod names;
 pub mod runtime;
+pub mod selftest;
 pub mod skills;
 pub mod state;
 pub mod tools;

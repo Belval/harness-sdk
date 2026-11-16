@@ -28,6 +28,7 @@ use crate::budget;
 use crate::gc::{self, Collected};
 use crate::journal::Journal;
 use crate::names;
+use crate::selftest;
 use crate::state::{AgentState, MailState, Persister, SwarmState, SESSIONS_DIR};
 use crate::tools::swarm_tools;
 use crate::worktree;
@@ -35,6 +36,9 @@ use crate::worktree;
 const RETRY_INITIAL: Duration = Duration::from_secs(15);
 const RETRY_MAX: Duration = Duration::from_secs(600);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a new binary's `--self-test` may take before a reload gives up on it.
+pub const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Exit code that tells the supervisor to restart immediately into `<run>/bin/current`.
 pub const RELOAD_EXIT_CODE: u8 = 75;
@@ -161,6 +165,9 @@ pub struct SwarmConfig {
     pub cargo_target_dir: Option<PathBuf>,
     /// Resolves model ids for [`Swarm::set_model`]; `None` disables model switching.
     pub models: Option<ModelResolver>,
+    /// Reclaim the disk of cancelled worktree agents ([`Swarm::gc`]). Off for a swarm that does
+    /// not own its agents' directories, such as a self-test of a copied run.
+    pub reclaim_disk: bool,
 }
 
 impl SwarmConfig {
@@ -176,6 +183,7 @@ impl SwarmConfig {
             state_dir: None,
             cargo_target_dir: None,
             models: None,
+            reclaim_disk: true,
         }
     }
 }
@@ -651,13 +659,16 @@ impl Swarm {
 
     /// Install `binary` as the run's next binary and ask the host process to restart into it.
     ///
-    /// The binary must answer `--version` within 30 s. It is copied to `<run>/bin/current`, the
+    /// The binary must answer `--version` within 30 s and pass its own `--self-test` on a
+    /// temporary copy of the run within [`SELF_TEST_TIMEOUT`] (see [`crate::selftest`]); otherwise
+    /// the reload fails and the swarm keeps its binary. It is copied to `<run>/bin/current`, the
     /// old one kept as `<run>/bin/previous` for the supervisor's crash rollback.
     pub async fn reload(&self, binary: &Path) -> Result<()> {
         let dir = self.inner.config.state_dir.as_ref().ok_or_else(|| {
             Error::other("Hot reload needs a persistent run (start the swarm with --run <name>).")
         })?;
         check_binary(binary).await?;
+        selftest::check_binary(binary, dir, SELF_TEST_TIMEOUT).await?;
         install_binary(binary, &dir.join("bin")).await?;
         if let Some(journal) = &self.inner.journal {
             journal.event("reload", serde_json::json!({ "binary": binary }));
@@ -747,6 +758,12 @@ impl Swarm {
     }
 
     async fn collect_node(&self, node: &Node) -> Collected {
+        if !self.inner.config.reclaim_disk {
+            return Collected {
+                id: node.id.clone(),
+                ..Default::default()
+            };
+        }
         let run_id = &self.inner.config.run_id;
         gc::collect(run_id, &node.id, node.branch.as_deref(), &node.cwd, &node.env).await
     }

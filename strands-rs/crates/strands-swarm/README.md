@@ -99,6 +99,16 @@ skill's location and its bundled files. On a name clash the first source wins:
 `scripts/swarmctl` keeps a run alive in tmux: restarts on exit, restarts into the new binary on
 `reload_swarm`, and rolls back if a new binary crashes within 30 s.
 
+Before a reload installs anything, the running swarm has the new binary prove itself:
+`NEW --self-test <copy>` resumes a temporary copy of the run directory (state and sessions, no
+`bin/` or logs) on a stub model that answers `ok`, messages every live agent, requires a reply from
+each and every saved conversation restored within 20 s, renders the TUI into a test backend and
+checks the deadlock watchdog. If it fails or takes over 60 s, `reload_swarm` returns the error with
+the tail of its stderr and the swarm keeps its binary. The copy's saved paths are the live run's, so
+its agents lose their branches, private env and working directories, disk reclamation is off
+(`SwarmConfig::reclaim_disk`), the stub never calls tools and agents get no sandbox: the real run,
+its worktrees, target dirs and sessions are never touched. The copy is deleted after.
+
 ```sh
 swarmctl start NAME ./target/release/strands-swarm --cwd REPO --goal "..."   # start or resume
 swarmctl attach NAME        # open the TUI (detach: C-b d)
