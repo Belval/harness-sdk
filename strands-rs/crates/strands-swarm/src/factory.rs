@@ -7,11 +7,12 @@ use strands_agents::context_manager::strategies::{
     Offload, OffloadConditions, OffloadTarget, TruncateConfig,
 };
 use strands_agents::context_manager::{
-    ContextManagerConfig, ContextManagerOption, StashOption, AGENTIC_TRUNCATE_THRESHOLD,
+    ContextManagerConfig, ContextManagerOption, StashConfig, StashOption, AGENTIC_TRUNCATE_THRESHOLD,
 };
 use strands_agents::plugins::vended::{GoalLoop, JudgeConfig, Skill};
 use strands_agents::sandbox::LocalSandbox;
 use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
+use strands_agents::storage::{namespace, LocalFileStorage};
 use strands_agents::tools::ToolRef;
 use strands_agents::Plugin;
 use strands_agents::{FileStorage, Result, SessionManager};
@@ -134,8 +135,9 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
 /// summarize old turns at `compact_at` tokens (see [`CompactAt`]). Earlier turns' reasoning is
 /// dropped first (see [`DropOldReasoning`]) and older large `shell`/`read` results are cut to a
-/// preview (see [`TrimOldResults`]).
-fn context_manager(compact_at: u64) -> ContextManagerOption {
+/// preview (see [`TrimOldResults`]). With `stash_dir` the full outputs behind those previews are
+/// kept there, so `retrieve_context` still finds them after a restart.
+fn context_manager(compact_at: u64, stash_dir: Option<&std::path::Path>) -> ContextManagerOption {
     let truncate = Offload::truncate(
         OffloadTarget::ToolResults,
         TruncateConfig {
@@ -161,7 +163,18 @@ fn context_manager(compact_at: u64) -> ContextManagerOption {
             Arc::new(TrimOldResults::default()),
             Arc::new(summarize),
         ]),
-        stash: StashOption::Enabled,
+        stash: match stash_dir {
+            // A namespaced view is used as the stash root as is; plain storage would be keyed by
+            // the agent's session id, which is new in every process.
+            Some(dir) => StashOption::Config(StashConfig {
+                storage: Some(namespace(
+                    Arc::new(LocalFileStorage::new(dir.to_string_lossy())),
+                    "stash",
+                )),
+                retrieval_tool: true,
+            }),
+            None => StashOption::Enabled,
+        },
     })
 }
 
@@ -170,6 +183,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         Some(dir) => agent_session(dir, &spec.id)?,
         None => SessionOption::Off,
     };
+    let stash_dir = spec.session_dir.as_ref().map(|dir| dir.join(&spec.id));
     let builtins = DEFAULT_BUILTIN_TOOLS
         .iter()
         .copied()
@@ -214,7 +228,10 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         // Discovery happens once at startup (crate::skills); the harness's own `./.agent/skills`
         // lookup, relative to the process rather than the agent, stays off.
         skills: SkillsOption::Off,
-        context_manager: context_manager(options.compact_at.unwrap_or(DEFAULT_COMPACT_AT)),
+        context_manager: context_manager(
+            options.compact_at.unwrap_or(DEFAULT_COMPACT_AT),
+            stash_dir.as_deref(),
+        ),
         id: Some(spec.id),
         name: Some(spec.name),
         ..Default::default()
@@ -255,7 +272,7 @@ mod tests {
             .model(Arc::new(MockMessageModel::new(Vec::new())))
             .build()
             .unwrap();
-        let manager = ContextManager::from(context_manager(DEFAULT_COMPACT_AT)).unwrap();
+        let manager = ContextManager::from(context_manager(DEFAULT_COMPACT_AT, None)).unwrap();
         let mut messages = vec![Message::user("start")];
         messages.extend(exchange("file-read", 16_000));
         messages.extend(exchange("huge-log", 200_000));
@@ -289,7 +306,7 @@ mod tests {
         let agent = Agent::builder().model(model.clone()).build().unwrap();
         // The mock has no known window, so the context manager assumes 200k: 5k tokens is 2.5%,
         // far below the 85% mark, but past `compact_at`.
-        let manager = ContextManager::from(context_manager(4_000)).unwrap();
+        let manager = ContextManager::from(context_manager(4_000, None)).unwrap();
 
         let mut below = chat(6);
         let changed = manager
@@ -315,6 +332,39 @@ mod tests {
             above.last().unwrap().text().starts_with("answer 5"),
             "recent turns kept"
         );
+    }
+
+    #[tokio::test]
+    async fn stashed_tool_output_outlives_the_process_with_a_stash_dir() {
+        use strands_agents::Plugin;
+        let dir = tempfile::tempdir().unwrap();
+        let stash_of = |agent: Agent| {
+            let dir = dir.path().to_owned();
+            async move {
+                let manager = ContextManager::from(context_manager(DEFAULT_COMPACT_AT, Some(&dir))).unwrap();
+                manager.init_agent(&agent).await.unwrap();
+                manager.stash().unwrap()
+            }
+        };
+        let agent = || {
+            Agent::builder()
+                .id("a1")
+                .model(Arc::new(MockMessageModel::new(Vec::new())))
+                .build()
+                .unwrap()
+        };
+        let [_, result] = exchange("t1", 3_000);
+        stash_of(agent())
+            .await
+            .store_message(&result, &Default::default())
+            .await;
+
+        let restarted = stash_of(agent()).await;
+        let full = restarted
+            .retrieve("t1_0")
+            .await
+            .expect("the output is still stashed");
+        assert!(full.to_string().contains(&"x".repeat(3_000)), "{full}");
     }
 
     use strands_agents::tools::FunctionTool;
