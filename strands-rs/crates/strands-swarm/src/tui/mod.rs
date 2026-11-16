@@ -145,3 +145,208 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
     };
     app.notice = Some(outcome.unwrap_or_else(|error| format!("error: {error}")));
 }
+
+/// End-to-end: drive [`App`] with key events and swarm events, render into a [`TestBackend`]
+/// and assert on what is on screen.
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
+
+    use super::*;
+    use crate::runtime::{AgentStatus, Mail};
+
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 24;
+
+    fn screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        terminal.draw(|frame| view::draw(frame, app, "run1", 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..HEIGHT)
+            .map(|y| (0..WIDTH).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Option<Command> {
+        on_key(app, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn type_line(app: &mut App, line: &str) -> Option<Command> {
+        for c in line.chars() {
+            assert_eq!(press(app, KeyCode::Char(c)), None);
+        }
+        press(app, KeyCode::Enter)
+    }
+
+    fn spawn(app: &mut App, id: &str, parent: &str) {
+        app.apply(SwarmEvent::Spawned {
+            id: id.into(),
+            parent: parent.into(),
+            name: format!("name-{id}"),
+            task: format!("task for {id}"),
+            cwd: PathBuf::from("/w"),
+            branch: None,
+        });
+        app.apply(SwarmEvent::Status {
+            id: id.into(),
+            status: AgentStatus::Idle,
+        });
+    }
+
+    #[test]
+    fn an_empty_swarm_asks_for_a_root_task_and_submits_it() {
+        let mut app = App::default();
+        let before = screen(&app);
+        assert!(before.contains("Type a task below"), "{before}");
+        assert!(before.contains("new root task"), "{before}");
+
+        for c in "fix the bug".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(screen(&app).contains("fix the bug"));
+        press(&mut app, KeyCode::Backspace);
+        assert!(screen(&app).contains("fix the bu "));
+
+        let command = press(&mut app, KeyCode::Enter);
+        assert_eq!(command, Some(Command::NewRoot("fix the bu".into())));
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn the_tree_shows_children_under_parents_and_arrows_select() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        spawn(&mut app, "a2", "a1");
+        app.mark_seen();
+        let shown = screen(&app);
+        assert!(shown.contains("● name-a1 a1"), "{shown}");
+        assert!(shown.contains("  ● name-a2 a2"), "{shown}");
+        assert!(shown.contains("message → name-a1 (a1)"), "{shown}");
+        assert!(shown.contains("task for a1"), "{shown}");
+
+        press(&mut app, KeyCode::Down);
+        let shown = screen(&app);
+        assert!(shown.contains("message → name-a2 (a2)"), "{shown}");
+        assert!(shown.contains("task for a2"), "{shown}");
+        assert_eq!(
+            type_line(&mut app, "status?"),
+            Some(Command::Message("status?".into()))
+        );
+        assert_eq!(type_line(&mut app, "/cancel"), Some(Command::Cancel));
+    }
+
+    #[test]
+    fn the_log_shows_text_tool_calls_and_mail() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        app.apply(SwarmEvent::Text {
+            id: "a1".into(),
+            delta: "Reading the ".into(),
+        });
+        app.apply(SwarmEvent::Text {
+            id: "a1".into(),
+            delta: "code.".into(),
+        });
+        app.apply(SwarmEvent::ToolStarted {
+            id: "a1".into(),
+            name: "shell".into(),
+            summary: "cargo test".into(),
+        });
+        app.apply(SwarmEvent::ToolFinished {
+            id: "a1".into(),
+            name: "shell".into(),
+            ok: false,
+        });
+        app.apply(SwarmEvent::Mail {
+            to: "a1".into(),
+            mail: Mail {
+                from: "a2".into(),
+                from_label: "a2".into(),
+                kind: "message",
+                text: "all green".into(),
+            },
+        });
+        let shown = screen(&app);
+        for expected in [
+            "Reading the code.",
+            "✗ shell cargo test",
+            "✉ a2 (message)",
+            "  all green",
+        ] {
+            assert!(shown.contains(expected), "missing {expected:?} in\n{shown}");
+        }
+    }
+
+    #[test]
+    fn a_resumed_agent_shows_its_restored_conversation() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        let call = ToolUseBlock::new("shell", "t1", serde_json::json!({"command": "ls -la"}));
+        app.apply(SwarmEvent::History {
+            id: "a1".into(),
+            messages: vec![
+                Message::new(Role::User, vec!["task for a1".into()]),
+                Message::new(
+                    Role::Assistant,
+                    vec!["Listing files.".into(), ContentBlock::ToolUse(call)],
+                ),
+                Message::new(Role::User, vec!["[message from a2] done".into()]),
+            ],
+            omitted: 7,
+        });
+        let shown = screen(&app);
+        for expected in [
+            "task for a1",
+            "restored conversation (7 earlier messages not shown)",
+            "Listing files.",
+            "✓ shell ls -la",
+            "◀ input",
+            "[message from a2] done",
+            "— restarted —",
+        ] {
+            assert!(shown.contains(expected), "missing {expected:?} in\n{shown}");
+        }
+    }
+
+    #[test]
+    fn scrolling_pages_through_a_capped_log() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        for i in 0..app::MAX_LOG_ENTRIES + 50 {
+            app.apply(SwarmEvent::ToolStarted {
+                id: "a1".into(),
+                name: "shell".into(),
+                summary: format!("step {i}"),
+            });
+        }
+        let last = format!("⋯ shell step {}", app::MAX_LOG_ENTRIES + 49);
+        assert!(screen(&app).contains(&last));
+
+        press(&mut app, KeyCode::PageUp);
+        let shown = screen(&app);
+        assert!(!shown.contains(&last), "{shown}");
+        assert!(shown.contains(&format!("step {}", app::MAX_LOG_ENTRIES + 30)));
+
+        app.scroll = u16::MAX;
+        let top = screen(&app);
+        assert!(
+            top.contains("⋯ shell step 50 "),
+            "oldest kept entry at the top\n{top}"
+        );
+        assert!(!top.contains("step 49 "), "{top}");
+
+        press(&mut app, KeyCode::End);
+        assert!(screen(&app).contains(&last));
+    }
+
+    #[test]
+    fn ctrl_c_quits() {
+        let mut app = App::default();
+        on_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+    }
+}
