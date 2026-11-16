@@ -514,10 +514,28 @@ impl Swarm {
             .node(id)
             .ok_or_else(|| Error::other(format!("Unknown agent id {id}.")))?;
         node.cancel.cancel();
-        if let Some(agent) = node.agent.get() {
-            agent.cancel();
+        // Recorded right away for the whole subtree, so capacity, mail and `list_agents` reflect
+        // it even while an actor is still starting or finishing a tool call.
+        for node in self.subtree(&node.id) {
+            if let Some(agent) = node.agent.get() {
+                agent.cancel();
+            }
+            self.set_status(&node, AgentStatus::Cancelled);
         }
         Ok(())
+    }
+
+    /// `id` and all of its descendants, parents first.
+    fn subtree(&self, id: &str) -> Vec<Arc<Node>> {
+        let agents = self.inner.agents.lock();
+        let mut out: Vec<Arc<Node>> = agents.get(id).cloned().into_iter().collect();
+        // Agents are kept in spawn order, so every parent comes before its children.
+        for node in agents.values() {
+            if out.iter().any(|parent| parent.id == node.parent) {
+                out.push(node.clone());
+            }
+        }
+        out
     }
 
     /// Switch agent `id` to `model` (`None`: the swarm default), effective from its next model
@@ -858,8 +876,15 @@ impl Swarm {
         }
     }
 
+    /// Record a status change; `Cancelled` is terminal and never overwritten.
     fn set_status(&self, node: &Node, status: AgentStatus) {
-        *node.status.lock() = status.clone();
+        {
+            let mut current = node.status.lock();
+            if *current == AgentStatus::Cancelled {
+                return;
+            }
+            *current = status.clone();
+        }
         self.persist();
         self.emit(SwarmEvent::Status {
             id: node.id.clone(),

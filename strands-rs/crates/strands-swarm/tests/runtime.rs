@@ -392,6 +392,60 @@ async fn spawning_beyond_the_live_agent_limit_fails() {
     assert!(error.to_string().contains("Agent limit reached"), "{error}");
 }
 
+#[tokio::test]
+async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let script = |id: &str, responses| {
+        map.lock()
+            .insert(id.to_owned(), MockMessageModel::shared(responses))
+    };
+    script(
+        "a1",
+        vec![
+            tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
+            say("spawned"),
+        ],
+    );
+    script("a2", vec![say("never")]);
+    script("a3", vec![say("three")]);
+    // Every agent but a1 takes a while to build, so a2 is still starting when a1 is cancelled.
+    let inner = mock_factory(&map);
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            if spec.id != "a1" {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            inner(spec).await
+        })
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.max_agents = 2;
+    let (swarm, mut events) = Swarm::new(config);
+    let task = |task: &str| SpawnRequest {
+        task: task.into(),
+        ..Default::default()
+    };
+
+    swarm.spawn(USER, task("one")).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "spawned");
+    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Starting);
+
+    swarm.cancel("a1").unwrap();
+    for id in ["a1", "a2"] {
+        assert_eq!(swarm.agent(id).unwrap().status, AgentStatus::Cancelled, "{id}");
+    }
+    swarm.spawn(USER, task("three")).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "three");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        swarm.agent("a2").unwrap().status,
+        AgentStatus::Cancelled,
+        "stays cancelled"
+    );
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")
