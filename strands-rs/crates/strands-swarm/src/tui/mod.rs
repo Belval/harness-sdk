@@ -117,9 +117,13 @@ async fn on_terminal_event(swarm: &Swarm, app: &mut App, event: Event) {
     }
 }
 
+/// Columns one Ctrl-←/→ press resizes the agent tree by.
+const TREE_STEP: i16 = 4;
+
 /// Apply a key press to the state; returns a command when the input line was submitted.
 fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Char('c') if ctrl => app.quit = true,
         KeyCode::Char(c) => app.input.push(c),
@@ -131,6 +135,8 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
         KeyCode::End => app.scroll = 0,
         KeyCode::Esc => app.input.clear(),
         KeyCode::F(2) => app.show_plain = true,
+        KeyCode::Left if ctrl || alt => app.resize_tree(-TREE_STEP),
+        KeyCode::Right if ctrl || alt => app.resize_tree(TREE_STEP),
         KeyCode::Enter => {
             let line = std::mem::take(&mut app.input);
             return parse_command(&line, !app.agents.is_empty());
@@ -427,6 +433,39 @@ mod tests {
         let row = shown.lines().find(|l| l.contains("copy me")).unwrap();
         let log_part = &row[row.find("copy me").unwrap()..];
         assert_eq!(log_part.trim_end(), "copy me", "{shown}");
+    }
+
+    fn tree_column(shown: &str) -> Option<usize> {
+        let row = shown.lines().nth(2)?;
+        row.chars().position(|c| c == '│')
+    }
+
+    #[test]
+    fn the_agent_tree_fits_its_labels_and_resizes_with_ctrl_arrows() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        spawn(&mut app, "a2", "a1");
+        let fitted = tree_column(&screen(&app)).unwrap();
+        assert!(fitted < usize::from(WIDTH) / 4, "fits short labels: {fitted}");
+
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        on_key(&mut app, ctrl(KeyCode::Right));
+        assert_eq!(tree_column(&screen(&app)), Some(fitted + 4));
+        for _ in 0..5 {
+            on_key(&mut app, ctrl(KeyCode::Left));
+        }
+        let hidden = screen(&app);
+        assert_eq!(tree_column(&hidden), None, "{hidden}");
+        assert!(!hidden.contains(" agents ─"), "{hidden}");
+        assert!(
+            hidden.contains("name-a1 (a1) · idle"),
+            "the log still names the agent\n{hidden}"
+        );
+        for _ in 0..100 {
+            on_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        }
+        let widest = tree_column(&screen(&app)).unwrap();
+        assert!(widest <= usize::from(WIDTH) * 6 / 10, "capped: {widest}");
     }
 
     #[test]

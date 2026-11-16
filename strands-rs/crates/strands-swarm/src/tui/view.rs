@@ -10,8 +10,10 @@ use super::app::{AgentView, App, LogEntry};
 use crate::runtime::{AgentStatus, USER};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Narrowest agent tree; shrinking it further hides it.
+const MIN_TREE: usize = 10;
 const HELP: &str = "enter send · /new <task> · /goal <goal> · /model [<id>|default] · /cancel · ↑↓ select · \
-     pgup/pgdn scroll · f2 plain text · ctrl-c quit";
+     pgup/pgdn scroll · ctrl-←→ tree width · f2 plain text · ctrl-c quit";
 
 /// Draw the whole screen. `tick` animates spinners.
 pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
@@ -22,11 +24,13 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let [agents, log] =
-        Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)]).areas(body);
+    let tree = tree_width(app, body.width);
+    let [agents, log] = Layout::horizontal([Constraint::Length(tree), Constraint::Min(0)]).areas(body);
 
     draw_header(frame, header, app, run_id);
-    draw_agents(frame, agents, app, tick);
+    if tree > 0 {
+        draw_agents(frame, agents, app, tick);
+    }
     draw_log(frame, log, app, tick);
     draw_input(frame, input, app);
     let footer_text = app.notice.clone().unwrap_or_else(|| HELP.to_owned());
@@ -67,6 +71,26 @@ fn draw_agents(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected((!app.agents.is_empty()).then_some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The agent tree's width: its longest name line plus room for the unseen marker, at most 30% of
+/// `total`, adjusted by the user (up to 60%); 0 hides it.
+fn tree_width(app: &App, total: u16) -> u16 {
+    let fit = app
+        .tree()
+        .into_iter()
+        .map(|(depth, view)| agent_item(depth, view, 0).lines[0].width() + if view.unseen { 1 } else { 3 })
+        .max()
+        .unwrap_or(0)
+        .max(MIN_TREE);
+    let fit = i32::try_from(fit)
+        .unwrap_or(i32::MAX)
+        .min(i32::from(total) * 3 / 10);
+    let width = (fit + i32::from(app.tree_adjust)).clamp(0, i32::from(total) * 6 / 10);
+    match u16::try_from(width) {
+        Ok(width) if width >= MIN_TREE as u16 => width,
+        _ => 0,
+    }
 }
 
 /// Two lines per agent: `⠋ parser a2 ⎇ •`, then what it is doing, dimmed. Both are clipped by

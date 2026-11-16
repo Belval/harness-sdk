@@ -30,6 +30,7 @@ TUI: ↑/↓ select an agent, type to message it, `/new <task>`, `/goal <goal>`,
 returns it to `--model`; `/model` alone shows the current one). The id is resolved like `--model`
 (`provider/name` or a Bedrock id, same effort), an invalid one is rejected without touching the
 agent, and the choice is saved with the run. Programmatically: `Swarm::set_model`.
+Ctrl-←/→ (or Alt-←/→) narrows or widens the agent tree; narrow it past its minimum to hide it.
 F2 prints the selected agent's log as plain text into the terminal's own scrollback (native
 scrolling, search and copy-paste); any key returns. A resumed run shows each agent's restored
 conversation.

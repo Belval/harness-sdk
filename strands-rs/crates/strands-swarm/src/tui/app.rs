@@ -187,6 +187,9 @@ pub struct App {
     /// Set when the user asked to read the selected log as plain text in the terminal's own
     /// scrollback (for native scrolling, search and copy-paste).
     pub show_plain: bool,
+    /// Columns added to (or taken from) the agent tree's fitted width; the tree hides when
+    /// shrunk below a few columns.
+    pub tree_adjust: i16,
 }
 
 impl App {
@@ -318,6 +321,11 @@ impl App {
         }
         self.selected = self.selected.saturating_add_signed(delta).min(len - 1);
         self.scroll = 0;
+    }
+
+    /// Grow (or with a negative `delta`, shrink) the agent tree.
+    pub fn resize_tree(&mut self, delta: i16) {
+        self.tree_adjust = self.tree_adjust.saturating_add(delta).clamp(-200, 200);
     }
 
     /// Mark the selected agent's log as seen.
