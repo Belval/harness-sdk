@@ -997,17 +997,19 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
     )]);
     let mut config = SwarmConfig::new(windowed_factory(&scripts), dir.path());
     config.state_dir = Some(state_dir.clone());
+    // The compaction point is min(85% of the 4000-token window, 2000) = 2000 tokens.
+    config.compact_at = 2000;
     let (swarm, mut events) = Swarm::new(config.clone());
     let id = spawn_root(&swarm, "count").await;
 
     let seen = usage_until_reply(&mut events, &id).await;
-    // Context is the last call's input over the 4000-token window.
+    // Context is the last call's input over the compaction point.
     assert_eq!(
         seen.first(),
-        Some(&(1000, 10, Some(0.25))),
+        Some(&(1000, 10, Some(0.5))),
         "mid-turn report: {seen:?}"
     );
-    assert_eq!(seen.last(), Some(&(1005, 11, Some(5.0 / 4000.0))), "{seen:?}");
+    assert_eq!(seen.last(), Some(&(1005, 11, Some(5.0 / 2000.0))), "{seen:?}");
     swarm.shutdown().await;
 
     let saved = strands_swarm::state::load(&state_dir)
@@ -1018,7 +1020,7 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
         (saved.agents[0].input_tokens, saved.agents[0].output_tokens),
         (1005, 11)
     );
-    assert_eq!(saved.agents[0].context, Some(5.0 / 4000.0));
+    assert_eq!(saved.agents[0].context, Some(5.0 / 2000.0));
     let (_resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
     let restored = async {
         loop {
@@ -1036,7 +1038,7 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
     let restored = tokio::time::timeout(Duration::from_secs(10), restored)
         .await
         .expect("no usage after resume");
-    assert_eq!(restored, (1005, 11, Some(5.0 / 4000.0)));
+    assert_eq!(restored, (1005, 11, Some(5.0 / 2000.0)));
 }
 
 #[tokio::test]
@@ -1568,8 +1570,10 @@ async fn the_goal_judge_runs_on_the_side_model_and_counts_toward_the_agents_toke
         1,
         "the judge is not the agent's model"
     );
-    // The judge's call adds to the totals without touching the agent's context fill.
-    assert_eq!(seen, [(100, 10, Some(0.025)), (150, 15, Some(0.025))]);
+    // The judge's call adds to the totals without touching the agent's context fill (100 tokens
+    // of the 3400-token compaction point: 85% of the 4000-token window).
+    let fill = Some(100.0 / 3400.0);
+    assert_eq!(seen, [(100, 10, fill), (150, 15, fill)]);
     assert_eq!(swarm.tokens_used(), 165);
     swarm.shutdown().await;
 }

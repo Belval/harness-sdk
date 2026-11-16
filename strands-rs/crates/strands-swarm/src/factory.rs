@@ -8,7 +8,6 @@ use strands_agents::context_manager::strategies::{
 };
 use strands_agents::context_manager::{
     ContextManagerConfig, ContextManagerOption, StashOption, AGENTIC_TRUNCATE_THRESHOLD,
-    AUTO_SUMMARIZE_UTILIZATION,
 };
 use strands_agents::plugins::vended::{GoalLoop, JudgeConfig, Skill};
 use strands_agents::sandbox::LocalSandbox;
@@ -24,6 +23,7 @@ use strands_harness::{
 };
 
 use crate::catalog::ToolCatalog;
+use crate::compaction::{CompactAt, DEFAULT_COMPACT_AT};
 use crate::runtime::{AgentFactory, AgentSpec, ModelResolver};
 use crate::skills::{skills_prompt, skills_tool};
 
@@ -56,6 +56,9 @@ pub struct HarnessFactoryOptions {
     /// Skills offered to every agent: one line each in the system prompt, loaded with the
     /// `skills` tool. Neither when empty.
     pub skills: Arc<Vec<Skill>>,
+    /// Summarize older turns once a call's input reaches this many tokens (or 85% of the
+    /// model's window, if smaller); [`DEFAULT_COMPACT_AT`] when `None`.
+    pub compact_at: Option<u64>,
 }
 
 /// A factory that builds harness agents.
@@ -120,8 +123,8 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// The `auto` pipeline with coding-sized limits: the preset offloads any tool result over 1,500
 /// tokens, which stashes most file reads and command outputs and costs a retrieval call each.
 /// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
-/// still summarize old turns near the context limit.
-fn context_manager() -> ContextManagerOption {
+/// summarize old turns at `compact_at` tokens (see [`CompactAt`]).
+fn context_manager(compact_at: u64) -> ContextManagerOption {
     let truncate = Offload::truncate(
         OffloadTarget::ToolResults,
         TruncateConfig {
@@ -133,11 +136,13 @@ fn context_manager() -> ContextManagerOption {
         threshold: Some(AGENTIC_TRUNCATE_THRESHOLD),
         ..Default::default()
     });
+    // Ungated (utilization 0) and message-level; `CompactAt` decides when it runs.
     let summarize = Offload::summarize(OffloadTarget::All).when(OffloadConditions {
-        utilization: Some(AUTO_SUMMARIZE_UTILIZATION),
+        utilization: Some(0.0),
         preserve_recent: Some(4.0),
         ..Default::default()
     });
+    let summarize = CompactAt::new(Arc::new(summarize), compact_at);
     ContextManagerOption::Config(ContextManagerConfig {
         strategies: Some(vec![Arc::new(truncate), Arc::new(summarize)]),
         stash: StashOption::Enabled,
@@ -192,7 +197,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         // Discovery happens once at startup (crate::skills); the harness's own `./.agent/skills`
         // lookup, relative to the process rather than the agent, stays off.
         skills: SkillsOption::Off,
-        context_manager: context_manager(),
+        context_manager: context_manager(options.compact_at.unwrap_or(DEFAULT_COMPACT_AT)),
         id: Some(spec.id),
         name: Some(spec.name),
         ..Default::default()
@@ -233,7 +238,7 @@ mod tests {
             .model(Arc::new(MockMessageModel::new(Vec::new())))
             .build()
             .unwrap();
-        let manager = ContextManager::from(context_manager()).unwrap();
+        let manager = ContextManager::from(context_manager(DEFAULT_COMPACT_AT)).unwrap();
         let mut messages = vec![Message::user("start")];
         messages.extend(exchange("file-read", 16_000));
         messages.extend(exchange("huge-log", 200_000));
@@ -245,6 +250,54 @@ mod tests {
 
         assert_eq!(result_len(&messages[2]), 16_000);
         assert!(result_len(&messages[4]) < 20_000);
+    }
+
+    fn chat(turns: usize) -> Vec<Message> {
+        (0..turns)
+            .flat_map(|i| {
+                [
+                    Message::user(format!("question {i} {}", "q".repeat(400))),
+                    Message::assistant(format!("answer {i} {}", "a".repeat(400))),
+                ]
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn summarizes_older_turns_once_input_reaches_compact_at() {
+        use strands_agents::testing::MockResponse;
+        let model = MockMessageModel::shared(vec![MockResponse::message(Message::assistant(
+            "SUMMARY of the early turns",
+        ))]);
+        let agent = Agent::builder().model(model.clone()).build().unwrap();
+        // The mock has no known window, so the context manager assumes 200k: 5k tokens is 2.5%,
+        // far below the 85% mark, but past `compact_at`.
+        let manager = ContextManager::from(context_manager(4_000)).unwrap();
+
+        let mut below = chat(6);
+        let changed = manager
+            .run_strategies_on(&agent, &mut below, Some(3_000), false)
+            .await
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(below.len(), 12);
+        assert_eq!(model.call_count(), 0);
+
+        let mut above = chat(6);
+        let changed = manager
+            .run_strategies_on(&agent, &mut above, Some(5_000), false)
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(model.call_count(), 1);
+        assert!(above.len() < 12, "{} messages", above.len());
+        assert!(above
+            .iter()
+            .any(|m| m.text().contains("SUMMARY of the early turns")));
+        assert!(
+            above.last().unwrap().text().starts_with("answer 5"),
+            "recent turns kept"
+        );
     }
 
     use strands_agents::tools::FunctionTool;

@@ -4,7 +4,6 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
-use strands_agents::context_manager::AUTO_SUMMARIZE_UTILIZATION;
 
 use strands_agents::types::{ContentBlock, Message, Role, ToolResultStatus};
 
@@ -12,6 +11,10 @@ use crate::runtime::{summarize_input, AgentStatus, SwarmEvent, USER};
 
 /// Entries kept per agent log; the oldest are dropped beyond this.
 pub const MAX_LOG_ENTRIES: usize = 2000;
+
+/// Context share (of the compaction point) at which an agent's log notes that summarization is
+/// near.
+const COMPACTION_NOTICE_AT: f64 = 0.9;
 
 /// One entry in an agent's log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,11 +353,11 @@ impl App {
                 view.input_tokens = input_tokens;
                 view.output_tokens = output_tokens;
                 // Note the crossing once, from a known lower value, so a restart does not repeat it.
-                let crossed = |c: Option<f64>| c.is_some_and(|c| c >= AUTO_SUMMARIZE_UTILIZATION);
+                let crossed = |c: Option<f64>| c.is_some_and(|c| c >= COMPACTION_NOTICE_AT);
                 if crossed(context) && view.context.is_some() && !crossed(view.context) {
                     let percent = (context.unwrap_or_default() * 100.0).round();
                     view.push(LogEntry::Status(format!(
-                        "context {percent}% — older turns will be summarized"
+                        "context {percent}% of the compaction point — older turns will be summarized soon"
                     )));
                 }
                 view.context = context.or(view.context);
@@ -1064,14 +1067,16 @@ mod tests {
                 .count()
         };
         // A restored value above the threshold is not a crossing.
-        app.apply(usage(Some(0.9)));
+        app.apply(usage(Some(0.95)));
         assert_eq!(notes(&app), 0);
         app.apply(usage(Some(0.3)));
-        app.apply(usage(Some(0.86)));
-        app.apply(usage(Some(0.88)));
+        app.apply(usage(Some(0.91)));
+        app.apply(usage(Some(0.97)));
         assert_eq!(notes(&app), 1);
-        assert!(app.agents["a1"].log.iter().any(
-            |entry| matches!(entry, LogEntry::Status(note) if note == "context 86% — older turns will be summarized")
-        ));
+        assert!(app.agents["a1"]
+            .log
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::Status(note)
+            if note == "context 91% of the compaction point — older turns will be summarized soon")));
     }
 }

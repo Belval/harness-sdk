@@ -29,7 +29,7 @@ cargo build --release -p strands-swarm
 strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--judge-model ID]
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
-              [--max-agents N] [--max-concurrent-calls N] [--memory FILE | --no-memory]
+              [--max-agents N] [--max-concurrent-calls N] [--compact-at TOKENS] [--memory FILE | --no-memory]
               [--headless] [--journal | --gc] [TASK]
 ```
 
@@ -59,8 +59,11 @@ message continues the same conversation. Programmatically: `Swarm::interrupt`. `
 agent and its whole subtree for good.
 Typing `/` opens a popup of the commands with one-line help, filtered as you type; ↑/↓ and
 Tab or Enter pick one; F1 lists the keys. Each agent is one line in the tree: status, name, model,
-input/output tokens and how full its context window was on its last model call, e.g.
-`● parser opus-5-5 1.2M/34.0k 34% a3`.
+input/output tokens and how close its last model call came to the compaction point, e.g.
+`● parser opus-5-5 1.2M/34.0k 34% a3`: at 100% its older turns are summarized before the next call
+(the log notes it at 90%). The compaction point is `--compact-at` (default `200k`) or 85% of the
+model's context window, whichever is smaller, so agents on 1M-token models do not carry ~850k
+tokens per call; it follows the window on a `/model` switch.
 `/model <id>` switches the selected agent's model from its next model call on (`/model default`
 returns it to `--model`; `/model` alone shows the current one). The id is resolved like `--model`
 (`provider/name` or a Bedrock id, same effort), an invalid one is rejected without touching the

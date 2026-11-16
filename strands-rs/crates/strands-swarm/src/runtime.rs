@@ -176,6 +176,10 @@ pub struct SwarmConfig {
     /// Model for every agent's side calls, such as the goal judge; `None` uses the agent's own
     /// model. Side calls are gated and counted like the agent's own model calls either way.
     pub side_model: Option<Arc<dyn Model>>,
+    /// Input size (tokens) at which the factory summarizes older turns
+    /// ([`crate::compaction::compaction_point`]); the context share in [`SwarmEvent::Usage`] is
+    /// relative to it.
+    pub compact_at: u64,
 }
 
 impl SwarmConfig {
@@ -194,6 +198,7 @@ impl SwarmConfig {
             reclaim_disk: true,
             memory: None,
             side_model: None,
+            compact_at: crate::compaction::DEFAULT_COMPACT_AT,
         }
     }
 }
@@ -306,8 +311,8 @@ pub enum SwarmEvent {
         input_tokens: u64,
         /// Output tokens so far.
         output_tokens: u64,
-        /// Share of the model's context window the last model call's input filled (`0..1+`), as
-        /// the context manager estimates it; `None` before the first model call.
+        /// The last model call's input as a share of the compaction point (`0..1+`; at 1.0 older
+        /// turns are summarized before the next call); `None` before the first model call.
         context: Option<f64>,
     },
     /// The token budget was set or lifted (`None`).
@@ -1434,10 +1439,13 @@ impl Swarm {
             total.0 += input;
             total.1 += usage.output_tokens;
         }
-        // The same estimate the context manager gates summarization on, including its default
-        // window for models whose window is unknown. A side call's input is not the agent's context.
+        // Relative to the compaction point, so 100% means older turns are summarized before the
+        // next call; the window is the one the context manager assumes. A side call's input is
+        // not the agent's context.
         if let Some(agent) = node.agent.get().filter(|_| own_call) {
-            *node.context.lock() = Some(agent.model().estimate_utilization(input));
+            let window = crate::compaction::window_of(agent.model().as_ref());
+            let point = crate::compaction::compaction_point(window, self.inner.config.compact_at);
+            *node.context.lock() = Some(input as f64 / point as f64);
         }
         self.emit_usage(node);
     }

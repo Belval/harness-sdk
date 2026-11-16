@@ -4681,6 +4681,7 @@ name = "strands-swarm"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "clap",
  "crossterm",
  "futures",

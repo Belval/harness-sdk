@@ -14,6 +14,7 @@
 
 pub mod budget;
 pub mod catalog;
+pub mod compaction;
 pub mod factory;
 pub mod gc;
 pub mod journal;

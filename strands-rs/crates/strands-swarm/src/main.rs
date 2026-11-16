@@ -47,6 +47,10 @@ struct Cli {
     /// is raised (TUI `/budget N`). A resumed run keeps its last budget.
     #[arg(long, value_parser = strands_swarm::budget::parse_tokens)]
     budget_tokens: Option<u64>,
+    /// Summarize an agent's older turns once a call's input reaches this many tokens (e.g. `200k`,
+    /// `1.5M`), or 85% of the model's window if that is smaller.
+    #[arg(long, value_parser = strands_swarm::budget::parse_tokens, default_value = "200k")]
+    compact_at: u64,
     /// File with extra instructions given to every agent.
     #[arg(long)]
     instructions: Option<PathBuf>,
@@ -210,6 +214,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         tools,
         catalog,
         skills: std::sync::Arc::new(skills.for_agents()),
+        compact_at: Some(cli.compact_at),
     };
     let root = root_request(cli.task, cli.goal);
     let mut config = SwarmConfig::new(harness_factory(options.clone()), cwd);
@@ -221,6 +226,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
     config.budget_tokens = cli.budget_tokens;
+    config.compact_at = cli.compact_at;
     if !cli.no_memory {
         config.memory = cli
             .memory
