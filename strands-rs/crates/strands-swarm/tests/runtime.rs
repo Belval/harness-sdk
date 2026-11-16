@@ -836,3 +836,91 @@ async fn a_large_run_resumes_without_deadlocking_under_concurrent_snapshots() {
     );
     swarm.shutdown().await;
 }
+
+fn usage(input: u64, cache_read: u64, output: u64) -> strands_agents::types::Usage {
+    strands_agents::types::Usage {
+        input_tokens: input,
+        output_tokens: output,
+        total_tokens: input + cache_read + output,
+        cache_read_input_tokens: Some(cache_read),
+        ..Default::default()
+    }
+}
+
+/// Every `Usage` event for `id` until `id` replies to the user.
+async fn usage_until_reply(events: &mut UnboundedReceiver<SwarmEvent>, id: &str) -> Vec<(u64, u64)> {
+    let mut seen = Vec::new();
+    let wait = async {
+        while let Some(event) = events.recv().await {
+            match event {
+                SwarmEvent::Usage {
+                    id: agent,
+                    input_tokens,
+                    output_tokens,
+                } if agent == id => seen.push((input_tokens, output_tokens)),
+                SwarmEvent::Mail { to, mail } if to == USER && mail.kind == "reply" => return,
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .expect("timed out waiting for a reply");
+    seen
+}
+
+#[tokio::test]
+async fn token_usage_is_reported_after_each_model_call_and_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let call = Message::new(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse(ToolUseBlock::new(
+            "list_agents",
+            "t1",
+            json!({}),
+        ))],
+    );
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            MockResponse::with_usage(call, usage(100, 900, 10)),
+            MockResponse::with_usage(Message::assistant("done"), usage(5, 0, 1)),
+        ],
+    )]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config.clone());
+    let id = spawn_root(&swarm, "count").await;
+
+    let seen = usage_until_reply(&mut events, &id).await;
+    assert_eq!(seen.first(), Some(&(1000, 10)), "mid-turn report: {seen:?}");
+    assert_eq!(seen.last(), Some(&(1005, 11)), "{seen:?}");
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&state_dir)
+        .await
+        .unwrap()
+        .expect("state saved");
+    assert_eq!(
+        (saved.agents[0].input_tokens, saved.agents[0].output_tokens),
+        (1005, 11)
+    );
+    let (_resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    let restored = async {
+        loop {
+            if let Some(SwarmEvent::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            }) = events.recv().await
+            {
+                return (input_tokens, output_tokens);
+            }
+        }
+    };
+    let restored = tokio::time::timeout(Duration::from_secs(10), restored)
+        .await
+        .expect("no usage after resume");
+    assert_eq!(restored, (1005, 11));
+}

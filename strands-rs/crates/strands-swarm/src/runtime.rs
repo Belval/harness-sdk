@@ -17,7 +17,7 @@ use strands_agents::hooks::AfterToolCallEvent;
 use strands_agents::models::streaming::{ContentBlockDelta, ModelStreamEvent};
 use strands_agents::tools::ToolRef;
 use strands_agents::types::{
-    ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolResultStatus,
+    ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolResultStatus, Usage,
 };
 use strands_agents::{Agent, Error, Model, Result};
 use tokio::sync::{mpsc, Notify};
@@ -325,7 +325,12 @@ struct Node {
     model: Mutex<Option<String>>,
     goal: Option<String>,
     env: BTreeMap<String, String>,
+    /// Tokens used so far, across restarts.
+    usage: Mutex<Tokens>,
 }
+
+/// Cumulative `(input, output)` tokens.
+type Tokens = (u64, u64);
 
 impl Node {
     /// `parser (a2)`.
@@ -471,6 +476,7 @@ impl Swarm {
                 model: Mutex::new(request.model.clone()),
                 goal: request.goal.clone(),
                 env,
+                usage: Mutex::new((0, 0)),
             });
             agents.insert(id.clone(), node.clone());
             node
@@ -673,6 +679,7 @@ impl Swarm {
             model: Mutex::new(saved.model),
             goal: saved.goal,
             env,
+            usage: Mutex::new((saved.input_tokens, saved.output_tokens)),
         });
         agents.insert(saved.id.clone(), node.clone());
         drop(agents);
@@ -688,6 +695,7 @@ impl Swarm {
             id: node.id.clone(),
             status: status.clone(),
         });
+        self.emit_usage(&node);
         if status.is_live() {
             let swarm = self.clone();
             let start = Start::Resume { interrupted };
@@ -954,7 +962,6 @@ impl Swarm {
                 Err(error) => failure = Some(error),
             }
         }
-        self.report_usage(node, agent);
         if node.cancel.is_cancelled() || self.inner.shutting_down.load(Ordering::SeqCst) {
             return None;
         }
@@ -973,17 +980,18 @@ impl Swarm {
     fn forward(&self, node: &Node, event: &AgentStreamEvent) -> Option<String> {
         let id = node.id.clone();
         match event {
-            AgentStreamEvent::ModelStreamUpdate(update) => {
-                if let ModelStreamEvent::ContentBlockDelta {
+            AgentStreamEvent::ModelStreamUpdate(update) => match &update.event {
+                ModelStreamEvent::ContentBlockDelta {
                     delta: ContentBlockDelta::Text { text },
-                } = &update.event
-                {
-                    self.emit(SwarmEvent::Text {
-                        id,
-                        delta: text.clone(),
-                    });
-                }
-            }
+                } => self.emit(SwarmEvent::Text {
+                    id,
+                    delta: text.clone(),
+                }),
+                ModelStreamEvent::Metadata {
+                    usage: Some(usage), ..
+                } => self.add_usage(node, usage),
+                _ => {}
+            },
             AgentStreamEvent::BeforeToolCall(call) => self.emit(SwarmEvent::ToolStarted {
                 id,
                 name: call.tool_use.name.clone(),
@@ -1000,12 +1008,25 @@ impl Swarm {
         None
     }
 
-    fn report_usage(&self, node: &Node, agent: &Agent) {
-        let usage = agent.meter().metrics().accumulated_usage;
+    /// Add one model call's usage (its trailing metadata) to the agent's totals and publish them.
+    fn add_usage(&self, node: &Node, usage: &Usage) {
+        let input = usage.input_tokens
+            + usage.cache_read_input_tokens.unwrap_or(0)
+            + usage.cache_write_input_tokens.unwrap_or(0);
+        {
+            let mut total = node.usage.lock();
+            total.0 += input;
+            total.1 += usage.output_tokens;
+        }
+        self.emit_usage(node);
+    }
+
+    fn emit_usage(&self, node: &Node) {
+        let (input_tokens, output_tokens) = *node.usage.lock();
         self.emit(SwarmEvent::Usage {
             id: node.id.clone(),
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
+            input_tokens,
+            output_tokens,
         });
     }
 
@@ -1132,6 +1153,7 @@ fn status_name(status: &AgentStatus) -> &'static str {
 }
 
 fn node_state(node: &Node) -> AgentState {
+    let (input_tokens, output_tokens) = *node.usage.lock();
     AgentState {
         id: node.id.clone(),
         name: Some(node.name.clone()),
@@ -1144,6 +1166,8 @@ fn node_state(node: &Node) -> AgentState {
         status: status_name(&node.status.lock()).to_owned(),
         mailbox: node.mailbox.lock().iter().map(mail_state).collect(),
         env: node.env.clone(),
+        input_tokens,
+        output_tokens,
     }
 }
 

@@ -55,6 +55,12 @@ pub struct AgentState {
     /// Environment variables for the agent's commands.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Input tokens used so far (cache reads and writes included), across restarts.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Output tokens used so far, across restarts.
+    #[serde(default)]
+    pub output_tokens: u64,
 }
 
 /// Persisted mail.
