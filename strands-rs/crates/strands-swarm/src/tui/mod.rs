@@ -2,12 +2,18 @@
 //! input line that messages the selected agent (or starts a root agent).
 
 pub mod app;
+pub mod select;
 pub mod view;
 
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures::StreamExt;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Position, Rect};
 use strands_agents::Result;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -32,6 +38,14 @@ pub async fn run(
     root: Option<SpawnRequest>,
 ) -> Result<Exit> {
     let mut terminal = ratatui::init();
+    set_mouse_capture(true);
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        set_mouse_capture(false);
+        hook(info);
+    }));
+    // The last frame, for copying a mouse selection out of it.
+    let mut screen = Buffer::empty(Rect::default());
     let mut app = App::default();
     if let Some(request) = root {
         let outcome = swarm.spawn(USER, request).await;
@@ -46,8 +60,9 @@ pub async fn run(
     let outcome = loop {
         app.mark_seen();
         if !plain {
-            if let Err(error) = terminal.draw(|frame| view::draw(frame, &app, swarm.run_id(), tick)) {
-                break Err(strands_agents::Error::other(format!("terminal error: {error}")));
+            match terminal.draw(|frame| view::draw(frame, &app, swarm.run_id(), tick)) {
+                Ok(frame) => screen.clone_from(frame.buffer),
+                Err(error) => break Err(strands_agents::Error::other(format!("terminal error: {error}"))),
             }
         }
         tokio::select! {
@@ -65,7 +80,7 @@ pub async fn run(
                     }
                 }
                 true => {}
-                false => on_terminal_event(&swarm, &mut app, event).await,
+                false => on_terminal_event(&swarm, &mut app, event, &screen).await,
             },
             _ = ticker.tick() => tick = tick.wrapping_add(1),
             _ = swarm.reload_requested() => break Ok(Exit::Reload),
@@ -81,6 +96,7 @@ pub async fn run(
         }
     };
 
+    set_mouse_capture(false);
     ratatui::restore();
     swarm.shutdown().await;
     outcome
@@ -95,6 +111,7 @@ fn enter_plain(app: &App) -> std::io::Result<()> {
         .and_then(|id| app.agents.get(&id))
         .map_or_else(|| "(no agent selected)\n".to_owned(), view::plain_log);
     let mut out = std::io::stdout();
+    set_mouse_capture(false);
     crossterm::execute!(out, crossterm::terminal::LeaveAlternateScreen)?;
     crossterm::terminal::disable_raw_mode()?;
     write!(out, "\n{text}\n— press any key to return to the swarm —")?;
@@ -104,17 +121,88 @@ fn enter_plain(app: &App) -> std::io::Result<()> {
 
 fn leave_plain(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
     crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    set_mouse_capture(true);
     terminal.clear()
 }
 
-async fn on_terminal_event(swarm: &Swarm, app: &mut App, event: Event) {
-    let Event::Key(key) = event else { return };
-    if key.kind != KeyEventKind::Press {
-        return;
+async fn on_terminal_event(swarm: &Swarm, app: &mut App, event: Event, screen: &Buffer) {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if let Some(command) = on_key(app, key) {
+                submit(swarm, app, command).await;
+            }
+        }
+        Event::Mouse(mouse) => {
+            if let Some(text) = on_mouse(app, mouse, screen) {
+                copy_to_clipboard(app, &text);
+            }
+        }
+        _ => {}
     }
-    if let Some(command) = on_key(app, key) {
-        submit(swarm, app, command).await;
+}
+
+/// Turn mouse capture on (selection and wheel go to the TUI) or off (the terminal's own).
+fn set_mouse_capture(on: bool) {
+    let mut out = std::io::stdout();
+    let _ = match on {
+        true => crossterm::execute!(out, crossterm::event::EnableMouseCapture),
+        false => crossterm::execute!(out, crossterm::event::DisableMouseCapture),
+    };
+}
+
+fn copy_to_clipboard(app: &mut App, text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let written = out
+        .write_all(select::osc52(text).as_bytes())
+        .and_then(|()| out.flush());
+    app.notice = Some(match written {
+        Ok(()) => format!("copied {} chars", text.chars().count()),
+        Err(error) => format!("copy failed: {error}"),
+    });
+}
+
+/// Rows the mouse wheel scrolls the log by.
+const WHEEL_STEP: u16 = 3;
+
+/// Apply a mouse event to the state: a left drag selects inside the pane it started in, and
+/// releasing it returns the selected text of `screen` (the last frame) to copy. The wheel scrolls
+/// the log.
+fn on_mouse(app: &mut App, mouse: MouseEvent, screen: &Buffer) -> Option<String> {
+    let at = Position::new(mouse.column, mouse.row);
+    let areas = view::areas(app, screen.area);
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll = app.scroll.saturating_add(WHEEL_STEP),
+        MouseEventKind::ScrollDown => app.scroll = app.scroll.saturating_sub(WHEEL_STEP),
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.selection = areas.pane_at(at).map(|pane| select::Selection {
+                pane,
+                anchor: at,
+                cursor: at,
+            });
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(selection) = &mut app.selection {
+                selection.cursor = select::clamp(at, areas.inner(selection.pane));
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let selection = app.selection.filter(|s| !s.is_empty());
+            let Some(selection) = selection else {
+                app.selection = None;
+                return None;
+            };
+            let inner = areas.inner(selection.pane);
+            let continues = match selection.pane {
+                select::Pane::Log => view::log_continuations(app, inner),
+                select::Pane::Tree => Vec::new(),
+            };
+            let text = select::selected_text(screen, inner, &selection, &continues);
+            return (!text.is_empty()).then_some(text);
+        }
+        _ => {}
     }
+    None
 }
 
 /// Columns one Ctrl-←/→ press resizes the agent tree by.
@@ -144,7 +232,10 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
         KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(10),
         KeyCode::End => app.scroll = 0,
         KeyCode::Esc if app.show_keys => app.show_keys = false,
-        KeyCode::Esc => app.input.clear(),
+        KeyCode::Esc => {
+            app.input.clear();
+            app.selection = None;
+        }
         KeyCode::F(1) => app.show_keys = !app.show_keys,
         KeyCode::F(2) => app.show_plain = true,
         KeyCode::F(3) => app.toggle_cancelled(),
@@ -233,6 +324,7 @@ mod tests {
     use std::path::PathBuf;
 
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
     use ratatui::Terminal;
     use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
 
@@ -241,6 +333,40 @@ mod tests {
 
     const WIDTH: u16 = 100;
     const HEIGHT: u16 = 24;
+
+    fn render(app: &App) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        terminal.draw(|frame| view::draw(frame, app, "run1", 0)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) -> Option<String> {
+        let screen = render(app);
+        let event = MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        on_mouse(app, event, &screen)
+    }
+
+    fn drag(app: &mut App, from: (u16, u16), to: (u16, u16)) -> Option<String> {
+        let left = MouseButton::Left;
+        assert_eq!(mouse(app, MouseEventKind::Down(left), from.0, from.1), None);
+        assert_eq!(mouse(app, MouseEventKind::Drag(left), to.0, to.1), None);
+        mouse(app, MouseEventKind::Up(left), to.0, to.1)
+    }
+
+    fn row_of(app: &App, needle: &str) -> u16 {
+        let shown = screen(app);
+        let row = shown.lines().position(|l| l.contains(needle));
+        u16::try_from(row.unwrap_or_else(|| panic!("{needle:?} not on screen\n{shown}"))).unwrap()
+    }
+
+    fn log_pane(app: &App) -> Rect {
+        view::areas(app, Rect::new(0, 0, WIDTH, HEIGHT)).inner(select::Pane::Log)
+    }
 
     fn screen(app: &App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
@@ -518,6 +644,75 @@ mod tests {
         let shown = screen(&app);
         assert!(shown.contains("⊘ name-a2 a2"), "{shown}");
         assert!(!shown.contains("cancelled hidden"), "{shown}");
+    }
+
+    #[test]
+    fn a_drag_in_the_log_copies_only_log_text_and_is_highlighted() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        app.apply(SwarmEvent::Text {
+            id: "a1".into(),
+            delta: "first line\nsecond line".into(),
+        });
+        let log = log_pane(&app);
+        let first = row_of(&app, "first line");
+        let copied = drag(&mut app, (log.x, first), (log.x + 10, first + 1));
+        assert_eq!(copied.as_deref(), Some("first line\nsecond line"));
+
+        let buffer = render(&app);
+        let reversed = |x, y| buffer[(x, y)].modifier.contains(Modifier::REVERSED);
+        assert!(reversed(log.x, first) && reversed(log.right() - 1, first));
+        assert!(reversed(log.x + 10, first + 1) && !reversed(log.x + 11, first + 1));
+        assert!(!reversed(0, first), "the tree is not highlighted");
+
+        // Dragging over the tree stays clamped to the log.
+        let copied = drag(&mut app, (log.x, first), (0, first + 1)).unwrap();
+        assert_eq!(copied, "first line\ns");
+        assert!(!copied.contains("name-a1"), "{copied}");
+    }
+
+    #[test]
+    fn a_wrapped_line_is_copied_as_one_line() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        let long: String = (0..40).map(|i| format!("word{i} ")).collect();
+        let long = long.trim_end().to_owned();
+        app.apply(SwarmEvent::Text {
+            id: "a1".into(),
+            delta: long.clone(),
+        });
+        let log = log_pane(&app);
+        let (start, end) = (row_of(&app, "word0 "), row_of(&app, "word39"));
+        assert!(end > start, "the line wraps");
+        let copied = drag(&mut app, (log.x, start), (log.right() - 1, end));
+        assert_eq!(copied, Some(long));
+    }
+
+    #[test]
+    fn a_drag_in_the_tree_copies_only_the_tree() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        spawn(&mut app, "a2", "a1");
+        let tree = view::areas(&app, Rect::new(0, 0, WIDTH, HEIGHT)).inner(select::Pane::Tree);
+        let copied = drag(&mut app, (0, tree.y), (WIDTH - 1, tree.y + 2)).unwrap();
+        assert!(copied.starts_with("● name-a1 a1"), "{copied}");
+        assert!(copied.contains("● name-a2 a2"), "{copied}");
+        assert!(!copied.contains("▶ task") && !copied.contains('│'), "{copied}");
+    }
+
+    #[test]
+    fn a_click_selects_nothing_and_the_wheel_scrolls_the_log() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        let log = log_pane(&app);
+        assert_eq!(drag(&mut app, (log.x, log.y), (log.x, log.y)), None);
+        assert_eq!(app.selection, None);
+
+        mouse(&mut app, MouseEventKind::ScrollUp, log.x, log.y);
+        mouse(&mut app, MouseEventKind::ScrollUp, log.x, log.y);
+        assert_eq!(app.scroll, 2 * WHEEL_STEP);
+        mouse(&mut app, MouseEventKind::ScrollDown, log.x, log.y);
+        assert_eq!(app.scroll, WHEEL_STEP);
     }
 
     #[test]

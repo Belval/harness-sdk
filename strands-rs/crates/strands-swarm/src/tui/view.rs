@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding
 use ratatui::Frame;
 
 use super::app::{AgentView, App, LogEntry};
+use super::select::{self, Pane};
 use crate::runtime::{AgentStatus, USER};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -18,38 +19,100 @@ const KEYS: &[(&str, &str)] = &[
     ("enter", "send to the selected agent"),
     ("/", "commands"),
     ("↑ ↓", "select an agent (or a command)"),
-    ("pgup pgdn end", "scroll the log"),
+    ("pgup pgdn end", "scroll the log (or the mouse wheel)"),
+    ("drag", "select in one pane and copy (shift-drag: terminal's own)"),
     ("ctrl-← →", "tree width (hides when narrow)"),
     ("f2", "plain-text log, for native scroll and copy"),
     ("f3", "show or hide cancelled agents"),
-    ("esc", "clear the input, close this"),
+    ("esc", "clear the input and selection, close this"),
     ("ctrl-c", "quit"),
 ];
 
-/// Draw the whole screen. `tick` animates spinners.
-pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
+/// Where each part of the screen goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Areas {
+    /// Run summary line.
+    pub header: Rect,
+    /// Tree and log together.
+    pub body: Rect,
+    /// Agent tree, empty when hidden.
+    pub tree: Rect,
+    /// Selected agent's log.
+    pub log: Rect,
+    /// Input line.
+    pub input: Rect,
+    /// Help or notice line.
+    pub footer: Rect,
+}
+
+impl Areas {
+    /// The text area of `pane`, inside its borders.
+    pub fn inner(&self, pane: Pane) -> Rect {
+        match pane {
+            // Top border; right border.
+            Pane::Tree => Rect {
+                y: self.tree.y + 1,
+                height: self.tree.height.saturating_sub(1),
+                width: self.tree.width.saturating_sub(1),
+                ..self.tree
+            },
+            // Top border; one column of left padding.
+            Pane::Log => Rect {
+                x: self.log.x + 1,
+                y: self.log.y + 1,
+                width: self.log.width.saturating_sub(1),
+                height: self.log.height.saturating_sub(1),
+            },
+        }
+    }
+
+    /// The pane whose text area contains `position`.
+    pub fn pane_at(&self, position: ratatui::layout::Position) -> Option<Pane> {
+        [Pane::Log, Pane::Tree]
+            .into_iter()
+            .find(|pane| self.inner(*pane).contains(position))
+    }
+}
+
+/// Lay out a screen of `area` for `app`.
+pub fn areas(app: &App, area: Rect) -> Areas {
     let [header, body, input, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(5),
         Constraint::Length(2),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
     let tree = tree_width(app, body.width);
-    let [agents, log] = Layout::horizontal([Constraint::Length(tree), Constraint::Min(0)]).areas(body);
-
-    draw_header(frame, header, app, run_id);
-    if tree > 0 {
-        draw_agents(frame, agents, app, tick);
+    let [tree, log] = Layout::horizontal([Constraint::Length(tree), Constraint::Min(0)]).areas(body);
+    Areas {
+        header,
+        body,
+        tree,
+        log,
+        input,
+        footer,
     }
-    draw_log(frame, log, app, tick);
-    draw_input(frame, input, app);
-    draw_completions(frame, input, app);
+}
+
+/// Draw the whole screen. `tick` animates spinners.
+pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
+    let areas = areas(app, frame.area());
+    draw_header(frame, areas.header, app, run_id);
+    if areas.tree.width > 0 {
+        draw_agents(frame, areas.tree, app, tick);
+    }
+    draw_log(frame, areas.log, app, tick);
+    draw_input(frame, areas.input, app);
+    if let Some(selection) = &app.selection {
+        select::highlight(frame.buffer_mut(), areas.inner(selection.pane), selection);
+    }
+    draw_completions(frame, areas.input, app);
     if app.show_keys {
-        draw_keys(frame, body);
+        draw_keys(frame, areas.body);
     }
     let footer_text = app.notice.clone().unwrap_or_else(|| HINT.to_owned());
-    frame.render_widget(Paragraph::new(footer_text).dim(), footer);
+    frame.render_widget(Paragraph::new(footer_text).dim(), areas.footer);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
@@ -206,6 +269,23 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         return;
     };
     let title = log_title(view);
+    let paragraph = Paragraph::new(Text::from(log_lines(view, tick)))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .padding(Padding::left(1))
+                .title(title),
+        );
+    // `line_count` takes the inner width but counts the block's top border as a line.
+    let count = paragraph
+        .line_count(area.width.saturating_sub(1))
+        .saturating_sub(1);
+    let offset = log_offset(app, count, area.height.saturating_sub(1));
+    frame.render_widget(paragraph.scroll((offset, 0)), area);
+}
+
+fn log_lines(view: &AgentView, tick: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = view.log.iter().flat_map(entry_lines).collect();
     if let Some(activity) = view.activity() {
         let glyph = SPINNER[tick % SPINNER.len()];
@@ -214,22 +294,34 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
             Style::new().fg(Color::Cyan),
         ));
     }
-    let text = Text::from(lines);
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::TOP)
-            .padding(Padding::left(1))
-            .title(title),
-    );
-    // `line_count` takes the inner width but counts the block's top border as a line.
-    let inner_height = area.height.saturating_sub(1);
-    let count = paragraph
-        .line_count(area.width.saturating_sub(1))
-        .saturating_sub(1);
-    let total = u16::try_from(count).unwrap_or(u16::MAX);
-    let bottom = total.saturating_sub(inner_height);
-    let offset = bottom.saturating_sub(app.scroll);
-    frame.render_widget(paragraph.scroll((offset, 0)), area);
+    lines
+}
+
+/// First visible row of a log of `rows` wrapped rows in a pane `height` rows tall.
+fn log_offset(app: &App, rows: usize, height: u16) -> u16 {
+    let total = u16::try_from(rows).unwrap_or(u16::MAX);
+    total.saturating_sub(height).saturating_sub(app.scroll)
+}
+
+/// For each row of the log's text area `inner`: whether it continues the row above (a wrapped
+/// line), so a copied selection can rejoin it.
+pub fn log_continuations(app: &App, inner: Rect) -> Vec<bool> {
+    let Some(view) = app.selected_id().and_then(|id| app.agents.get(&id)) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for line in log_lines(view, 0) {
+        let wrapped = Paragraph::new(line)
+            .wrap(Wrap { trim: false })
+            .line_count(inner.width);
+        rows.push(false);
+        rows.extend(std::iter::repeat_n(true, wrapped.max(1) - 1));
+    }
+    let offset = usize::from(log_offset(app, rows.len(), inner.height));
+    rows.into_iter()
+        .skip(offset)
+        .take(usize::from(inner.height))
+        .collect()
 }
 
 /// `parser a2 · running · opus-5-5 · 1.2M/34k tok · 34% · …/a2/repo`.

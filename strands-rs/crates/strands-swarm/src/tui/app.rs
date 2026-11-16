@@ -203,6 +203,8 @@ pub struct App {
     pub budget: Option<u64>,
     /// Set while the F1 key-binding popup is open.
     pub show_keys: bool,
+    /// The mouse selection being made or last made, highlighted until the next click.
+    pub selection: Option<super::select::Selection>,
 }
 
 /// A slash command, for the popup that opens when the input starts with `/`.

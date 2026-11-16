@@ -49,6 +49,12 @@ F2 prints the selected agent's log as plain text into the terminal's own scrollb
 scrolling, search and copy-paste); any key returns. A resumed run shows each agent's restored
 conversation.
 
+Mouse: drag to select text inside the log or the agent tree (the selection never crosses into the
+other pane); releasing copies it to the system clipboard with an OSC 52 escape, which works over
+ssh too. Under tmux this needs `set -g set-clipboard on`. The wheel scrolls the log, Esc clears the
+highlight. For the terminal's own selection, hold Shift while dragging (Option/Alt in iTerm2), or
+use F2.
+
 `--run NAME` makes the run persistent under `~/.local/state/strands-swarm/NAME`: the agent tree,
 unread messages and every conversation (saved after each message). Starting again with the same
 name resumes it. `--mcp-config` accepts any `mcp.json` (or `~/.claude.json`); the servers are
