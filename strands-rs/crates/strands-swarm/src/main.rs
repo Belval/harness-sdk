@@ -209,7 +209,7 @@ fn print_event(event: &SwarmEvent) {
             )
         }
         SwarmEvent::Status { id, status } => eprintln!("[{id}] {status}"),
-        SwarmEvent::Text { .. } | SwarmEvent::Usage { .. } => {}
+        SwarmEvent::Text { .. } | SwarmEvent::Usage { .. } | SwarmEvent::MailRead { .. } => {}
         SwarmEvent::Model { id, model } => eprintln!("[{id}] model {model}"),
         SwarmEvent::ToolStarted { id, name, summary } => eprintln!("[{id}] {name} {summary}"),
         SwarmEvent::ToolFinished { id, name, ok: false } => eprintln!("[{id}] {name} failed"),

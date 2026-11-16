@@ -150,7 +150,23 @@ async fn an_idle_agent_wakes_up_for_a_new_message() {
     assert_eq!(reply_to(&mut events, USER).await, "first");
 
     swarm.send(USER, &id, "again please").unwrap();
-    assert_eq!(reply_to(&mut events, USER).await, "second");
+    let mut seen = Vec::new();
+    let delivered = async {
+        while let Some(event) = events.recv().await {
+            match event {
+                SwarmEvent::Mail { to, mail } if to == id => seen.push(format!("mail {}", mail.text)),
+                SwarmEvent::MailRead { id: reader } if reader == id => seen.push("read".to_owned()),
+                SwarmEvent::Mail { to, mail } if to == USER && mail.kind == "reply" => return mail.text,
+                _ => {}
+            }
+        }
+        panic!("event stream closed");
+    };
+    let reply = tokio::time::timeout(Duration::from_secs(10), delivered)
+        .await
+        .unwrap();
+    assert_eq!(reply, "second");
+    assert_eq!(seen, ["mail again please", "read"]);
     let root = scripts.lock()["a1"].clone();
     assert!(sent_text(&root, 1).contains("again please"));
 }

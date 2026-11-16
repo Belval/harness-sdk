@@ -111,7 +111,10 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
                 task,
                 ..Default::default()
             };
-            swarm.spawn(USER, request).await.map(|id| format!("started {id}"))
+            swarm
+                .spawn(USER, request)
+                .await
+                .map(|id| format!("started {}", swarm.label(&id)))
         }
         (Command::Goal(goal), _) => {
             let request = SpawnRequest {
@@ -122,18 +125,22 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             swarm
                 .spawn(USER, request)
                 .await
-                .map(|id| format!("started {id} with a goal"))
+                .map(|id| format!("started {} with a goal", swarm.label(&id)))
         }
-        (Command::Message(text), Some(id)) => swarm.send(USER, &id, text).map(|()| format!("sent to {id}")),
-        (Command::Cancel, Some(id)) => swarm.cancel(&id).map(|()| format!("cancelled {id}")),
+        (Command::Message(text), Some(id)) => swarm
+            .send(USER, &id, text)
+            .map(|()| format!("sent to {}", swarm.label(&id))),
+        (Command::Cancel, Some(id)) => swarm
+            .cancel(&id)
+            .map(|()| format!("cancelled {}", swarm.label(&id))),
         (Command::ShowModel, Some(id)) => Ok(match swarm.agent(&id).and_then(|info| info.model) {
-            Some(model) => format!("{id} uses {model}"),
-            None => format!("{id} uses the default model"),
+            Some(model) => format!("{} uses {model}", swarm.label(&id)),
+            None => format!("{} uses the default model", swarm.label(&id)),
         }),
         (Command::SetModel(model), Some(id)) => swarm
             .set_model(&id, model)
             .await
-            .map(|model| format!("{id} now uses {model}")),
+            .map(|model| format!("{} now uses {model}", swarm.label(&id))),
         (_, None) => Ok("no agent selected".to_owned()),
     };
     app.notice = Some(outcome.unwrap_or_else(|error| format!("error: {error}")));

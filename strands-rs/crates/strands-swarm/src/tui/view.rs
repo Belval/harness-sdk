@@ -27,7 +27,7 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
 
     draw_header(frame, header, app, run_id);
     draw_agents(frame, agents, app, tick);
-    draw_log(frame, log, app);
+    draw_log(frame, log, app, tick);
     draw_input(frame, input, app);
     let footer_text = app.notice.clone().unwrap_or_else(|| HELP.to_owned());
     frame.render_widget(Paragraph::new(footer_text).dim(), footer);
@@ -99,7 +99,7 @@ fn status_glyph(status: &AgentStatus, tick: usize) -> (&'static str, Color) {
     }
 }
 
-fn draw_log(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let selected = app.selected_id().and_then(|id| app.agents.get(&id));
     let Some(view) = selected else {
         let hint = Paragraph::new("Type a task below and press enter to start the root agent.")
@@ -108,7 +108,15 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let title = log_title(view);
-    let text = Text::from(view.log.iter().flat_map(entry_lines).collect::<Vec<_>>());
+    let mut lines: Vec<Line> = view.log.iter().flat_map(entry_lines).collect();
+    if let Some(activity) = view.activity() {
+        let glyph = SPINNER[tick % SPINNER.len()];
+        lines.push(Line::styled(
+            format!("{glyph} {activity}"),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    let text = Text::from(lines);
     let paragraph = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -155,13 +163,24 @@ fn entry_lines(entry: &LogEntry) -> Vec<Line<'static>> {
                 Span::styled(summary.clone(), Style::new().dim()),
             ])]
         }
-        LogEntry::MailIn { from, kind, text } => {
+        LogEntry::MailIn {
+            from,
+            kind,
+            text,
+            read,
+        } => {
             let color = if kind == "error" {
                 Color::Red
             } else {
                 Color::Yellow
             };
-            block_lines(&format!("✉ {from} ({kind})"), text, color)
+            let mut lines = block_lines(&format!("✉ {from} ({kind})"), text, color);
+            match read {
+                Some(false) => lines[0].push_span(Span::styled(" · queued", Style::new().dim())),
+                Some(true) => lines[0].push_span(Span::styled(" · read ✓", Style::new().fg(Color::Green))),
+                None => {}
+            }
+            lines
         }
         LogEntry::Status(note) => vec![Line::styled(format!("— {note}"), Style::new().fg(Color::Red))],
     }

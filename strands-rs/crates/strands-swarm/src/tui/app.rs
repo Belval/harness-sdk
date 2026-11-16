@@ -22,7 +22,7 @@ pub enum LogEntry {
         /// Outcome.
         ok: Option<bool>,
     },
-    /// A message the agent received.
+    /// A message the agent received (or, on the sender, a message it sent the user).
     MailIn {
         /// Sender label.
         from: String,
@@ -30,6 +30,8 @@ pub enum LogEntry {
         kind: String,
         /// Body.
         text: String,
+        /// Whether the receiving agent has taken it from its mailbox; `None` for mail to the user.
+        read: Option<bool>,
     },
     /// A status change worth showing (errors, cancellation).
     Status(String),
@@ -81,6 +83,32 @@ impl AgentView {
             _ => self.log.push(LogEntry::Text(delta.to_owned())),
         }
         self.unseen = true;
+    }
+
+    fn mark_read(&mut self) {
+        for entry in &mut self.log {
+            if let LogEntry::MailIn { read: Some(read), .. } = entry {
+                *read = true;
+            }
+        }
+    }
+
+    /// What a starting or running agent is doing right now, for the log's live indicator.
+    pub fn activity(&self) -> Option<String> {
+        match self.status {
+            AgentStatus::Starting => return Some("starting…".to_owned()),
+            AgentStatus::Running => {}
+            _ => return None,
+        }
+        Some(match self.log.last() {
+            Some(LogEntry::Tool {
+                name,
+                summary,
+                ok: None,
+            }) => format!("running {name}: {summary}…"),
+            Some(LogEntry::Text(_)) => "writing…".to_owned(),
+            _ => "thinking…".to_owned(),
+        })
     }
 
     fn finish_tool(&mut self, name: &str, ok: bool) {
@@ -160,6 +188,7 @@ impl App {
             SwarmEvent::ToolFinished { id, name, ok } => self.with(&id, |view| view.finish_tool(&name, ok)),
             SwarmEvent::Mail { to, mail } => self.apply_mail(&to, mail),
             SwarmEvent::Model { id, model } => self.with(&id, |view| view.model = Some(model)),
+            SwarmEvent::MailRead { id } => self.with(&id, AgentView::mark_read),
             SwarmEvent::Usage {
                 id,
                 input_tokens,
@@ -198,6 +227,7 @@ impl App {
             from,
             kind: mail.kind.to_owned(),
             text: mail.text,
+            read: (to != USER).then_some(false),
         };
         self.with(&target, |view| view.push(entry));
     }
@@ -401,6 +431,69 @@ mod tests {
         });
         assert_eq!(app.agents["a1"].log.len(), 2);
         assert!(matches!(&app.agents["a1"].log[1], LogEntry::MailIn { from, .. } if from == "a1 → user"));
+    }
+
+    #[test]
+    fn marks_mail_read_once_the_agent_takes_it() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        let mail = Mail {
+            from: USER.into(),
+            from_label: USER.into(),
+            kind: "message",
+            text: "hi".into(),
+        };
+        let read = |app: &App| match app.agents["a1"].log.last() {
+            Some(LogEntry::MailIn { read, .. }) => *read,
+            other => panic!("{other:?}"),
+        };
+        app.apply(SwarmEvent::Mail {
+            to: "a1".into(),
+            mail: mail.clone(),
+        });
+        assert_eq!(read(&app), Some(false));
+        app.apply(SwarmEvent::MailRead { id: "a1".into() });
+        assert_eq!(read(&app), Some(true));
+        app.apply(SwarmEvent::Mail {
+            to: "a1".into(),
+            mail,
+        });
+        assert_eq!(read(&app), Some(false));
+    }
+
+    #[test]
+    fn describes_the_live_activity_of_a_running_agent() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        let activity = |app: &App| app.agents["a1"].activity();
+        assert_eq!(activity(&app).as_deref(), Some("starting…"));
+        app.apply(SwarmEvent::Status {
+            id: "a1".into(),
+            status: AgentStatus::Running,
+        });
+        assert_eq!(activity(&app).as_deref(), Some("thinking…"));
+        app.apply(SwarmEvent::Text {
+            id: "a1".into(),
+            delta: "hm".into(),
+        });
+        assert_eq!(activity(&app).as_deref(), Some("writing…"));
+        app.apply(SwarmEvent::ToolStarted {
+            id: "a1".into(),
+            name: "shell".into(),
+            summary: "cargo test".into(),
+        });
+        assert_eq!(activity(&app).as_deref(), Some("running shell: cargo test…"));
+        app.apply(SwarmEvent::ToolFinished {
+            id: "a1".into(),
+            name: "shell".into(),
+            ok: true,
+        });
+        assert_eq!(activity(&app).as_deref(), Some("thinking…"));
+        app.apply(SwarmEvent::Status {
+            id: "a1".into(),
+            status: AgentStatus::Idle,
+        });
+        assert_eq!(activity(&app), None);
     }
 
     #[test]

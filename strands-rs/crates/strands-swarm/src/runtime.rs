@@ -277,6 +277,12 @@ pub enum SwarmEvent {
         /// Output tokens so far.
         output_tokens: u64,
     },
+    /// An agent took all of its unread mail, as a new turn or appended to a tool result. Every
+    /// [`SwarmEvent::Mail`] to it that came before has now been read.
+    MailRead {
+        /// Id.
+        id: String,
+    },
 }
 
 /// How an actor begins.
@@ -579,6 +585,7 @@ impl Swarm {
             .unwrap_or_default();
         if !mail.is_empty() {
             self.persist();
+            self.emit(SwarmEvent::MailRead { id: id.to_owned() });
         }
         mail
     }
@@ -806,11 +813,12 @@ impl Swarm {
             kind,
             text,
         };
-        self.emit(SwarmEvent::Mail {
+        let event = SwarmEvent::Mail {
             to: to.to_owned(),
             mail: mail.clone(),
-        });
+        };
         if to == USER {
+            self.emit(event);
             return Ok(());
         }
         let node = self
@@ -819,7 +827,11 @@ impl Swarm {
         if !node.status.lock().is_live() {
             return Err(Error::other(format!("Agent {to} is cancelled.")));
         }
-        node.mailbox.lock().push_back(mail);
+        // Emitted under the mailbox lock, so it always precedes the `MailRead` of its drain.
+        let mut mailbox = node.mailbox.lock();
+        self.emit(event);
+        mailbox.push_back(mail);
+        drop(mailbox);
         self.persist();
         node.notify.notify_waiters();
         node.notify.notify_one();
