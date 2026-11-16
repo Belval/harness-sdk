@@ -9,7 +9,7 @@ use strands_agents::tools::{FunctionTool, ToolContext, ToolRef};
 use strands_agents::Result;
 
 use crate::runtime::{
-    render_mail, AgentInfo, AgentStatus, ReloadWhen, ScheduleRequest, SpawnRequest, Swarm, USER,
+    render_mail, AgentInfo, AgentStatus, ReloadWhen, ScheduleRequest, SpawnRequest, Swarm, WaitOutcome, USER,
 };
 use crate::schedule::{self, Schedule};
 
@@ -375,10 +375,11 @@ fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
                     .iter()
                     .map(|who| resolve(&swarm, &me, who))
                     .collect::<Result<Vec<_>>>()?;
-                let wait = swarm.wait_for_mail(&me, &from, &ctx.cancel);
+                let wait = swarm.wait(&me, &from, &ctx.cancel);
                 let text = match tokio::time::timeout(Duration::from_secs(seconds), wait).await {
-                    Ok(Some(mail)) => render_mail(&mail),
-                    Ok(None) => "Wait cancelled.".to_owned(),
+                    Ok(WaitOutcome::Mail(mail)) => render_mail(&mail),
+                    Ok(WaitOutcome::Cancelled) => "Wait cancelled.".to_owned(),
+                    Ok(WaitOutcome::Unreachable(notice)) => notice,
                     Err(_) => timeout_summary(&swarm, &from, seconds),
                 };
                 Result::Ok(text)

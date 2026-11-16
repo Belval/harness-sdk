@@ -40,6 +40,6 @@ pub use mcp::{load_shared_mcp, SharedMcp};
 pub use memory::Memory;
 pub use runtime::{
     AgentFactory, AgentInfo, AgentSpec, AgentStatus, Mail, ModelResolver, ReloadWhen, ScheduleRequest,
-    SpawnRequest, Swarm, SwarmConfig, SwarmEvent, RELOAD_EXIT_CODE, USER,
+    SpawnRequest, Swarm, SwarmConfig, SwarmEvent, WaitOutcome, RELOAD_EXIT_CODE, USER,
 };
 pub use skills::{discover_skills, Skills};

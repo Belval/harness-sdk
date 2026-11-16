@@ -447,6 +447,17 @@ pub const INTERRUPTED_TEXT: &str = "Interrupted by the user before finishing thi
 /// How many restored messages [`SwarmEvent::History`] carries at most.
 pub const HISTORY_MESSAGES: usize = 100;
 
+/// How a [`Swarm::wait`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// Mail arrived; all of it was taken.
+    Mail(Vec<Mail>),
+    /// The wait or the agent was cancelled.
+    Cancelled,
+    /// No awaited agent is left to write; the notice says why.
+    Unreachable(String),
+}
+
 /// How an actor begins.
 enum Start {
     /// A new agent: its first turn is the task.
@@ -1325,18 +1336,73 @@ impl Swarm {
         filter: &[String],
         cancel: &CancellationToken,
     ) -> Option<Vec<Mail>> {
-        let node = self.node(id)?;
+        match self.wait_until(id, filter, cancel, |_, _| None).await {
+            WaitOutcome::Mail(mail) => Some(mail),
+            _ => None,
+        }
+    }
+
+    /// Like [`Swarm::wait_for_mail`], for the `wait` tool: also ends, with a notice, once no mail
+    /// can come any more because every agent in `from` (or, without `from`, every agent `id`
+    /// spawned) is cancelled.
+    pub async fn wait(&self, id: &str, from: &[String], cancel: &CancellationToken) -> WaitOutcome {
+        self.wait_until(id, from, cancel, |swarm, node| swarm.unreachable(node, from))
+            .await
+    }
+
+    async fn wait_until(
+        &self,
+        id: &str,
+        filter: &[String],
+        cancel: &CancellationToken,
+        give_up: impl Fn(&Self, &Node) -> Option<String>,
+    ) -> WaitOutcome {
+        let Some(node) = self.node(id) else {
+            return WaitOutcome::Cancelled;
+        };
         loop {
             let notified = node.notify.notified();
             if has_matching_mail(&node, filter) {
-                return Some(self.drain(id));
+                return WaitOutcome::Mail(self.drain(id));
+            }
+            if let Some(notice) = give_up(self, &node) {
+                return WaitOutcome::Unreachable(notice);
             }
             tokio::select! {
                 _ = notified => {}
-                _ = cancel.cancelled() => return None,
-                _ = node.cancel.cancelled() => return None,
+                _ = cancel.cancelled() => return WaitOutcome::Cancelled,
+                _ = node.cancel.cancelled() => return WaitOutcome::Cancelled,
             }
         }
+    }
+
+    /// Why `node` cannot get mail from `from` any more, if so.
+    fn unreachable(&self, node: &Node, from: &[String]) -> Option<String> {
+        let agents = self.inner.agents.lock();
+        let live = |id: &str| id == USER || agents.get(id).is_some_and(|n| n.status.lock().is_live());
+        if from.is_empty() {
+            let mut children = agents.values().filter(|n| n.parent == node.id).peekable();
+            if children.peek().is_none() || children.any(|n| live(&n.id)) {
+                return None;
+            }
+            return Some(
+                "Every agent you spawned is cancelled, so no replies will come. To wait for anyone \
+                 else, end your turn: idle agents wake up when a message arrives."
+                    .to_owned(),
+            );
+        }
+        if from.iter().any(|id| live(id)) {
+            return None;
+        }
+        Some(format!(
+            "No messages will come: {} cancelled.",
+            from.iter()
+                .map(|id| agents
+                    .get(id)
+                    .map_or(id.clone(), |n| format!("{} ({id})", n.name)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
     }
 
     /// Reopen a saved run: restore every agent with its conversation and unread mail, wake those
@@ -1630,6 +1696,11 @@ impl Swarm {
         // A turn that ended or was cancelled has nothing in flight, finished events or not.
         if status != AgentStatus::Running {
             *node.tool_calls.lock() = 0;
+        }
+        if status == AgentStatus::Cancelled {
+            // Waits on this agent may now be pointless; let them re-check.
+            let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+            nodes.iter().for_each(|node| node.notify.notify_waiters());
         }
         self.persist();
         let freed = status == AgentStatus::Cancelled;

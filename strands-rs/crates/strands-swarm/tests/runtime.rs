@@ -570,6 +570,88 @@ async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
     );
 }
 
+#[tokio::test]
+async fn wait_returns_at_once_when_the_awaited_agents_are_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let wait = |id: &str, from: serde_json::Value| {
+        tool_call("wait", id, json!({"from": from, "timeout_seconds": 600}))
+    };
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
+                    wait("w1", json!(["a2"])),
+                    wait("w2", json!(["sub"])),
+                    wait("w3", json!(["nobody"])),
+                    say("done"),
+                ],
+            ),
+            ("a2", vec![wait("w1", json!([])), say("unreachable")]),
+        ],
+        dir.path(),
+    );
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "go".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let a1 = scripts.lock()["a1"].clone();
+    eventually("a1 waits", || a1.calls().len() >= 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    swarm.cancel("a2").unwrap();
+
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let notice = "No messages will come: sub (a2) cancelled.";
+    assert!(sent_text(&a1, 2).contains(notice), "{}", sent_text(&a1, 2));
+    assert_eq!(sent_text(&a1, 3).matches(notice).count(), 2, "already cancelled");
+    assert!(sent_text(&a1, 4).contains("No agent with id or name `nobody`"));
+}
+
+#[tokio::test]
+async fn wait_without_from_returns_once_every_child_is_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
+                    tool_call("wait", "w1", json!({"timeout_seconds": 600})),
+                    say("done"),
+                ],
+            ),
+            (
+                "a2",
+                vec![tool_call("wait", "w1", json!({"timeout_seconds": 600}))],
+            ),
+        ],
+        dir.path(),
+    );
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "go".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let a1 = scripts.lock()["a1"].clone();
+    eventually("a1 waits", || a1.calls().len() >= 2).await;
+    swarm.cancel("a2").unwrap();
+
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    assert!(sent_text(&a1, 2).contains("Every agent you spawned is cancelled"));
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .arg("-C")
