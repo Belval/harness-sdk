@@ -24,11 +24,11 @@ Agents also get the harness's `shell`, `read`, `write`, `edit`, `web_fetch`, `to
 `retrieve_context`, but not the SDK's background tasks (`_background_execution` on every tool):
 `run_background` covers slow commands. A `shell` result reaches the model as the text a terminal
 would show (stdout, then `[stderr]` and `[exit code N]` when there are any), not the SDK's JSON
-block, whose escaped quotes models copied into `edit`'s `old_str`. That result and a job report's
-last lines carry no ANSI escape sequences (colours, cursor moves, OSC links), and a line a `\r`
-overwrote (progress bars) shows only its final text. Tool specs and the swarm's
-prompt sections are sent on every model call, so `the_fixed_prefix_stays_within_its_budget` pins
-their size: 16.3 kB (about 4.8k tokens) with 20 skills, the skills list at 2.5 kB of it.
+block, whose escaped quotes models copied into `edit`'s `old_str`. It and a job report's last lines
+drop ANSI escape sequences, and of a line `\r` overwrote (progress bars) only the final text. Tool
+specs and the swarm's prompt sections are sent on every model call, so
+`the_fixed_prefix_stays_within_its_budget` pins their size: 16.3 kB (about 4.8k tokens) with 20
+skills, the skills list at 2.5 kB of it.
 
 ## Run
 
@@ -48,16 +48,15 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
 `--run NAME` makes the run persistent under `$XDG_STATE_HOME/strands-swarm/NAME` (default
 `~/.local/state`): the agent tree, unread mail, schedules and every conversation (saved after
 each message; see [Persistence](#persistence)). Starting again with the same name resumes it; a
-TASK given then is sent to the root agent as a message, unless it is the one the run was last
-started with: a supervisor replays its arguments on every restart. `--goal` is never sent, as it
-only seeds a new root. With `--run`, `--journal`, `--gc` and
-`--cost` print a report on the saved run and exit.
+TASK given then goes to the root agent as a message unless it is the one the run was last started
+with (a supervisor replays its arguments), and `--goal` only seeds a new root. With `--run`,
+`--journal`, `--gc` and `--cost` print a report on the saved run and exit.
 
 `--headless` prints events to stderr and messages to you to stdout instead of the TUI, and exits
 once the root has replied and no agent is busy (a resume without a task: once no agent is busy)
 or every agent has stopped, with a non-zero status when that reply is an error. A new run needs a
-TASK or `--goal`. Without a terminal (stdout not a tty), the TUI exits with an error that
-points to `--headless` before it starts or resumes anything.
+TASK or `--goal`. Without a terminal, the TUI refuses to start (before resuming anything) and
+points to `--headless`.
 
 ## Agents
 
@@ -117,17 +116,17 @@ points to `--headless` before it starts or resumes anything.
 - **Restarts.** An agent that was mid-turn resumes with a short notice instead of re-reading its
   work. The notice lists the tool calls the restart cut short, each with how long it had run, and
   `git status --short --branch` of its directory. After a hard crash, "how long" runs to the
-  run's last write (an event, a save, or swarmctl noting the exit), not to its last save. When a cut call had run a minute or more, it
-  also says that background jobs survive restarts. The cut turn ends with "Interrupted: the swarm
+  run's last write (an event, a save, or swarmctl noting the exit). When a cut call had run a
+  minute or more, it also says that background jobs survive restarts. The cut turn ends with "Interrupted: the swarm
   restarted." rather than the SDK's "Cancelled by user", which a real `/stop` keeps. An agent
   that had finished its turn rests until its next message; a goal agent whose turn failed
   retries.
 - **Hard crashes.** The SDK adds a batch of tool calls to the conversation only once all of them
   finished, so each agent's batch in progress is also written ahead to
   `sessions/<agent>/open-batch.json`. After a kill -9, OOM kill or power loss the resumed agent gets
-  the batch back: the calls, the results that came in, and the cut calls in its notice.
-  Only after such a crash (no `clean-stop` mark from a quit or reload) does a resume (Linux) kill
-  the process groups of the shell calls the batch had cut, found by `STRANDS_SWARM_SHELL=<run dir>#<agent>`;
+  the batch back: the calls, the results that came in, and the cut calls in its notice. Only after
+  such a crash (no `clean-stop` mark from a quit or reload) does a resume (Linux) kill the process
+  groups of the shell calls the batch had cut, found by `STRANDS_SWARM_SHELL=<run dir>#<agent>`;
   `nohup … &` leftovers of earlier calls and background jobs run on.
 
 ## Limits
@@ -223,8 +222,7 @@ points to `--headless` before it starts or resumes anything.
   - An agent that polls something schedules itself and ends its turn instead of a long `wait`.
   - From its second fire on, a repeat adds what the receiver spent since the last one:
     `(You used 330.0k tokens, est. $0.21, since this schedule last fired 2m ago: about $6.30/h at
-    this interval.)`. A poll over a large context costs about that each time even when nothing
-    changed, so the agent can see what its loop costs and pick the interval.
+    this interval.)`, so a polling agent sees what its loop costs.
   - Schedules are saved with the run. One that came due while the swarm was down fires once on
     resume, then keeps its interval.
   - Schedules of a cancelled agent (receiver or creator) are dropped.
@@ -251,12 +249,11 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
     repository's git dir), so of two that finish together one lands and the other is told so.
   - A conflict (with the files), a failing check (with its last 30 lines) or a refusal changes
     nothing.
-  - The scratch worktree is always removed, and the caller's branch is never modified. A land job
-    that is stopped (killed with `jobs`, or its agent cancelled) kills the check in flight with its
-    children and removes the scratch worktree too. One killed outright (`kill -9`, a reboot)
-    leaves it behind; the next resume, `/gc` or `--gc` that finds no land job running removes it
-    (a `gc` event for `land`), with any plan left in `jobs/land` (each job deletes its own) once
-    a minute old.
+  - The scratch worktree is always removed, and the caller's branch is never modified. A stopped
+    land job (killed with `jobs`, or its agent cancelled) kills the check in flight with its
+    children. What a job killed outright (`kill -9`, a reboot) leaves in `jobs/land` goes once a
+    minute old, on the next resume, `/gc` or `--gc` that finds no land job running (a `gc` event
+    for `land`).
   - The checks' shared target dir (`$CARGO_TARGET_DIR-land/<run>`, else `jobs/land/target`) stays
     for the next landing's incremental build. `/gc` and `--gc` delete it when no land job runs,
     and a run without `--run` on exit.
@@ -380,35 +377,31 @@ messages you.
   - Once a cancelled worktree agent and its subtree have stopped (or on resume), its private target
     dir is deleted.
   - Its worktree is removed with `git worktree remove` unless it has uncommitted changes (the
-    reason names the first three, e.g. `uncommitted changes: ?? tests/__pycache__/`, often only
-    build output to delete), and so are `<repo>.swarm/<run>` and `<repo>.swarm` once that leaves
-    them empty. A worktree with
-    another branch checked out goes only once the base has all of that branch (which stays);
-    otherwise it is kept, e.g. `on branch swarm/r/a3-fix: 1 commit not on main`. A detached one
-    is kept.
+    reason names the first three, e.g. `uncommitted changes: ?? tests/__pycache__/`), and so are
+    `<repo>.swarm/<run>` and `<repo>.swarm` once that leaves them empty. A worktree with another
+    branch checked out goes only once the base has all of that branch (which stays), else it is
+    kept (`on branch swarm/r/a3-fix: 1 commit not on main`). A detached one is kept.
   - Its branch `swarm/<run>/<agent>` is deleted once no worktree has it checked out and the base
     `/status` uses has every commit on it: reachable (`merged`) or as a patch-equivalent copy
     (`all applied`, per `git cherry` or the landing record; a merge commit never counts as
-    applied unless landed). Otherwise it stays,
-    e.g. `kept branch swarm/r/a3 (2 commits not on main)`, until a later pass (resume, `/gc`,
-    `--gc`) finds it merged. The ref is deleted only if it still points at the commit checked.
+    applied unless landed). Otherwise it stays, e.g. `kept branch swarm/r/a3 (2 commits not on
+    main)`, until a later pass (resume, `/gc`, `--gc`) finds it merged. The ref is deleted only if it still points at the commit checked.
   - `cancel_agent` waits up to 10 s for this and its result says what was removed and kept.
     `list_agents` with `include_cancelled` shows it later: `cwd … (removed)`, `branch … (deleted)`
     or `branch … (kept: 2 not on main, merges cleanly)`.
   - A run without `--run` cannot be resumed, so on exit every worktree agent is treated as
     cancelled.
   - Nothing outside those exact paths and that branch is touched, and each removal is logged as a
-    `gc` event. A pass on its own (after a cancel, on resume) logs an agent only when its outcome
-    changed: a worktree still kept for the same reason is not logged again on every restart.
+    `gc` event. A pass after a cancel or on resume logs an agent only when its outcome changed,
+    not a worktree kept for the same reason on every restart.
   - Only the swarm's own `$CARGO_TARGET_DIR-worktrees/<run>/<agent>` dirs are reclaimed. An agent
     that points `CARGO_TARGET_DIR` somewhere else owns that dir and must clean it itself.
   - Every minute the swarm checks free space on the filesystems of the run dir, the agents'
     directories and the cargo target dirs. Below `--min-free-disk` (default `20G`, `0` turns it
     off) it mails the live root agents (or, with none, you) once, from `disk`, with the free space
-    and the biggest per-agent target dirs (and the land checks' shared `$CARGO_TARGET_DIR-land/<run>`,
-    which only `/gc` and `--gc` reclaim); the TUI shows the first line in its footer. It warns
-    again only after the space has recovered to 10% above the threshold, restarts included (a
-    persistent run notes the warning in `<run dir>/disk-warned`).
+    and the biggest target dirs (per agent, and the land checks' shared one); the TUI shows the
+    first line in its footer. It warns again only after the space has recovered to 10% above the
+    threshold, restarts included (`<run dir>/disk-warned`).
 - **Memory.**
   - One Markdown file is shared by every agent and run: `$XDG_CONFIG_HOME/strands-swarm/memory.md`
     (default `~/.config`), or `--memory FILE`, or off with `--no-memory`.
