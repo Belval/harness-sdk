@@ -41,6 +41,7 @@ mod actor;
 mod background;
 mod capacity;
 mod collect;
+mod disk;
 mod landing;
 mod mailbox;
 mod persist;
@@ -55,6 +56,7 @@ use actor::Start;
 pub use actor::SILENT_REPLY;
 use background::jobs_dir;
 use capacity::started;
+pub use disk::{free_space, FreeSpace, DISK_CHECK_EVERY, DISK_SENDER};
 use persist::history_event;
 pub use warm::{KEEP_WARM_EVERY, KEEP_WARM_MAX};
 

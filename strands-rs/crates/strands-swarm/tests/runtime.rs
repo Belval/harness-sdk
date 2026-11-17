@@ -3959,3 +3959,62 @@ async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_cal
     assert_eq!(model.calls.load(Ordering::SeqCst), 2 + refreshes);
     swarm.shutdown().await;
 }
+
+#[tokio::test]
+async fn low_disk_space_warns_the_root_once_per_episode() {
+    let dir = tempfile::tempdir().unwrap();
+    let replies = (0..4).map(|_| say("noted")).collect();
+    let (swarm, mut events, _) = swarm_with(vec![("a1", replies)], dir.path());
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "root".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    reply_to(&mut events, USER).await;
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(5 << 30));
+    let probe = free.clone();
+    let check: strands_swarm::runtime::FreeSpace =
+        Arc::new(move |_: &Path| Some(probe.load(std::sync::atomic::Ordering::SeqCst)));
+    tokio::spawn(
+        swarm
+            .clone()
+            .guard_disk(20 << 30, Duration::from_millis(10), check),
+    );
+    let mut warnings = async |wait: Duration| {
+        let mut seen = Vec::new();
+        let _ = tokio::time::timeout(wait, async {
+            while let Some(event) = events.recv().await {
+                if let SwarmEvent::Mail { to, mail } = event {
+                    if mail.from == strands_swarm::runtime::DISK_SENDER {
+                        seen.push((to, mail.text));
+                    }
+                }
+            }
+        })
+        .await;
+        seen
+    };
+    let first = warnings(Duration::from_millis(300)).await;
+    assert_eq!(first.len(), 1, "one warning while space stays low: {first:?}");
+    assert_eq!(first[0].0, "a1");
+    assert!(
+        first[0].1.starts_with("disk space low: 5.0 GB free"),
+        "{}",
+        first[0].1
+    );
+    // Just above the threshold is not recovered yet; well above re-arms the warning.
+    free.store(21 << 30, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    free.store(5 << 30, std::sync::atomic::Ordering::SeqCst);
+    assert!(warnings(Duration::from_millis(100)).await.is_empty());
+    free.store(30 << 30, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    free.store(5 << 30, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(warnings(Duration::from_millis(300)).await.len(), 1);
+    swarm.shutdown().await;
+}

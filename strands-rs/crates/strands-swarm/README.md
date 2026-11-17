@@ -39,7 +39,7 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
               [--max-agents N] [--max-concurrent-calls N] [--budget-tokens N] [--compact-at TOKENS]
               [--allow-land] [--land-into GLOB]... [--gate CMD]...
-              [--notify] [--status-base BRANCH] [--prices FILE] [--headless]
+              [--notify] [--status-base BRANCH] [--prices FILE] [--min-free-disk SIZE] [--headless]
               [--journal | --gc | --cost] [TASK]
 ```
 
@@ -336,6 +336,13 @@ Typing text without a command messages the selected agent.
     cancelled.
   - Nothing outside those exact paths and that branch is touched, and each removal is logged as a
     `gc` event.
+  - Only the swarm's own `$CARGO_TARGET_DIR-worktrees/<run>/<agent>` dirs are reclaimed. An agent
+    that points `CARGO_TARGET_DIR` somewhere else owns that dir and must clean it itself.
+  - Every minute the swarm checks free space on the filesystems of the run dir, the agents'
+    directories and the cargo target dirs. Below `--min-free-disk` (default `20G`, `0` turns it
+    off) it mails the live root agents once, from `disk`, with the free space and the biggest
+    per-agent target dirs; the TUI shows the first line in its footer. It warns again only after
+    the space has recovered to 10% above the threshold.
 - **Memory.**
   - One Markdown file is shared by every agent and run: `~/.config/strands-swarm/memory.md`, or
     `--memory FILE`, or off with `--no-memory`.

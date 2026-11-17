@@ -325,7 +325,7 @@ async fn remove_worktree(root: &Path, branch: &str, out: &mut Collected) {
 }
 
 /// Total size of the files under `dir`, without following symlinks.
-fn dir_size(dir: &Path) -> u64 {
+pub(crate) fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };

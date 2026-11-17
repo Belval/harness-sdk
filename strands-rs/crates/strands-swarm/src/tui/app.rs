@@ -396,6 +396,10 @@ impl App {
             self.notice = Some(format!("supervisor: {line}"));
             self.bell |= self.notify;
         }
+        if mail.from == crate::runtime::DISK_SENDER {
+            self.notice = mail.text.lines().next().map(str::to_owned);
+            self.bell |= self.notify;
+        }
         // Replies to the user are already visible as the sender's streamed text.
         if to == USER && mail.kind == "reply" {
             return;
@@ -829,6 +833,27 @@ mod tests {
             mail,
         });
         assert_eq!(read(&app), Some(false));
+    }
+
+    #[test]
+    fn a_disk_warning_shows_in_the_footer() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        app.apply(SwarmEvent::Mail {
+            to: "a1".into(),
+            mail: Mail {
+                from: crate::runtime::DISK_SENDER.into(),
+                from_label: crate::runtime::DISK_SENDER.into(),
+                kind: "disk",
+                text: "disk space low: 3.0 GB free on the filesystem of /w (warning below 20 GB)\nmore"
+                    .into(),
+                images: vec![],
+            },
+        });
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("disk space low: 3.0 GB free on the filesystem of /w (warning below 20 GB)")
+        );
     }
 
     #[test]

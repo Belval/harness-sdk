@@ -82,6 +82,10 @@ struct Cli {
     /// is raised (TUI `/budget N`). A resumed run keeps its last budget.
     #[arg(long, value_parser = strands_swarm::text::parse_tokens)]
     budget_tokens: Option<u64>,
+    /// Tell the root agents (and the TUI) once free space on the run's, the worktrees' or the
+    /// cargo target dirs' filesystem drops below this (e.g. `20G`, `512M`); `0` turns it off.
+    #[arg(long, value_parser = strands_swarm::text::parse_bytes, default_value = "20G")]
+    min_free_disk: u64,
     /// Summarize an agent's older turns once a call's input reaches this many tokens (e.g. `200k`,
     /// `1.5M`), or 85% of the model's window if that is smaller.
     #[arg(long, value_parser = strands_swarm::text::parse_tokens, default_value = "200k")]
@@ -379,6 +383,14 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         }
         None => Swarm::new(config),
     };
+    if cli.min_free_disk > 0 {
+        let free = std::sync::Arc::new(strands_swarm::runtime::free_space);
+        let guard =
+            swarm
+                .clone()
+                .guard_disk(cli.min_free_disk, strands_swarm::runtime::DISK_CHECK_EVERY, free);
+        tokio::spawn(guard);
+    }
     // A resumed run already has its root: a task goes to it as a message (a new root only when
     // none is left), and the goal only seeds a new one.
     let live_root = || {

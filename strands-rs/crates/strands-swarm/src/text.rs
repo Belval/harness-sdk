@@ -15,6 +15,23 @@ pub fn parse_tokens(text: &str) -> Result<u64, String> {
     }
 }
 
+/// Parse a size in bytes: `0`, `512M`, `20G`, `1.5TB` (binary units, case-insensitive).
+pub fn parse_bytes(text: &str) -> Result<u64, String> {
+    let lower = text.trim().to_ascii_lowercase();
+    let number = lower.strip_suffix('b').unwrap_or(&lower);
+    let (number, shift) = match number.chars().last() {
+        Some('k') => (&number[..number.len() - 1], 10),
+        Some('m') => (&number[..number.len() - 1], 20),
+        Some('g') => (&number[..number.len() - 1], 30),
+        Some('t') => (&number[..number.len() - 1], 40),
+        _ => (number, 0),
+    };
+    match number.trim().parse::<f64>() {
+        Ok(n) if n.is_finite() && n >= 0.0 => Ok((n * (1u64 << shift) as f64).round() as u64),
+        _ => Err(format!("`{text}` is not a size (e.g. 20G, 512M, 0)")),
+    }
+}
+
 /// `950`, `12.3k`, `4.5M`.
 pub fn compact(n: u64) -> String {
     match n {
@@ -35,6 +52,15 @@ pub fn clip(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_sizes_in_binary_units() {
+        assert_eq!(parse_bytes("20G"), Ok(20 << 30));
+        assert_eq!(parse_bytes("1.5gb"), Ok(3 << 29));
+        assert_eq!(parse_bytes("512M"), Ok(512 << 20));
+        assert_eq!(parse_bytes("0"), Ok(0));
+        assert!(parse_bytes("lots").is_err());
+    }
 
     #[test]
     fn parses_token_counts_with_suffixes() {

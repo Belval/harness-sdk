@@ -96,21 +96,7 @@ impl Swarm {
             .find(|&i| text.is_char_boundary(i))
             .unwrap_or(0);
         let text = format!("[From the swarm's supervisor (swarmctl)]\n{}", &text[start..]);
-        let roots: Vec<String> = self
-            .inner
-            .agents
-            .lock()
-            .values()
-            .filter(|node| node.parent == USER && node.status.lock().is_live())
-            .map(|node| node.id.clone())
-            .collect();
-        if roots.is_empty() {
-            let _ = self.post(SUPERVISOR_SENDER, USER, "supervisor", text);
-            return;
-        }
-        for root in roots {
-            let _ = self.post(SUPERVISOR_SENDER, &root, "supervisor", text.clone());
-        }
+        self.tell_roots(SUPERVISOR_SENDER, "supervisor", text);
     }
 
     /// Resolves once an agent has requested a reload; the host should then call
