@@ -336,7 +336,7 @@ exit 75"#;
 /// running: the supervisor and the swarm still find the run there.
 #[test]
 fn a_custom_state_home_reaches_the_supervisor_through_a_running_tmux_server() {
-    let Some(shown) = start_in_tmux(&["--headless"]) else {
+    let Some(shown) = start_in_tmux(&["--headless"], &[]) else {
         return;
     };
     assert_eq!(
@@ -348,16 +348,29 @@ fn a_custom_state_home_reaches_the_supervisor_through_a_running_tmux_server() {
 /// With no arguments for the swarm, the supervisor passes none (not one empty TASK).
 #[test]
 fn a_start_without_arguments_replays_none() {
-    let Some(shown) = start_in_tmux(&[]) else {
+    let Some(shown) = start_in_tmux(&[], &[]) else {
         return;
     };
     assert_eq!(shown, "$STATE 2 --run r");
 }
 
-/// `swarmctl start r <fake binary> args` in a private tmux server that already has a session:
-/// what the fake binary saw (`$XDG_STATE_HOME $# $*`, the state home as `$STATE`), or None
-/// without tmux.
-fn start_in_tmux(args: &[&str]) -> Option<String> {
+/// `start` keeps the swarm's own AWS settings (`STRANDS_SWARM_AWS_*`) next to the user's
+/// `AWS_*`, both reaching the swarm unchanged: the swarm calls Bedrock under the first, its agents
+/// inherit the second. The tmux server's own `AWS_PROFILE` does not reach it (see
+/// [`start_in_tmux`]).
+#[test]
+fn start_keeps_the_swarm_s_aws_settings_apart_from_the_user_s() {
+    let env = [("STRANDS_SWARM_AWS_PROFILE", "swarm"), ("AWS_PROFILE", "mine")];
+    let Some(shown) = start_in_tmux(&[], &env) else {
+        return;
+    };
+    assert_eq!(shown, "$STATE 2 --run r swarm-profile=swarm profile=mine");
+}
+
+/// `swarmctl start r <fake binary> args` with `env` in a private tmux server that already has a
+/// session: what the fake binary saw (`$XDG_STATE_HOME $# $*`, the state home as `$STATE`, then
+/// any AWS profiles), or None without tmux. The tmux server has an `AWS_PROFILE` of its own.
+fn start_in_tmux(args: &[&str], env: &[(&str, &str)]) -> Option<String> {
     let tmux_works = std::process::Command::new("tmux").arg("-V").output();
     if !tmux_works.is_ok_and(|output| output.status.success()) {
         eprintln!("skipped: no tmux");
@@ -372,6 +385,8 @@ fn start_in_tmux(args: &[&str]) -> Option<String> {
             .args(args)
             .env("TMUX_TMPDIR", &sockets)
             .env("HOME", tmp.path())
+            // Not in the env file, so the swarm must not see it.
+            .env("AWS_PROFILE", "from-the-tmux-server")
             .env_remove("TMUX")
             .env_remove("XDG_STATE_HOME")
             .status()
@@ -381,7 +396,7 @@ fn start_in_tmux(args: &[&str]) -> Option<String> {
     let seen = tmp.path().join("seen");
     let binary = tmp.path().join("fake-swarm");
     let body = format!(
-        "#!/bin/sh\necho \"$XDG_STATE_HOME $# $*\" > '{}'\ntouch \"$XDG_STATE_HOME/strands-swarm/r/stop\"\n",
+        "#!/bin/sh\necho \"$XDG_STATE_HOME $# $*${{STRANDS_SWARM_AWS_PROFILE:+ swarm-profile=$STRANDS_SWARM_AWS_PROFILE}}${{AWS_PROFILE:+ profile=$AWS_PROFILE}}\" > '{}'\ntouch \"$XDG_STATE_HOME/strands-swarm/r/stop\"\n",
         seen.display()
     );
     std::fs::write(&binary, body).unwrap();
@@ -400,6 +415,9 @@ fn start_in_tmux(args: &[&str]) -> Option<String> {
         .env("TMUX_TMPDIR", &sockets)
         .env("HOME", tmp.path())
         .env_remove("TMUX")
+        .env_remove("AWS_PROFILE")
+        .env_remove("STRANDS_SWARM_AWS_PROFILE")
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);

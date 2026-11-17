@@ -33,6 +33,10 @@ usage:
   swarmctl status                                        list runs
   swarmctl boot <run> | unboot <run>                     resume <run> after every reboot (crontab @reboot)
 Environment for the swarm (credentials, PATH) is captured at `start` into <state>/<run>/env.
+AWS settings for the swarm's own Bedrock calls go in STRANDS_SWARM_AWS_PROFILE,
+STRANDS_SWARM_AWS_CONFIG_FILE, STRANDS_SWARM_AWS_SHARED_CREDENTIALS_FILE and
+STRANDS_SWARM_AWS_REGION; agents' shells, jobs, checks and MCP servers do not read them and
+inherit the plain AWS_* variables (the user's) unchanged.
 EOF
 }
 
@@ -64,8 +68,9 @@ start() {
   mv "$dir/bin/current.new" "$dir/bin/current"
   # printf would write one empty argument for none.
   if (( $# )); then printf '%s\0' "$@"; fi > "$dir/args"
-  # Keep the environment the swarm needs (credentials config, PATH for MCP servers) across reboots.
-  { export -p | grep -E '^declare -x (PATH|HOME|USER|LANG|TERM|XDG_CONFIG_HOME|AWS_[A-Z_]*|CARGO_[A-Z_]*|RUSTUP_[A-Z_]*|QUICK_EVALS_[A-Z_]*|SSH_AUTH_SOCK)='; } > "$dir/env" || true
+  # Keep the environment the swarm needs (credentials config, PATH for MCP servers) across reboots:
+  # STRANDS_SWARM_AWS_* for the swarm's own Bedrock calls, AWS_* for what its agents run.
+  { export -p | grep -E '^declare -x (PATH|HOME|USER|LANG|TERM|XDG_CONFIG_HOME|AWS_[A-Z_]*|STRANDS_SWARM_AWS_[A-Z_]*|CARGO_[A-Z_]*|RUSTUP_[A-Z_]*|QUICK_EVALS_[A-Z_]*|SSH_AUTH_SOCK)='; } > "$dir/env" || true
   chmod 600 "$dir/env"
   resume "$run"
 }
@@ -112,6 +117,10 @@ supervise() {
   local run="$1" dir; dir="$(run_dir "$run")"
   local args=() failures=0 i
   mapfile -d '' args < "$dir/args"
+  # The env file alone decides the AWS settings: a tmux server started from another shell would
+  # pass on its own (say an AWS_PROFILE meant for the swarm only).
+  local name
+  for name in $(compgen -e | grep -E '^(STRANDS_SWARM_)?AWS_' || true); do unset "$name"; done
   # shellcheck disable=SC1091
   source "$dir/env"
   cd "$HOME"

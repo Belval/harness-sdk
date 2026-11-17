@@ -58,6 +58,20 @@ or every agent has stopped, with a non-zero status when that reply is an error. 
 TASK or `--goal`. Without a terminal, the TUI refuses to start (before resuming anything) and
 points to `--headless`.
 
+**AWS credentials.** Every process the swarm starts (agent shells, `run_background` jobs, land
+checks, MCP servers) inherits its environment, `AWS_*` included, untouched. To call Bedrock under
+settings of its own without handing them to those, set `STRANDS_SWARM_AWS_PROFILE`,
+`STRANDS_SWARM_AWS_CONFIG_FILE`, `STRANDS_SWARM_AWS_SHARED_CREDENTIALS_FILE` and/or
+`STRANDS_SWARM_AWS_REGION`: only the swarm's model client reads them, in place of the matching
+`AWS_*`, and no AWS tool knows these names. With a profile set, its credentials and region win
+over access keys and `AWS_REGION` in the environment; unset ones fall back to the AWS chain. A
+user who just exports `AWS_PROFILE` gets it for both, as before.
+
+```sh
+STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-swarm/aws-config \
+  STRANDS_SWARM_AWS_SHARED_CREDENTIALS_FILE=/dev/null swarmctl start NAME ./strands-swarm ...
+```
+
 ## Agents
 
 - **Names.** Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else
@@ -452,6 +466,9 @@ messages you.
 `SWARMCTL_RESTART_DELAY`), a normal quit included, until `swarmctl stop`, and restarts into the
 new binary at once on `reload_swarm`. The swarm's stderr goes to `<run dir>/stderr.log` and the
 supervisor's notes to `supervisor.log`, each rotated to `<log>.1` at 8 MB (`SWARMCTL_LOG_MAX`).
+`start` saves the environment the swarm needs (`PATH`, `AWS_*`, `STRANDS_SWARM_AWS_*`, cargo's)
+to `<run dir>/env` (mode 600), and every restart sources it. That file alone sets the AWS
+variables: those the tmux server has from the shell that started it are dropped first.
 
 **Failures.**
 

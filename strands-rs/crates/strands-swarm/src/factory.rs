@@ -20,9 +20,9 @@ use strands_agents::Plugin;
 use strands_agents::{Agent, FileStorage, Result, SessionManager};
 use strands_harness::defaults::{DEFAULT_BUILTIN_TOOLS, DEFAULT_MODEL};
 use strands_harness::{
-    create_harness, resolve_model, BackgroundTasksOption, BuiltinToolsConfig, Effort, EnvironmentContext,
-    EnvironmentContextConfig, HarnessAgentOptions, MemoryOption, ModelOption, ResolveModelOptions,
-    SandboxOption, SessionOption, SkillsOption,
+    create_harness, resolve_model, AwsSettings, BackgroundTasksOption, BuiltinToolsConfig, Effort,
+    EnvironmentContext, EnvironmentContextConfig, HarnessAgentOptions, MemoryOption, ModelOption,
+    ResolveModelOptions, SandboxOption, SessionOption, SkillsOption,
 };
 
 use crate::catalog::ToolCatalog;
@@ -98,6 +98,23 @@ pub struct HarnessFactoryOptions {
     pub compact_at: Option<u64>,
     /// TTL of the prompt-cache points (`"5m"`, `"1h"`); the provider default (5m) when `None`.
     pub cache_ttl: Option<String>,
+    /// AWS settings for the swarm's own Bedrock calls ([`swarm_aws_settings`]); shells, jobs and
+    /// MCP servers keep the environment's.
+    pub aws: AwsSettings,
+}
+
+/// The swarm's own AWS settings, read by `var` from `STRANDS_SWARM_AWS_PROFILE`,
+/// `STRANDS_SWARM_AWS_CONFIG_FILE`, `STRANDS_SWARM_AWS_SHARED_CREDENTIALS_FILE` and
+/// `STRANDS_SWARM_AWS_REGION`. Only the swarm's Bedrock client uses them: no child process reads
+/// these names, so an agent's `aws` sees the user's `AWS_*`. Empty values count as unset.
+pub fn swarm_aws_settings(var: impl Fn(&str) -> Option<String>) -> AwsSettings {
+    let get = |name: &str| var(&format!("STRANDS_SWARM_AWS_{name}")).filter(|value| !value.is_empty());
+    AwsSettings {
+        profile: get("PROFILE"),
+        config_file: get("CONFIG_FILE").map(std::path::PathBuf::from),
+        credentials_file: get("SHARED_CREDENTIALS_FILE").map(std::path::PathBuf::from),
+        region: get("REGION"),
+    }
 }
 
 /// A factory that builds harness agents.
@@ -214,12 +231,14 @@ pub fn harness_model_resolver(options: HarnessFactoryOptions) -> ModelResolver {
         let model = model_option(&options, model);
         let effort = options.effort;
         let cache_ttl = options.cache_ttl.clone();
+        let aws = options.aws.clone();
         Box::pin(async move {
             resolve_model(ResolveModelOptions {
                 model,
                 default: DEFAULT_MODEL.to_owned(),
                 effort,
                 cache_ttl,
+                aws,
                 // `web_search` is excluded from the builtins, so the harness never asks for it.
                 web_search: false,
                 ..Default::default()
@@ -369,6 +388,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         model: model_option(options, spec.model),
         effort: options.effort,
         cache_ttl: options.cache_ttl.clone(),
+        aws: options.aws.clone(),
         instructions: Some(instructions),
         tools,
         plugins,
@@ -587,6 +607,44 @@ mod tests {
         };
         let harness = harness_options(&options, spec()).unwrap();
         harness.tools.iter().map(|t| t.name().to_owned()).collect()
+    }
+
+    #[test]
+    fn the_swarm_s_aws_settings_come_from_its_own_names_and_reach_every_agent_s_model() {
+        fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        }
+        let user = [
+            ("AWS_PROFILE", "mine"),
+            ("AWS_REGION", "eu-west-1"),
+            ("STRANDS_SWARM_AWS_REGION", ""),
+        ];
+        assert_eq!(swarm_aws_settings(env(&user)), AwsSettings::default());
+        let swarm = swarm_aws_settings(env(&[
+            ("AWS_PROFILE", "mine"),
+            ("STRANDS_SWARM_AWS_PROFILE", "swarm"),
+            ("STRANDS_SWARM_AWS_CONFIG_FILE", "/etc/swarm-aws"),
+            ("STRANDS_SWARM_AWS_SHARED_CREDENTIALS_FILE", "/dev/null"),
+            ("STRANDS_SWARM_AWS_REGION", "us-west-2"),
+        ]));
+        let expected = AwsSettings {
+            profile: Some("swarm".into()),
+            config_file: Some("/etc/swarm-aws".into()),
+            credentials_file: Some("/dev/null".into()),
+            region: Some("us-west-2".into()),
+        };
+        assert_eq!(swarm, expected);
+        let options = HarnessFactoryOptions {
+            aws: swarm,
+            ..Default::default()
+        };
+        let harness = harness_options(&options, spec()).unwrap();
+        assert_eq!(harness.aws, expected);
     }
 
     #[test]

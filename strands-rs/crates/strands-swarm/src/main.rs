@@ -14,8 +14,8 @@ use strands_swarm::state;
 use strands_swarm::tui::Exit;
 use strands_swarm::RELOAD_EXIT_CODE;
 use strands_swarm::{
-    discover_skills, harness_factory, harness_model_resolver, load_shared_mcp, HarnessFactoryOptions,
-    McpOptions, Memory, Skills, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
+    discover_skills, harness_factory, harness_model_resolver, load_shared_mcp, swarm_aws_settings,
+    HarnessFactoryOptions, McpOptions, Memory, Skills, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -349,6 +349,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         skills: std::sync::Arc::new(skills.for_agents()),
         compact_at: cli.compact_at,
         cache_ttl: cli.cache_ttl.clone(),
+        aws: swarm_aws_settings(|name| std::env::var(name).ok()),
     };
     let (task, goal) = (cli.task, cli.goal);
     let mut config = SwarmConfig::new(harness_factory(options.clone()), cwd);

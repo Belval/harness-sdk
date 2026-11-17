@@ -47,7 +47,8 @@ pub mod worktree;
 
 pub use catalog::ToolCatalog;
 pub use factory::{
-    agent_session_manager, bounded_goal, harness_factory, harness_model_resolver, HarnessFactoryOptions,
+    agent_session_manager, bounded_goal, harness_factory, harness_model_resolver, swarm_aws_settings,
+    HarnessFactoryOptions,
 };
 pub use mcp::{load_shared_mcp, McpOptions, SharedMcp};
 pub use memory::Memory;
