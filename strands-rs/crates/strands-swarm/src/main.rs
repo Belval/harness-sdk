@@ -36,6 +36,11 @@ struct Cli {
     /// Reasoning effort.
     #[arg(long, default_value = "auto")]
     effort: Effort,
+    /// Prompt-cache TTL on Bedrock/Anthropic: `5m` (the provider default) or `1h`. One-hour
+    /// entries survive long waits and reloads but cost 2x input to write instead of 1.25x, so
+    /// they pay off only when an agent often idles 5-60 minutes between calls.
+    #[arg(long, value_parser = ["5m", "1h"])]
+    cache_ttl: Option<String>,
     /// Working directory of the root agent.
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
@@ -200,6 +205,12 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         Some(path) => strands_swarm::cost::Prices::load(path)?,
         None => strands_swarm::cost::Prices::default(),
     };
+    // Writes are priced at the TTL the run uses now; a run that switched TTL is estimated as if
+    // it had always used this one.
+    let prices = match cli.cache_ttl.as_deref() {
+        Some("1h") => prices.with_cache_write_factor(strands_swarm::cost::CACHE_WRITE_1H_FACTOR),
+        _ => prices,
+    };
     let default_model = cli
         .model
         .clone()
@@ -301,6 +312,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         catalog,
         skills: std::sync::Arc::new(skills.for_agents()),
         compact_at: Some(cli.compact_at),
+        cache_ttl: cli.cache_ttl.clone(),
     };
     let root = root_request(cli.task, cli.goal);
     let mut config = SwarmConfig::new(harness_factory(options.clone()), cwd);

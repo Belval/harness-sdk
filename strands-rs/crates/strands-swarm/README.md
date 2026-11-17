@@ -25,6 +25,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 ```sh
 cargo build --release -p strands-swarm
 strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model ID] [--effort E]
+              [--cache-ttl 5m|1h]
               [--instructions FILE] [--memory FILE | --no-memory]
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
@@ -69,7 +70,7 @@ and exit.
     end returns the full output.
   - Both edit history, and the prompt cache only matches an unchanged prefix, so they run only when
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
-    the `context` tool), on the first call after five idle minutes (the cache's lifetime), on
+    the `context` tool), on the first call after the cache's lifetime (five idle minutes, an hour with `--cache-ttl 1h`), on
     overflow, or once they would remove 15% of the history. Every other call re-sends history byte
     for byte. (Run on every turn they raised input cost per call by ~80%; a replay with the gate
     saves 29%.)
@@ -107,11 +108,18 @@ and exit.
   a `/model` switch is priced per model.
 - **Prices.**
   - A built-in table holds Claude list prices per 1M tokens by tier (opus, sonnet, haiku, plus older
-    versions). Cache reads cost 0.1× the input price and cache writes 1.25×.
+    versions). Cache reads cost 0.1× the input price and cache writes 1.25× (2× with
+    `--cache-ttl 1h`).
   - `--prices FILE` adds or overrides entries. It is a JSON object keyed by model-id substring:
     `{"opus": {"input": 5, "output": 25}}`, with optional `cache_read`/`cache_write`.
   - Its keys win over the built-in ones; within each, the longest match wins.
   - Unpriced models show `unknown`, or `$3.10+?` when partly priced.
+- **Cache TTL.** `--cache-ttl 1h` makes Bedrock/Anthropic keep cached prefixes for an hour
+  instead of five minutes, so a call after a long `wait` or a slow reload reads its prefix
+  instead of rewriting it. Every write then costs 2× input instead of 1.25×, so it pays off only
+  when calls often follow a 5–60 minute pause: per call, 0.75× the new tokens it writes against
+  1.15× the prefix for each pause it bridges. Unavoidable misses (a new agent, a binary that
+  changed the tools or prompt) cost the 2× rate too. Off by default.
 - **Where it shows.**
   - `/cost` (or `--run NAME --cost`) shows per agent: input, output, cache-read and cache-write
     tokens, the model, an estimated `$`, and the median input per call and cache hit rate over the

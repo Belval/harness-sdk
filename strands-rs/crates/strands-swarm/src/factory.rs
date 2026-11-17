@@ -26,7 +26,7 @@ use strands_harness::{
 use crate::catalog::ToolCatalog;
 use crate::compaction::{CompactAt, CompactedSink, DEFAULT_COMPACT_AT};
 use crate::dashboard::ContextControl;
-use crate::pruning::CachePrune;
+use crate::pruning::{CachePrune, CACHE_TTL, CACHE_TTL_1H};
 use crate::runtime::{AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
 use crate::skills::{skills_prompt, skills_tool};
 
@@ -70,6 +70,8 @@ pub struct HarnessFactoryOptions {
     /// Summarize older turns once a call's input reaches this many tokens (or 85% of the
     /// model's window, if smaller); [`DEFAULT_COMPACT_AT`] when `None`.
     pub compact_at: Option<u64>,
+    /// TTL of the prompt-cache points (`"5m"`, `"1h"`); the provider default (5m) when `None`.
+    pub cache_ttl: Option<String>,
 }
 
 /// A factory that builds harness agents.
@@ -99,11 +101,13 @@ pub fn harness_model_resolver(options: HarnessFactoryOptions) -> ModelResolver {
     Arc::new(move |model: Option<String>| {
         let model = model_option(&options, model);
         let effort = options.effort;
+        let cache_ttl = options.cache_ttl.clone();
         Box::pin(async move {
             resolve_model(ResolveModelOptions {
                 model,
                 default: DEFAULT_MODEL.to_owned(),
                 effort,
+                cache_ttl,
                 // `web_search` is excluded from the builtins, so the harness never asks for it.
                 web_search: false,
                 ..Default::default()
@@ -148,6 +152,7 @@ fn context_manager(
     stash_dir: Option<&std::path::Path>,
     control: &Arc<ContextControl>,
     on_compacted: Option<CompactedSink>,
+    cache_ttl: Option<&str>,
 ) -> ContextManagerOption {
     let truncate = Offload::truncate(
         OffloadTarget::ToolResults,
@@ -165,7 +170,10 @@ fn context_manager(
             .on_request(Arc::clone(control))
             .on_compacted(on_compacted),
     );
-    let prune = CachePrune::new(Some(Arc::clone(&summarize)));
+    let prune = CachePrune::new(Some(Arc::clone(&summarize))).with_cache_ttl(match cache_ttl {
+        Some("1h") => CACHE_TTL_1H,
+        _ => CACHE_TTL,
+    });
     ContextManagerOption::Config(ContextManagerConfig {
         strategies: Some(vec![
             Arc::new(prune.clone()),
@@ -240,6 +248,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
     Ok(HarnessAgentOptions {
         model: model_option(options, spec.model),
         effort: options.effort,
+        cache_ttl: options.cache_ttl.clone(),
         instructions: Some(instructions),
         tools,
         plugins,
@@ -250,7 +259,13 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         // Discovery happens once at startup (crate::skills); the harness's own `./.agent/skills`
         // lookup, relative to the process rather than the agent, stays off.
         skills: SkillsOption::Off,
-        context_manager: context_manager(compact_at, stash_dir.as_deref(), &control, spec.on_compacted),
+        context_manager: context_manager(
+            compact_at,
+            stash_dir.as_deref(),
+            &control,
+            spec.on_compacted,
+            options.cache_ttl.as_deref(),
+        ),
         id: Some(spec.id),
         name: Some(spec.name),
         ..Default::default()
@@ -295,6 +310,7 @@ mod tests {
             None,
             &ContextControl::new(DEFAULT_COMPACT_AT),
             None,
+            None,
         ))
         .unwrap();
         let mut messages = vec![Message::user("start")];
@@ -330,8 +346,14 @@ mod tests {
         let agent = Agent::builder().model(model.clone()).build().unwrap();
         // The mock has no known window, so the context manager assumes 200k: 5k tokens is 2.5%,
         // far below the 85% mark, but past `compact_at`.
-        let manager =
-            ContextManager::from(context_manager(4_000, None, &ContextControl::new(4_000), None)).unwrap();
+        let manager = ContextManager::from(context_manager(
+            4_000,
+            None,
+            &ContextControl::new(4_000),
+            None,
+            None,
+        ))
+        .unwrap();
 
         let mut below = chat(6);
         let changed = manager
@@ -368,7 +390,7 @@ mod tests {
         let agent = Agent::builder().model(model.clone()).build().unwrap();
         let control = ContextControl::new(DEFAULT_COMPACT_AT);
         let manager =
-            ContextManager::from(context_manager(DEFAULT_COMPACT_AT, None, &control, None)).unwrap();
+            ContextManager::from(context_manager(DEFAULT_COMPACT_AT, None, &control, None, None)).unwrap();
         control.request_summary();
 
         let mut messages = chat(6);
@@ -399,6 +421,7 @@ mod tests {
                     DEFAULT_COMPACT_AT,
                     Some(&dir),
                     &ContextControl::new(DEFAULT_COMPACT_AT),
+                    None,
                     None,
                 ))
                 .unwrap();

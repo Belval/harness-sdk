@@ -132,9 +132,11 @@ impl ContextStrategy for TrimOldResults {
     }
 }
 
-/// How long the provider keeps a cached prompt prefix (Anthropic and Bedrock: 5 minutes,
-/// refreshed on every hit).
+/// How long the provider keeps a cached prompt prefix by default (Anthropic and Bedrock: 5
+/// minutes, refreshed on every hit).
 pub const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// The cache lifetime with `--cache-ttl 1h`.
+pub const CACHE_TTL_1H: Duration = Duration::from_secs(60 * 60);
 /// Prune for its own sake once that would remove this share of the history (in characters).
 pub const PRUNE_SHARE: f64 = 0.15;
 /// Agent state key: when the agent last called its model (Unix milliseconds). Kept in the
@@ -150,7 +152,8 @@ pub enum PruneReason {
     Compaction,
     /// History changed since the last call (the `context` tool offloaded results, say).
     Edited,
-    /// The last call was over [`CACHE_TTL`] ago, so the cache has expired.
+    /// The last call was longer ago than the cache lives ([`CACHE_TTL`] by default), so the cache
+    /// has expired.
     Idle,
     /// Pruning would remove at least [`PRUNE_SHARE`] of the history, worth one cache rewrite.
     Large,
@@ -167,6 +170,8 @@ pub struct CachePrune {
 struct Gate {
     trim: TrimOldResults,
     compaction: Option<Arc<CompactAt>>,
+    /// How long the cache lives.
+    ttl: Duration,
     /// A hash of each message as the last call sent it (this process only).
     sent: Mutex<Option<Vec<u64>>>,
 }
@@ -177,9 +182,16 @@ impl CachePrune {
         let gate = Gate {
             trim: TrimOldResults::default(),
             compaction,
+            ttl: CACHE_TTL,
             sent: Mutex::new(None),
         };
         Self { gate: Arc::new(gate) }
+    }
+
+    /// The gate for a cache that lives `ttl` (e.g. [`CACHE_TTL_1H`]) instead of [`CACHE_TTL`].
+    pub fn with_cache_ttl(mut self, ttl: Duration) -> Self {
+        Arc::get_mut(&mut self.gate).expect("set before use").ttl = ttl;
+        self
     }
 
     /// The pipeline's last strategy: notes what this call sends and when, for the next call's
@@ -201,7 +213,7 @@ impl CachePrune {
             return Some(PruneReason::Edited);
         }
         let idle = last_call(ctx.agent)
-            .is_some_and(|at| SystemTime::now().duration_since(at).unwrap_or_default() > CACHE_TTL);
+            .is_some_and(|at| SystemTime::now().duration_since(at).unwrap_or_default() > self.gate.ttl);
         if idle {
             return Some(PruneReason::Idle);
         }
@@ -642,6 +654,21 @@ mod tests {
             !pass(&prune, &agent, &mut messages, 0.1).await,
             "the mark restarts the clock"
         );
+    }
+
+    #[tokio::test]
+    async fn a_one_hour_cache_is_still_warm_after_five_idle_minutes() {
+        let (prune, agent) = (CachePrune::new(None).with_cache_ttl(CACHE_TTL_1H), agent());
+        let mut messages = prunable();
+        assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
+        let ago = |minutes: u64| {
+            let at = SystemTime::now() - Duration::from_secs(minutes * 60);
+            at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+        };
+        agent.state().set(LAST_CALL_KEY, ago(30));
+        assert!(!pass(&prune, &agent, &mut messages, 0.1).await, "still cached");
+        agent.state().set(LAST_CALL_KEY, ago(61));
+        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
     }
 
     #[tokio::test]

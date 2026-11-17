@@ -16,6 +16,9 @@ pub const CACHE_READ_FACTOR: f64 = 0.1;
 /// Cache writes cost this share of the input price unless a price says otherwise.
 pub const CACHE_WRITE_FACTOR: f64 = 1.25;
 
+/// [`CACHE_WRITE_FACTOR`] for writes with the one-hour cache TTL (`--cache-ttl 1h`).
+pub const CACHE_WRITE_1H_FACTOR: f64 = 2.0;
+
 /// Built-in USD list prices per 1M input/output tokens, by model-id substring. Unknown newer
 /// versions fall back to their tier's latest known price.
 const BUILTIN: &[(&str, f64, f64)] = &[
@@ -185,6 +188,7 @@ impl Price {
 pub struct Prices {
     user: BTreeMap<String, Price>,
     builtin: BTreeMap<String, Price>,
+    write_factor: f64,
 }
 
 impl Default for Prices {
@@ -204,6 +208,7 @@ impl Default for Prices {
         Self {
             user: BTreeMap::new(),
             builtin,
+            write_factor: CACHE_WRITE_FACTOR,
         }
     }
 }
@@ -227,6 +232,13 @@ impl Prices {
         Self::with_overrides(&json).map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    /// Price cache writes without a price of their own at `factor` × input, e.g.
+    /// [`CACHE_WRITE_1H_FACTOR`].
+    pub fn with_cache_write_factor(mut self, factor: f64) -> Self {
+        self.write_factor = factor;
+        self
+    }
+
     /// The price of `model`, if any key is part of its id (case-insensitive).
     pub fn price(&self, model: &str) -> Option<Price> {
         let model = model.to_lowercase();
@@ -237,7 +249,9 @@ impl Prices {
                 .max_by_key(|(key, _)| key.len())
                 .map(|(_, price)| *price)
         };
-        best(&self.user).or_else(|| best(&self.builtin))
+        let mut price = best(&self.user).or_else(|| best(&self.builtin))?;
+        price.cache_write = price.cache_write.or(Some(price.input * self.write_factor));
+        Some(price)
     }
 }
 
@@ -416,8 +430,9 @@ impl CostReport {
         let mut lines = vec![
             format!(
                 "Estimated cost: {} (list prices per 1M tokens; cache read {CACHE_READ_FACTOR}×, \
-                 write {CACHE_WRITE_FACTOR}× input; not a bill)",
-                self.total().render()
+                 write {}× input; not a bill)",
+                self.total().render(),
+                self.prices.write_factor
             ),
             String::new(),
             row([
@@ -551,6 +566,18 @@ mod tests {
         // 1M uncached at $3, 1M out at $15, 2M read at $0.30, 1M written at $3.75.
         let cost = price.cost(&counts(4_000_000, 1_000_000, 2_000_000, 1_000_000));
         assert!((cost - (3.0 + 15.0 + 0.6 + 3.75)).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn one_hour_cache_writes_cost_twice_the_input_price_unless_priced() {
+        let prices = Prices::default().with_cache_write_factor(CACHE_WRITE_1H_FACTOR);
+        let price = prices.price("claude-sonnet-4-5").unwrap();
+        assert_eq!(price.cache_write, Some(6.0));
+        let json = r#"{"sonnet": {"input": 3, "output": 15, "cache_write": 5}}"#;
+        let priced = Prices::with_overrides(json)
+            .unwrap()
+            .with_cache_write_factor(CACHE_WRITE_1H_FACTOR);
+        assert_eq!(priced.price("claude-sonnet-4-5").unwrap().cache_write, Some(5.0));
     }
 
     #[test]
