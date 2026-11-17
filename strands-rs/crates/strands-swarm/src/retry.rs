@@ -120,7 +120,7 @@ mod tests {
             "ValidationException: A conversation must alternate between user and assistant roles."
         )));
         assert!(!is_transient(&Error::model(
-            "No AWS credentials found (dispatch failure). Run `ada credentials update`."
+            "No AWS credentials found (dispatch failure). Run `aws configure`."
         )));
         assert!(!is_transient(&Error::model(
             "The provided model identifier is invalid."

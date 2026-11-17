@@ -399,7 +399,8 @@ async fn a_tool_line_breaks_a_long_path_live_and_restored() {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("run");
     let sinks = Sinks::default();
-    let path = "/local/home/belvae/workplace/harness-sdk.swarm/self-improve/a64/strands-rs/crates/strands-swarm/src/tui/view.rs";
+    let path =
+        "/home/user/workplace/project.swarm/self-improve/a64/strands-rs/crates/strands-swarm/src/tui/view.rs";
     let scripts = HashMap::from([(
         "a1",
         vec![
@@ -414,7 +415,7 @@ async fn a_tool_line_breaks_a_long_path_live_and_restored() {
     let mut screen = Screen::sized(80, 24);
     screen.type_line(&swarm, &mut app, "read the view").await;
     let shown = screen.until(&mut app, &mut events, "root: read it").await;
-    assert!(shown.contains("✗ read /local/home/"), "live\n{shown}");
+    assert!(shown.contains("✗ read /home/user/"), "live\n{shown}");
     swarm.shutdown().await;
 
     let saved = crate::state::load(&state_dir)
@@ -433,7 +434,7 @@ async fn a_tool_line_breaks_a_long_path_live_and_restored() {
         true => shown,
         false => screen.until(&mut app, &mut events, "root: read it").await,
     };
-    assert!(shown.contains("✗ read /local/home/"), "restored\n{shown}");
+    assert!(shown.contains("✗ read /home/user/"), "restored\n{shown}");
     swarm.shutdown().await;
 }
 

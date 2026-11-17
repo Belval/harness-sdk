@@ -1081,8 +1081,7 @@ mod tests {
     #[test]
     fn a_tool_line_breaks_a_long_summary_instead_of_orphaning_its_name() {
         let mut app = app_with_an_image(None);
-        let path =
-            "/local/home/belvae/workplace/harness-sdk.swarm/self-improve/a19/strands-rs/crates/view.rs";
+        let path = "/home/user/workplace/project.swarm/self-improve/a19/strands-rs/crates/view.rs";
         app.agents.get_mut("a1").unwrap().log.push_back(LogEntry::Tool {
             name: "read".into(),
             summary: path.into(),
@@ -1090,7 +1089,7 @@ mod tests {
         });
         let screen = render(&app, 80, 24);
         let row = screen.lines().find(|row| row.contains("✗ read")).expect(&screen);
-        assert!(row.contains("✗ read /local/home/"), "{screen}");
+        assert!(row.contains("✗ read /home/user/"), "{screen}");
         assert!(!screen.contains('\u{a0}'), "the glue renders as spaces");
         let plain = plain_log(&app.agents["a1"]);
         assert!(plain.contains(&format!("✗ read {path}")), "{plain}");
