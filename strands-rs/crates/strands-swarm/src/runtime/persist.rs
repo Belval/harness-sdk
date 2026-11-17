@@ -286,34 +286,33 @@ impl Swarm {
         }
     }
 
+    /// Save the state in the background.
     pub(super) fn persist(&self) {
-        let Some(persister) = self.inner.persister.clone() else {
-            return;
-        };
-        if self.inner.shutting_down.load(Ordering::SeqCst) {
-            return;
+        if let Some(save) = self.state_save() {
+            tokio::spawn(save);
         }
-        let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let state = self.snapshot();
-        tokio::spawn(async move {
-            if let Err(error) = persister.write(generation, &state).await {
-                tracing::warn!(%error, "state save failed");
-            }
-        });
     }
 
     /// [`Swarm::persist`], returning once the state is on disk.
     pub(super) async fn persist_now(&self) {
-        let Some(persister) = self.inner.persister.clone() else {
-            return;
-        };
+        if let Some(save) = self.state_save() {
+            save.await;
+        }
+    }
+
+    /// The save of the state as it is now, for a persistent run that is not shutting down.
+    fn state_save(&self) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+        let persister = self.inner.persister.clone()?;
         if self.inner.shutting_down.load(Ordering::SeqCst) {
-            return;
+            return None;
         }
         let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Err(error) = persister.write(generation, &self.snapshot()).await {
-            tracing::warn!(%error, "state save failed");
-        }
+        let state = self.snapshot();
+        Some(async move {
+            if let Err(error) = persister.write(generation, &state).await {
+                tracing::warn!(%error, "state save failed");
+            }
+        })
     }
 }
 
@@ -331,9 +330,6 @@ pub(super) fn status_name(status: &AgentStatus) -> &'static str {
     }
 }
 
-/// The persistable view of one agent. Each lock is read on its own (see `Node::info`): guards
-/// taken inside the struct literal are all held until it is built, and holding `model` while
-/// waiting for `status` deadlocked against `Node::info`.
 /// The budget a resumed run starts with: the saved one, unless `--budget-tokens` was given with a
 /// value other than the run was last started with ([`SwarmState::budget_flag`]).
 fn resumed_budget(flag: Option<u64>, state: &SwarmState) -> Option<u64> {
@@ -343,6 +339,9 @@ fn resumed_budget(flag: Option<u64>, state: &SwarmState) -> Option<u64> {
     }
 }
 
+/// The persistable view of one agent. Each lock is read on its own (see `Node::info`): guards
+/// taken inside the struct literal are all held until it is built, and holding `model` while
+/// waiting for `status` deadlocked against `Node::info`.
 pub(super) fn node_state(node: &Node) -> AgentState {
     let usage = *node.usage.lock();
     let model = node.model.lock().clone();
