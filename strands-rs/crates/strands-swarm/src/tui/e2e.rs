@@ -436,3 +436,30 @@ async fn a_tool_line_breaks_a_long_path_live_and_restored() {
     assert!(shown.contains("✗ read /local/home/"), "restored\n{shown}");
     swarm.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_cost_popup_wraps_its_prose_at_80_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = HashMap::from([("a1", vec![say("root: done")])]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory(scripts, &Sinks::default()), dir.path()));
+    let mut app = App::default();
+    let mut screen = Screen::sized(80, 24);
+    screen.type_line(&swarm, &mut app, "fix the bug").await;
+    screen.until(&mut app, &mut events, "root: done").await;
+    screen.type_line(&swarm, &mut app, "/cost").await;
+    let shown = screen.until(&mut app, &mut events, "┌ estimated cost").await;
+    // The popup's text, its rows joined: the prose is all there, wrapped rather than clipped.
+    let text = shown
+        .lines()
+        .filter_map(|row| row.split('│').nth(1))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+    for prose in [
+        "(list prices per 1M tokens; cache read 0.1×, write 1.25× input; not a bill)",
+        "Unpriced models show as unknown; --prices FILE adds or overrides prices.",
+    ] {
+        assert!(text.contains(prose), "{prose:?}\n{shown}");
+    }
+    swarm.shutdown().await;
+}

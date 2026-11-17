@@ -273,7 +273,7 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
 | `/stop` (or Esc twice on an empty input) | Interrupt the selected agent's turn without cancelling it (`Swarm::interrupt`). |
 | `/cancel` | Stop the selected agent and its subtree for good. |
 | `/status` | Each live agent's state, activity, todos, unmerged commits and merge outlook, jobs and schedules, without a model call. |
-| `/cost` | Estimated spend (see [Cost](#cost)). |
+| `/cost` | Estimated spend (see [Cost](#cost)); its intro and footnote wrap, its table is clipped on narrow terminals. |
 | `/budget`, `/max-agents` | See [Limits](#limits). |
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
 | `/schedules` | All schedules. |
