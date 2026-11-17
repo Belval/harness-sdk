@@ -767,6 +767,7 @@ mod tests {
             mailbox: Vec::new(),
             env,
             compact_at: None,
+            budget_tokens: None,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,

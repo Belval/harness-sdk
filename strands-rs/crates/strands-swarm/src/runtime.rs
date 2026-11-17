@@ -378,6 +378,9 @@ pub struct SpawnRequest {
     /// Summarize this agent's older turns at this many tokens (or 85% of its window, if
     /// smaller); `None` uses [`SwarmConfig::compact_at`].
     pub compact_at: Option<u64>,
+    /// Token budget (input + output) for this agent and its descendants together; once spent,
+    /// their model calls are refused until the parent raises it ([`Swarm::set_agent_budget`]).
+    pub budget_tokens: Option<u64>,
 }
 
 /// What a `schedule` call (or the user) asks for; see [`Swarm::schedule`].
@@ -418,6 +421,8 @@ pub struct AgentInfo {
     pub model: Option<String>,
     /// Its own compaction point from `spawn_agent` (`None`: the swarm default).
     pub compact_at: Option<u64>,
+    /// Its own token budget from `spawn_agent`, shared with its descendants (`None`: none).
+    pub budget: Option<u64>,
     /// When it last showed a sign of progress (a successful tool call or a model reply), unix
     /// seconds.
     pub progress: i64,
@@ -658,6 +663,8 @@ struct Node {
     env: BTreeMap<String, String>,
     /// Compaction point override from the spawn; `None` follows [`SwarmConfig::compact_at`].
     compact_at: Option<u64>,
+    /// Token budget for the agent and its descendants; see [`SpawnRequest::budget_tokens`].
+    budget: Mutex<Option<u64>>,
     /// Tokens used so far, across restarts.
     usage: Mutex<Tokens>,
     /// Tokens by model and recent calls, for cost estimates; across restarts.
@@ -722,6 +729,7 @@ impl Node {
             unread,
             model,
             compact_at: self.compact_at,
+            budget: *self.budget.lock(),
             progress: self.progress.load(Ordering::Relaxed),
         }
     }
@@ -956,6 +964,7 @@ impl Swarm {
                 goal: request.goal.clone(),
                 env,
                 compact_at: request.compact_at,
+                budget: Mutex::new(request.budget_tokens),
                 // No actor runs until a queued agent starts.
                 finished: AtomicBool::new(queued),
                 progress: AtomicI64::new(self.now().timestamp()),

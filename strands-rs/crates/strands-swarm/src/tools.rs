@@ -58,16 +58,15 @@ const DEFAULT_WAIT_SECONDS: u64 = 600;
 const MAX_WAIT_SECONDS: u64 = 3600;
 
 const SPAWN_DESCRIPTION: &str = concat!(
-    "Start an agent on `task`; returns at once. It has your tools (MCP ones it enables ",
-    "itself). Its final reply each turn reaches you; messaging it resumes it with its context. ",
-    "The task is all it knows. It works in `cwd` (default: yours); worktree=true: its own git ",
-    "worktree and branch off that HEAD (no uncommitted changes); you merge it. At the agent ",
-    "limit it is `queued`."
+    "Start an agent on `task` (all it knows); returns at once. It has your tools (MCP: it enables its ",
+    "own); its final reply each turn reaches you, and messaging resumes it. Works ",
+    "in `cwd` (default yours); worktree=true: own git worktree and branch off your HEAD (no ",
+    "uncommitted changes), you merge it. Past the agent limit it is `queued`."
 );
 
 const SEND_DESCRIPTION: &str = concat!(
-    "Message an agent (id or name) or `parent` (who spawned you; the user for the root agent); a comma-",
-    "separated `to` sends to each. A busy agent sees it after its current tool call; an idle one starts a turn."
+    "Message agents (`to`: comma-separated ids or names, or `parent`: your spawner, else the user). ",
+    "A busy one sees it after its current tool call; an idle one starts a turn."
 );
 
 const WAIT_DESCRIPTION: &str =
@@ -80,7 +79,7 @@ const LIST_DESCRIPTION: &str = concat!(
 
 const CANCEL_DESCRIPTION: &str = concat!(
     "Stop an agent, its descendants and their jobs. A clean worktree is removed, its branch too once ",
-    "the base has all its commits (merged or cherry-picked); the result says what stays and why."
+    "merged or cherry-picked into the base; the result says what stays and why."
 );
 
 /// How long `cancel_agent` waits to report what reclaiming the cancelled worktrees did.
@@ -90,21 +89,24 @@ const CANCEL_RECLAIM_WAIT: Duration = Duration::from_secs(10);
 struct SpawnInput {
     /// Goal, context, constraints, what to report back.
     task: String,
-    /// Role name, e.g. `tui-tests`; also its address.
+    /// Role name; also its address.
     name: String,
     #[serde(default)]
     worktree: bool,
     #[serde(default)]
     cwd: String,
-    /// Model id or opus/sonnet/haiku. Cost vs opus: sonnet 0.6×, haiku 0.2× (mechanical work).
+    /// Model id or opus/sonnet/haiku (cost 1×/0.6×/0.2×).
     #[serde(default)]
     model: Option<String>,
-    /// Checkable criterion; a judge sends it back to work until met.
+    /// Checkable; a judge sends it back to work until met.
     #[serde(default)]
     goal: Option<String>,
-    /// Context summary point (tokens); default 85% of its window.
+    /// Compaction point in tokens (default 85% of window).
     #[serde(default)]
     compact_at: Option<u64>,
+    /// Token cap including descendants.
+    #[serde(default)]
+    budget_tokens: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -114,6 +116,9 @@ struct SendInput {
     /// false: no idle recipient wakes for it (FYIs).
     #[serde(default = "yes")]
     wake: bool,
+    /// Set its token budget (parent only).
+    #[serde(default)]
+    budget_tokens: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -149,16 +154,16 @@ struct ListInput {
 struct ReloadInput {
     /// Absolute path of the built `strands-swarm` binary.
     binary: String,
-    /// `idle` (default): once no tool call but `wait` is in flight, at most 10 min later. `now`: at once, interrupting tool calls.
+    /// `idle` (default): once only `wait` is in flight, within 10 min. `now`: at once, interrupting tool calls.
     #[serde(default)]
     #[schemars(schema_with = "reload_when_schema")]
     when: ReloadWhen,
 }
 
 const RELOAD_DESCRIPTION: &str = concat!(
-    "Hot-reload the whole swarm into a built strands-swarm binary: it is self-tested and installed now, ",
+    "Hot-reload the whole swarm into a built strands-swarm binary: it is self-tested and installed, ",
     "then every agent is saved and resumed under it with its conversation and mail (mid-turn agents get ",
-    "a restart notice). A newer reload supersedes a pending one; a binary that crashes on start is rolled back."
+    "a restart notice). A newer reload supersedes a pending one; a crashing binary is rolled back."
 );
 
 fn reload_when_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -180,7 +185,7 @@ async fn reload_tool(swarm: Swarm, _me: String, input: ReloadInput, _ctx: ToolCo
 }
 
 const RUN_BACKGROUND_DESCRIPTION: &str = concat!(
-    "Run a shell command in your cwd, detached and with no timeout (survives swarm restarts); returns ",
+    "Run a shell command in your cwd, detached and with no timeout (survives restarts); returns ",
     "its job id at once. When it ends you get a message from `jobs` with the exit code and last 40 ",
     "output lines, waking you if idle."
 );
@@ -334,7 +339,7 @@ struct ScheduleInput {
 }
 
 const SCHEDULE_DESCRIPTION: &str = concat!(
-    "Post `message` to a mailbox later and/or repeatedly; a fire wakes an idle recipient. An agent ",
+    "Post `message` later and/or repeatedly; a fire wakes an idle recipient. An agent ",
     "idle on a schedule holds no agent slot, unlike one in `wait`. Survives restarts (a missed fire is ",
     "delivered once)."
 );
@@ -482,6 +487,7 @@ async fn spawn_tool(swarm: Swarm, me: String, input: SpawnInput, _ctx: ToolConte
         model: input.model,
         goal: input.goal,
         compact_at: input.compact_at,
+        budget_tokens: input.budget_tokens,
     };
     let id = swarm.spawn(&me, request).await?;
     let Some(info) = swarm.agent(&id) else {
@@ -516,10 +522,13 @@ async fn send_tool(swarm: Swarm, me: String, input: SendInput, _ctx: ToolContext
     let (mut sent, mut failed) = (Vec::new(), Vec::new());
     for id in &to {
         let message = input.message.clone();
-        let posted = match input.wake {
+        let raised = input
+            .budget_tokens
+            .map_or(Ok(()), |tokens| swarm.set_agent_budget(&me, id, Some(tokens)));
+        let posted = raised.and_then(|()| match input.wake {
             true => swarm.send(&me, id, message),
             false => swarm.send_fyi(&me, id, message),
-        };
+        });
         match posted {
             Ok(()) => sent.push(id),
             Err(error) if to.len() == 1 => return Err(error),
@@ -765,6 +774,13 @@ fn list_agents(
             .compact_at
             .map(|at| format!(", compacts at {}", crate::text::compact(at)));
         let model = model + &point.unwrap_or_default();
+        let model = match info.budget {
+            Some(budget) => {
+                let used = crate::text::usage(swarm.subtree_tokens(&info.id), budget);
+                format!("{model}, budget: {used}")
+            }
+            None => model,
+        };
         let spend = cost.spend(&info.id).map(|s| format!(", {}", s.describe()));
         model + &spend.unwrap_or_default()
     };

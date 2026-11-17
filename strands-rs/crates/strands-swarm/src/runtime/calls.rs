@@ -98,7 +98,7 @@ impl Swarm {
     /// call limit, to be held for the call's duration. Waiting is published as
     /// [`SwarmEvent::ModelQueued`].
     pub(super) async fn admit_model_call(&self, id: &str, cancel: &CancellationToken) -> Result<CallPermit> {
-        if let Some(message) = self.budget_exhausted() {
+        if let Some(message) = self.budget_exhausted(id) {
             let mut stopped = self.inner.over_budget.lock();
             if !stopped.iter().any(|stopped| stopped == id) {
                 stopped.push(id.to_owned());

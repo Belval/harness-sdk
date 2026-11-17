@@ -216,6 +216,19 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     last `--budget-tokens` given, which a start without the flag does not forget, so a supervisor
     replaying its arguments leaves a `/budget` change in place. To reset it to the flag's value
     again, use `/budget N`.
+- **Per-agent tokens.** `spawn_agent`'s `budget_tokens` bounds one agent, e.g. a worker the
+  spawner does not fully trust. It is saved with the agent and `list_agents` shows
+  `budget: 1.2M of 2M tokens used`.
+  - It counts the agent's own calls and its descendants' (input + output, as the swarm budget
+    does), so a worker cannot get past it by spawning helpers. Once spent, model calls are
+    refused for the agent and all of them, through the same gate as the swarm budget: the agent
+    goes idle as `errored: <budget exhausted …>`, and its parent gets one error mail naming the
+    agent, its usage and how to raise it. A descendant stopped by it reports to its own parent
+    the same way, once.
+  - The parent raises it with `send_message`'s `budget_tokens` (any ancestor, or the user, may;
+    the agent itself may not). Agents it had stopped are told to continue; the message goes
+    with that note, so one turn follows. A later `send_message` with a lower value lowers it
+    again.
 
 ## Cost
 

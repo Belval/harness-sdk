@@ -155,7 +155,7 @@ impl Swarm {
             // A goal-driven agent must survive transient failures (throttling, outages) unattended.
             // Out of budget, it waits for the mail that `set_budget` sends instead of retrying.
             if node.goal.is_some()
-                && self.budget_exhausted().is_none()
+                && self.budget_exhausted(&node.id).is_none()
                 && sleep_unless_cancelled(&node, backoff).await
             {
                 input = Some(InvokeInput::Text(format!(

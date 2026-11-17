@@ -85,6 +85,9 @@ pub struct AgentState {
     /// Compaction point from `spawn_agent` (tokens); `None` follows the swarm's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_at: Option<u64>,
+    /// Token budget of the agent and its descendants, set at spawn or raised since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u64>,
     /// Input tokens used so far (cache reads and writes included), across restarts.
     #[serde(default)]
     pub input_tokens: u64,

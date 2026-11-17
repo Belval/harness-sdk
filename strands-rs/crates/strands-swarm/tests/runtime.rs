@@ -3001,6 +3001,168 @@ async fn a_spent_token_budget_stops_model_calls_until_it_is_raised() {
     assert_eq!(swarm.snapshot().budget_tokens, Some(1_000));
 }
 
+/// Error mails to `to` that arrive within `quiet` of the last event.
+async fn error_mails_until_quiet(events: &mut UnboundedReceiver<SwarmEvent>, to: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(400), events.recv()).await {
+        if let SwarmEvent::Mail { to: receiver, mail } = event {
+            if receiver == to && mail.kind == "error" {
+                errors.push(mail.text);
+            }
+        }
+    }
+    errors
+}
+
+#[tokio::test]
+async fn an_agents_budget_counts_its_descendants_and_stops_them_until_its_parent_raises_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let spent = || MockResponse::with_usage(Message::assistant("spent"), usage(15, 0, 5));
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            ("a1", vec![say("ok")]),
+            ("a2", vec![spent(), say("continued")]),
+            ("a3", vec![spent(), say("grandchild continued")]),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "ok");
+    let worker = SpawnRequest {
+        task: "work".into(),
+        budget_tokens: Some(30),
+        ..Default::default()
+    };
+    let worker = swarm.spawn("a1", worker).await.unwrap();
+    assert_eq!(mail_to(&mut events, "a1", "reply").await, "spent");
+    assert_eq!(swarm.subtree_tokens(&worker), 20, "under its 30: not stopped");
+
+    // Its grandchild's 20 tokens count against it: the worker's next call is refused.
+    let child = SpawnRequest {
+        task: "sub".into(),
+        ..Default::default()
+    };
+    let grandchild = swarm.spawn(&worker, child).await.unwrap();
+    eventually("the grandchild spent its tokens", || {
+        swarm.subtree_tokens(&worker) == 40
+    })
+    .await;
+    let errors = error_mails_until_quiet(&mut events, "a1").await;
+    assert_eq!(errors.len(), 1, "the parent hears once: {errors:?}");
+    let report = &errors[0];
+    assert!(
+        report.contains("a2") && report.contains("40 tokens used, over the 30 budget"),
+        "{report}"
+    );
+    assert!(
+        report.contains("send_message") && report.contains("budget_tokens"),
+        "{report}"
+    );
+    let worker_model = scripts.lock()["a2"].clone();
+    assert_eq!(worker_model.call_count(), 1, "the refused call reached the model");
+    assert!(matches!(
+        swarm.agent(&worker).unwrap().status,
+        AgentStatus::Errored(_)
+    ));
+
+    // The grandchild is stopped by the worker's budget too, and more mail changes nothing.
+    swarm.send("a1", &worker, "more").unwrap();
+    swarm.send(&worker, &grandchild, "more").unwrap();
+    let errors = error_mails_until_quiet(&mut events, "a1").await;
+    assert!(errors.is_empty(), "already reported: {errors:?}");
+    assert_eq!(scripts.lock()["a3"].call_count(), 1);
+    assert_eq!(worker_model.call_count(), 1);
+
+    // Only an ancestor (or the user) can raise it.
+    assert!(swarm.set_agent_budget(&grandchild, &worker, Some(9_999)).is_err());
+    assert!(swarm.set_agent_budget("a1", "a1", Some(9_999)).is_err());
+    assert_eq!(swarm.agent(&worker).unwrap().budget, Some(30));
+    swarm.set_agent_budget("a1", &worker, Some(1_000)).unwrap();
+    assert_eq!(mail_to(&mut events, "a1", "reply").await, "continued");
+    assert!(sent_text(&worker_model, 1).contains("The token budget of a2 was raised to 1.0k"));
+    assert_eq!(swarm.agent(&worker).unwrap().budget, Some(1_000));
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_spawn_budget_shows_in_list_agents_and_survives_a_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let scripts = scripts_of(vec![
+        (
+            "a1",
+            vec![
+                tool_call(
+                    "spawn_agent",
+                    "s1",
+                    json!({"task": "t", "name": "capped", "budget_tokens": 30}),
+                ),
+                tool_call("list_agents", "l1", json!({})),
+                say("spawned"),
+                // After the resume, a2's error mail wakes a1, which raises a2's budget.
+                tool_call(
+                    "send_message",
+                    "m1",
+                    json!({"to": "a2", "message": "go on", "budget_tokens": 500}),
+                ),
+                say("raised"),
+            ],
+        ),
+        (
+            "a2",
+            vec![
+                MockResponse::with_usage(Message::assistant("spent"), usage(40, 0, 10)),
+                say("never"),
+            ],
+        ),
+    ]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config.clone());
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "spawned");
+    let listing = sent_text(&scripts.lock()["a1"], 2);
+    assert!(
+        listing.contains("budget: ") && listing.contains("30"),
+        "{listing}"
+    );
+    assert_eq!(swarm.agent("a2").unwrap().budget, Some(30));
+    eventually("the capped agent spent its budget", || {
+        swarm.subtree_tokens("a2") == 50
+    })
+    .await;
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&state_dir)
+        .await
+        .unwrap()
+        .expect("state saved");
+    let saved_budgets: Vec<_> = saved.agents.iter().map(|a| a.budget_tokens).collect();
+    assert_eq!(saved_budgets, vec![None, Some(30)]);
+
+    // Resumed, the budget (and the tokens already spent) still stop it.
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    assert_eq!(resumed.agent("a2").unwrap().budget, Some(30));
+    resumed.send("a1", "a2", "more").unwrap();
+    let errors = error_mails_until_quiet(&mut events, "a1").await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("50 tokens used, over the 30 budget"),
+        "{}",
+        errors[0]
+    );
+    // The error mail woke a1, whose script answers with `send_message`'s `budget_tokens`.
+    let a2 = scripts.lock()["a2"].clone();
+    eventually("the budget was raised and a2 went on", || a2.call_count() == 2).await;
+    assert_eq!(resumed.agent("a2").unwrap().budget, Some(500));
+    let resumed_call = sent_text(&a2, 1);
+    assert!(
+        resumed_call.contains("raised to 500") && resumed_call.contains("go on"),
+        "{resumed_call}"
+    );
+    resumed.shutdown().await;
+}
+
 /// Poll `check` until it holds; the 20s cap is only for a stuck test (git work under a loaded
 /// machine can take seconds).
 async fn eventually(what: &str, check: impl Fn() -> bool) {

@@ -63,16 +63,46 @@ impl Swarm {
         *self.inner.budget.lock() = tokens;
         self.persist();
         self.emit(SwarmEvent::Budget { tokens });
-        if self.budget_exhausted().is_some() {
-            return;
+        self.resume_stopped("The token budget", tokens);
+    }
+
+    /// Set (or lift) agent `id`'s own token budget, which `by` (an ancestor of `id`, or the
+    /// user) is allowed to do; the budget covers `id` and its descendants. Agents it had
+    /// stopped that now have budget left are told to continue.
+    pub fn set_agent_budget(&self, by: &str, id: &str, tokens: Option<u64>) -> Result<()> {
+        let node = self.known(id)?;
+        let mut parent = node.parent.clone();
+        while by != USER && parent != by {
+            parent = match self.node(&parent) {
+                Some(above) => above.parent.clone(),
+                None => {
+                    return Err(Error::other(format!(
+                        "Only an ancestor of {} can set its budget.",
+                        node.label()
+                    )))
+                }
+            };
         }
-        let stopped: Vec<String> = std::mem::take(&mut *self.inner.over_budget.lock());
+        *node.budget.lock() = tokens;
+        self.persist();
+        self.journal_event("agent_budget", serde_json::json!({ "id": id, "tokens": tokens }));
+        self.resume_stopped(&format!("The token budget of {id}"), tokens);
+        Ok(())
+    }
+
+    /// Tell each agent stopped for lack of budget that can run again to continue.
+    fn resume_stopped(&self, what: &str, tokens: Option<u64>) {
         let limit = tokens.map_or_else(
             || "lifted".to_owned(),
             |t| format!("raised to {}", crate::text::compact(t)),
         );
-        for id in stopped {
-            let note = format!("[The token budget was {limit}. Continue where you left off.]");
+        let stopped: Vec<String> = self.inner.over_budget.lock().clone();
+        for id in stopped
+            .into_iter()
+            .filter(|id| self.budget_exhausted(id).is_none())
+        {
+            self.inner.over_budget.lock().retain(|stopped| *stopped != id);
+            let note = format!("[{what} was {limit}. Continue where you left off.]");
             let _ = self.send(USER, &id, note);
         }
     }
@@ -98,18 +128,50 @@ impl Swarm {
         Ok(())
     }
 
-    /// The refusal message when the budget is spent.
-    pub(super) fn budget_exhausted(&self) -> Option<String> {
-        let budget = self.budget()?;
-        let used = self.tokens_used();
-        (used >= budget).then(|| {
-            format!(
-                "Token budget exhausted ({}), so no further model calls run. Report this to \
-                 whoever is waiting on you; you will be told when the user raises the budget (TUI \
-                 `/budget N`).",
-                crate::text::usage(used, budget)
-            )
-        })
+    /// Tokens (input + output) used by `id` and its descendants.
+    pub fn subtree_tokens(&self, id: &str) -> u64 {
+        self.subtree(id)
+            .iter()
+            .map(|node| {
+                let usage = *node.usage.lock();
+                usage.input + usage.output
+            })
+            .sum()
+    }
+
+    /// The refusal message when the swarm's budget, or that of `id` or of an ancestor of it, is
+    /// spent.
+    pub(super) fn budget_exhausted(&self, id: &str) -> Option<String> {
+        if let Some(budget) = self.budget() {
+            let used = self.tokens_used();
+            if used >= budget {
+                return Some(format!(
+                    "Token budget exhausted ({}), so no further model calls run. Report this to \
+                     whoever is waiting on you; you will be told when the user raises the budget (TUI \
+                     `/budget N`).",
+                    crate::text::usage(used, budget)
+                ));
+            }
+        }
+        let mut next = self.node(id);
+        while let Some(node) = next {
+            let budget = *node.budget.lock();
+            if let Some(budget) = budget {
+                let used = self.subtree_tokens(&node.id);
+                if used >= budget {
+                    return Some(format!(
+                        "{} token budget exhausted ({}), so no model calls run for it or its \
+                         descendants. Report this to whoever is waiting on you; its parent can \
+                         raise it (send_message to {} with budget_tokens).",
+                        node.label(),
+                        crate::text::usage(used, budget),
+                        node.id
+                    ));
+                }
+            }
+            next = self.node(&node.parent);
+        }
+        None
     }
 
     /// Gate every model call: refuse it once the token budget is spent, and hold a swarm-wide
