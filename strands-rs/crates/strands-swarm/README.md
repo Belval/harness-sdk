@@ -107,7 +107,8 @@ TASK or `--goal`.
     Builds are not shared, so cargo cannot take another checkout's artifacts as fresh.
 - **Restarts.** An agent that was mid-turn resumes with a short notice instead of re-reading its
   work. The notice lists the tool calls the restart cut short, each with how long it had run, and
-  `git status --short --branch` of its directory. When a cut call had run a minute or more, it
+  `git status --short --branch` of its directory. After a hard crash, "how long" runs to the
+  run's last write (an event, a save, or swarmctl noting the exit), not to its last save. When a cut call had run a minute or more, it
   also says that background jobs survive restarts. The cut turn ends with "Interrupted: the swarm
   restarted." rather than the SDK's "Cancelled by user", which a real `/stop` keeps. An agent
   that had finished its turn rests until its next message; a goal agent whose turn failed

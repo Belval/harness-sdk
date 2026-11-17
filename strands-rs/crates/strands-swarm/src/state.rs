@@ -131,8 +131,45 @@ pub fn run_dir(run: &str) -> Result<PathBuf> {
     Ok(base.join("strands-swarm").join(run))
 }
 
+/// Files a run (or its supervisor) writes as it goes, read for when it was last alive. Not
+/// `swarm.log` or `stderr.log`: a resuming process writes those before it loads the state.
+const ALIVE_FILES: [&str; 4] = [
+    STATE_FILE,
+    crate::journal::EVENTS_FILE,
+    crate::journal::JOURNAL_FILE,
+    "supervisor.log",
+];
+
 /// Load `swarm.json` from `dir`, or `None` when the run has never been saved.
+///
+/// The saved [`AgentState::running_calls`] are as of the last save, which a hard crash can
+/// follow by minutes; each is extended to the run's last sign of life: the newest write among
+/// [`ALIVE_FILES`] (swarmctl notes the exit in `supervisor.log` the moment it happens).
 pub async fn load(dir: &Path) -> Result<Option<SwarmState>> {
+    let mut state = match load_saved(dir).await? {
+        Some(state) => state,
+        None => return Ok(None),
+    };
+    let gap = ran_on_after_save(dir).as_secs();
+    for agent in &mut state.agents {
+        agent.running_calls.values_mut().for_each(|ran| *ran += gap);
+    }
+    Ok(Some(state))
+}
+
+/// How long the run went on after `swarm.json` was last written.
+fn ran_on_after_save(dir: &Path) -> std::time::Duration {
+    let modified = |name: &str| std::fs::metadata(dir.join(name)).and_then(|m| m.modified()).ok();
+    let (Some(saved), Some(alive)) = (
+        modified(STATE_FILE),
+        ALIVE_FILES.iter().filter_map(|name| modified(name)).max(),
+    ) else {
+        return std::time::Duration::ZERO;
+    };
+    alive.duration_since(saved).unwrap_or_default()
+}
+
+async fn load_saved(dir: &Path) -> Result<Option<SwarmState>> {
     let path = dir.join(STATE_FILE);
     let text = match tokio::fs::read_to_string(&path).await {
         Ok(text) => text,
@@ -193,5 +230,46 @@ impl Persister {
         }
         *written = generation;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn touch(path: &Path, ago: u64) {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(ago))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cut_call_runs_on_to_the_last_sign_of_life_not_the_last_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = serde_json::json!({
+            "run_id": "r",
+            "cwd": dir.path(),
+            "next_id": 2,
+            "agents": [{"id": "a1", "parent": "user", "cwd": dir.path(), "task": "t",
+                        "status": "running", "mailbox": [], "running_calls": {"t1": 10}}],
+        });
+        std::fs::write(dir.path().join(STATE_FILE), state.to_string()).unwrap();
+        touch(&dir.path().join(STATE_FILE), 100);
+        let ran = |state: Option<SwarmState>| state.unwrap().agents[0].running_calls["t1"];
+        // Nothing written since the save: the saved time stands.
+        assert_eq!(ran(load(dir.path()).await.unwrap()), 10);
+        // Events went on for 30s after it, and swarmctl noted the exit 60s after it.
+        touch(&dir.path().join(crate::journal::EVENTS_FILE), 70);
+        assert_eq!(ran(load(dir.path()).await.unwrap()), 40);
+        touch(&dir.path().join("supervisor.log"), 40);
+        assert_eq!(ran(load(dir.path()).await.unwrap()), 70);
+        // The resuming process's own log is no sign of the old one's life.
+        touch(&dir.path().join(crate::logging::LOG_FILE), 0);
+        assert_eq!(ran(load(dir.path()).await.unwrap()), 70);
     }
 }
