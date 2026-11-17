@@ -118,9 +118,8 @@ mod tests {
     /// `sh -c script` in a session of its own, as a shell call runs, with `agent`'s marker.
     #[cfg(target_os = "linux")]
     fn shell_call(run: &Path, agent: &str, script: &str) -> tokio::process::Child {
-        let mut command = tokio::process::Command::new("sh");
+        let mut command = strands_agents::sandbox::session_command("sh");
         command.args(["-c", script]).env(SHELL_MARKER, marker(run, agent));
-        strands_agents::sandbox::detach_from_terminal(&mut command);
         command.spawn().unwrap()
     }
 

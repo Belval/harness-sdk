@@ -69,7 +69,7 @@ cedar-policy-mcp-schema-generator = { workspace = true, optional = true }
 mcp-tools-sdk = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
+nix = { workspace = true, features = ["process"] }
 process-wrap = { workspace = true }
 
 [dev-dependencies]

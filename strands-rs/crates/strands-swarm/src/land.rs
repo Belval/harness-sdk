@@ -15,7 +15,7 @@ use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
-use strands_agents::sandbox::detach_from_terminal;
+use strands_agents::sandbox::session_command;
 
 use crate::worktree::{git, git_in, same_subdir};
 
@@ -410,8 +410,8 @@ async fn check_passes(
     target_dir: &Path,
     log: Option<&std::fs::File>,
 ) -> Result<(), String> {
-    let mut command = tokio::process::Command::new("sh");
-    detach_from_terminal(&mut command)
+    let mut command = session_command("sh");
+    command
         .arg("-c")
         .arg(format!("exec 2>&1\n{check}"))
         .current_dir(dir)

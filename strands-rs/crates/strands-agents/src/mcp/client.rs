@@ -451,10 +451,17 @@ impl McpClient {
                 env,
                 cwd,
             } => {
-                let mut cmd = tokio::process::Command::new(command);
                 // Off the terminal: a server that opens `/dev/tty` (a login prompt, progress
                 // output) would otherwise draw over a full-screen UI.
-                crate::sandbox::detach_from_terminal(&mut cmd);
+                let path = env.get("PATH").map(std::ffi::OsStr::new);
+                let dir = cwd.as_deref().map(std::path::Path::new);
+                if !crate::sandbox::program_exists(std::ffi::OsStr::new(command), path, dir) {
+                    return Err(self.connect_error(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("{command}: command not found"),
+                    )));
+                }
+                let mut cmd = crate::sandbox::session_command(command);
                 cmd.args(args);
                 cmd.envs(env);
                 if let Some(cwd) = cwd {

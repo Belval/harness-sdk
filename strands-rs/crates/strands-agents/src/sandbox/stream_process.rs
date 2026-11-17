@@ -7,7 +7,7 @@
 //! command already running in a container or on a remote host keeps running, exactly as in TS.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -153,7 +153,24 @@ fn launch(
         });
     }
 
-    let mut cmd = Command::new(&spawn.program);
+    // Through `setsid`, a missing program would only show as the child's exit 127.
+    let path = spawn.env.as_ref().and_then(|env| env.get("PATH")).map(OsStr::new);
+    if !program_exists(&spawn.program, path, spawn.cwd.as_deref()) {
+        return match spawn.enoent_message {
+            Some(message) => Ok(Launched::Missing(ExecutionResult {
+                stderr: message.to_owned(),
+                exit_code: NOT_FOUND_EXIT_CODE,
+                ..ExecutionResult::default()
+            })),
+            None => Err(SandboxError::Other(format!(
+                "{}: {}",
+                spawn.program.to_string_lossy(),
+                std::io::Error::from(std::io::ErrorKind::NotFound)
+            ))),
+        };
+    }
+    // Own session and group, so the whole tree (not just the program) can be signalled.
+    let mut cmd = session_command(&spawn.program);
     cmd.args(&spawn.args)
         .stdin(if options.stdin.is_some() {
             Stdio::piped()
@@ -163,8 +180,6 @@ fn launch(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Own session and group, so the whole tree (not just the program) can be signalled.
-    detach_from_terminal(&mut cmd);
     if let Some(cwd) = &spawn.cwd {
         cmd.current_dir(cwd);
     }
@@ -377,6 +392,73 @@ impl Drop for GroupKill {
     }
 }
 
+/// A command that runs `program` in a new session, like [`detach_from_terminal`], but without
+/// forking this process: on Linux it execs through util-linux's (or busybox's) `setsid`, so std can
+/// still spawn it with `posix_spawn`.
+///
+/// A `pre_exec` hook (what [`detach_from_terminal`] installs) makes std `fork()` the whole
+/// process, which copies its page tables while holding its memory map lock: from a process with
+/// 2 GB resident that took ~160 ms per spawn and stalled every thread meanwhile, against ~2 ms for
+/// this command. `setsid` is spawned by absolute path, so an environment that sets `PATH` does not
+/// force the fork path either; the child is not a group leader, so `setsid` calls `setsid()` and
+/// execs `program` in place: the child's pid stays the session's and group's id.
+///
+/// A missing `program` makes the child exit 127 instead of failing the spawn; check with
+/// [`program_exists`] first where that matters. Where no `setsid` binary is found (and off
+/// Linux) this falls back to [`detach_from_terminal`].
+pub fn session_command(program: impl AsRef<OsStr>) -> Command {
+    #[cfg(target_os = "linux")]
+    if let Some(setsid) = setsid_binary() {
+        let mut command = Command::new(setsid);
+        command.arg("--").arg(program);
+        return command;
+    }
+    let mut command = Command::new(program);
+    detach_from_terminal(&mut command);
+    command
+}
+
+/// The `setsid` binary, looked up once.
+#[cfg(target_os = "linux")]
+fn setsid_binary() -> Option<&'static std::path::Path> {
+    static SETSID: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SETSID
+        .get_or_init(|| {
+            ["/usr/bin/setsid", "/bin/setsid"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|path| is_executable(path))
+        })
+        .as_deref()
+}
+
+/// Whether `program` would be found by `execvp` with `path` as `PATH` (this process's `PATH`
+/// when `None`) in the directory `cwd` (this process's when `None`): a name with a `/` is checked
+/// as a path, a bare name in each `PATH` directory.
+pub fn program_exists(program: &OsStr, path: Option<&OsStr>, cwd: Option<&std::path::Path>) -> bool {
+    let name = std::path::Path::new(program);
+    if program.as_encoded_bytes().contains(&b'/') {
+        return is_executable(&cwd.map_or_else(|| name.to_path_buf(), |cwd| cwd.join(name)));
+    }
+    let inherited = std::env::var_os("PATH");
+    let path = path
+        .or(inherited.as_deref())
+        .unwrap_or(OsStr::new("/bin:/usr/bin"));
+    std::env::split_paths(path).any(|dir| is_executable(&dir.join(name)))
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
 /// Start `command` in a new session (`setsid`): its own process group, led by the child, and no
 /// controlling terminal.
 ///
@@ -386,6 +468,9 @@ impl Drop for GroupKill {
 /// call; in a session of its own, opening `/dev/tty` fails, so such a program errors out at once.
 /// Signal the whole tree with `killpg(child pid)`. Do not also set `process_group`: a group
 /// leader cannot start a session. A no-op off Unix.
+///
+/// This installs a `pre_exec` hook, which forces std to `fork()` the whole process; prefer
+/// [`session_command`], which does not.
 pub fn detach_from_terminal(command: &mut Command) -> &mut Command {
     #[cfg(unix)]
     {
@@ -400,10 +485,37 @@ pub fn detach_from_terminal(command: &mut Command) -> &mut Command {
 /// SIGKILL the whole process group led by `pid`; children of the command die with it.
 #[cfg(unix)]
 fn kill_group(pid: Option<u32>) {
-    let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
-        return;
+    if let Some(pid) = pid {
+        signal_session(pid, nix::sys::signal::SIGKILL);
+    }
+}
+
+/// Send `signal` to the session (process group) led by `leader`, a child started by
+/// [`session_command`]; whether it reached any process.
+///
+/// Right after the spawn the child may not have called `setsid()` yet, so there is no group to
+/// signal: it is then still in this process's group and is signalled alone (nothing it starts
+/// exists yet), and the group once more in case it formed meanwhile. A `leader` that is neither a
+/// group leader nor in this process's group (a reused pid) is left alone.
+#[cfg(unix)]
+pub fn signal_session(leader: u32, signal: nix::sys::signal::Signal) -> bool {
+    use nix::sys::signal::{kill, killpg};
+    use nix::unistd::{getpgid, getpgrp, Pid};
+    let Some(pid) = i32::try_from(leader)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .map(Pid::from_raw)
+    else {
+        return false;
     };
-    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGKILL);
+    if killpg(pid, signal).is_ok() {
+        return true;
+    }
+    if getpgid(Some(pid)) != Ok(getpgrp()) {
+        return false;
+    }
+    let alone = kill(pid, signal).is_ok();
+    killpg(pid, signal).is_ok() || alone
 }
 
 #[cfg(not(unix))]
@@ -457,6 +569,76 @@ mod tests {
         assert_eq!(ids, [ids[0]; 3], "pid, group and session: {ids:?}");
         assert_ne!(ids[0], std::process::id().to_string());
         assert_eq!(lines.next(), Some("no tty"));
+    }
+
+    /// A program named by absolute path keeps `posix_spawn` even when the command's environment
+    /// sets `PATH` (std forks for a bare name then), and the session holds with a `PATH` override.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_session_command_needs_no_fork() {
+        let command = session_command("sh");
+        let program = std::path::Path::new(command.as_std().get_program());
+        assert!(program.is_absolute(), "{}", program.display());
+        let env = HashMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]);
+        let script =
+            "read -r pid comm state ppid group session rest < /proc/$$/stat; echo \"$pid $group $session\"";
+        let result = run(sh(script).env(Some(env)), ExecuteOptions::default())
+            .await
+            .unwrap();
+        let ids: Vec<&str> = result.stdout.trim().split(' ').collect();
+        assert_eq!(ids, [ids[0]; 3], "pid, group and session: {ids:?}");
+    }
+
+    #[test]
+    fn program_exists_searches_path_and_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        let path = Some(dir.path().as_os_str());
+        assert!(!program_exists(OsStr::new("tool"), path, None), "not executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(program_exists(OsStr::new("tool"), path, None));
+            assert!(!program_exists(
+                OsStr::new("tool"),
+                Some(OsStr::new("/nonexistent")),
+                None
+            ));
+            assert!(program_exists(OsStr::new("./tool"), None, Some(dir.path())));
+            assert!(program_exists(tool.as_os_str(), Some(OsStr::new("")), None));
+        }
+    }
+
+    /// A session signalled right after the spawn, before the child may have called `setsid()`,
+    /// still dies with everything it started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_signalled_at_once_dies() {
+        for _ in 0..20 {
+            let mut child = session_command("sh")
+                .args(["-c", "sleep 30 & wait"])
+                .spawn()
+                .unwrap();
+            assert!(signal_session(child.id().unwrap(), nix::sys::signal::SIGKILL));
+            let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            assert!(status.unwrap().unwrap().code().is_none(), "killed by the signal");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_program_fails_by_name() {
+        let error = run(
+            Spawn::new("strands_nonexistent_binary_xyz", [""; 0]),
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("strands_nonexistent_binary_xyz"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

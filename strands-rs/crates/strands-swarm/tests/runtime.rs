@@ -1977,11 +1977,10 @@ async fn a_crash_while_a_worktree_is_created_does_not_hand_its_id_to_the_next_sp
 /// `sh -c "sleep 30; true"` in a session of its own, as a shell call runs, marked as `marker`'s.
 #[cfg(target_os = "linux")]
 fn marked_shell_call(marker: &str) -> tokio::process::Child {
-    let mut command = tokio::process::Command::new("sh");
+    let mut command = strands_agents::sandbox::session_command("sh");
     command
         .args(["-c", "sleep 30; true"])
         .env(strands_swarm::orphans::SHELL_MARKER, marker);
-    strands_agents::sandbox::detach_from_terminal(&mut command);
     command.spawn().unwrap()
 }
 

@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
-use strands_agents::sandbox::detach_from_terminal;
+use strands_agents::sandbox::session_command;
 use strands_agents::{Error, Result};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -178,7 +178,7 @@ impl Jobs {
         let _guard = self.start.lock().await;
         tokio::fs::create_dir_all(&self.dir).await?;
         let id = self.next_id().await?;
-        let mut child = quiet(detach_from_terminal(&mut tokio::process::Command::new("sh")))
+        let mut child = quiet(&mut session_command("sh"))
             .arg("-c")
             .arg(WRAPPER)
             .arg("job")
@@ -480,9 +480,11 @@ fn alive(pid: u32) -> bool {
     positive(pid).is_some_and(|pid| nix::sys::signal::kill(pid, None).is_ok())
 }
 
-/// Send `signal` to the process group led by `leader`; whether it went to any process.
+/// Send `signal` to the process group led by `leader`; whether it went to any process. A child
+/// spawned a moment ago may not lead its group yet, which
+/// [`strands_agents::sandbox::signal_session`] handles.
 pub(crate) fn signal_group(leader: u32, signal: Signal) -> bool {
-    positive(leader).is_some_and(|group| nix::sys::signal::killpg(group, signal).is_ok())
+    strands_agents::sandbox::signal_session(leader, signal)
 }
 
 /// `pid` as a [`Pid`], if it names one process (`0` and the negative ones name groups).

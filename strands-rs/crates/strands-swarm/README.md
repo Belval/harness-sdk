@@ -485,6 +485,10 @@ messages you.
 - **Terminal.** Every child the swarm starts (shell commands, jobs, git, land gates, MCP servers)
   runs in a session of its own, without a controlling terminal. Nothing it writes to `/dev/tty`
   reaches the TUI, and a prompt (git credentials, an ssh host key) fails at once instead of hanging.
+  On Linux each is started through util-linux's `setsid` (by absolute path) rather than a
+  `pre_exec` hook, so std spawns it with `posix_spawn` instead of `fork()`ing the whole swarm: from
+  a process with 2 GB resident a fork took ~160 ms and stalled every thread (the TUI too), a
+  spawn through `setsid` ~2 ms. Without a `setsid` binary it falls back to the hook.
 - **Disk.**
   - Once a cancelled worktree agent and its subtree have stopped (or on resume), its private target
     dir is deleted.
