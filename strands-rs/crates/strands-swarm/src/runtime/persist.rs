@@ -262,6 +262,20 @@ impl Swarm {
             }
         });
     }
+
+    /// [`Swarm::persist`], returning once the state is on disk.
+    pub(super) async fn persist_now(&self) {
+        let Some(persister) = self.inner.persister.clone() else {
+            return;
+        };
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Err(error) = persister.write(generation, &self.snapshot()).await {
+            tracing::warn!(%error, "state save failed");
+        }
+    }
 }
 
 /// Write `value` as JSON to `path` through a temporary file and a rename, so a crash leaves the

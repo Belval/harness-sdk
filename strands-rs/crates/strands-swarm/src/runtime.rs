@@ -809,6 +809,9 @@ impl Swarm {
             .map_or_else(|| self.inner.config.cwd.clone(), |node| node.cwd.clone());
         let (cwd, branch, env) = match request.worktree {
             true => {
+                // Saved first: a crash after `git worktree add` must not hand the id, and with it
+                // the worktree's path and branch, to the next spawn, which would then fail.
+                self.persist_now().await;
                 let created = worktree::create(&base_cwd, &self.inner.config.run_id, &id).await?;
                 (created.cwd, Some(created.branch), self.worktree_env(&id))
             }

@@ -1415,6 +1415,42 @@ async fn mail_folded_into_a_turn_a_failed_call_left_open_survives_a_hard_crash()
     resumed.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_crash_while_a_worktree_is_created_does_not_hand_its_id_to_the_next_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[]);
+    let state_dir = dir.path().join("run");
+    // `git worktree add` runs post-checkout in the new worktree: the moment to look at the disk.
+    let hook = repo.join(".git/hooks/post-checkout");
+    let at_checkout = dir.path().join("at-checkout.json");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncp '{}' '{}'\n",
+            state_dir.join("swarm.json").display(),
+            at_checkout.display()
+        ),
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&hook)
+        .status()
+        .unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("ok")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
+    config.state_dir = Some(state_dir);
+    let (swarm, _events) = Swarm::new(config);
+    let request = SpawnRequest {
+        task: "t".into(),
+        worktree: true,
+        ..Default::default()
+    };
+    assert_eq!(swarm.spawn(USER, request).await.unwrap(), "a1");
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&at_checkout).unwrap()).unwrap();
+    assert_eq!(saved["next_id"], 2, "a1 was taken before its worktree existed");
+    swarm.shutdown().await;
+}
 /// The system prompt and tool specs an agent sends, serialized: the prompt cache is keyed on these
 /// bytes, so a resumed agent must send exactly what it sent before the restart.
 fn request_prefix(model: &MockMessageModel, call: usize) -> String {
