@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// How often a `wait` re-checks whether it can still get mail ([`Swarm::stalled_on_queue`]).
+const GIVE_UP_RECHECK: Duration = Duration::from_secs(1);
+
 impl Swarm {
     /// Post `text` from `from` to `to`'s mailbox. `to` may be [`USER`].
     pub fn send(&self, from: &str, to: &str, text: impl Into<String>) -> Result<()> {
@@ -58,10 +61,14 @@ impl Swarm {
 
     /// Like [`Swarm::wait_for_mail`], for the `wait` tool: also ends, with a notice, once no mail
     /// can come any more because every agent in `from` (or, without `from`, every agent `id`
-    /// spawned) is cancelled.
+    /// spawned) is cancelled, or none can come until the waiter frees a slot for them.
     pub async fn wait(&self, id: &str, from: &[String], cancel: &CancellationToken) -> WaitOutcome {
-        self.wait_until(id, from, cancel, |swarm, node| swarm.unreachable(node, from))
-            .await
+        let give_up = |swarm: &Self, node: &Node| {
+            swarm
+                .unreachable(node, from)
+                .or_else(|| swarm.stalled_on_queue(node, from))
+        };
+        self.wait_until(id, from, cancel, give_up).await
     }
 
     /// Whether `id` has unread mail from one of `from` (from anyone when empty).
@@ -89,6 +96,8 @@ impl Swarm {
             }
             tokio::select! {
                 _ = notified => {}
+                // Other agents' status changes (one going idle) notify no waiter.
+                _ = tokio::time::sleep(GIVE_UP_RECHECK) => {}
                 _ = cancel.cancelled() => return WaitOutcome::Cancelled,
                 _ = node.cancel.cancelled() => return WaitOutcome::Cancelled,
             }
@@ -123,6 +132,55 @@ impl Swarm {
                     .map_or(id.clone(), |n| format!("{} ({id})", n.name)))
                 .collect::<Vec<_>>()
                 .join(", ")
+        ))
+    }
+
+    /// Why `node` cannot get mail from `from` (without `from`, its children) until it acts: every
+    /// one still live is queued at the agent limit, which only a cancel frees, and no other agent
+    /// is running (or has mail to run on) that could cancel one.
+    pub(super) fn stalled_on_queue(&self, node: &Node, from: &[String]) -> Option<String> {
+        let (limit, scheduled) = (self.max_agents(), self.scheduled_targets());
+        let agents = self.inner.agents.lock();
+        let awaited: Vec<&Arc<Node>> = match from.is_empty() {
+            true => agents.values().filter(|n| n.parent == node.id).collect(),
+            // The user and job reports can come at any time.
+            false => from.iter().map(|id| agents.get(id)).collect::<Option<_>>()?,
+        };
+        let mut queued = Vec::new();
+        for other in awaited {
+            match other.status.lock().clone() {
+                AgentStatus::Queued => queued.push(format!("{} ({})", other.name, other.id)),
+                AgentStatus::Cancelled => {}
+                _ => return None,
+            }
+        }
+        let mut holding = Vec::new();
+        for other in agents.values().filter(|n| n.id != node.id) {
+            let status = other.status.lock().clone();
+            match status {
+                AgentStatus::Running | AgentStatus::Starting => return None,
+                AgentStatus::Idle | AgentStatus::Errored(_) if !other.mailbox.lock().is_empty() => {
+                    return None
+                }
+                AgentStatus::Idle | AgentStatus::Errored(_) if !scheduled.contains(&other.id) => {
+                    holding.push(format!("{} ({})", other.name, other.id))
+                }
+                _ => {}
+            }
+        }
+        if queued.is_empty() {
+            return None;
+        }
+        let holding = match holding.is_empty() {
+            true => String::new(),
+            false => format!(" Idle agents holding slots: {}.", holding.join(", ")),
+        };
+        Some(format!(
+            "No messages will come yet: {} queued at the agent limit ({limit}). A queued agent \
+             starts only once a live one is cancelled, and no other agent is running to do that.\
+             {holding} Cancel agents you are done with (or ask the user to raise /max-agents), \
+             then wait again.",
+            queued.join(", "),
         ))
     }
 

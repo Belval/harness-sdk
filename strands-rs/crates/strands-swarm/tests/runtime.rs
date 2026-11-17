@@ -797,6 +797,45 @@ async fn wait_returns_at_once_when_the_awaited_agents_are_cancelled() {
 }
 
 #[tokio::test]
+async fn wait_returns_when_the_awaited_agents_are_queued_behind_idle_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let wait_all = tool_call(
+        "wait",
+        "w1",
+        json!({"from": ["two", "three"], "all": true, "timeout_seconds": 600}),
+    );
+    let scripts = scripts_of(vec![
+        (
+            "a1",
+            vec![
+                tool_call("spawn_agent", "t1", json!({"task": "two", "name": "two"})),
+                tool_call("spawn_agent", "t2", json!({"task": "three", "name": "three"})),
+                wait_all,
+                say("done"),
+            ],
+        ),
+        ("a2", vec![say("two done")]),
+        ("a3", vec![say("three done")]),
+    ]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.max_agents = 2;
+    let (swarm, mut events) = Swarm::new(config);
+
+    spawn_root(&swarm, "one").await;
+    // Only a1 could free a slot for `three`, and it is the one waiting.
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let a1 = scripts.lock()["a1"].clone();
+    let waited = sent_text(&a1, 3);
+    assert!(waited.contains("two done"), "{waited}");
+    assert!(
+        waited.contains("three (a3) queued at the agent limit (2)")
+            && waited.contains("Idle agents holding slots: two (a2)."),
+        "{waited}"
+    );
+    assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Queued);
+}
+
+#[tokio::test]
 async fn wait_without_from_returns_once_every_child_is_cancelled() {
     let dir = tempfile::tempdir().unwrap();
     let (swarm, mut events, scripts) = swarm_with(

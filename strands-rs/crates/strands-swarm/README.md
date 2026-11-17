@@ -124,6 +124,8 @@ TASK or `--goal`.
 - **Agents.** `--max-agents N` (16) caps live agents.
   - Spawns beyond the cap are `queued` and start oldest first as slots free.
   - A queued agent can already be messaged; cancelling it drops it.
+  - A `wait` for queued agents returns at once, naming the idle agents that hold slots, when no
+    other agent is running that could cancel one: only the waiter can free a slot for them.
   - An idle agent that is only waiting on a schedule holds no slot.
   - `/max-agents N` changes the cap for the running swarm and is kept across restarts.
     `/max-agents default` returns to the flag.
