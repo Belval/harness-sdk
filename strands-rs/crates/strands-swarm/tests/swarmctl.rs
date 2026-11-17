@@ -183,3 +183,65 @@ exit 75"#;
         run.read("supervisor.notice")
     );
 }
+
+/// `swarmctl start` under a custom `XDG_STATE_HOME` while a tmux server without it is already
+/// running: the supervisor and the swarm still find the run there.
+#[test]
+fn a_custom_state_home_reaches_the_supervisor_through_a_running_tmux_server() {
+    let tmux_works = std::process::Command::new("tmux").arg("-V").output();
+    if !tmux_works.is_ok_and(|output| output.status.success()) {
+        eprintln!("skipped: no tmux");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let sockets = tmp.path().join("tmux");
+    std::fs::create_dir_all(&sockets).unwrap();
+    let tmux = |args: &[&str]| {
+        std::process::Command::new("tmux")
+            .args(args)
+            .env("TMUX_TMPDIR", &sockets)
+            .env("HOME", tmp.path())
+            .env_remove("TMUX")
+            .env_remove("XDG_STATE_HOME")
+            .status()
+            .unwrap()
+    };
+    assert!(tmux(&["new-session", "-d", "-s", "other", "sleep 60"]).success());
+    let seen = tmp.path().join("seen");
+    let binary = tmp.path().join("fake-swarm");
+    let body = format!(
+        "#!/bin/sh\necho \"$XDG_STATE_HOME $*\" > '{}'\ntouch \"$XDG_STATE_HOME/strands-swarm/r/stop\"\n",
+        seen.display()
+    );
+    std::fs::write(&binary, body).unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&binary)
+        .status()
+        .unwrap();
+
+    let started = std::process::Command::new("bash")
+        .arg(SCRIPT)
+        .args(["start", "r"])
+        .arg(&binary)
+        .arg("--headless")
+        .env("XDG_STATE_HOME", &state)
+        .env("TMUX_TMPDIR", &sockets)
+        .env("HOME", tmp.path())
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !seen.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let shown = std::fs::read_to_string(&seen).unwrap_or_default();
+    tmux(&["kill-server"]);
+    assert!(started.status.success(), "{started:?}");
+    assert_eq!(
+        shown.trim(),
+        format!("{} --run r --headless", state.display()),
+        "the supervisor never ran the binary under the custom state home"
+    );
+}

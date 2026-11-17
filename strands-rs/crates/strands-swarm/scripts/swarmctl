@@ -9,7 +9,8 @@
 # `swarmctl stop` ends it.
 set -euo pipefail
 
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/strands-swarm"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE="$STATE_HOME/strands-swarm"
 SELF="$(readlink -f "$0")"
 RELOAD_EXIT=75
 # A binary installed (or reloaded into) less than this many seconds ago is rolled back on failure.
@@ -63,7 +64,7 @@ start() {
   mv "$dir/bin/current.new" "$dir/bin/current"
   printf '%s\0' "$@" > "$dir/args"
   # Keep the environment the swarm needs (credentials config, PATH for MCP servers) across reboots.
-  { export -p | grep -E '^declare -x (PATH|HOME|USER|LANG|TERM|AWS_[A-Z_]*|CARGO_[A-Z_]*|RUSTUP_[A-Z_]*|QUICK_EVALS_[A-Z_]*|SSH_AUTH_SOCK)='; } > "$dir/env" || true
+  { export -p | grep -E '^declare -x (PATH|HOME|USER|LANG|TERM|XDG_CONFIG_HOME|AWS_[A-Z_]*|CARGO_[A-Z_]*|RUSTUP_[A-Z_]*|QUICK_EVALS_[A-Z_]*|SSH_AUTH_SOCK)='; } > "$dir/env" || true
   chmod 600 "$dir/env"
   resume "$run"
 }
@@ -73,7 +74,10 @@ resume() {
   [[ -x "$dir/bin/current" ]] || die "no binary for run $run; use swarmctl start"
   running "$run" && die "run $run is already running"
   rm -f "$dir/stop"
-  tmux new-session -d -s "$(session "$run")" -x 220 -y 60 "$SELF supervise $run"
+  # A tmux server that is already running has its own environment, so the state home is passed on
+  # (the supervisor and the swarm both find the run under it).
+  tmux new-session -d -s "$(session "$run")" -x 220 -y 60 -e "XDG_STATE_HOME=$STATE_HOME" \
+    "$SELF supervise $run"
   echo "run $run started: swarmctl attach $run"
 }
 
@@ -176,14 +180,17 @@ status() {
 # The current crontab minus `line`; empty (not an error) when there is no crontab yet.
 crontab_without() { { crontab -l 2>/dev/null || true; } | { grep -vF "$1" || true; }; }
 
+# The crontab line that resumes run $1, under the custom state home if one is set.
+boot_line() { echo "@reboot ${XDG_STATE_HOME:+XDG_STATE_HOME=$XDG_STATE_HOME }$SELF resume $1"; }
+
 boot() {
-  local line="@reboot $SELF resume $1"
+  local line; line="$(boot_line "$1")"
   { crontab_without "$line"; echo "$line"; } | crontab -
   echo "run $1 will resume after reboot"
 }
 
 unboot() {
-  local line="@reboot $SELF resume $1"
+  local line; line="$(boot_line "$1")"
   crontab_without "$line" | crontab -
 }
 
