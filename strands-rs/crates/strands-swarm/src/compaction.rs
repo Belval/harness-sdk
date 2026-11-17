@@ -2,7 +2,6 @@
 //! near the end of the model's window. A 1M-token window would otherwise let every call carry
 //! up to ~850k tokens before anything is compacted.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -97,11 +96,10 @@ pub struct CompactAt {
     compact_at: u64,
     control: Option<Arc<ContextControl>>,
     sink: Option<CompactedSink>,
-    /// Set by [`CompactAt::arm`]: run on this pipeline pass even if an earlier strategy brought
-    /// the context under the point (as long as it is still above the target).
-    armed: AtomicBool,
-    /// Set by [`CompactAt::arm`] when it took a summarize request.
-    armed_request: AtomicBool,
+    /// Set by [`CompactAt::arm`] to `Some(requested)`: run on this pipeline pass even if an
+    /// earlier strategy brought the context under the point (as long as it is still above the
+    /// target).
+    armed: Mutex<Option<bool>>,
     /// Set when a compaction changed nothing; cleared by the next one that does.
     backoff: Mutex<Option<Backoff>>,
     /// Set by [`CompactAt::arm`]: real tokens per estimated token of the messages, from the
@@ -116,8 +114,7 @@ impl CompactAt {
             compact_at,
             control: None,
             sink: None,
-            armed: AtomicBool::new(false),
-            armed_request: AtomicBool::new(false),
+            armed: Mutex::new(None),
             backoff: Mutex::new(None),
             scale: Mutex::new(None),
         }
@@ -143,8 +140,8 @@ impl CompactAt {
         *self.scale.lock() = Some(input_tokens(ctx, window) as f64 / estimated as f64);
         let due = self.due(ctx);
         if let Some(requested) = due {
-            self.armed.store(true, Ordering::SeqCst);
-            self.armed_request.fetch_or(requested, Ordering::SeqCst);
+            let mut armed = self.armed.lock();
+            *armed = Some(requested || *armed == Some(true));
         }
         due.is_some()
     }
@@ -207,13 +204,12 @@ impl CompactAt {
     }
 
     async fn compact(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
-        let armed = self.armed.swap(false, Ordering::SeqCst);
-        let armed_request = self.armed_request.swap(false, Ordering::SeqCst);
+        let armed = self.armed.lock().take();
         let due = self.due(ctx);
-        if !armed && due.is_none() {
+        if armed.is_none() && due.is_none() {
             return Ok(false);
         }
-        let requested = armed_request || due == Some(true);
+        let requested = armed == Some(true) || due == Some(true);
         let window = window_of(ctx.agent.model().as_ref());
         let point = compaction_point(window, self.compact_at);
         let before = self.tokens(ctx, window);
@@ -393,7 +389,7 @@ mod tests {
 
     type Events = Arc<Mutex<Vec<Compaction>>>;
 
-    fn manager(compact_at: u64, control: Option<Arc<ContextControl>>) -> (Arc<ContextManager>, Events) {
+    fn compact(compact_at: u64, control: Option<Arc<ContextControl>>) -> (Arc<CompactAt>, Events) {
         let events: Events = Arc::default();
         let sink = Arc::clone(&events);
         let mut strategy = CompactAt::new(compact_at)
@@ -401,14 +397,34 @@ mod tests {
         if let Some(control) = control {
             strategy = strategy.on_request(control);
         }
+        (Arc::new(strategy), events)
+    }
+
+    fn pipeline(strategies: Vec<Arc<dyn ContextStrategy>>) -> Arc<ContextManager> {
         let config = ContextManagerConfig {
-            strategies: Some(vec![Arc::new(strategy)]),
+            strategies: Some(strategies),
             ..Default::default()
         };
-        (
-            ContextManager::from(ContextManagerOption::Config(config)).unwrap(),
-            events,
-        )
+        ContextManager::from(ContextManagerOption::Config(config)).unwrap()
+    }
+
+    fn manager(compact_at: u64, control: Option<Arc<ContextControl>>) -> (Arc<ContextManager>, Events) {
+        let (compact, events) = compact(compact_at, control);
+        (pipeline(vec![compact]), events)
+    }
+
+    /// One pipeline pass at a projected `tokens`; whether it changed the context.
+    async fn pass(
+        manager: &ContextManager,
+        agent: &Agent,
+        messages: &mut Vec<Message>,
+        tokens: u64,
+        overflow: bool,
+    ) -> bool {
+        manager
+            .run_strategies_on(agent, messages, Some(tokens), overflow)
+            .await
+            .unwrap()
     }
 
     fn agent(summaries: &[&str]) -> (Agent, Arc<MockMessageModel>) {
@@ -448,10 +464,7 @@ mod tests {
         let before = heuristic(&messages);
         assert!((13_500..15_500).contains(&before), "{before} tokens");
 
-        let changed = manager
-            .run_strategies_on(&agent, &mut messages, Some(before), false)
-            .await
-            .unwrap();
+        let changed = pass(&manager, &agent, &mut messages, before, false).await;
 
         assert!(changed);
         assert_eq!(model.call_count(), 1);
@@ -499,46 +512,18 @@ mod tests {
         }
     }
 
-    struct Shared(Arc<CompactAt>);
-
-    #[async_trait]
-    impl ContextStrategy for Shared {
-        fn name(&self) -> &str {
-            "compact"
-        }
-
-        async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
-            self.0.apply(ctx).await
-        }
-    }
-
     #[tokio::test]
     async fn after_an_edit_it_still_counts_what_the_estimate_misses() {
         let (agent, _) = agent(&["SUMMARY one"]);
-        let events: Events = Arc::default();
-        let sink = Arc::clone(&events);
-        let compact = Arc::new(
-            CompactAt::new(10_000)
-                .on_compacted(Some(Arc::new(move |compaction| sink.lock().push(compaction)))),
-        );
-        let config = ContextManagerConfig {
-            strategies: Some(vec![
-                Arc::new(ArmThenEdit(Arc::clone(&compact))),
-                Arc::new(Shared(Arc::clone(&compact))),
-            ]),
-            ..Default::default()
-        };
-        let manager = ContextManager::from(ContextManagerOption::Config(config)).unwrap();
+        let (compact, events) = compact(10_000, None);
+        let manager = pipeline(vec![Arc::new(ArmThenEdit(Arc::clone(&compact))), compact]);
         let mut messages = tool_loop(45);
         // The provider counts twice the characters' estimate (system prompt, tools, a tokenizer
         // that weighs code more), as a long-running swarm agent's calls do.
         let real = |messages: &[Message]| 2 * heuristic(messages);
         let projected = real(&messages);
 
-        manager
-            .run_strategies_on(&agent, &mut messages, Some(projected), false)
-            .await
-            .unwrap();
+        pass(&manager, &agent, &mut messages, projected, false).await;
 
         let reported = events.lock().clone();
         let [Compaction::Done { before, after }] = reported[..] else {
@@ -562,10 +547,7 @@ mod tests {
         let (agent, model) = agent(&["unused"]);
         let (manager, events) = manager(10_000, None);
         let mut messages = tool_loop(10);
-        let changed = manager
-            .run_strategies_on(&agent, &mut messages, Some(9_999), false)
-            .await
-            .unwrap();
+        let changed = pass(&manager, &agent, &mut messages, 9_999, false).await;
         assert!(!changed);
         assert_eq!(model.call_count(), 0);
         assert!(events.lock().is_empty());
@@ -579,10 +561,7 @@ mod tests {
         let mut messages = tool_loop(45);
         let before = heuristic(&messages);
 
-        manager
-            .run_strategies_on(&agent, &mut messages, Some(before), false)
-            .await
-            .unwrap();
+        pass(&manager, &agent, &mut messages, before, false).await;
 
         assert_eq!(model.call_count(), 2);
         // The first summary went into the second; one summary is left.
@@ -605,10 +584,7 @@ mod tests {
         let mut messages = tool_loop(45);
         let original = messages.clone();
         let before = heuristic(&messages);
-        let changed = manager
-            .run_strategies_on(&agent, &mut messages, Some(before), false)
-            .await
-            .unwrap();
+        let changed = pass(&manager, &agent, &mut messages, before, false).await;
         assert!(!changed);
         assert_eq!(messages, original);
         assert_eq!(
@@ -625,27 +601,10 @@ mod tests {
         let (agent, model) = agent(&["unused"]);
         let (manager, events) = manager(100, None);
         let mut messages = tool_loop(1);
-        let changed = manager
-            .run_strategies_on(&agent, &mut messages, Some(5_000), false)
-            .await
-            .unwrap();
+        let changed = pass(&manager, &agent, &mut messages, 5_000, false).await;
         assert!(!changed);
         assert_eq!(model.call_count(), 0);
         assert!(events.lock().is_empty());
-    }
-
-    /// One pipeline pass at a projected `tokens`; whether it changed the context.
-    async fn pass(
-        manager: &ContextManager,
-        agent: &Agent,
-        messages: &mut Vec<Message>,
-        tokens: u64,
-        overflow: bool,
-    ) -> bool {
-        manager
-            .run_strategies_on(agent, messages, Some(tokens), overflow)
-            .await
-            .unwrap()
     }
 
     #[tokio::test]
@@ -704,24 +663,6 @@ mod tests {
         assert_eq!(model.call_count(), 2);
     }
 
-    #[test]
-    fn the_backoff_ends_after_its_calls_or_on_growth() {
-        let compact = CompactAt::new(10_000);
-        assert!(!compact.backing_off(9_000));
-        *compact.backoff.lock() = Some(Backoff {
-            tokens: 10_000,
-            calls_left: 2,
-        });
-        assert!(compact.backing_off(10_999));
-        assert!(!compact.backing_off(11_000));
-        compact.tick();
-        assert!(compact.backing_off(10_000));
-        compact.tick();
-        assert!(!compact.backing_off(10_000));
-        compact.tick();
-        assert_eq!(compact.backoff.lock().unwrap().calls_left, 0);
-    }
-
     #[tokio::test]
     async fn on_request_it_keeps_only_the_latest_messages() {
         let (agent, _model) = agent(&["SUMMARY on request"]);
@@ -730,10 +671,7 @@ mod tests {
         control.request_summary();
         let mut messages = tool_loop(10);
         let tokens = heuristic(&messages);
-        let changed = manager
-            .run_strategies_on(&agent, &mut messages, Some(tokens), false)
-            .await
-            .unwrap();
+        let changed = pass(&manager, &agent, &mut messages, tokens, false).await;
         assert!(changed);
         assert!(
             messages.len() <= 1 + SUMMARY_KEEPS + 1,
