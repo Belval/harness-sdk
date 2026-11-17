@@ -7,11 +7,11 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | --- | --- |
 | `spawn_agent` | Start an agent on a task (optionally in its own git worktree, with a model or a goal). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
-| `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports); a user message always ends it. With `all`, until every agent in `from` has sent something; a timeout returns what came and who is still missing. |
+| `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports, which returns at once when none is pending); a user message always ends it. With `all`, until every agent in `from` has sent something; a timeout (default 10 min, at most an hour) returns what came and who is still missing. |
 | `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model and estimated spend. |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
-| `schedule` | Post a message to a mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
+| `schedule` | Post a message to a mailbox (default: your own) later and/or repeatedly (`every: "30m"`, at least a minute); list or cancel schedules. |
 | `run_background` | Run a shell command as a background job; its owner gets the exit code and last 40 output lines when it ends. |
 | `jobs` | List background jobs (status, log path), or kill one with everything it started. |
 | `context` | The agent's context dashboard: size against the compaction point, the biggest items, the stash; offload results or summarize now. |
@@ -43,14 +43,16 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
               [--journal | --gc | --cost] [TASK]
 ```
 
-`--run NAME` makes the run persistent under `~/.local/state/strands-swarm/NAME`: the agent tree,
-unread mail, schedules and every conversation (saved after each message). Starting again with the
-same name resumes it; a TASK given then is sent to the root agent as a message. With `--run`,
-`--journal`, `--gc` and `--cost` print a report on the saved run and exit.
+`--run NAME` makes the run persistent under `$XDG_STATE_HOME/strands-swarm/NAME` (default
+`~/.local/state`): the agent tree, unread mail, schedules and every conversation (saved after
+each message; see [Persistence](#persistence)). Starting again with the same name resumes it; a
+TASK given then is sent to the root agent as a message. With `--run`, `--journal`, `--gc` and
+`--cost` print a report on the saved run and exit.
 
-`--headless` prints events instead of the TUI and exits once the root has replied and no agent is
-busy (a resume without a task: once no agent is busy), with a non-zero status when that reply is an
-error.
+`--headless` prints events to stderr and messages to you to stdout instead of the TUI, and exits
+once the root has replied and no agent is busy (a resume without a task: once no agent is busy)
+or every agent has stopped, with a non-zero status when that reply is an error. A new run needs a
+TASK or `--goal`.
 
 ## Agents
 
@@ -179,8 +181,8 @@ error.
 - **Background jobs.**
   - Jobs run with `sh -c` in the agent's directory and environment, private `CARGO_TARGET_DIR`
     included. Each runs in a session of its own, so neither a reload nor Ctrl-C stops it.
-  - Each job is `<id>.json`, `<id>.log` and `<id>.exit` in `<run>/jobs` (a temp directory without
-    `--run`).
+  - Each job is `<id>.json`, `<id>.log`, `<id>.exit` and, once its owner was told, `<id>.reported`
+    in `<run>/jobs` (a temp directory without `--run`).
   - The swarm polls jobs and mails the owner when one ends, also for jobs started before a restart.
     A job whose process vanished without an exit code (a reboot) is reported as such.
   - A killed job is not reported. Cancelling an agent kills its whole subtree's jobs.
@@ -236,7 +238,7 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
 | `/to <agent> <message>` | Message an agent without selecting it. |
 | `/model [<id> \| default]` | Switch the selected agent's model from its next call on (saved with the run, `Swarm::set_model`). |
 | `/image <path> [text]` | Send the selected agent an image. |
-| `/stop` (or Esc twice) | Interrupt the selected agent's turn without cancelling it (`Swarm::interrupt`). |
+| `/stop` (or Esc twice on an empty input) | Interrupt the selected agent's turn without cancelling it (`Swarm::interrupt`). |
 | `/cancel` | Stop the selected agent and its subtree for good. |
 | `/status` | Each live agent's state, activity, todos, unmerged commits and merge outlook, jobs and schedules, without a model call. |
 | `/cost` | Estimated spend (see [Cost](#cost)). |
@@ -244,9 +246,9 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
 | `/schedules` | All schedules. |
 | `/gc` | Retry reclaiming the disk of cancelled worktree agents. |
-| `/quit` (or Ctrl-C) | Quit. |
+| `/quit` (`/q`, Ctrl-C) | Quit. |
 
-Typing text without a command messages the selected agent.
+Other text messages the selected agent, or starts a root agent when there is none.
 
 **Command details.**
 
@@ -278,7 +280,7 @@ Typing text without a command messages the selected agent.
 
 - Each agent is one line: status, name, model, input/output tokens and how close its last call
   came to the compaction point, e.g. `● parser opus-5-5 1.2M/34.0k 34% a3`.
-- Cancelled agents are hidden (the header counts them); F3 shows them.
+- Cancelled agents without a live descendant are hidden (the header counts them); F3 shows them.
 - Alt-←/→ narrows or widens the tree. Narrow it past its minimum to hide it.
 
 **Header.**
@@ -289,7 +291,7 @@ Typing text without a command messages the selected agent.
 **Input.**
 
 - The input box edits like a shell line: ←/→, Home/End (Ctrl-A/E), Ctrl-←/→ by word, Delete,
-  Ctrl-W/Ctrl-U (Alt-Backspace).
+  Ctrl-W/Ctrl-U (Alt-Backspace). Tab completes the highlighted command.
 - Alt-Enter (or Shift-Enter where reported) inserts a new line.
 - ↑/↓ go through sent messages while the input holds text (Ctrl-P/N from an empty one). On an
   empty input they select agents.
@@ -310,24 +312,31 @@ Typing text without a command messages the selected agent.
   agents included (F3 lists them).
 - Drag to select text in the log or tree. Releasing copies it with OSC 52, which works over ssh;
   tmux needs `set -g set-clipboard on`.
-- The wheel scrolls the log and Esc clears the highlight. Hold Shift (Option/Alt in iTerm2) for
-  the terminal's own selection.
+- The wheel and PgUp/PgDn scroll the log, End (on an empty input) jumps to its bottom, and Esc
+  clears the highlight. Hold Shift (Option/Alt in iTerm2) for the terminal's own selection.
 
-**Notifications.** `--notify` rings the bell when an agent messages you.
+**Notifications.** `--notify` rings the bell when an agent, the supervisor or the disk guard
+messages you.
 
 ## Persistence
 
+- **Run dir.** `swarm.json` (agent tree, statuses, unread mail, token counts, schedules, budget,
+  agent cap; replaced atomically), `sessions/` (each agent's conversation and context stash),
+  `jobs/`, `journal.jsonl`, `events.jsonl`, `swarm.log`, `logs/` (MCP servers), `mcp-tools.json`
+  and `bin/` (installed binaries). `swarmctl` adds `args`, `env`, `stderr.log`, `supervisor.log`,
+  `supervisor.notice` and the `stop` marker.
 - **Journal.**
   - A persistent run keeps `journal.jsonl` with every message to and from the user, and
-    `events.jsonl` with compact lifecycle events: spawns, status changes, tool calls, model
-    switches, compactions (`before`/`after` tokens) and failed ones, side calls (`side_call`:
-    purpose, model and tokens of each judge or summarizer call), resumes, reloads, shutdowns
-    and disk reclaimed.
+    `events.jsonl` with compact lifecycle events: spawns, status changes, tool calls and their
+    ends, model switches, compactions (`before`/`after` tokens) and failed ones, side calls
+    (`side_call`: purpose, model and tokens of each judge or summarizer call), keep-warm
+    refreshes, schedules, jobs, budget and agent-cap changes, resumes, reloads, version
+    `changes`, shutdowns and disk reclaimed (`gc`).
   - Both are JSON lines with a UTC `ts`, written by a background thread and rotated to `<file>.1`
     at 8 MB.
 - **Log.** Warnings and errors (or whatever `RUST_LOG` selects) go to `<run dir>/swarm.log` under
-  the TUI (a temp file without `--run`), and to stderr otherwise. When a process opens a log that
-  has grown past 8 MB, it is first moved to `swarm.log.1`.
+  the TUI (`$TMPDIR/strands-swarm-<pid>.log` without `--run`), and to stderr otherwise. When a
+  process opens a log that has grown past 8 MB, it is first moved to `swarm.log.1`.
 - **Terminal.** Every child the swarm starts (shell commands, jobs, git, land gates, MCP servers)
   runs in a session of its own, without a controlling terminal. Nothing it writes to `/dev/tty`
   reaches the TUI, and a prompt (git credentials, an ssh host key) fails at once instead of hanging.
@@ -355,12 +364,12 @@ Typing text without a command messages the selected agent.
     that points `CARGO_TARGET_DIR` somewhere else owns that dir and must clean it itself.
   - Every minute the swarm checks free space on the filesystems of the run dir, the agents'
     directories and the cargo target dirs. Below `--min-free-disk` (default `20G`, `0` turns it
-    off) it mails the live root agents once, from `disk`, with the free space and the biggest
-    per-agent target dirs; the TUI shows the first line in its footer. It warns again only after
-    the space has recovered to 10% above the threshold.
+    off) it mails the live root agents (or, with none, you) once, from `disk`, with the free space
+    and the biggest per-agent target dirs; the TUI shows the first line in its footer. It warns
+    again only after the space has recovered to 10% above the threshold.
 - **Memory.**
-  - One Markdown file is shared by every agent and run: `~/.config/strands-swarm/memory.md`, or
-    `--memory FILE`, or off with `--no-memory`.
+  - One Markdown file is shared by every agent and run: `$XDG_CONFIG_HOME/strands-swarm/memory.md`
+    (default `~/.config`), or `--memory FILE`, or off with `--no-memory`.
   - Entries are dated bullets, and the file can be edited by hand.
   - Its newest ~4k tokens are appended to every agent's system prompt, re-read at each turn's
     start.
@@ -379,8 +388,9 @@ Typing text without a command messages the selected agent.
     catalog and enables tools from the next call on. Enabled tools come back on resume.
   - `--mcp-eager` registers every tool on every agent, `--mcp-deny` hides tools by name, and
     `--list-tools` prints what is allowed and denied.
-  - Under the TUI a server's stderr goes to `<run dir>/logs/mcp-<server>.log`, rotated to
-    `<log>.1` at 4 MB; `--headless` keeps it on the terminal.
+  - Under the TUI a server's stderr goes to `<run dir>/logs/mcp-<server>.log`
+    (`$TMPDIR/strands-swarm-<pid>/` without `--run`), rotated to `<log>.1` at 4 MB; other modes
+    keep it on the terminal.
 - **Skills.**
   - Skills are `<name>/SKILL.md` files with `name` and `description` frontmatter, as in Claude Code
     and Codex. They are discovered at startup.
@@ -394,38 +404,41 @@ Typing text without a command messages the selected agent.
 
 ## Operate 24/7
 
-`scripts/swarmctl` keeps a run alive in tmux. It restarts the run on exit and restarts into the
-new binary on `reload_swarm`. The swarm's stderr goes to `<run dir>/stderr.log` and the
+`scripts/swarmctl` keeps a run alive in tmux. It restarts the run whenever it exits (after 5 s,
+`SWARMCTL_RESTART_DELAY`), a normal quit included, until `swarmctl stop`, and restarts into the
+new binary at once on `reload_swarm`. The swarm's stderr goes to `<run dir>/stderr.log` and the
 supervisor's notes to `supervisor.log`, each rotated to `<log>.1` at 8 MB (`SWARMCTL_LOG_MAX`).
 
 **Failures.**
 
 - A swarm that hangs exits instead, so the supervisor sees it: 70 when a deadlock is detected, 71
   when it is not up (first TUI frame drawn, or headless running) within 180 s.
-- A new binary is on trial for 10 minutes from its reload (or `swarmctl start`). If it fails
-  (non-zero exit, a signal, 70, 71) on trial, the supervisor puts the previous binary back and
-  keeps the failed one as `bin/failed`. A binary that ran longer is restarted, never rolled back,
-  and a rolled-back one is not rolled back again.
+- A new binary is on trial for 10 minutes (`SWARMCTL_TRIAL_WINDOW`) from its reload (or
+  `swarmctl start`). If it fails (non-zero exit, a signal, 70, 71) on trial, the supervisor puts
+  the previous binary back and keeps the failed one as `bin/failed`. A binary that ran longer is
+  restarted, never rolled back, and a rolled-back one is not rolled back again.
 - Quick failures in a row (each within 60 s of starting) back off from 5 s, doubling up to 5
   minutes. The tmux pane shows each failure with the tail of `stderr.log`, and `swarmctl status`
   the supervisor's last note.
-- A rollback, and the third quick failure in a row, are left in `<run dir>/supervisor.notice` with
-  the stderr tail. When the swarm next starts it mails the notice to its live root agents (from
-  `supervisor`, also shown in the footer) and deletes it.
+- A rollback, and a third failure in a row (the last two quick), are left in
+  `<run dir>/supervisor.notice` with the stderr tail. When the swarm next starts it mails the
+  notice to its live root agents (or you, with none; from `supervisor`, also shown in the footer)
+  and deletes it.
 
 ```sh
 swarmctl start NAME ./target/release/strands-swarm --cwd REPO --goal "..."   # start or resume
 swarmctl attach NAME        # open the TUI (detach: C-b d)
-swarmctl stop NAME          # graceful stop; state is kept
+swarmctl stop NAME          # graceful stop (the session is killed after 30 s); state is kept
 swarmctl resume NAME        # start again with the saved binary and arguments
-swarmctl boot NAME          # resume after every reboot (crontab @reboot)
+swarmctl boot NAME          # resume after every reboot (crontab @reboot); unboot NAME undoes it
 swarmctl status
 ```
 
 **Self-test.**
 
-- Before a reload installs a binary, `NEW --self-test <copy>` resumes a temporary copy of the run
-  directory on a stub model that answers `ok`.
+- Before a reload installs a binary, `NEW --version` must answer within 30 s, then
+  `NEW --self-test <copy>` resumes a temporary copy of the run directory on a stub model that
+  answers `ok`.
 - It messages every live agent and requires each to reply and every saved conversation to be
   restored within 20 s. It also renders the TUI into a test backend and checks the deadlock
   watchdog.
