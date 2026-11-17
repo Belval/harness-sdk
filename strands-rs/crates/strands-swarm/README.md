@@ -382,13 +382,27 @@ messages you.
   `jobs/`, `journal.jsonl`, `events.jsonl`, `swarm.log`, `logs/` (MCP servers), `mcp-tools.json`
   and `bin/` (installed binaries). `swarmctl` adds `args`, `env`, `stderr.log`, `supervisor.log`,
   `supervisor.notice` and the `stop` marker.
+- **Bounds.** A run dir grows with the live agents' work since the last resume and with unreported
+  jobs, not with the run's age:
+  - `journal.jsonl`, `events.jsonl` and `swarm.log` are rotated to `<file>.1` at 8 MB, so each
+    takes at most 16 MB.
+  - In `jobs/`, a running job's log is cut to its last 1 MB past 32 MB, and only the newest 200
+    reported jobs keep their files (see **Background jobs**).
+  - The stash (`sessions/<agent>/stash`) holds every tool result and text block of an agent's
+    conversation, for `retrieve_context`. A cancelled agent's goes once its last turn has ended
+    (or on resume). On each resume, before any agent runs, a live agent's entries are deleted
+    unless a file of its saved session (the conversation with its summaries, an open tool batch)
+    still names their id, so whatever the agent can still name stays retrievable. A session that
+    is missing or does not read as JSON keeps its whole stash. Each pruning is logged as
+    `stash_pruned` (`entries`, `bytes`).
+  - `mcp-tools.json` is rewritten only when a server lists different tools.
 - **Journal.**
   - A persistent run keeps `journal.jsonl` with every message to and from the user, and
     `events.jsonl` with compact lifecycle events: spawns, status changes, tool calls and their
     ends, model switches, compactions (`before`/`after` tokens) and failed ones, side calls
     (`side_call`: purpose, model and tokens of each judge or summarizer call), keep-warm
     refreshes, schedules, jobs, budget and agent-cap changes, resumes, reloads, version
-    `changes`, shutdowns and disk reclaimed (`gc`).
+    `changes`, shutdowns, disk reclaimed (`gc`) and stash entries pruned (`stash_pruned`).
   - Both are JSON lines with a UTC `ts`, written by a background thread and rotated to `<file>.1`
     at 8 MB.
 - **Log.** Warnings and errors (or whatever `RUST_LOG` selects) go to `<run dir>/swarm.log` under

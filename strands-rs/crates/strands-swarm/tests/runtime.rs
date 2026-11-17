@@ -809,6 +809,68 @@ async fn a_queued_agent_stays_queued_across_a_resume_until_there_is_room() {
 }
 
 #[tokio::test]
+async fn stashes_keep_only_what_a_live_agent_can_still_retrieve() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let sessions = state_dir.join("sessions");
+    let stash = |id: &str| sessions.join(id).join("stash");
+    for (id, keys) in [
+        ("a1", &["tooluse_kept_0", "tooluse_gone_0"][..]),
+        ("a2", &["tooluse_x_0"][..]),
+        ("a3", &["tooluse_y_0"][..]),
+    ] {
+        std::fs::create_dir_all(stash(id)).unwrap();
+        for key in keys {
+            std::fs::write(stash(id).join(key), "{}").unwrap();
+        }
+    }
+    // a1's saved conversation names only one of its entries; a3 has none saved.
+    let snapshot = sessions.join("a1/scopes/agent/a1/snapshots/snapshot_latest.json");
+    std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+    let conversation =
+        json!({"data": {"messages": [{"role": "user", "content": [{"text": "[ref: tooluse_kept_0]"}]}]}});
+    std::fs::write(&snapshot, conversation.to_string()).unwrap();
+    let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({
+        "run_id": "old",
+        "cwd": dir.path(),
+        "next_id": 4,
+        "agents": [
+            {"id": "a1", "parent": "user", "cwd": dir.path(), "branch": null, "task": "one",
+             "model": null, "goal": null, "status": "idle", "mailbox": []},
+            {"id": "a2", "parent": "a1", "cwd": dir.path(), "branch": null, "task": "two",
+             "model": null, "goal": null, "status": "cancelled", "mailbox": []},
+            {"id": "a3", "parent": "a1", "cwd": dir.path(), "branch": null, "task": "three",
+             "model": null, "goal": null, "status": "idle", "mailbox": []},
+        ],
+    }))
+    .unwrap();
+    let map = scripts_of(vec![("a1", vec![say("ok")]), ("a3", vec![say("ok")])]);
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, _events) = Swarm::resume(config, saved).await.unwrap();
+    let keys = |id: &str| -> Vec<String> {
+        let mut keys: Vec<String> = std::fs::read_dir(stash(id))
+            .map(|dir| {
+                dir.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    };
+    assert_eq!(keys("a1"), ["tooluse_kept_0"], "the unnamed entry is pruned");
+    assert!(!stash("a2").exists(), "a cancelled agent's stash goes");
+    assert_eq!(keys("a3"), ["tooluse_y_0"], "an unsaved session keeps its stash");
+    assert!(snapshot.exists());
+
+    wait_for_status(&swarm, "a3", AgentStatus::Idle).await;
+    swarm.cancel("a3").unwrap();
+    eventually("a3's stash goes once it is cancelled", || !stash("a3").exists()).await;
+    assert_eq!(keys("a1"), ["tooluse_kept_0"]);
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
 async fn raising_the_agent_limit_at_runtime_starts_queued_agents_and_survives_a_resume() {
     let dir = tempfile::tempdir().unwrap();
     let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({

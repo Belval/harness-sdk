@@ -27,6 +27,7 @@ impl Swarm {
                 swarm.emit(SwarmEvent::Reloaded { from, to, changes });
             }
         }
+        swarm.prune_stashes(&state.agents).await;
         for agent in state.agents {
             swarm.restore_agent(agent);
         }
@@ -203,6 +204,59 @@ impl Swarm {
     fn batch_file(&self, id: &str) -> Option<PathBuf> {
         let dir = self.inner.config.state_dir.as_ref()?;
         Some(dir.join(SESSIONS_DIR).join(id).join(resume::OPEN_BATCH_FILE))
+    }
+
+    /// Before any agent runs, bound the saved agents' stashes ([`crate::stash_gc::prune_run`]).
+    async fn prune_stashes(&self, agents: &[AgentState]) {
+        let Some(sessions) = self
+            .inner
+            .config
+            .state_dir
+            .as_ref()
+            .map(|dir| dir.join(SESSIONS_DIR))
+        else {
+            return;
+        };
+        let agents: Vec<(String, bool)> = agents
+            .iter()
+            .map(|agent| (agent.id.clone(), agent.status == "cancelled"))
+            .collect();
+        let pruned = tokio::task::spawn_blocking(move || {
+            crate::stash_gc::prune_run(
+                &sessions,
+                agents.iter().map(|(id, cancelled)| (id.as_str(), *cancelled)),
+            )
+        })
+        .await
+        .unwrap_or_default();
+        self.journal_stash(None, pruned);
+    }
+
+    /// Delete the stash of `id`, cancelled and done ([`crate::stash_gc::drop_stash`]).
+    pub(super) async fn drop_stash(&self, id: &str) {
+        let Some(dir) = self
+            .inner
+            .config
+            .state_dir
+            .as_ref()
+            .map(|dir| dir.join(SESSIONS_DIR).join(id))
+        else {
+            return;
+        };
+        let pruned = tokio::task::spawn_blocking(move || crate::stash_gc::drop_stash(&dir))
+            .await
+            .unwrap_or_default();
+        self.journal_stash(Some(id), pruned);
+    }
+
+    fn journal_stash(&self, id: Option<&str>, pruned: crate::stash_gc::Pruned) {
+        if pruned.entries > 0 {
+            let mut fields = serde_json::json!({ "entries": pruned.entries, "bytes": pruned.bytes });
+            if let Some(id) = id {
+                fields["id"] = id.into();
+            }
+            self.journal_event("stash_pruned", fields);
+        }
     }
 
     /// `id`'s [`Swarm::batch_file`] and what it holds, if there is one.

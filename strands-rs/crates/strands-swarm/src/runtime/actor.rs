@@ -151,6 +151,8 @@ impl Swarm {
         }
         if !self.inner.shutting_down.load(Ordering::SeqCst) {
             self.set_status(&node, AgentStatus::Cancelled);
+            // Its turns are over, so nothing can retrieve from the stash or add to it.
+            self.drop_stash(&node.id).await;
         }
     }
 
