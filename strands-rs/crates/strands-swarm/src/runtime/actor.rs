@@ -127,8 +127,12 @@ impl Swarm {
         let mut backoff = RETRY_INITIAL;
         while let Some(text) = self.next_input(&node, input.take()).await {
             // Only the first failure of a retry streak reaches the parent: each one would wake it.
+            // So does only the first refusal for want of budget, however often mail (a schedule)
+            // wakes the agent until the budget is raised.
             let retrying = backoff > RETRY_INITIAL;
-            let Some(error) = self.run_turn(&node, &agent, text, !retrying).await else {
+            let refused = self.inner.over_budget.lock().contains(&node.id);
+            let report = !retrying && !refused;
+            let Some(error) = self.run_turn(&node, &agent, text, report).await else {
                 backoff = RETRY_INITIAL;
                 continue;
             };

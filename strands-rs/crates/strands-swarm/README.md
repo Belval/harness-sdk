@@ -142,6 +142,8 @@ TASK or `--goal`.
   - The next message picks up where the failed call stopped.
 - **Tokens.** `--budget-tokens N` (e.g. `5M`) caps the swarm's input + output tokens.
   - Once spent, model calls fail with a "budget exhausted" error that travels up to you.
+    Each agent reports it once: mail that wakes it again (a schedule firing) is refused without
+    another error until the budget is raised.
   - `/budget N` raises it and tells every stopped agent to continue. `/budget off` lifts it and
     `/budget` shows usage.
   - The budget is saved with the run. A resume keeps it unless given a `--budget-tokens` other

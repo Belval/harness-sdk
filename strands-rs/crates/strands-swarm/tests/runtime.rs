@@ -2254,6 +2254,32 @@ async fn a_spent_token_budget_stops_model_calls_until_it_is_raised() {
     let root = scripts.lock()["a1"].clone();
     assert_eq!(root.call_count(), 1, "the refused call reached the model");
 
+    // Further mail (a schedule firing every minute) is refused too, without telling anyone again.
+    swarm.send(USER, &id, "again").unwrap();
+    let errors_until_refused = async {
+        let mut errors = 0;
+        let mut running = false;
+        loop {
+            match events.recv().await {
+                Some(SwarmEvent::Mail { to, mail }) if to == USER && mail.kind == "error" => errors += 1,
+                Some(SwarmEvent::Status {
+                    status: AgentStatus::Running,
+                    ..
+                }) => running = true,
+                Some(SwarmEvent::Status {
+                    status: AgentStatus::Errored(_),
+                    ..
+                }) if running => return errors,
+                _ => {}
+            }
+        }
+    };
+    let errors = tokio::time::timeout(Duration::from_secs(10), errors_until_refused)
+        .await
+        .unwrap();
+    assert_eq!(errors, 0, "the exhausted budget is reported once");
+    assert_eq!(root.call_count(), 1);
+
     swarm.set_budget(Some(1_000));
     assert_eq!(reply_to(&mut events, USER).await, "continued");
     assert!(sent_text(&root, 1).contains("The token budget was raised to 1.0k"));
