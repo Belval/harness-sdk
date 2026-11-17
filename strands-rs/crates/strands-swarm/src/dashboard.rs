@@ -138,6 +138,7 @@ impl ContextControl {
                 item.what
             ));
         }
+        let offloadable = !listed.is_empty();
         *self.listed.lock() = listed;
 
         let previews: Vec<&Item> = items.iter().filter(|item| item.stashed).collect();
@@ -154,7 +155,7 @@ impl ContextControl {
                 ));
             }
         }
-        if !self.listed.lock().is_empty() {
+        if offloadable {
             out.push_str("\nOffload numbered results with `context {\"offload\": [1, 2]}`.");
         }
         out
@@ -427,17 +428,17 @@ mod tests {
     }
 
     fn result_text(model: &MockMessageModel, call: usize, tool_use_id: &str) -> String {
-        let (messages, _) = &model.calls()[call];
-        for message in messages {
-            for block in &message.content {
-                if let ContentBlock::ToolResult(result) = block {
-                    if result.tool_use_id == tool_use_id {
-                        return format!("{:?}", result.content);
-                    }
+        model.calls()[call]
+            .0
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                ContentBlock::ToolResult(result) if result.tool_use_id == tool_use_id => {
+                    Some(format!("{:?}", result.content))
                 }
-            }
-        }
-        panic!("no result {tool_use_id} in call {call}");
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no result {tool_use_id} in call {call}"))
     }
 
     #[tokio::test]
