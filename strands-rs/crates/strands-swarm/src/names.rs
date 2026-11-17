@@ -46,12 +46,14 @@ pub fn slug(raw: &str) -> String {
 }
 
 /// A name for an agent whose spawner gave none: the first few meaningful words of its task.
+/// Stopwords and single letters (`multiply(a, b)`'s `b`) are skipped; numbers are kept.
 pub fn derive(task: &str) -> String {
     let first_line = task
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or_default();
-    let meaningful = words(first_line).filter(|word| !STOPWORDS.contains(&word.as_str()));
+    let letter = |word: &str| word.chars().count() == 1 && word.chars().all(char::is_alphabetic);
+    let meaningful = words(first_line).filter(|word| !STOPWORDS.contains(&word.as_str()) && !letter(word));
     join(meaningful.take(DERIVED_WORDS))
 }
 
@@ -123,6 +125,11 @@ mod tests {
             "internationalization"
         );
         assert_eq!(derive("the to of"), "");
+        assert_eq!(
+            derive("Add a multiply(a, b) function to calc.py"),
+            "add-multiply-function"
+        );
+        assert_eq!(derive("Bump x to v2 in 3 crates"), "bump-v2-3");
     }
 
     #[test]
