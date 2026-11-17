@@ -198,7 +198,11 @@ impl Jobs {
         };
         // Reap the wrapper once it ends; the job reports through its files, not this handle.
         tokio::spawn(async move { child.wait().await });
-        tokio::fs::write(self.file(&id, "json"), serde_json::to_vec_pretty(&meta)?).await?;
+        // Through a rename: a crash mid-write must not leave a half `.json`, which no listing
+        // could read.
+        let staged = self.file(&id, "json.tmp");
+        tokio::fs::write(&staged, serde_json::to_vec_pretty(&meta)?).await?;
+        tokio::fs::rename(&staged, self.file(&id, "json")).await?;
         Ok(Job {
             meta,
             state: JobState::Running,
@@ -207,15 +211,18 @@ impl Jobs {
         })
     }
 
-    /// One more than the highest job number on disk.
+    /// One more than the highest job number on disk. Any file counts, not just a job's `.json`:
+    /// a swarm killed between starting a job and describing it leaves only its `.log` (and later
+    /// `.exit`), and a new job must not share them.
     async fn next_id(&self) -> Result<String> {
-        let highest = self
-            .metas()
-            .await
-            .iter()
-            .filter_map(|meta| number(&meta.id))
-            .max()
-            .unwrap_or(0);
+        let mut highest = 0;
+        if let Ok(mut entries) = tokio::fs::read_dir(&self.dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name();
+                let id = name.to_str().and_then(|name| name.split('.').next());
+                highest = highest.max(id.and_then(number).unwrap_or(0));
+            }
+        }
         Ok(format!("j{}", highest + 1))
     }
 
@@ -460,6 +467,34 @@ mod tests {
 
         let next = jobs.start("a2", None, "true", dir.path(), &BTreeMap::new()).await;
         assert_eq!(next.unwrap().meta.id, "j2", "ids continue after those on disk");
+    }
+
+    #[tokio::test]
+    async fn a_job_the_swarm_died_before_describing_keeps_its_id_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path().join("jobs"));
+        tokio::fs::create_dir_all(dir.path().join("jobs")).await.unwrap();
+        // Killed between starting j1 and writing its `.json` (or mid-write, before the rename).
+        tokio::fs::write(jobs.log_path("j1"), "orphan output\n")
+            .await
+            .unwrap();
+        tokio::fs::write(jobs.file("j1", "exit"), "0").await.unwrap();
+        tokio::fs::write(jobs.file("j2", "json.tmp"), "{\"id\": \"j2\", \"ow")
+            .await
+            .unwrap();
+        assert!(jobs.list().await.is_empty(), "nothing half-written is listed");
+
+        let job = jobs
+            .start("a1", None, "true", dir.path(), &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(job.meta.id, "j3", "no new job writes into a dead one's files");
+        let log = tokio::fs::read_to_string(jobs.log_path("j1")).await.unwrap();
+        assert_eq!(log, "orphan output\n");
+        assert!(
+            !jobs.file("j3", "json.tmp").exists(),
+            "the description is renamed into place"
+        );
     }
 
     #[tokio::test]
