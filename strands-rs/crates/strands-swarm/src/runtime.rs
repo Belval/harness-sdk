@@ -345,8 +345,12 @@ pub struct SpawnRequest {
     pub task: String,
     /// Short human-readable name; derived from the task when `None`. Made unique with a suffix.
     pub name: Option<String>,
-    /// Give the agent its own git worktree and branch, cut from the spawner's `HEAD`.
+    /// Give the agent its own git worktree and branch, cut from the `HEAD` of the repository at
+    /// its working directory.
     pub worktree: bool,
+    /// Working directory (absolute, or relative to the spawner's); `None` uses the spawner's
+    /// (the swarm's for a root agent). With `worktree`, the repository the worktree is cut from.
+    pub cwd: Option<PathBuf>,
     /// Optional model override.
     pub model: Option<String>,
     /// Optional completion criterion; the agent keeps working until it is met.
@@ -832,10 +836,32 @@ impl Swarm {
         let default = self.inner.config.default_model.as_deref();
         request.model = request.model.map(|model| expand_model(&model, default));
 
-        let id = format!("a{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let base_cwd = parent_node
+        let spawner_cwd = parent_node
             .as_ref()
             .map_or_else(|| self.inner.config.cwd.clone(), |node| node.cwd.clone());
+        let base_cwd = match &request.cwd {
+            Some(dir) => {
+                // Lexically normalized: no trailing `/`, `.` or `..` in prompts and listings, and
+                // a worktree keeps the subdirectory (which needs a path below the toplevel).
+                let mut normal = PathBuf::new();
+                for part in spawner_cwd.join(dir).components() {
+                    match part {
+                        std::path::Component::ParentDir => {
+                            normal.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        part => normal.push(part),
+                    }
+                }
+                let dir = normal;
+                if !dir.is_dir() {
+                    return Err(Error::other(format!("cwd {} is not a directory.", dir.display())));
+                }
+                dir
+            }
+            None => spawner_cwd,
+        };
+        let id = format!("a{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let (cwd, branch, env) = match request.worktree {
             true => {
                 // Saved first: a crash after `git worktree add` must not hand the id, and with it

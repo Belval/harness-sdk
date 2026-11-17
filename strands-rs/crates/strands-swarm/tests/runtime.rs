@@ -1271,6 +1271,56 @@ async fn a_worktree_agent_gets_its_own_checkout_and_branch() {
 }
 
 #[tokio::test]
+async fn spawn_agent_can_start_an_agent_in_another_directory_or_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = init_repo(dir.path(), &[("pkg/lib.py", "x")]);
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call(
+                        "spawn_agent",
+                        "t1",
+                        json!({"task": "t", "name": "plain", "cwd": format!("{}/", other.join("pkg").display())}),
+                    ),
+                    tool_call(
+                        "spawn_agent",
+                        "t2",
+                        json!({"task": "t", "name": "isolated", "cwd": "../repo/pkg", "worktree": true}),
+                    ),
+                    tool_call(
+                        "spawn_agent",
+                        "t3",
+                        json!({"task": "t", "name": "lost", "cwd": "/no/such/dir"}),
+                    ),
+                    say("done"),
+                ],
+            ),
+            ("a2", vec![say("ok")]),
+            ("a3", vec![say("ok")]),
+        ],
+        &home,
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+
+    let plain = swarm.agent("a2").unwrap();
+    assert_eq!(plain.cwd, other.join("pkg"), "no trailing slash");
+    assert_eq!(plain.branch, None);
+    let isolated = swarm.agent("a3").unwrap();
+    let checkout = dir.path().join("repo.swarm").join(swarm.run_id()).join("a3");
+    assert_eq!(isolated.branch, Some(format!("swarm/{}/a3", swarm.run_id())));
+    assert!(isolated.cwd.ends_with("pkg") && isolated.cwd.join("lib.py").exists());
+    assert!(isolated.cwd.starts_with(&checkout), "{}", isolated.cwd.display());
+    let root = sent_text(&scripts.lock()["a1"].clone(), 3);
+    assert!(root.contains("cwd /no/such/dir is not a directory"), "{root}");
+    assert!(swarm.agent("a4").is_none());
+}
+
+#[tokio::test]
 async fn worktree_agents_get_a_private_cargo_target_dir_that_their_children_share() {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path(), &[]);

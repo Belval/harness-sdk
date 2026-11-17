@@ -5,7 +5,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 
 | Tool | What it does |
 | --- | --- |
-| `spawn_agent` | Start an agent on a task (optionally in its own git worktree, with a model or a goal). Non-blocking. |
+| `spawn_agent` | Start an agent on a task (optionally in another directory, in its own git worktree, with a model or a goal). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports, which returns at once when none is pending); a user message always ends it. With `all`, until every agent in `from` has sent something; a timeout (default 10 min, at most an hour) returns what came and who is still missing. Mail stays unread (and saved) until it returns, so a restart meanwhile loses none. |
 | `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model and estimated spend. |
@@ -67,6 +67,9 @@ points to `--headless` before it starts or resumes anything.
   that found nothing) reaches no agent parent; the user's root always replies. A `send_message` to
   an agent's parent says so in its result, as agents that report mid-turn tend to repeat the report
   as their final reply, which costs the parent a turn.
+- **Working directory.** An agent works where its spawner does unless `spawn_agent` gets a `cwd`
+  (absolute or relative), e.g. another repository; with `worktree` the worktree is cut from the
+  repository there.
 - **Goals.** A `goal` (`spawn_agent`, `/goal`, `--goal`) puts a judge in the loop that sends the
   agent back to work until the goal is met. It runs after every turn and sees the goal, the task
   and the latest ~40k characters of the conversation.

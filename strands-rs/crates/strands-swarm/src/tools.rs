@@ -58,11 +58,11 @@ const DEFAULT_WAIT_SECONDS: u64 = 600;
 const MAX_WAIT_SECONDS: u64 = 3600;
 
 const SPAWN_DESCRIPTION: &str = concat!(
-    "Start an agent working on `task` concurrently; returns its id at once. It has your tools. Its final ",
-    "reply each turn comes to you as a message; message it any time and it continues with its context. ",
-    "The task is all it knows. worktree=true gives it its own git worktree and branch off your HEAD ",
-    "(uncommitted changes excluded); you integrate the branch. At the agent limit it is `queued` until a ",
-    "slot frees."
+    "Start an agent on `task` concurrently; returns its id at once. It has your tools. Its final reply ",
+    "each turn comes to you as a message; message it any time and it goes on with its context. The task ",
+    "is all it knows. It works in `cwd` (default: yours); worktree=true gives it its own git worktree ",
+    "and branch off that HEAD (uncommitted changes excluded); you integrate the branch. At the agent ",
+    "limit it is `queued` until a slot frees."
 );
 
 const SEND_DESCRIPTION: &str = concat!(
@@ -94,6 +94,8 @@ struct SpawnInput {
     name: String,
     #[serde(default)]
     worktree: bool,
+    #[serde(default)]
+    cwd: String,
     /// Model id, or opus/sonnet/haiku, instead of the default. Cost vs opus: sonnet ≈ 0.6×, haiku ≈ 0.2× (mechanical work).
     #[serde(default)]
     model: Option<String>,
@@ -444,6 +446,7 @@ async fn spawn_tool(swarm: Swarm, me: String, input: SpawnInput, _ctx: ToolConte
         task: input.task,
         name: Some(input.name),
         worktree: input.worktree,
+        cwd: Some(input.cwd).filter(|cwd| !cwd.is_empty()).map(Into::into),
         model: input.model,
         goal: input.goal,
     };
