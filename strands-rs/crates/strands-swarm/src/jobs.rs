@@ -659,10 +659,19 @@ mod tests {
             until_ended(&jobs, &job.meta.id).await;
             jobs.mark_reported(&job.meta.id).await.unwrap();
         }
-        // Writes 3000 bytes, waits to be cut, then appends a last line.
-        let command = "head -c 3000 /dev/zero | tr '\\0' x; echo; sleep 1; echo last";
+        // Writes 3000 bytes, waits to be cut (until the test creates `go`), then appends a last
+        // line.
+        let command = "head -c 3000 /dev/zero | tr '\\0' x; echo; touch written; \
+                       until [ -e go ] || [ ! -e \"$PWD\" ]; do sleep 0.01; done; echo last";
         jobs.start("a1", None, command, dir.path(), &none).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let written = dir.path().join("written");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !written.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job never wrote its output");
 
         jobs.tidy(1000, 100, 1).await;
         let ids: Vec<String> = jobs.list().await.into_iter().map(|job| job.meta.id).collect();
@@ -672,6 +681,7 @@ mod tests {
         assert!(log.starts_with("[strands-swarm: log over 1000 bytes"), "{log}");
         assert!(log.len() < 200, "{}", log.len());
 
+        std::fs::write(dir.path().join("go"), "").unwrap();
         until_ended(&jobs, "j4").await;
         let log = tokio::fs::read_to_string(jobs.log_path("j4")).await.unwrap();
         assert!(
