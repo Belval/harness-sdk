@@ -66,8 +66,8 @@ const SPAWN_DESCRIPTION: &str = concat!(
 );
 
 const SEND_DESCRIPTION: &str = concat!(
-    "Message an agent (id or name) or `parent` (who spawned you; the user for the root agent). A busy agent ",
-    "sees it after its current tool call; an idle one starts a turn."
+    "Message an agent (id or name) or `parent` (who spawned you; the user for the root agent); a comma-",
+    "separated `to` sends to each. A busy agent sees it after its current tool call; an idle one starts a turn."
 );
 
 const WAIT_DESCRIPTION: &str =
@@ -498,17 +498,41 @@ async fn spawn_tool(swarm: Swarm, me: String, input: SpawnInput, _ctx: ToolConte
 }
 
 async fn send_tool(swarm: Swarm, me: String, input: SendInput, _ctx: ToolContext) -> Result<String> {
-    let to = resolve(&swarm, &me, &input.to)?;
-    swarm.send(&me, &to, input.message)?;
-    let sent = format!("Sent to {}.", swarm.label(&to));
+    // Every name resolves before anything is sent, so a typo can be fixed and the call repeated.
+    let mut to = Vec::new();
+    for who in input.to.split(',').map(str::trim).filter(|who| !who.is_empty()) {
+        let id = resolve(&swarm, &me, who)?;
+        if !to.contains(&id) {
+            to.push(id);
+        }
+    }
+    let (mut sent, mut failed) = (Vec::new(), Vec::new());
+    for id in &to {
+        match swarm.send(&me, id, input.message.clone()) {
+            Ok(()) => sent.push(id),
+            Err(error) if to.len() == 1 => return Err(error),
+            Err(error) => failed.push(format!("{}: {error}", swarm.label(id))),
+        }
+    }
+    if sent.is_empty() {
+        return Err(strands_agents::Error::other(match failed.is_empty() {
+            true => "`to` names no one.".to_owned(),
+            false => format!("Sent to no one. {}", failed.join(" ")),
+        }));
+    }
+    let labels: Vec<String> = sent.iter().map(|id| swarm.label(id)).collect();
+    let mut text = format!("Sent to {}.", labels.join(", "));
+    if !failed.is_empty() {
+        text = format!("{text} Not sent to {}", failed.join(" "));
+    }
     // An agent that reports to its parent mid-turn tends to end the turn by repeating the
     // report, which costs the parent a turn (and often the user a duplicate notification).
     let parent = swarm.agent(&me).map(|info| info.parent);
     Ok(match parent {
-        Some(parent) if parent == to && parent != USER => {
-            format!("{sent} {}", REPLY_ALSO_REACHES_PARENT)
+        Some(parent) if sent.contains(&&parent) && parent != USER => {
+            format!("{text} {}", REPLY_ALSO_REACHES_PARENT)
         }
-        _ => sent,
+        _ => text,
     })
 }
 

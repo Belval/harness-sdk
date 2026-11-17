@@ -200,6 +200,58 @@ async fn a_message_to_the_parent_says_the_final_reply_reaches_it_too() {
     assert!(!root.contains("final reply"), "{root}");
 }
 
+#[tokio::test]
+async fn one_message_reaches_several_recipients_and_an_unknown_one_stops_the_whole_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = || {
+        vec![
+            tool_call("wait", "w", json!({"timeout_seconds": 10})),
+            say("got it"),
+        ]
+    };
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", json!({"task": "x", "name": "one"})),
+                    tool_call("spawn_agent", "t2", json!({"task": "y", "name": "two"})),
+                    tool_call(
+                        "send_message",
+                        "t3",
+                        json!({"to": "one, two (a3),a2", "message": "go on"}),
+                    ),
+                    tool_call(
+                        "send_message",
+                        "t4",
+                        json!({"to": "one, nobody", "message": "stray"}),
+                    ),
+                    tool_call("wait", "t5", json!({"from": ["a2", "a3"], "all": true})),
+                    say("done"),
+                ],
+            ),
+            ("a2", child()),
+            ("a3", child()),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+
+    let root = scripts.lock()["a1"].clone();
+    let sent = sent_text(&root, 3);
+    assert!(sent.contains("Sent to one (a2), two (a3)."), "{sent}");
+    let stray = sent_text(&root, 4);
+    assert!(stray.contains("nobody") && stray.contains("Error"), "{stray}");
+    for id in ["a2", "a3"] {
+        let child = scripts.lock()[id].clone();
+        let woken = sent_text(&child, 1);
+        assert_eq!(woken.matches("go on").count(), 1, "{woken}");
+        assert!(!woken.contains("stray"), "{woken}");
+        assert_eq!(child.call_count(), 2, "{id} got one message");
+    }
+}
+
 /// Children that reply one after another: a child that waits `seconds` first, then says `text`.
 fn slow_child(seconds: u64, text: &str) -> Vec<MockResponse> {
     match seconds {
