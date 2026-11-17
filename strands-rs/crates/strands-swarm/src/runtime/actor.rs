@@ -16,7 +16,7 @@ impl Swarm {
 
     /// First input after a restore: a restart notice for an interrupted agent (or one with a goal,
     /// which must keep going), otherwise nothing, so it waits for mail.
-    pub(super) async fn resume_input(
+    async fn resume_input(
         &self,
         node: &Node,
         agent: &Agent,
@@ -69,7 +69,7 @@ impl Swarm {
         })
     }
 
-    pub(super) async fn run_actor(self, node: Arc<Node>, start: Start) {
+    async fn run_actor(self, node: Arc<Node>, start: Start) {
         // Read under its own statement: `instructions` takes the agents lock, and `snapshot` takes
         // the agents lock before per-agent locks.
         let model = node.model.lock().clone();
@@ -122,7 +122,7 @@ impl Swarm {
             // Out of budget, it waits for the mail that `set_budget` sends instead of retrying.
             if node.goal.is_some()
                 && self.budget_exhausted().is_none()
-                && self.sleep_unless_cancelled(&node, backoff).await
+                && sleep_unless_cancelled(&node, backoff).await
             {
                 input = Some(InvokeInput::Text(format!(
                     "Your previous turn failed with: {error}\nContinue working toward your goal."
@@ -135,7 +135,7 @@ impl Swarm {
         }
     }
 
-    pub(super) fn fail_construction(&self, node: &Node, error: Error) {
+    fn fail_construction(&self, node: &Node, error: Error) {
         let message = format!("Failed to start: {error}");
         self.set_status(node, AgentStatus::Errored(message.clone()));
         let _ = self.post(&node.id, &node.parent, "error", message);
@@ -143,7 +143,7 @@ impl Swarm {
     }
 
     /// The next turn's input: the initial task, else the agent's mail once some arrives.
-    pub(super) async fn next_input(&self, node: &Node, initial: Option<InvokeInput>) -> Option<InvokeInput> {
+    async fn next_input(&self, node: &Node, initial: Option<InvokeInput>) -> Option<InvokeInput> {
         if node.cancel.is_cancelled() {
             return None;
         }
@@ -160,23 +160,9 @@ impl Swarm {
         })
     }
 
-    /// `true` when the full delay elapsed, `false` when the agent was cancelled first.
-    pub(super) async fn sleep_unless_cancelled(&self, node: &Node, delay: Duration) -> bool {
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => true,
-            _ = node.cancel.cancelled() => false,
-        }
-    }
-
     /// Run one turn; returns the error message when it failed (not when it was cancelled). A
     /// failure is posted to the parent when `report` is set.
-    pub(super) async fn run_turn(
-        &self,
-        node: &Node,
-        agent: &Agent,
-        input: InvokeInput,
-        report: bool,
-    ) -> Option<String> {
+    async fn run_turn(&self, node: &Node, agent: &Agent, input: InvokeInput, report: bool) -> Option<String> {
         let turn = node.cancel.child_token();
         *node.turn.lock() = Some(turn.clone());
         node.paused.store(false, Ordering::SeqCst);
@@ -224,7 +210,7 @@ impl Swarm {
     }
 
     /// Translate one stream event into swarm events; returns the final reply on `AgentResult`.
-    pub(super) fn forward(&self, node: &Node, event: &AgentStreamEvent) -> Option<String> {
+    fn forward(&self, node: &Node, event: &AgentStreamEvent) -> Option<String> {
         let id = node.id.clone();
         match event {
             AgentStreamEvent::ModelStreamUpdate(update) => match &update.event {
@@ -478,6 +464,14 @@ impl Model for SideModel {
 }
 
 /// One model call's tokens from its usage metadata; `input` includes cache reads and writes.
+/// `true` when the full delay elapsed, `false` when the agent was cancelled first.
+async fn sleep_unless_cancelled(node: &Node, delay: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        _ = node.cancel.cancelled() => false,
+    }
+}
+
 pub(super) fn usage_counts(usage: &Usage) -> crate::cost::Counts {
     let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
     let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
