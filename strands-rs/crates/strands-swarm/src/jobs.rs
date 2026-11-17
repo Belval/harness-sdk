@@ -295,9 +295,15 @@ impl Jobs {
 
     /// Ended jobs whose owner has not been told yet. Running jobs whose process has disappeared
     /// are recorded as lost first when `check_alive`.
+    ///
+    /// The watcher asks twice a second, so reported jobs (up to [`KEEP_JOBS`] of them) are told
+    /// apart by name in one directory listing, without reading their files.
     pub async fn unreported(&self, check_alive: bool) -> Vec<Job> {
         let mut ended = Vec::new();
-        for job in self.list().await {
+        for id in self.unreported_ids().await {
+            let Ok(job) = self.get(&id).await else {
+                continue;
+            };
             if job.reported {
                 continue;
             }
@@ -317,6 +323,25 @@ impl Jobs {
             }
         }
         ended
+    }
+
+    /// The ids of the jobs described on disk and not marked reported, oldest first.
+    async fn unreported_ids(&self) -> Vec<String> {
+        let Ok(mut entries) = tokio::fs::read_dir(&self.dir).await else {
+            return Vec::new();
+        };
+        let (mut described, mut reported) = (Vec::new(), std::collections::HashSet::new());
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name.strip_suffix(".json") {
+                described.push(id.to_owned());
+            } else if let Some(id) = name.strip_suffix(".reported") {
+                reported.insert(id.to_owned());
+            }
+        }
+        described.retain(|id| !reported.contains(id));
+        described.sort_by_key(|id| (number(id), id.clone()));
+        described
     }
 
     /// Whether a job that `matches` still runs (its process alive, whatever its files say).
@@ -563,6 +588,40 @@ mod tests {
         assert_eq!(lost.len(), 1);
         assert_eq!(lost[0].state, JobState::Lost);
         assert_eq!(lost[0].status(), "ended without an exit code");
+    }
+
+    #[tokio::test]
+    async fn ended_jobs_not_yet_reported_are_listed_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path());
+        for n in [2, 10, 1, 3] {
+            let id = format!("j{n}");
+            let meta = JobMeta {
+                id: id.clone(),
+                owner: "a1".into(),
+                name: None,
+                command: "true".into(),
+                cwd: dir.path().into(),
+                pid: u32::MAX / 2,
+                started: now(),
+            };
+            std::fs::write(
+                dir.path().join(format!("{id}.json")),
+                serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join(format!("{id}.exit")), "0").unwrap();
+        }
+        jobs.mark_reported("j2").await.unwrap();
+        // A report mark without a description is not a job.
+        std::fs::write(dir.path().join("j9.reported"), "").unwrap();
+        let ids: Vec<String> = jobs
+            .unreported(true)
+            .await
+            .into_iter()
+            .map(|job| job.meta.id)
+            .collect();
+        assert_eq!(ids, ["j1", "j3", "j10"]);
     }
 
     #[tokio::test]
