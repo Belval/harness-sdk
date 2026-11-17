@@ -197,11 +197,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         return Ok(Exit::Quit);
     }
     if cli.gc {
-        let name = cli.run.as_deref().unwrap_or_default();
-        let dir = state::run_dir(name)?;
-        let saved = state::load(&dir)
-            .await?
-            .ok_or_else(|| format!("no saved run {name}"))?;
+        let (dir, saved) = load_run(cli.run.as_deref().unwrap_or_default()).await?;
         let collected = strands_swarm::gc::collect_run(&saved, cli.status_base.as_deref()).await;
         let journal = strands_swarm::journal::Journal::open(&dir);
         for agent in collected.iter().filter(|c| !c.is_empty()) {
@@ -227,9 +223,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| strands_harness::defaults::DEFAULT_MODEL.to_owned());
     if let (true, Some(name)) = (cli.cost, &cli.run) {
-        let saved = state::load(&state::run_dir(name)?)
-            .await?
-            .ok_or_else(|| format!("no saved run {name}"))?;
+        let (_, saved) = load_run(name).await?;
         let report = strands_swarm::cost::CostReport::from_state(&saved, prices, Some(&default_model));
         report.lines().iter().for_each(|line| println!("{line}"));
         return Ok(Exit::Quit);
@@ -258,12 +252,14 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         .map(std::fs::read_to_string)
         .transpose()?;
     let run_dir = cli.run.as_deref().map(state::run_dir).transpose()?;
-    // The TUI owns the terminal, so warnings go to a file; other modes keep them on stderr.
+    // The TUI owns the terminal, so warnings and MCP server logs (which would paint over it) go
+    // to files; other modes keep them on stderr.
     let tui = !(cli.headless || cli.list_tools || cli.list_skills);
-    let log = tui.then(|| match &run_dir {
-        Some(dir) => dir.join(logging::LOG_FILE),
-        None => std::env::temp_dir().join(format!("strands-swarm-{}.log", std::process::id())),
-    });
+    let private_path = |in_run: &str, suffix: &str| match &run_dir {
+        Some(dir) => dir.join(in_run),
+        None => std::env::temp_dir().join(format!("strands-swarm-{}{suffix}", std::process::id())),
+    };
+    let log = tui.then(|| private_path(logging::LOG_FILE, ".log"));
     logging::init(
         log.as_deref()
             .map(|path| logging::open_log(path, logging::MAX_LOG_BYTES))
@@ -283,12 +279,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         skills.skills.len(),
         skills.shadowed.len()
     );
-    // Server logs would paint over the TUI; headless mode keeps them on our stderr.
-    let mcp_logs = match (&run_dir, cli.headless || cli.list_tools) {
-        (_, true) => None,
-        (Some(dir), false) => Some(dir.join("logs")),
-        (None, false) => Some(std::env::temp_dir().join(format!("strands-swarm-{}", std::process::id()))),
-    };
+    let mcp_logs = tui.then(|| private_path("logs", ""));
     let started = std::time::Instant::now();
     let mcp_options = McpOptions {
         deny: cli.mcp_deny.clone(),
@@ -431,6 +422,15 @@ fn release_terminal() {
     if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
         ratatui::restore();
     }
+}
+
+/// The saved run `name` and its directory.
+async fn load_run(name: &str) -> Result<(PathBuf, state::SwarmState), Box<dyn std::error::Error>> {
+    let dir = state::run_dir(name)?;
+    let saved = state::load(&dir)
+        .await?
+        .ok_or_else(|| format!("no saved run {name}"))?;
+    Ok((dir, saved))
 }
 
 fn print_skills(skills: &Skills) {
