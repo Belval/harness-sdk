@@ -59,6 +59,9 @@ and exit.
     messages. If the first pass leaves the input above the point, a second pass runs. The log
     notes `context compacted: 305.0k → 98.1k tokens`. If the summarizer fails, the context is sent
     as it is, and the log, the footer and `events.jsonl` (`compact_failed`) say why.
+  - When a compaction changes nothing (the summarizer failed, or nothing could be cut), automatic
+    retries wait until the input has grown 10% or ten calls have passed; overflow and `context`
+    requests still retry at once.
   - **Pruning.** Reasoning from earlier turns (thinking text and signatures, which some models bill
     as input on every call) is dropped; the turn in progress keeps it, as Anthropic requires within
     a tool-use loop. `shell` and `read` results over 2,000 characters are cut to their head and

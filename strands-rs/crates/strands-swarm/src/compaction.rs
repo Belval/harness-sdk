@@ -5,6 +5,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::dashboard::{ContextControl, SUMMARY_KEEPS};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -47,6 +49,19 @@ pub fn window_of(model: &dyn Model) -> u64 {
 /// above the compaction point (a summary much longer than expected, say).
 const MAX_PASSES: usize = 2;
 
+/// After a compaction that changed nothing (the summarizer failed, or nothing could be cut), the
+/// automatic retries wait until the input has grown by this share of what it was then…
+const RETRY_GROWTH: f64 = 0.10;
+/// …or this many model calls have passed. Overflow and `context` requests retry at once.
+const RETRY_CALLS: u32 = 10;
+
+/// Why automatic compaction is holding off: the input it last failed at, and the calls left.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Backoff {
+    tokens: u64,
+    calls_left: u32,
+}
+
 /// What [`CompactAt`] reports when it summarized, or tried to and failed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Compaction {
@@ -87,6 +102,8 @@ pub struct CompactAt {
     armed: AtomicBool,
     /// Set by [`CompactAt::arm`] when it took a summarize request.
     armed_request: AtomicBool,
+    /// Set when a compaction changed nothing; cleared by the next one that does.
+    backoff: Mutex<Option<Backoff>>,
 }
 
 impl CompactAt {
@@ -98,6 +115,7 @@ impl CompactAt {
             sink: None,
             armed: AtomicBool::new(false),
             armed_request: AtomicBool::new(false),
+            backoff: Mutex::new(None),
         }
     }
 
@@ -124,12 +142,27 @@ impl CompactAt {
         due.is_some()
     }
 
-    /// `Some(requested)` when this pass is to compact: on request, overflow, or at the point.
+    /// `Some(requested)` when this pass is to compact: on request, overflow, or at the point
+    /// unless a recent failure is being backed off from.
     fn due(&self, ctx: &ContextState<'_>) -> Option<bool> {
         let requested = self.control.as_ref().is_some_and(|c| c.take_summarize_request());
         let window = window_of(ctx.agent.model().as_ref());
-        let at_point = ctx.utilization >= compaction_utilization(window, self.compact_at);
+        let at_point = ctx.utilization >= compaction_utilization(window, self.compact_at)
+            && !self.backing_off(input_tokens(ctx, window));
         (requested || ctx.overflow || at_point).then_some(requested)
+    }
+
+    fn backing_off(&self, tokens: u64) -> bool {
+        self.backoff.lock().is_some_and(|backoff| {
+            backoff.calls_left > 0 && (tokens as f64) < backoff.tokens as f64 * (1.0 + RETRY_GROWTH)
+        })
+    }
+
+    /// One more model call towards the end of a backoff.
+    fn tick(&self) {
+        if let Some(backoff) = self.backoff.lock().as_mut() {
+            backoff.calls_left = backoff.calls_left.saturating_sub(1);
+        }
     }
 }
 
@@ -140,6 +173,21 @@ impl ContextStrategy for CompactAt {
     }
 
     async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
+        let compacted = self.compact(ctx).await;
+        // After deciding, so `arm` and `apply` in one pass see the same backoff.
+        self.tick();
+        compacted
+    }
+}
+
+impl CompactAt {
+    fn report(&self, compaction: Compaction) {
+        if let Some(sink) = &self.sink {
+            sink(compaction);
+        }
+    }
+
+    async fn compact(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
         let armed = self.armed.swap(false, Ordering::SeqCst);
         let armed_request = self.armed_request.swap(false, Ordering::SeqCst);
         let due = self.due(ctx);
@@ -149,7 +197,7 @@ impl ContextStrategy for CompactAt {
         let requested = armed_request || due == Some(true);
         let window = window_of(ctx.agent.model().as_ref());
         let point = compaction_point(window, self.compact_at);
-        let before = (ctx.utilization * window as f64).round() as u64;
+        let before = input_tokens(ctx, window);
         let target = if requested { 0 } else { point / 2 };
         // Armed, but an earlier strategy (pruning) already took it under the target.
         if !requested && !ctx.overflow && before <= target {
@@ -174,8 +222,16 @@ impl ContextStrategy for CompactAt {
             self.report(Compaction::Failed { tokens, error });
         }
         if passes == 0 {
+            tracing::warn!(
+                "tokens=<{before}>, retry_growth=<{RETRY_GROWTH}>, retry_calls=<{RETRY_CALLS}> | compaction changed nothing, backing off"
+            );
+            *self.backoff.lock() = Some(Backoff {
+                tokens: before,
+                calls_left: RETRY_CALLS,
+            });
             return Ok(false);
         }
+        *self.backoff.lock() = None;
         tracing::info!("before=<{before}>, after=<{tokens}>, passes=<{passes}> | compacted the context");
         self.report(Compaction::Done {
             before,
@@ -185,12 +241,9 @@ impl ContextStrategy for CompactAt {
     }
 }
 
-impl CompactAt {
-    fn report(&self, compaction: Compaction) {
-        if let Some(sink) = &self.sink {
-            sink(compaction);
-        }
-    }
+/// The projected input of this pipeline pass, in tokens.
+fn input_tokens(ctx: &ContextState<'_>, window: u64) -> u64 {
+    (ctx.utilization * window as f64).round() as u64
 }
 
 /// One pass: summarize the leading messages (after the first) that bring `tokens` (the projected
@@ -295,7 +348,6 @@ async fn summarize(model: &Arc<dyn Model>, content: Vec<ContentBlock>) -> Result
 mod tests {
     use super::*;
 
-    use parking_lot::Mutex;
     use strands_agents::context_manager::{ContextManager, ContextManagerConfig, ContextManagerOption};
     use strands_agents::testing::{MockMessageModel, MockResponse};
     use strands_agents::types::{ToolResultBlock, ToolResultContent, ToolUseBlock};
@@ -482,6 +534,94 @@ mod tests {
         assert!(!changed);
         assert_eq!(model.call_count(), 0);
         assert!(events.lock().is_empty());
+    }
+
+    /// One pipeline pass at a projected `tokens`; whether it changed the context.
+    async fn pass(
+        manager: &ContextManager,
+        agent: &Agent,
+        messages: &mut Vec<Message>,
+        tokens: u64,
+        overflow: bool,
+    ) -> bool {
+        manager
+            .run_strategies_on(agent, messages, Some(tokens), overflow)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn after_a_failed_summary_it_backs_off_until_the_input_grows_or_calls_pass() {
+        let (agent, model) = agent(&["", "", "", "SUMMARY at last", "SUMMARY again"]);
+        let control = ContextControl::new(10_000);
+        let (manager, events) = manager(10_000, Some(Arc::clone(&control)));
+        let mut messages = tool_loop(45);
+        let tokens = heuristic(&messages);
+
+        // The first attempt fails; the next calls at about the same size do not retry.
+        assert!(!pass(&manager, &agent, &mut messages, tokens, false).await);
+        assert_eq!(model.call_count(), 1);
+        for _ in 1..RETRY_CALLS {
+            pass(&manager, &agent, &mut messages, tokens + 100, false).await;
+        }
+        assert_eq!(model.call_count(), 1, "backing off");
+        // The RETRY_CALLS-th call after the failure retries (and fails again).
+        pass(&manager, &agent, &mut messages, tokens, false).await;
+        assert_eq!(model.call_count(), 2);
+        // Growth past RETRY_GROWTH retries at once (and fails again).
+        let grown = (tokens as f64 * (1.0 + RETRY_GROWTH)) as u64 + 1;
+        pass(&manager, &agent, &mut messages, grown, false).await;
+        assert_eq!(model.call_count(), 3);
+        pass(&manager, &agent, &mut messages, grown, false).await;
+        assert_eq!(model.call_count(), 3, "backing off again");
+        // A request goes through, here the one that succeeds.
+        control.request_summary();
+        assert!(pass(&manager, &agent, &mut messages, grown, false).await);
+        assert_eq!(model.call_count(), 4);
+        // Each failed attempt is reported once, the backed-off calls not at all.
+        let reported = events.lock().clone();
+        assert_eq!(reported.len(), 4, "{reported:?}");
+        assert!(reported[..3]
+            .iter()
+            .all(|c| matches!(c, Compaction::Failed { .. })));
+        assert!(matches!(reported[3], Compaction::Done { .. }));
+        assert!(messages[0].text().contains("SUMMARY at last"));
+        // Success ends the backoff: the next call at the point compacts again (on a fresh history,
+        // the request left nothing to cut).
+        let mut messages = tool_loop(45);
+        assert!(pass(&manager, &agent, &mut messages, tokens, false).await);
+        assert_eq!(model.call_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn overflow_retries_during_a_backoff() {
+        let (agent, model) = agent(&["", "SUMMARY"]);
+        let (manager, _events) = manager(10_000, None);
+        let mut messages = tool_loop(45);
+        let tokens = heuristic(&messages);
+        pass(&manager, &agent, &mut messages, tokens, false).await;
+        pass(&manager, &agent, &mut messages, tokens, false).await;
+        assert_eq!(model.call_count(), 1);
+        assert!(pass(&manager, &agent, &mut messages, tokens, true).await);
+        assert_eq!(model.call_count(), 2);
+    }
+
+    #[test]
+    fn the_backoff_ends_after_its_calls_or_on_growth() {
+        let compact = CompactAt::new(10_000);
+        assert!(!compact.backing_off(9_000));
+        *compact.backoff.lock() = Some(Backoff {
+            tokens: 10_000,
+            calls_left: 2,
+        });
+        assert!(compact.backing_off(10_999));
+        assert!(!compact.backing_off(11_000));
+        compact.tick();
+        assert!(compact.backing_off(10_000));
+        compact.tick();
+        assert!(!compact.backing_off(10_000));
+        compact.tick();
+        assert_eq!(compact.backoff.lock().unwrap().calls_left, 0);
     }
 
     #[tokio::test]
