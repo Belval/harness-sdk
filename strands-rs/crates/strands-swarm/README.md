@@ -216,7 +216,7 @@ points to `--headless` before it starts or resumes anything.
     their files.
 - **Schedules.**
   - `schedule {message, to?, every?: "30m", at?: "in 2h" | "2026-11-17T09:00Z", id?}` posts
-    `[schedule sN] message` (kind `schedule`) at the given times.
+    `[schedule sN, 2026-11-17 09:00 UTC] message` (kind `schedule`) at the given times.
   - `{cancel: id}` removes one and `{}` lists them. Repeats are at least a minute apart.
   - An agent that polls something schedules itself and ends its turn instead of a long `wait`.
   - From its second fire on, a repeat adds what the receiver spent since the last one:

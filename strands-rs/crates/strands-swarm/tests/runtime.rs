@@ -3807,7 +3807,9 @@ async fn a_recurring_schedule_wakes_its_agent_until_it_is_cancelled() {
     assert_eq!(reply_to(&mut events, USER).await, "tick 1");
     let woken = sent_text(&scripts.lock()["a1"].clone(), 1);
     assert!(
-        woken.contains("kind=\\\"schedule\\\"") && woken.contains("[schedule s1] check the queue"),
+        woken.contains("kind=\\\"schedule\\\"")
+            && woken.contains("[schedule s1, ")
+            && woken.contains(" UTC] check the queue"),
         "{woken}"
     );
 
@@ -3899,8 +3901,12 @@ async fn schedules_persist_and_missed_fires_fire_once_on_resume() {
         .flat_map(|(messages, _)| messages.last().map(|m| m.text()))
         .collect();
     let fired = fired.join("\n");
-    assert_eq!(fired.matches("[schedule s1] repeating").count(), 1, "{fired}");
-    assert_eq!(fired.matches("[schedule s2] one-shot").count(), 1, "{fired}");
+    assert_eq!(fired.matches("[schedule s1, ").count(), 1, "{fired}");
+    assert_eq!(fired.matches("[schedule s2, ").count(), 1, "{fired}");
+    assert!(
+        fired.contains(" UTC] repeating") && fired.contains(" UTC] one-shot"),
+        "{fired}"
+    );
 
     let left = resumed.schedules();
     assert_eq!(left.len(), 1, "the one-shot is done");

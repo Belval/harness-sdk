@@ -57,11 +57,13 @@ impl Schedule {
         true
     }
 
-    /// The text this posts at `now`, given the receiver's spend so far: after a repeat's first
-    /// fire it says what the receiver spent since the last one (and per hour at this interval),
-    /// so a polling agent sees what its loop costs.
+    /// The text this posts at `now`, given the receiver's spend so far. It carries the time, which
+    /// a polling agent otherwise runs `date` for on every fire. After a repeat's first fire it
+    /// says what the receiver spent since the last one (and per hour at this interval), so a
+    /// polling agent sees what its loop costs.
     pub fn text(&self, now: Fired) -> String {
-        let text = format!("[schedule {}] {}", self.id, self.message);
+        let at = now.at.format("%Y-%m-%d %H:%M UTC");
+        let text = format!("[schedule {}, {at}] {}", self.id, self.message);
         let (Some(every), Some(last)) = (self.every_secs, self.fired) else {
             return text;
         };
@@ -290,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_says_what_its_receiver_spent_since_the_last_fire() {
+    fn a_fire_says_when_it_is_and_a_repeat_what_its_receiver_spent_since_the_last() {
         let mut schedule = Schedule {
             id: "poll".into(),
             owner: "a1".into(),
@@ -308,30 +310,30 @@ mod tests {
         let first = at("2026-11-17T09:00:00Z", 1_000_000, Some(10.0));
         assert_eq!(
             schedule.text(first),
-            "[schedule poll] poll slack",
+            "[schedule poll, 2026-11-17 09:00 UTC] poll slack",
             "nothing to compare yet"
         );
         schedule.fired = Some(first);
         assert_eq!(
             schedule.text(at("2026-11-17T09:02:00Z", 1_330_000, Some(10.21))),
-            "[schedule poll] poll slack\n(You used 330.0k tokens, est. $0.21, since this schedule last \
+            "[schedule poll, 2026-11-17 09:02 UTC] poll slack\n(You used 330.0k tokens, est. $0.21, since this schedule last \
              fired 2m ago: about $6.30/h at this interval.)"
         );
         assert_eq!(
             schedule.text(at("2026-11-17T09:02:00Z", 1_000_000, Some(10.0))),
-            "[schedule poll] poll slack",
+            "[schedule poll, 2026-11-17 09:02 UTC] poll slack",
             "nothing spent, nothing said"
         );
         schedule.fired = Some(at("2026-11-17T09:00:00Z", 1_000_000, None));
         assert_eq!(
             schedule.text(at("2026-11-17T09:04:00Z", 1_002_000, None)),
-            "[schedule poll] poll slack\n(You used 2.0k tokens since this schedule last fired 4m ago.)",
+            "[schedule poll, 2026-11-17 09:04 UTC] poll slack\n(You used 2.0k tokens since this schedule last fired 4m ago.)",
             "unpriced: tokens only"
         );
         schedule.every_secs = None;
         assert_eq!(
             schedule.text(at("2026-11-17T09:04:00Z", 1_002_000, None)),
-            "[schedule poll] poll slack",
+            "[schedule poll, 2026-11-17 09:04 UTC] poll slack",
             "a one-shot has no loop to price"
         );
     }
