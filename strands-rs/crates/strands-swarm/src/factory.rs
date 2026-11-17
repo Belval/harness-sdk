@@ -29,7 +29,7 @@ use crate::catalog::ToolCatalog;
 use crate::compaction::{CompactAt, CompactedSink, DEFAULT_COMPACT_AT};
 use crate::dashboard::ContextControl;
 use crate::pruning::{CachePrune, CACHE_TTL, CACHE_TTL_1H};
-use crate::runtime::{AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
+use crate::runtime::{expand_model, AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
 use crate::skills::{skills_prompt, skills_tool};
 
 /// `subagent` is replaced by the swarm tools; `web_search` fails construction on models without
@@ -188,8 +188,16 @@ pub fn harness_model_resolver(options: HarnessFactoryOptions) -> ModelResolver {
     })
 }
 
+/// The model `model` (else the default) names, with a tier alias (`--model sonnet`,
+/// `--side-model haiku`) expanded as `spawn_agent` expands it: the provider would reject it.
 fn model_option(options: &HarnessFactoryOptions, model: Option<String>) -> Option<ModelOption> {
-    model.or_else(|| options.model.clone()).map(ModelOption::Id)
+    let default = options
+        .model
+        .as_deref()
+        .map(|model| expand_model(model, Some(DEFAULT_MODEL)));
+    let model = model.or_else(|| options.model.clone())?;
+    let prefix_from = default.as_deref().unwrap_or(DEFAULT_MODEL);
+    Some(ModelOption::Id(expand_model(&model, Some(prefix_from))))
 }
 
 /// A session manager for `agent_id` under `dir`, saved after every message so a crash loses at
@@ -541,6 +549,34 @@ mod tests {
         };
         let harness = harness_options(&options, spec()).unwrap();
         harness.tools.iter().map(|t| t.name().to_owned()).collect()
+    }
+
+    #[test]
+    fn tier_aliases_in_model_flags_resolve_to_full_ids() {
+        let id = |options: &HarnessFactoryOptions, model: Option<&str>| match model_option(
+            options,
+            model.map(str::to_owned),
+        ) {
+            Some(ModelOption::Id(id)) => Some(id),
+            _ => None,
+        };
+        let sonnet = HarnessFactoryOptions {
+            model: Some("sonnet".into()),
+            ..Default::default()
+        };
+        let full = |tier: &str| format!("bedrock/global.anthropic.claude-{tier}-5-5");
+        assert_eq!(id(&sonnet, None), Some(full("sonnet")));
+        assert_eq!(id(&sonnet, Some("haiku")), Some(full("haiku")));
+        let anthropic = HarnessFactoryOptions {
+            model: Some("anthropic/claude-opus-4-5".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            id(&anthropic, Some("haiku")),
+            Some("anthropic/claude-haiku-5-5".into())
+        );
+        assert_eq!(id(&anthropic, Some("openai/gpt-5")), Some("openai/gpt-5".into()));
+        assert_eq!(id(&HarnessFactoryOptions::default(), None), None);
     }
 
     #[test]

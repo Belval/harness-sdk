@@ -223,10 +223,10 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         Some("1h") => prices.with_cache_write_factor(strands_swarm::cost::CACHE_WRITE_1H_FACTOR),
         _ => prices,
     };
-    let default_model = cli
-        .model
-        .clone()
-        .unwrap_or_else(|| strands_harness::defaults::DEFAULT_MODEL.to_owned());
+    let default_model = cli.model.as_deref().map_or_else(
+        || strands_harness::defaults::DEFAULT_MODEL.to_owned(),
+        |model| strands_swarm::runtime::expand_model(model, Some(strands_harness::defaults::DEFAULT_MODEL)),
+    );
     if let (true, Some(name)) = (cli.cost, &cli.run) {
         let (_, saved) = load_run(name).await?;
         let report = strands_swarm::cost::CostReport::from_state(&saved, prices, Some(&default_model));
