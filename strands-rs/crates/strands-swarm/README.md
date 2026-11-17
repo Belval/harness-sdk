@@ -546,19 +546,29 @@ messages you.
     not a worktree kept for the same reason on every restart.
   - Only the swarm's own `$CARGO_TARGET_DIR-worktrees/<run>/<agent>` dirs are reclaimed. An agent
     that points `CARGO_TARGET_DIR` somewhere else owns that dir and must clean it itself.
-  - Every minute the swarm checks free space on the filesystems of the run dir, the agents'
-    directories and the cargo target dirs. Below `--min-free-disk` (default `20G`, `0` turns it
-    off) it mails the live root agents (or, with none, you) once, from `disk`, with the free space
-    and the biggest target dirs (per agent, and the land checks' shared one); the TUI shows the
-    first line in its footer. It warns again only after the space has recovered to 10% above the
-    threshold, restarts included (`<run dir>/disk-warned`).
+  - On start and then every minute (every 5 s while space is low) the swarm checks free space
+    (`statvfs`) on the filesystems of the run dir, the agents' directories and the cargo target
+    dirs. Below `--min-free-disk` (default `20G`, `0` turns it off) it mails the live root agents
+    (or, with none, you) once, from `disk`, with the free space and the biggest target dirs (per
+    agent, and the land checks' shared one); the TUI shows the first line in its footer. It warns
+    again only after the space has recovered to 10% above the threshold, restarts included
+    (`<run dir>/disk-warned`).
+  - Meanwhile agents' worktree spawns and land jobs wait, shown like a load hold: `waiting: disk
+    space low: 3.0 GB free on the filesystem of /x (below 20 GB; cancel finished worktree agents
+    to free some)`. They go on once space has recovered to 10% above the threshold. Spawns
+    without a worktree, other jobs and the user's own spawns are not held.
+  - **Reserve.** A persistent run keeps 1 GB allocated in `<run dir>/disk-reserve` while space is
+    fine. The first save of `swarm.json` or of a conversation that fails with a full disk deletes
+    it and tries again, so the run can still be saved and resumed; the guard recreates it once
+    space has recovered.
   - Finished worktree agents are never cancelled for you (one may be kept on purpose), but a live
     one that is idle, runs no background job, has a clean worktree and nothing on its branches
     the base lacks is flagged in `list_agents`: `…, idle with nothing left to merge: cancel to
     reclaim its worktree and 12 GB target dir`. When the disk guard warns, it first deletes the
     private target dirs of such agents (never their worktree, branch or conversation; the next
     build recreates it) and says so in the warning: `Deleted the target dirs of idle agents with
-    nothing left to merge (…): 12 GB done (a4)`. Off with `SwarmConfig::reclaim_disk`.
+    nothing left to merge (…): 12 GB done (a4)`. While space stays low it does so again every
+    minute, for agents that finished since. Off with `SwarmConfig::reclaim_disk`.
 - **Memory.**
   - One Markdown file is shared by every agent and run: `$XDG_CONFIG_HOME/strands-swarm/memory.md`
     (default `~/.config`), or `--memory FILE`, or off with `--no-memory`.

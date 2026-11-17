@@ -1,6 +1,7 @@
 //! Host protection: while the host is overloaded (1-minute load average above
 //! [`Swarm::max_load`], or available memory below [`SwarmConfig::min_free_mem`]), new model
-//! calls, background jobs and agents spawned by agents wait. Nothing already running is held.
+//! calls, background jobs and agents spawned by agents wait; while its disk is low, agents'
+//! worktree spawns and land jobs too. Nothing already running is held.
 
 use super::*;
 
@@ -57,6 +58,8 @@ pub(super) struct HostGate {
     max_load: Mutex<Option<f64>>,
     /// Agents held now, with why.
     held: Mutex<BTreeMap<String, String>>,
+    /// Why worktree spawns and land jobs wait: space is low ([`Swarm::guard_disk`]).
+    pub(super) disk_low: Mutex<Option<String>>,
 }
 
 /// Clears an agent's hold when its wait ends, however it ends.
@@ -129,10 +132,15 @@ impl Swarm {
         held.get(id).map(|why| format!("waiting: {why}"))
     }
 
-    /// Wait while [`Self::host_busy`], published as [`SwarmEvent::HostHeld`] for agent `id`.
-    /// Errors with [`Error::Cancelled`] when `cancel` fires or the swarm shuts down first.
-    pub(super) async fn wait_for_host(&self, id: &str, cancel: &CancellationToken) -> Result<()> {
-        let Some(mut why) = self.host_busy() else {
+    /// Wait while [`Self::host_busy`] (with `disk`, also while disk space is low:
+    /// [`Swarm::guard_disk`]), published as [`SwarmEvent::HostHeld`] for agent `id`. Errors with
+    /// [`Error::Cancelled`] when `cancel` fires or the swarm shuts down first.
+    pub(super) async fn wait_for_host(&self, id: &str, disk: bool, cancel: &CancellationToken) -> Result<()> {
+        let busy = || {
+            self.host_busy()
+                .or_else(|| disk.then(|| self.disk_low()).flatten())
+        };
+        let Some(mut why) = busy() else {
             return Ok(());
         };
         let _held = Held(self, id);
@@ -149,7 +157,7 @@ impl Swarm {
                 () = cancel.cancelled() => return Err(Error::Cancelled),
                 () = self.inner.root_cancel.cancelled() => return Err(Error::Cancelled),
             }
-            match self.host_busy() {
+            match busy() {
                 Some(next) => why = next,
                 None => return Ok(()),
             }

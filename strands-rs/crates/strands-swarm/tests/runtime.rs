@@ -5748,6 +5748,85 @@ async fn a_restarted_swarm_does_not_repeat_a_disk_warning() {
     swarm.shutdown().await;
 }
 
+/// While space is low, an agent's worktree spawn waits (and says why) until it recovers; a spawn
+/// without a worktree goes on.
+#[tokio::test]
+async fn low_disk_space_holds_worktree_spawns_until_it_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[]);
+    let scripts = scripts_of(vec![
+        ("a1", (0..4).map(|_| say("noted")).collect()),
+        ("a2", vec![say("plain")]),
+        ("a3", vec![say("isolated")]),
+    ]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(mock_factory(&scripts), &repo));
+    spawn_root(&swarm, "root").await;
+    reply_to(&mut events, USER).await;
+    let probe = DiskProbe::new(5 << 30);
+    tokio::spawn(
+        swarm
+            .clone()
+            .guard_disk(20 << 30, Duration::from_millis(1), probe.check()),
+    );
+    probe.settle().await;
+
+    let request = |worktree| SpawnRequest {
+        task: "t".into(),
+        worktree,
+        ..Default::default()
+    };
+    assert_eq!(swarm.spawn("a1", request(false)).await.unwrap(), "a2");
+    let held = tokio::spawn({
+        let swarm = swarm.clone();
+        async move { swarm.spawn("a1", request(true)).await }
+    });
+    let why = host_held(&mut events, "a1").await.unwrap();
+    assert!(
+        why.starts_with("disk space low: 5.0 GB free on the filesystem of "),
+        "{why}"
+    );
+    assert!(swarm.agent("a3").is_none(), "no worktree while space is low");
+    probe.set(30 << 30);
+    assert_eq!(host_held(&mut events, "a1").await, None);
+    assert_eq!(held.await.unwrap().unwrap(), "a3");
+    assert!(swarm.agent("a3").unwrap().branch.is_some());
+    swarm.shutdown().await;
+}
+
+/// A persistent run keeps a disk reserve while space is fine, which a save on a full disk spends
+/// ([`strands_swarm::reserve`]); the guard recreates it once space has recovered, not before.
+#[tokio::test]
+async fn the_disk_guard_keeps_a_reserve_while_space_is_fine() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("noted"), say("noted")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    config.disk_reserve = 64 << 10;
+    let (swarm, _events) = Swarm::new(config);
+    let probe = DiskProbe::new(30 << 30);
+    tokio::spawn(
+        swarm
+            .clone()
+            .guard_disk(20 << 30, Duration::from_millis(1), probe.check()),
+    );
+    probe.settle().await;
+    let reserve = strands_swarm::reserve::path(&state_dir);
+    assert_eq!(std::fs::metadata(&reserve).unwrap().len(), 64 << 10);
+
+    // Spent by a full disk while space is low: left alone until it recovers.
+    probe.set(5 << 30);
+    probe.settle().await;
+    assert!(strands_swarm::reserve::release(&state_dir));
+    probe.settle().await;
+    assert!(!reserve.exists());
+    probe.set(30 << 30);
+    probe.settle().await;
+    assert!(reserve.exists());
+    swarm.shutdown().await;
+}
+
 /// A turn's last mail (reply or error) goes out before its agent's status leaves `Running`. In
 /// between, the agent looked done with nothing unread anywhere: `is_busy` said the swarm had
 /// nothing left to do, and a resumed headless run exited there, the root's error unprinted and
@@ -5931,6 +6010,10 @@ async fn finished_worktree_agents_are_flagged_and_lose_their_target_dir_when_dis
         busy_target.exists(),
         "an agent with unmerged work keeps its target dir"
     );
+    // Still low: later passes reclaim what a finished agent built since.
+    let rebuilt = target(&done);
+    eventually("the rebuilt target dir is reclaimed", || !rebuilt.exists()).await;
+    assert!(busy_target.exists());
     swarm.shutdown().await;
 }
 

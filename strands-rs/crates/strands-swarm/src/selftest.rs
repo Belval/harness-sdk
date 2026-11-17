@@ -29,11 +29,12 @@ use crate::watchdog;
 /// How long every live agent has to reply.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Top-level entries of a run directory the copy leaves out: binaries, logs, the audit trail and
-/// background jobs (their processes belong to the live run).
+/// Top-level entries of a run directory the copy leaves out: binaries, logs, the audit trail,
+/// background jobs (their processes belong to the live run) and the 1 GB disk reserve.
 const SKIPPED: &[&str] = &[
     "bin",
     "jobs",
+    crate::reserve::RESERVE_FILE,
     "stderr.log",
     "supervisor.log",
     "journal.jsonl",

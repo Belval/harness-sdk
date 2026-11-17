@@ -260,14 +260,17 @@ fn model_option(options: &HarnessFactoryOptions, model: Option<String>) -> Optio
     Some(ModelOption::Id(expand_model(&model, Some(prefix_from))))
 }
 
-/// A session manager for `agent_id` under `dir`, saved after every message so a crash loses at
-/// most the in-flight model call.
+/// A session manager for `agent_id` under `dir` (a run's `sessions` dir), saved after every
+/// message so a crash loses at most the in-flight model call. A save that finds the disk full
+/// spends the run's reserve ([`crate::reserve`]) on it.
 pub fn agent_session_manager(dir: &std::path::Path, agent_id: &str) -> Result<SessionManager> {
     let options = SessionManagerOptions {
         save_latest_on: SaveLatestStrategy::Message,
         ..Default::default()
     };
-    SessionManager::with_options(agent_id, Arc::new(FileStorage::new(dir)), options)
+    let run_dir = dir.parent().unwrap_or(dir);
+    let storage = crate::reserve::ReserveStorage::new(FileStorage::new(dir), run_dir);
+    SessionManager::with_options(agent_id, Arc::new(storage), options)
 }
 
 fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption> {

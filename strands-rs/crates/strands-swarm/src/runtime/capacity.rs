@@ -187,7 +187,7 @@ impl Swarm {
                 let cancel = context.agent.cancel_token();
                 async move {
                     swarm.hold_for_reload(&id, &cancel).await?;
-                    swarm.wait_for_host(&id, &cancel).await?;
+                    swarm.wait_for_host(&id, false, &cancel).await?;
                     let _permit = swarm.admit_model_call(&id, &cancel).await?;
                     next.run(context, &events).await
                 }

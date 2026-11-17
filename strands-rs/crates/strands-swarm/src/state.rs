@@ -233,10 +233,14 @@ impl Persister {
             return Ok(());
         }
         let json = serde_json::to_vec_pretty(state).map_err(|e| Error::other(e.to_string()))?;
-        // Durable: after a power loss, the old state or the new one, never an empty file.
-        crate::files::replace_async(&self.dir.join(STATE_FILE), json, true)
-            .await
-            .map_err(|e| Error::other(format!("Failed to save swarm state: {e}")))?;
+        // Durable: after a power loss, the old state or the new one, never an empty file. A full
+        // disk spends the run's reserve on it.
+        let path = self.dir.join(STATE_FILE);
+        crate::reserve::save_with(&self.dir, || {
+            crate::files::replace_async(&path, json.clone(), true)
+        })
+        .await
+        .map_err(|e| Error::other(format!("Failed to save swarm state: {e}")))?;
         *written = generation;
         Ok(())
     }

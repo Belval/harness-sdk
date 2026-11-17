@@ -13,6 +13,9 @@ pub const DISK_WARNED_FILE: &str = "disk-warned";
 /// How often [`Swarm::guard_disk`] checks.
 pub const DISK_CHECK_EVERY: Duration = Duration::from_secs(60);
 
+/// How often it checks at most while space is low, so held spawns go on soon after it returns.
+pub const LOW_DISK_CHECK_EVERY: Duration = Duration::from_secs(5);
+
 /// Free bytes on the filesystem holding a path; `None` when unknown.
 pub type FreeSpace = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 
@@ -23,13 +26,18 @@ const LAND_CHECKS: &str = "land checks (any land job's; safe to delete while non
 const BIGGEST: usize = 5;
 
 impl Swarm {
-    /// Every `every`, check the free space (`free`) on the filesystems the swarm writes to: the
-    /// run dir, the agents' working directories and the swarm's cargo target dirs. Once it drops
-    /// below `min_free` bytes, delete the target dirs of [`Self::finished_agents`] and tell the
-    /// live root agents once, with what was deleted and the biggest per-agent target
-    /// dirs; a new warning needs the space to recover first (by a tenth of `min_free`). A
-    /// persistent run keeps that state on disk ([`DISK_WARNED_FILE`]), so a restart does not
-    /// warn again. Runs until the swarm shuts down.
+    /// Check the free space (`free`) on the filesystems the swarm writes to (the run dir, the
+    /// agents' working directories and the swarm's cargo target dirs) now and every `every`
+    /// ([`LOW_DISK_CHECK_EVERY`] at most while it is low). Below `min_free` bytes:
+    /// - delete the target dirs of [`Self::finished_agents`], again every `every` while low;
+    /// - hold agents' worktree spawns and land jobs ([`Swarm::wait_for_host`]) until it recovers;
+    /// - tell the live root agents once, with what was deleted and the biggest per-agent target
+    ///   dirs; a new warning needs the space to recover first (by a tenth of `min_free`). A
+    ///   persistent run keeps that state on disk ([`DISK_WARNED_FILE`]), so a restart does not
+    ///   warn again.
+    ///
+    /// Once recovered, it recreates the run's disk reserve ([`SwarmConfig::disk_reserve`]) if a
+    /// full disk spent it. Runs until the swarm shuts down.
     pub async fn guard_disk(self, min_free: u64, every: Duration, free: FreeSpace) {
         let marker = self
             .inner
@@ -38,11 +46,10 @@ impl Swarm {
             .as_ref()
             .map(|dir| dir.join(DISK_WARNED_FILE));
         let mut warned = marker.as_ref().is_some_and(|marker| marker.exists());
+        let recovered_at = min_free.saturating_add(min_free / 10);
+        // The last pass over finished agents' target dirs, while space is low.
+        let mut reclaimed_at: Option<tokio::time::Instant> = None;
         loop {
-            tokio::select! {
-                () = self.inner.root_cancel.cancelled() => return,
-                () = tokio::time::sleep(every) => {}
-            }
             let paths = self.disk_paths();
             let lowest = {
                 let free = free.clone();
@@ -51,27 +58,78 @@ impl Swarm {
                     .ok()
                     .flatten()
             };
-            let Some((path, bytes)) = lowest else { continue };
-            if bytes >= min_free.saturating_add(min_free / 10) {
-                if std::mem::take(&mut warned) {
-                    if let Some(marker) = &marker {
-                        let _ = std::fs::remove_file(marker);
+            let low = match lowest {
+                Some((_, bytes)) if bytes >= recovered_at => {
+                    *self.inner.host.disk_low.lock() = None;
+                    if std::mem::take(&mut warned) {
+                        if let Some(marker) = &marker {
+                            let _ = std::fs::remove_file(marker);
+                        }
                     }
+                    self.keep_reserve().await;
+                    false
                 }
-            } else if bytes < min_free && !warned {
-                warned = true;
-                if let Some(marker) = &marker {
-                    let _ = std::fs::write(marker, format!("{bytes}\n"));
+                Some((path, bytes)) if bytes < min_free => {
+                    *self.inner.host.disk_low.lock() = Some(disk_hold(&path, bytes, min_free));
+                    let due = reclaimed_at.is_none_or(|at| at.elapsed() >= every);
+                    let mut reclaimed = Vec::new();
+                    if due {
+                        reclaimed_at = Some(tokio::time::Instant::now());
+                        reclaimed = self.reclaim_finished_targets().await;
+                    }
+                    if !warned {
+                        warned = true;
+                        if let Some(marker) = &marker {
+                            let _ = std::fs::write(marker, format!("{bytes}\n"));
+                        }
+                        let targets = self.target_dirs();
+                        let sizes = tokio::task::spawn_blocking(move || biggest(targets))
+                            .await
+                            .unwrap_or_default();
+                        let text = disk_warning(&path, bytes, min_free, &reclaimed, &sizes);
+                        self.tell_roots(DISK_SENDER, "disk", text);
+                    }
+                    true
                 }
-                let reclaimed = self.reclaim_finished_targets().await;
-                let targets = self.target_dirs();
-                let sizes = tokio::task::spawn_blocking(move || biggest(targets))
-                    .await
-                    .unwrap_or_default();
-                let text = disk_warning(&path, bytes, min_free, &reclaimed, &sizes);
-                self.tell_roots(DISK_SENDER, "disk", text);
+                // Between the threshold and recovery: as it was.
+                _ => self.inner.host.disk_low.lock().is_some(),
+            };
+            if !low {
+                reclaimed_at = None;
+            }
+            // While low, held spawns and land jobs should go on soon after space returns.
+            let pause = if low {
+                every.min(LOW_DISK_CHECK_EVERY)
+            } else {
+                every
+            };
+            tokio::select! {
+                () = self.inner.root_cancel.cancelled() => return,
+                () = tokio::time::sleep(pause) => {}
             }
         }
+    }
+
+    /// Recreate the run's disk reserve ([`crate::reserve`]) if a full disk spent it.
+    async fn keep_reserve(&self) {
+        let (Some(dir), bytes) = (&self.inner.config.state_dir, self.inner.config.disk_reserve) else {
+            return;
+        };
+        if bytes == 0 || crate::reserve::path(dir).exists() {
+            return;
+        }
+        let dir = dir.clone();
+        // Allocating can mean writing it all, where the filesystem cannot preallocate.
+        match tokio::task::spawn_blocking(move || crate::reserve::ensure(&dir, bytes)).await {
+            Ok(Ok(true)) => tracing::info!(bytes, "disk reserve created"),
+            Ok(Ok(false)) | Err(_) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "could not create the disk reserve"),
+        }
+    }
+
+    /// Why a worktree spawn or a land job waits now: the disk guard found space low.
+    pub(super) fn disk_low(&self) -> Option<String> {
+        self.inner.host.disk_low.lock().clone()
     }
 
     /// Live worktree agents that look finished: idle, without a running background job, with a
@@ -227,6 +285,18 @@ fn biggest(dirs: Vec<(String, PathBuf)>) -> Vec<(String, PathBuf, u64)> {
     sized
 }
 
+/// Why a worktree spawn or land job waits while space is low.
+fn disk_hold(path: &Path, free: u64, min_free: u64) -> String {
+    use crate::gc::human;
+    format!(
+        "disk space low: {} free on the filesystem of {} (below {}; cancel finished worktree \
+         agents to free some)",
+        human(free),
+        path.display(),
+        human(min_free)
+    )
+}
+
 /// The warning's text; its first line is the TUI's footer notice. `reclaimed`: the finished
 /// agents' target dirs just deleted.
 fn disk_warning(
@@ -267,16 +337,12 @@ fn disk_warning(
     text
 }
 
-/// Free bytes on the filesystem holding `path`, from `df -Pk` (POSIX output, 1024-byte blocks).
+/// Free bytes on the filesystem holding `path` for an unprivileged writer (`statvfs`'s
+/// available blocks, as `df` shows them).
+#[allow(clippy::useless_conversion)] // Not `u64` on every platform.
 pub fn free_space(path: &Path) -> Option<u64> {
-    let output = std::process::Command::new("df")
-        .arg("-Pk")
-        .arg(path)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let available = stdout.lines().nth(1)?.split_whitespace().nth(3)?;
-    available.parse::<u64>().ok()?.checked_mul(1024)
+    let stats = nix::sys::statvfs::statvfs(path).ok()?;
+    u64::from(stats.blocks_available()).checked_mul(u64::from(stats.fragment_size()))
 }
 
 #[cfg(test)]
@@ -284,7 +350,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn df_reports_free_space_for_an_existing_dir() {
+    fn statvfs_reports_free_space_for_an_existing_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert!(free_space(dir.path()).is_some_and(|bytes| bytes > 0));
     }

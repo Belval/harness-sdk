@@ -60,7 +60,7 @@ impl Swarm {
     /// while the host is overloaded ([`Swarm::host_busy`]).
     pub async fn start_job(&self, owner: &str, command: &str, name: Option<String>) -> Result<Job> {
         let node = self.known(owner)?;
-        self.wait_for_host(owner, &node.turn_token()).await?;
+        self.wait_for_host(owner, false, &node.turn_token()).await?;
         let job = self
             .inner
             .jobs

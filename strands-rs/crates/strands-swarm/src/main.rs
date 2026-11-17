@@ -380,6 +380,9 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         Some(jobs) => Some(jobs),
         None => Some(strands_swarm::runtime::default_build_jobs()),
     };
+    if cli.min_free_disk > 0 {
+        config.disk_reserve = strands_swarm::reserve::RESERVE_BYTES;
+    }
     config.min_free_mem = cli
         .min_free_mem
         .unwrap_or_else(strands_swarm::runtime::default_min_free_mem);

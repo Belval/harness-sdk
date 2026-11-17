@@ -58,7 +58,9 @@ use actor::Start;
 pub use actor::SILENT_REPLY;
 use background::jobs_dir;
 use capacity::started;
-pub use disk::{free_space, FreeSpace, DISK_CHECK_EVERY, DISK_SENDER, DISK_WARNED_FILE};
+pub use disk::{
+    free_space, FreeSpace, DISK_CHECK_EVERY, DISK_SENDER, DISK_WARNED_FILE, LOW_DISK_CHECK_EVERY,
+};
 pub use host::{default_max_load, default_min_free_mem, host_stats, HostProbe, HostStats, HOST_POLL};
 use persist::history_event;
 pub use warm::{KEEP_WARM_EVERY, KEEP_WARM_MAX};
@@ -323,6 +325,9 @@ pub struct SwarmConfig {
     /// unless this process's environment sets it; `None` sets none. Without it every cargo build
     /// starts a compiler per CPU, and a few dozen agents building at once swamp the host.
     pub build_jobs: Option<usize>,
+    /// Bytes [`Swarm::guard_disk`] keeps allocated in the run dir ([`crate::reserve`]) for saves
+    /// once the disk is full; `0` (the default) keeps none.
+    pub disk_reserve: u64,
 }
 
 impl SwarmConfig {
@@ -359,6 +364,7 @@ impl SwarmConfig {
             min_free_mem: 0,
             host_probe: Arc::new(host_stats),
             build_jobs: Some(default_build_jobs()),
+            disk_reserve: 0,
         }
     }
 }
@@ -933,7 +939,8 @@ impl Swarm {
 
     /// Spawn an agent under `parent` ([`USER`] for a root agent). Returns its id. At the agent
     /// limit the agent is [`AgentStatus::Queued`] instead, and starts once a slot frees. An
-    /// agent's spawn waits first while the host is overloaded ([`Swarm::host_busy`]).
+    /// agent's spawn waits first while the host is overloaded ([`Swarm::host_busy`]), and one
+    /// with a worktree also while disk space is low ([`Swarm::guard_disk`]).
     pub async fn spawn(&self, parent: &str, mut request: SpawnRequest) -> Result<String> {
         let parent_node = if parent == USER {
             None
@@ -942,7 +949,8 @@ impl Swarm {
         };
         // The user's spawns are not held: the TUI awaits them.
         if let Some(node) = &parent_node {
-            self.wait_for_host(parent, &node.turn_token()).await?;
+            self.wait_for_host(parent, request.worktree, &node.turn_token())
+                .await?;
         }
         let default = self.inner.config.default_model.as_deref();
         request.model = request.model.map(|model| expand_model(&model, default));

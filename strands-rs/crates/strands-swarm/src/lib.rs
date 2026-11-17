@@ -29,6 +29,7 @@ pub mod memory;
 pub mod names;
 pub mod orphans;
 pub mod pruning;
+pub mod reserve;
 pub mod resume;
 pub mod retry;
 pub mod runtime;
