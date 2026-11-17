@@ -529,6 +529,15 @@ pub const INTERRUPTED_TEXT: &str = "Interrupted by the user before finishing thi
 /// Sender of the message that tells an agent its background job ended.
 pub const JOBS_SENDER: &str = "jobs";
 
+/// Sender of the supervisor's notes (a rollback, a crash loop) from [`SUPERVISOR_NOTICE`].
+pub const SUPERVISOR_SENDER: &str = "supervisor";
+
+/// File in the run directory where `swarmctl` leaves notes for the swarm's next start.
+pub const SUPERVISOR_NOTICE: &str = "supervisor.notice";
+
+/// Most bytes of [`SUPERVISOR_NOTICE`] delivered (its tail).
+const SUPERVISOR_NOTICE_MAX: usize = 4000;
+
 /// How many restored messages [`SwarmEvent::History`] carries at most.
 pub const HISTORY_MESSAGES: usize = 100;
 

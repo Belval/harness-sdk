@@ -345,10 +345,24 @@ Typing text without a command messages the selected agent.
 
 ## Operate 24/7
 
-`scripts/swarmctl` keeps a run alive in tmux. It restarts the run on exit, restarts into the new
-binary on `reload_swarm`, and rolls back if a new binary crashes within 30 s. The swarm's stderr
-goes to `<run dir>/stderr.log` and the supervisor's notes to `supervisor.log`, each rotated to
-`<log>.1` at 8 MB (`SWARMCTL_LOG_MAX`).
+`scripts/swarmctl` keeps a run alive in tmux. It restarts the run on exit and restarts into the
+new binary on `reload_swarm`. The swarm's stderr goes to `<run dir>/stderr.log` and the
+supervisor's notes to `supervisor.log`, each rotated to `<log>.1` at 8 MB (`SWARMCTL_LOG_MAX`).
+
+**Failures.**
+
+- A swarm that hangs exits instead, so the supervisor sees it: 70 when a deadlock is detected, 71
+  when it is not up (first TUI frame drawn, or headless running) within 180 s.
+- A new binary is on trial for 10 minutes from its reload (or `swarmctl start`). If it fails
+  (non-zero exit, a signal, 70, 71) on trial, the supervisor puts the previous binary back and
+  keeps the failed one as `bin/failed`. A binary that ran longer is restarted, never rolled back,
+  and a rolled-back one is not rolled back again.
+- Quick failures in a row (each within 60 s of starting) back off from 5 s, doubling up to 5
+  minutes. The tmux pane shows each failure with the tail of `stderr.log`, and `swarmctl status`
+  the supervisor's last note.
+- A rollback, and the third quick failure in a row, are left in `<run dir>/supervisor.notice` with
+  the stderr tail. When the swarm next starts it mails the notice to its live root agents (from
+  `supervisor`, also shown in the footer) and deletes it.
 
 ```sh
 swarmctl start NAME ./target/release/strands-swarm --cwd REPO --goal "..."   # start or resume

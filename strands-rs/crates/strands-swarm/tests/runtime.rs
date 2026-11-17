@@ -379,6 +379,62 @@ async fn agents_get_unique_names_and_can_be_addressed_by_them() {
 }
 
 #[tokio::test]
+async fn a_supervisor_notice_reaches_the_live_root_once_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let notice = state_dir.join(strands_swarm::SUPERVISOR_NOTICE);
+    std::fs::write(&notice, "2026-01-01T00:00:00Z The new binary exited with code 70 (deadlock detected) 12s after it started, so the supervisor rolled back.\n").unwrap();
+    let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({
+        "run_id": "old",
+        "cwd": dir.path(),
+        "next_id": 3,
+        "agents": [
+            {"id": "a1", "name": "lead", "parent": "user", "cwd": dir.path(), "branch": null, "task": "lead",
+             "model": null, "goal": null, "status": "idle", "mailbox": []},
+            {"id": "a2", "name": "old-lead", "parent": "user", "cwd": dir.path(), "branch": null, "task": "t",
+             "model": null, "goal": null, "status": "cancelled", "mailbox": []},
+        ],
+    }))
+    .unwrap();
+    let scripts: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    scripts
+        .lock()
+        .insert("a1".into(), MockMessageModel::shared(vec![say("noted")]));
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::resume(config, saved).await.unwrap();
+
+    let mut delivered = Vec::new();
+    let reply = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                SwarmEvent::Mail { to, mail } if mail.from == strands_swarm::SUPERVISOR_SENDER => {
+                    delivered.push((to, mail.text));
+                }
+                SwarmEvent::Mail { to, mail } if to == USER && mail.kind == "reply" => return mail.text,
+                _ => {}
+            }
+        }
+        panic!("event stream closed");
+    })
+    .await
+    .expect("the root never answered the notice");
+    assert_eq!(reply, "noted");
+    assert_eq!(delivered.len(), 1, "only the live root: {delivered:?}");
+    let (to, text) = &delivered[0];
+    assert_eq!(to, "a1");
+    assert!(
+        text.starts_with("[From the swarm's supervisor (swarmctl)]\n2026-01-01T00:00:00Z The new binary exited with code 70"),
+        "{text}"
+    );
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 0);
+    assert!(sent.contains("rolled back"), "{sent}");
+    assert!(!notice.exists(), "a notice is delivered once");
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_saved_run_without_names_resumes_with_derived_ones() {
     let dir = tempfile::tempdir().unwrap();
     let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({

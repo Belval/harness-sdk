@@ -158,7 +158,8 @@ struct Cli {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     strands_swarm::watchdog::spawn(Duration::from_secs(10), |report| {
-        // The TUI may own the screen; under swarmctl stderr goes to the run's stderr.log.
+        // Under swarmctl stderr goes to the run's stderr.log.
+        release_terminal();
         eprintln!("strands-swarm: {report}");
         std::process::exit(strands_swarm::watchdog::DEADLOCK_EXIT_CODE);
     });
@@ -233,6 +234,17 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
             println!("{}", entry.render());
         }
         return Ok(Exit::Quit);
+    }
+    if !(cli.list_tools || cli.list_skills) {
+        let timeout = strands_swarm::watchdog::STARTUP_TIMEOUT;
+        strands_swarm::watchdog::watch_startup(timeout, strands_swarm::watchdog::is_ready, move || {
+            release_terminal();
+            eprintln!(
+                "strands-swarm: not up after {}s; exiting so that the supervisor restarts it (or rolls a new binary back)",
+                timeout.as_secs()
+            );
+            std::process::exit(strands_swarm::watchdog::STARTUP_HANG_EXIT_CODE);
+        });
     }
     let cwd = std::fs::canonicalize(&cli.cwd)?;
     let instructions = cli
@@ -395,9 +407,17 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         None if !resumed => return Err("--headless needs a task or a --goal".into()),
         None => {}
     }
+    strands_swarm::watchdog::ready();
     let exit = run_headless(&swarm, events, expect_reply).await;
     swarm.shutdown().await;
     exit
+}
+
+/// Give the screen back if the TUI holds it, before a watchdog exits the process.
+fn release_terminal() {
+    if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+        ratatui::restore();
+    }
 }
 
 fn print_skills(skills: &Skills) {

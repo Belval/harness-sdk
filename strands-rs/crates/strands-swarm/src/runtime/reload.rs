@@ -72,6 +72,47 @@ impl Swarm {
             .sum()
     }
 
+    /// Take what the supervisor left in [`SUPERVISOR_NOTICE`] (a rollback, a crash loop) and mail
+    /// it to every live root agent, or to the user when there is none, so that whoever reloaded
+    /// learns the new binary did not stick.
+    pub(super) async fn deliver_supervisor_notice(&self) {
+        let Some(dir) = &self.inner.config.state_dir else {
+            return;
+        };
+        let path = dir.join(SUPERVISOR_NOTICE);
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            return;
+        };
+        if let Err(error) = tokio::fs::remove_file(&path).await {
+            // Delivered again next start rather than lost.
+            tracing::warn!(%error, "supervisor notice not removed");
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let start = text.len().saturating_sub(SUPERVISOR_NOTICE_MAX);
+        let start = (start..text.len())
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
+        let text = format!("[From the swarm's supervisor (swarmctl)]\n{}", &text[start..]);
+        let roots: Vec<String> = self
+            .inner
+            .agents
+            .lock()
+            .values()
+            .filter(|node| node.parent == USER && node.status.lock().is_live())
+            .map(|node| node.id.clone())
+            .collect();
+        if roots.is_empty() {
+            let _ = self.post(SUPERVISOR_SENDER, USER, "supervisor", text);
+            return;
+        }
+        for root in roots {
+            let _ = self.post(SUPERVISOR_SENDER, &root, "supervisor", text.clone());
+        }
+    }
+
     /// Resolves once an agent has requested a reload; the host should then call
     /// [`Swarm::shutdown`] and exit with [`RELOAD_EXIT_CODE`].
     pub async fn reload_requested(&self) {

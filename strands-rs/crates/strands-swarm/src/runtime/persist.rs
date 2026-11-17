@@ -35,6 +35,7 @@ impl Swarm {
             swarm.start_scheduler();
         }
         swarm.start_queued();
+        swarm.deliver_supervisor_notice().await;
         swarm.persist();
         swarm.collect_in_background();
         swarm.watch_jobs();

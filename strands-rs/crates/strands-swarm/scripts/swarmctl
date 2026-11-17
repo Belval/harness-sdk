@@ -3,13 +3,22 @@
 #
 # The supervisor restarts the run whenever it exits (it resumes from its saved state), restarts
 # immediately into a new binary on a hot reload (exit 75), and rolls back to the previous binary
-# when a new one crashes within 30 seconds. Only `swarmctl stop` ends it.
+# when a new one fails within its trial (the first 10 minutes after it is installed or reloaded
+# into). Repeated quick failures back off up to 5 minutes. Each rollback and crash loop is left in
+# <run>/supervisor.notice, which the swarm mails to its root agent when it next starts. Only
+# `swarmctl stop` ends it.
 set -euo pipefail
 
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/strands-swarm"
 SELF="$(readlink -f "$0")"
 RELOAD_EXIT=75
-CRASH_WINDOW=30
+# A binary installed (or reloaded into) less than this many seconds ago is rolled back on failure.
+TRIAL_WINDOW="${SWARMCTL_TRIAL_WINDOW:-600}"
+# A failed run shorter than this counts toward a crash loop.
+QUICK_FAILURE=60
+# Seconds before a restart, doubled per quick failure in a row up to MAX_DELAY.
+RESTART_DELAY="${SWARMCTL_RESTART_DELAY:-5}"
+MAX_DELAY=300
 # stderr.log and supervisor.log are rotated to <log>.1 past this many bytes.
 LOG_MAX="${SWARMCTL_LOG_MAX:-8388608}"
 
@@ -48,7 +57,10 @@ start() {
   running "$run" && die "run $run is already running (swarmctl attach $run)"
   [[ -x "$binary" ]] || die "$binary is not executable"
   mkdir -p "$dir/bin"
-  install -m 755 "$binary" "$dir/bin/current.new" && mv "$dir/bin/current.new" "$dir/bin/current"
+  install -m 755 "$binary" "$dir/bin/current.new"
+  # Like a reload, keep the binary that ran before for a rollback.
+  [[ -f "$dir/bin/current" ]] && mv -f "$dir/bin/current" "$dir/bin/previous"
+  mv "$dir/bin/current.new" "$dir/bin/current"
   printf '%s\0' "$@" > "$dir/args"
   # Keep the environment the swarm needs (credentials config, PATH for MCP servers) across reboots.
   { export -p | grep -E '^declare -x (PATH|HOME|USER|LANG|TERM|AWS_[A-Z_]*|CARGO_[A-Z_]*|RUSTUP_[A-Z_]*|QUICK_EVALS_[A-Z_]*|SSH_AUTH_SOCK)='; } > "$dir/env" || true
@@ -65,29 +77,75 @@ resume() {
   echo "run $run started: swarmctl attach $run"
 }
 
+# What exit code $1 means, for the logs and the notice.
+describe() {
+  case "$1" in
+    70) echo "exited with code 70 (deadlock detected)" ;;
+    71) echo "exited with code 71 (not up within its startup timeout)" ;;
+    101) echo "panicked (exit code 101)" ;;
+    *) if (( $1 > 128 )); then echo "was killed by signal $(( $1 - 128 ))"; else echo "exited with code $1"; fi ;;
+  esac
+}
+
 supervise() {
   local run="$1" dir; dir="$(run_dir "$run")"
-  local args=()
+  local args=() failures=0 i
   mapfile -d '' args < "$dir/args"
   # shellcheck disable=SC1091
   source "$dir/env"
   cd "$HOME"
+  note() { echo "$(date -Is) $*" | capped_log "$dir/supervisor.log"; }
+  # Appended to supervisor.notice, for the swarm to mail its root agent when it next starts.
+  notice() { { echo "$(date -Is) $*"; echo "Last lines of $dir/stderr.log:"; tail -n 8 "$dir/stderr.log" 2>/dev/null || true; echo; } >> "$dir/supervisor.notice"; }
   while [[ ! -f "$dir/stop" ]]; do
-    local started code=0
+    local started installed code
     started=$(date +%s)
-    "$dir/bin/current" --run "$run" "${args[@]}" 2> >(capped_log "$dir/stderr.log") || code=$?
+    installed=$(stat -c %Y "$dir/bin/current" 2>/dev/null || echo 0)
+    # stderr goes through capped_log (fd 3 keeps stdout on the terminal); the pipeline returns
+    # only once the log has every line, so the tail below is complete.
+    set +e
+    { "$dir/bin/current" --run "$run" "${args[@]}" 2>&1 1>&3 3>&- | capped_log "$dir/stderr.log"; } 3>&1
+    code=${PIPESTATUS[0]}
+    set -e
     [[ -f "$dir/stop" ]] && break
+    local now elapsed why delay
+    now=$(date +%s); elapsed=$((now - started))
     if [[ $code -eq $RELOAD_EXIT ]]; then
-      echo "$(date -Is) reload" | capped_log "$dir/supervisor.log"
+      # The new binary's trial starts now, not when it was installed (an idle reload waits).
+      touch "$dir/bin/current" 2>/dev/null || true
+      failures=0
+      note "reload"
       continue
     fi
-    echo "$(date -Is) exited code=$code" | capped_log "$dir/supervisor.log"
-    if (( code != 0 && $(date +%s) - started < CRASH_WINDOW )) && [[ -x "$dir/bin/previous" ]]; then
-      mv "$dir/bin/current" "$dir/bin/failed"
-      mv "$dir/bin/previous" "$dir/bin/current"
-      echo "$(date -Is) rolled back to the previous binary" | capped_log "$dir/supervisor.log"
+    note "exited code=$code after ${elapsed}s"
+    if (( code == 0 )); then
+      failures=0
+      sleep "$RESTART_DELAY"
+      continue
     fi
-    sleep 5
+    why=$(describe "$code")
+    if (( elapsed < QUICK_FAILURE )); then failures=$((failures + 1)); else failures=1; fi
+    # Shown in the tmux pane, which is what `swarmctl attach` shows while the swarm is down.
+    echo "$(date -Is) strands-swarm $why after ${elapsed}s; last lines of $dir/stderr.log:"
+    tail -n 8 "$dir/stderr.log" 2>/dev/null || true
+    if (( now - installed < TRIAL_WINDOW )) && [[ -x "$dir/bin/previous" ]] \
+      && mv -f "$dir/bin/current" "$dir/bin/failed" && mv "$dir/bin/previous" "$dir/bin/current"; then
+      note "rolled back to the previous binary"
+      notice "The new binary $why ${elapsed}s after it started, so the supervisor rolled back to the previous binary (the failed one is $dir/bin/failed)."
+      echo "rolled back to the previous binary"
+      failures=0
+      sleep "$RESTART_DELAY"
+      continue
+    fi
+    delay=$RESTART_DELAY
+    for (( i = 1; i < failures && delay < MAX_DELAY; i++ )); do delay=$((delay * 2)); done
+    (( delay > MAX_DELAY )) && delay=$MAX_DELAY
+    if (( failures == 3 )); then
+      note "crash loop: $failures quick failures in a row"
+      notice "The swarm failed $failures times in a row, each within ${QUICK_FAILURE}s of starting (last: $why); nothing to roll back to, so the supervisor keeps restarting it with a growing delay (at most ${MAX_DELAY}s)."
+    fi
+    echo "restarting in ${delay}s"
+    sleep "$delay"
   done
 }
 
@@ -109,7 +167,9 @@ status() {
     [[ -f "$dir/swarm.json" ]] || continue
     local state="stopped"; running "$run" && state="running"
     local agents; agents=$(python3 -I -c 'import json,sys; a=json.load(open(sys.argv[1]))["agents"]; print(len([x for x in a if x["status"]!="cancelled"]), "live /", len(a))' "$dir/swarm.json")
-    echo "$run: $state, agents $agents"
+    local last=""
+    [[ -f "$dir/supervisor.log" ]] && last="; supervisor: $(tail -n 1 "$dir/supervisor.log")"
+    echo "$run: $state, agents $agents$last"
   done
 }
 

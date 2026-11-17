@@ -394,6 +394,11 @@ impl App {
         if to == USER && mail.from != USER {
             self.bell |= self.notify;
         }
+        if mail.from == crate::runtime::SUPERVISOR_SENDER {
+            let line = mail.text.lines().nth(1).unwrap_or_default();
+            self.notice = Some(format!("supervisor: {line}"));
+            self.bell |= self.notify;
+        }
         // Replies to the user are already visible as the sender's streamed text.
         if to == USER && mail.kind == "reply" {
             return;

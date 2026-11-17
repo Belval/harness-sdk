@@ -87,7 +87,10 @@ pub async fn run(
         }
         if !plain {
             match terminal.draw(|frame| view::draw(frame, &app, swarm.run_id(), tick)) {
-                Ok(frame) => screen.clone_from(frame.buffer),
+                Ok(frame) => {
+                    screen.clone_from(frame.buffer);
+                    crate::watchdog::ready();
+                }
                 Err(error) => break Err(strands_agents::Error::other(format!("terminal error: {error}"))),
             }
         }
