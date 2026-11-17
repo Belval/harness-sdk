@@ -15,6 +15,15 @@ pub use super::commands::{parse_command, Command, SlashCommand, SLASH_COMMANDS};
 /// Entries kept per agent log; the oldest are dropped beyond this.
 pub const MAX_LOG_ENTRIES: usize = 2000;
 
+/// Entries a cancelled agent's log keeps (also at most [`CANCELLED_LOG_BYTES`] of text).
+pub const CANCELLED_LOG_ENTRIES: usize = 100;
+
+/// Text a cancelled agent's log keeps, in bytes.
+pub const CANCELLED_LOG_BYTES: usize = 64 * 1024;
+
+/// Heads a cancelled agent's log once older entries were dropped.
+const SHRUNK_NOTE: &str = "older entries dropped when the agent was cancelled";
+
 /// Context share (of the compaction point) at which an agent's log notes that summarization is
 /// near.
 const COMPACTION_NOTICE_AT: f64 = 0.9;
@@ -63,6 +72,33 @@ pub enum LogEntry {
 }
 
 impl LogEntry {
+    /// Bytes of text it holds.
+    fn text_len(&self) -> usize {
+        match self {
+            Self::Task(text)
+            | Self::Text(text)
+            | Self::Status(text)
+            | Self::Input(text)
+            | Self::Note(text) => text.len(),
+            Self::Tool { name, summary, .. } => name.len() + summary.len(),
+            Self::MailIn { from, kind, text, .. } => from.len() + kind.len() + text.len(),
+            Self::Image { source, .. } => source.len(),
+        }
+    }
+
+    /// Free the spare capacity of its text (streamed text grows by doubling).
+    fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Task(text)
+            | Self::Text(text)
+            | Self::Status(text)
+            | Self::Input(text)
+            | Self::Note(text) => text.shrink_to_fit(),
+            Self::Tool { summary, .. } => summary.shrink_to_fit(),
+            Self::MailIn { text, .. } => text.shrink_to_fit(),
+            Self::Image { source, .. } => source.shrink_to_fit(),
+        }
+    }
     /// `[image: shot.png 640x480]`, the text an image entry stands for (also in plain text and
     /// copies, which never contain the thumbnail).
     pub fn placeholder(source: &str, decoded: Option<&super::images::Decoded>) -> String {
@@ -109,7 +145,8 @@ pub struct AgentView {
     pub model: Option<String>,
     /// The last model call's input as a share of the compaction point (`0..1+`), once known.
     pub context: Option<f64>,
-    /// Log, oldest first, at most [`MAX_LOG_ENTRIES`] entries.
+    /// Log, oldest first, at most [`MAX_LOG_ENTRIES`] entries ([`CANCELLED_LOG_ENTRIES`] once
+    /// cancelled).
     pub log: VecDeque<LogEntry>,
     /// Log entries the user has not looked at.
     pub unseen: bool,
@@ -215,10 +252,45 @@ impl AgentView {
         self.unseen = true;
     }
 
-    /// Drop the oldest entries beyond [`MAX_LOG_ENTRIES`].
+    /// Drop the oldest entries beyond [`MAX_LOG_ENTRIES`]; a cancelled agent's log [`shrink`]s.
+    ///
+    /// [`shrink`]: AgentView::shrink
     fn trim(&mut self) {
+        if self.status == AgentStatus::Cancelled {
+            return self.shrink();
+        }
         let excess = self.log.len().saturating_sub(MAX_LOG_ENTRIES);
         self.log.drain(..excess);
+    }
+
+    /// Cut a cancelled agent's log to its newest [`CANCELLED_LOG_ENTRIES`] entries and
+    /// [`CANCELLED_LOG_BYTES`] of text (at least one entry), noting the cut at the top, and free
+    /// the spare capacity, so a long run's many cancelled agents stay small.
+    fn shrink(&mut self) {
+        let noted = matches!(self.log.front(), Some(LogEntry::Note(note)) if note == SHRUNK_NOTE);
+        let start = usize::from(noted);
+        let mut bytes = 0;
+        let keep = self
+            .log
+            .range(start..)
+            .rev()
+            .take(CANCELLED_LOG_ENTRIES)
+            .take_while(|entry| {
+                bytes += entry.text_len();
+                bytes <= CANCELLED_LOG_BYTES
+            })
+            .count()
+            .max(1)
+            .min(self.log.len() - start);
+        let dropped = self.log.len() - start - keep;
+        if dropped > 0 {
+            self.log.drain(start..start + dropped);
+            if !noted {
+                self.log.push_front(LogEntry::Note(SHRUNK_NOTE.to_owned()));
+            }
+        }
+        self.log.iter_mut().for_each(LogEntry::shrink_to_fit);
+        self.log.shrink_to_fit();
     }
 
     fn finish_tool(&mut self, name: &str, ok: bool) {
@@ -1235,5 +1307,62 @@ mod tests {
             .iter()
             .any(|entry| matches!(entry, LogEntry::Status(note)
             if note == "context 91% of the compaction point — older turns will be summarized soon")));
+    }
+
+    /// A cancelled agent's log shrinks to its newest entries, within a byte cap, and frees the
+    /// rest, so hundreds of cancelled agents do not each hold [`MAX_LOG_ENTRIES`].
+    #[test]
+    fn a_cancelled_agents_log_shrinks_and_still_shows_its_end() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        app.apply(spawned("a2", "a1"));
+        let tool = |id: &str, n: usize, len: usize| SwarmEvent::ToolStarted {
+            id: id.into(),
+            name: "shell".into(),
+            summary: format!("{n:04} {}", "x".repeat(len)),
+        };
+        for n in 0..MAX_LOG_ENTRIES {
+            app.apply(tool("a1", n, 10));
+            app.apply(tool("a2", n, 1000));
+        }
+        for id in ["a1", "a2"] {
+            app.apply(SwarmEvent::Status {
+                id: id.into(),
+                status: AgentStatus::Cancelled,
+            });
+        }
+        let small = &app.agents["a1"].log;
+        assert_eq!(small.len(), CANCELLED_LOG_ENTRIES + 1);
+        assert!(small.capacity() < 2 * small.len(), "{}", small.capacity());
+        assert_eq!(small.front(), Some(&LogEntry::Note(SHRUNK_NOTE.into())));
+        assert_eq!(small.back(), Some(&LogEntry::Status("cancelled".into())));
+        let large = &app.agents["a2"].log;
+        let bytes: usize = large.iter().skip(1).map(LogEntry::text_len).sum();
+        assert!(
+            bytes <= CANCELLED_LOG_BYTES && large.len() > 50,
+            "{} entries, {bytes} bytes",
+            large.len()
+        );
+
+        // Later entries (restored history, mail) keep it within bounds, under one note.
+        for n in 0..10 * CANCELLED_LOG_ENTRIES {
+            app.apply(tool("a1", n, 10));
+        }
+        let small = &app.agents["a1"].log;
+        assert_eq!(small.len(), CANCELLED_LOG_ENTRIES + 1);
+        assert_eq!(small.iter().filter(|e| matches!(e, LogEntry::Note(_))).count(), 1);
+
+        // On screen, the shrunk log still ends with the agent's last steps.
+        app.show_cancelled = true;
+        app.selected = app.tree().iter().position(|(_, view)| view.id == "a2").unwrap();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| super::super::view::draw(frame, &app, "r", 0))
+            .unwrap();
+        let shown = super::super::view::buffer_text(terminal.backend().buffer());
+        assert!(
+            shown.contains("shell 1999") && shown.contains("— cancelled"),
+            "{shown}"
+        );
     }
 }
