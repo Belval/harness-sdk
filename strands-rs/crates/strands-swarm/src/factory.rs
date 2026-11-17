@@ -241,10 +241,11 @@ fn context_manager(
             .on_request(Arc::clone(control))
             .on_compacted(on_compacted),
     );
-    let prune = CachePrune::new(Some(Arc::clone(&summarize))).with_cache_ttl(match cache_ttl {
+    let ttl = match cache_ttl {
         Some("1h") => CACHE_TTL_1H,
         _ => CACHE_TTL,
-    });
+    };
+    let prune = CachePrune::new(Some(Arc::clone(&summarize)), ttl);
     ContextManagerOption::Config(ContextManagerConfig {
         strategies: Some(vec![
             Arc::new(prune.clone()),

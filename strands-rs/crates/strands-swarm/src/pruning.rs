@@ -36,21 +36,7 @@ use crate::compaction::CompactAt;
 use crate::resume::NOTICE_PREFIX;
 
 /// Stands in for an assistant message that held nothing but reasoning.
-pub const REASONING_DROPPED: &str = "[reasoning dropped]";
-
-/// Drops reasoning blocks (text and signatures) from every turn before the current one.
-pub struct DropOldReasoning;
-
-#[async_trait]
-impl ContextStrategy for DropOldReasoning {
-    fn name(&self) -> &str {
-        "swarm:drop-old-reasoning"
-    }
-
-    async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
-        Ok(drop_old_reasoning(ctx.messages))
-    }
-}
+const REASONING_DROPPED: &str = "[reasoning dropped]";
 
 /// Where the current turn starts: the last user message that carries no tool results.
 /// A restart notice is not a new turn: the turn it interrupted goes on.
@@ -67,7 +53,7 @@ fn is_restart_notice(message: &Message) -> bool {
 
 /// Removes reasoning from the assistant messages before the current turn; `true` when any went.
 /// A message left empty gets [`REASONING_DROPPED`] so the history stays valid.
-pub fn drop_old_reasoning(messages: &mut [Message]) -> bool {
+fn drop_old_reasoning(messages: &mut [Message]) -> bool {
     let start = turn_start(messages);
     let mut acted = false;
     for message in &mut messages[..start] {
@@ -85,51 +71,29 @@ pub fn drop_old_reasoning(messages: &mut [Message]) -> bool {
 }
 
 /// Tools whose older results are trimmed.
-pub const TRIMMED_TOOLS: [&str; 2] = ["shell", "read"];
+const TRIMMED_TOOLS: [&str; 2] = ["shell", "read"];
 /// The latest this many [`TRIMMED_TOOLS`] results stay whole.
-pub const KEEP_RECENT_RESULTS: usize = 6;
+const KEEP_RECENT_RESULTS: usize = 6;
 /// Older results longer than this (in characters) are trimmed.
-pub const TRIM_ABOVE_CHARS: usize = 2_000;
+const TRIM_ABOVE_CHARS: usize = 2_000;
 /// What a trimmed result keeps, in tokens (about 800 characters, head and tail).
 const TRIM_PREVIEW_TOKENS: usize = 200;
 
 /// Trims [`TRIMMED_TOOLS`] results longer than [`TRIM_ABOVE_CHARS`] once
-/// [`KEEP_RECENT_RESULTS`] newer ones exist, whenever it runs: gate it with [`CachePrune`].
-pub struct TrimOldResults {
-    inner: OffloadStrategy,
-}
-
-impl Default for TrimOldResults {
-    fn default() -> Self {
-        let truncate = Offload::truncate(
-            OffloadTarget::tools(TRIMMED_TOOLS),
-            TruncateConfig {
-                preview_tokens: Some(TRIM_PREVIEW_TOKENS),
-                preview: None,
-            },
-        );
-        let inner = truncate.when(OffloadConditions {
-            threshold: Some(TRIM_ABOVE_CHARS.div_ceil(4) as f64),
-            preserve_recent: Some(KEEP_RECENT_RESULTS as f64),
-            ..Default::default()
-        });
-        Self { inner }
-    }
-}
-
-#[async_trait]
-impl ContextStrategy for TrimOldResults {
-    fn name(&self) -> &str {
-        "swarm:trim-old-results"
-    }
-
-    fn init(&self, agent: &Agent, stash: Option<Arc<Stash>>) {
-        self.inner.init(agent, stash);
-    }
-
-    async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
-        self.inner.apply(ctx).await
-    }
+/// [`KEEP_RECENT_RESULTS`] newer ones exist, whenever it runs: gated by [`CachePrune`].
+fn trim_old_results() -> OffloadStrategy {
+    let truncate = Offload::truncate(
+        OffloadTarget::tools(TRIMMED_TOOLS),
+        TruncateConfig {
+            preview_tokens: Some(TRIM_PREVIEW_TOKENS),
+            preview: None,
+        },
+    );
+    truncate.when(OffloadConditions {
+        threshold: Some(TRIM_ABOVE_CHARS.div_ceil(4) as f64),
+        preserve_recent: Some(KEEP_RECENT_RESULTS as f64),
+        ..Default::default()
+    })
 }
 
 /// How long the provider keeps a cached prompt prefix by default (Anthropic and Bedrock: 5
@@ -163,16 +127,16 @@ pub enum PruneReason {
     Large,
 }
 
-/// [`DropOldReasoning`] and [`TrimOldResults`], run together and only for a [`PruneReason`]; on
-/// any other call history reaches the model byte for byte as last time. Goes first in the
-/// pipeline, with [`CachePrune::mark`] last.
+/// Drops earlier turns' reasoning and trims old results, together and only for a
+/// [`PruneReason`]; on any other call history reaches the model byte for byte as last time. Goes
+/// first in the pipeline, with [`CachePrune::mark`] last.
 #[derive(Clone)]
 pub struct CachePrune {
     gate: Arc<Gate>,
 }
 
 struct Gate {
-    trim: TrimOldResults,
+    trim: OffloadStrategy,
     compaction: Option<Arc<CompactAt>>,
     /// How long the cache lives.
     ttl: Duration,
@@ -181,21 +145,16 @@ struct Gate {
 }
 
 impl CachePrune {
-    /// A gate that also prunes when `compaction` will summarize in the same pass.
-    pub fn new(compaction: Option<Arc<CompactAt>>) -> Self {
+    /// A gate for a cache that lives `ttl` ([`CACHE_TTL`] or [`CACHE_TTL_1H`]), which also
+    /// prunes when `compaction` will summarize in the same pass.
+    pub fn new(compaction: Option<Arc<CompactAt>>, ttl: Duration) -> Self {
         let gate = Gate {
-            trim: TrimOldResults::default(),
+            trim: trim_old_results(),
             compaction,
-            ttl: CACHE_TTL,
+            ttl,
             sent: Mutex::new(None),
         };
         Self { gate: Arc::new(gate) }
-    }
-
-    /// The gate for a cache that lives `ttl` (e.g. [`CACHE_TTL_1H`]) instead of [`CACHE_TTL`].
-    pub fn with_cache_ttl(mut self, ttl: Duration) -> Self {
-        Arc::get_mut(&mut self.gate).expect("set before use").ttl = ttl;
-        self
     }
 
     /// The pipeline's last strategy: notes what this call sends and when, for the next call's
@@ -359,7 +318,11 @@ fn result_chars(result: &ToolResultBlock) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+    use strands_agents::testing::{MockMessageModel, MockResponse};
     use strands_agents::types::{ReasoningBlock, ToolResultBlock, ToolResultContent, ToolUseBlock};
+    use strands_agents::InMemoryStorage;
+
+    use crate::compaction::CompactAt;
 
     fn thinking(text: &str) -> ContentBlock {
         ContentBlock::Reasoning(ReasoningBlock {
@@ -377,14 +340,42 @@ mod tests {
         ContentBlock::ToolUse(ToolUseBlock::new("shell", id, json!({})))
     }
 
-    fn tool_result(id: &str) -> Message {
+    fn result(id: &str, text: String) -> Message {
         Message::new(
             Role::User,
             vec![ContentBlock::ToolResult(ToolResultBlock::success(
                 id,
-                vec![ToolResultContent::Text("ok".into())],
+                vec![ToolResultContent::Text(text)],
             ))],
         )
+    }
+
+    fn tool_result(id: &str) -> Message {
+        result(id, "ok".into())
+    }
+
+    fn agent() -> Agent {
+        Agent::builder()
+            .model(MockMessageModel::shared(vec![]))
+            .no_sandbox()
+            .build()
+            .unwrap()
+    }
+
+    fn ctx<'a>(messages: &'a mut Vec<Message>, agent: &'a Agent, utilization: f64) -> ContextState<'a> {
+        let stash = Arc::new(Stash::new(Arc::new(InMemoryStorage::new()), "s", "a1", false));
+        ContextState {
+            messages,
+            agent,
+            utilization,
+            overflow: false,
+            stash: Some(stash),
+        }
+    }
+
+    fn minutes_ago(minutes: u64) -> u64 {
+        let at = SystemTime::now() - Duration::from_secs(minutes * 60);
+        at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
     }
 
     fn reasoning_count(messages: &[Message]) -> usize {
@@ -457,13 +448,7 @@ mod tests {
                 &id,
                 json!({}),
             ))]));
-            messages.push(Message::new(
-                Role::User,
-                vec![ContentBlock::ToolResult(ToolResultBlock::success(
-                    &id,
-                    vec![ToolResultContent::Text("x".repeat(*chars))],
-                ))],
-            ));
+            messages.push(result(&id, "x".repeat(*chars)));
         }
         messages
     }
@@ -483,22 +468,11 @@ mod tests {
     }
 
     async fn trim(messages: &mut Vec<Message>) -> bool {
-        use strands_agents::testing::MockMessageModel;
-        use strands_agents::InMemoryStorage;
-        let agent = Agent::builder()
-            .model(MockMessageModel::shared(vec![]))
-            .no_sandbox()
-            .build()
-            .unwrap();
-        let stash = Arc::new(Stash::new(Arc::new(InMemoryStorage::new()), "s", "a1", false));
-        let mut ctx = ContextState {
-            messages,
-            agent: &agent,
-            utilization: 0.0,
-            overflow: false,
-            stash: Some(stash),
-        };
-        TrimOldResults::default().apply(&mut ctx).await.unwrap()
+        let agent = agent();
+        trim_old_results()
+            .apply(&mut ctx(messages, &agent, 0.0))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -526,29 +500,9 @@ mod tests {
         assert!(!trim(&mut messages).await, "nothing left to trim");
     }
 
-    use strands_agents::testing::{MockMessageModel, MockResponse};
-    use strands_agents::InMemoryStorage;
-
-    use crate::compaction::CompactAt;
-
-    fn agent() -> Agent {
-        Agent::builder()
-            .model(MockMessageModel::shared(vec![]))
-            .no_sandbox()
-            .build()
-            .unwrap()
-    }
-
     /// One pipeline pass: the gate, then the mark. `true` when the gate pruned.
     async fn pass(prune: &CachePrune, agent: &Agent, messages: &mut Vec<Message>, utilization: f64) -> bool {
-        let stash = Arc::new(Stash::new(Arc::new(InMemoryStorage::new()), "s", "a1", false));
-        let mut ctx = ContextState {
-            messages,
-            agent,
-            utilization,
-            overflow: false,
-            stash: Some(stash),
-        };
+        let mut ctx = ctx(messages, agent, utilization);
         let pruned = prune.apply(&mut ctx).await.unwrap();
         prune.mark().apply(&mut ctx).await.unwrap();
         pruned
@@ -559,13 +513,7 @@ mod tests {
     fn prunable() -> Vec<Message> {
         let mut messages = vec![Message::user("first task")];
         messages.push(assistant(vec![thinking("old"), tool_call("t0")]));
-        messages.push(Message::new(
-            Role::User,
-            vec![ContentBlock::ToolResult(ToolResultBlock::success(
-                "t0",
-                vec![ToolResultContent::Text("x".repeat(3_000))],
-            ))],
-        ));
+        messages.push(result("t0", "x".repeat(3_000)));
         messages.push(assistant(vec![ContentBlock::text("done")]));
         let mut second = history(&[("shell", 6_000); KEEP_RECENT_RESULTS]);
         second[0] = Message::user("second task");
@@ -588,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_normal_next_call_leaves_history_byte_identical() {
-        let (prune, agent) = (CachePrune::new(None), agent());
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
         let mut messages = prunable();
         assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
         let sent = json(&messages);
@@ -618,20 +566,9 @@ mod tests {
             .build()
             .unwrap();
         let compact = Arc::new(CompactAt::new(1_000));
-        let prune = CachePrune::new(Some(compact.clone()));
+        let prune = CachePrune::new(Some(compact.clone()), CACHE_TTL);
         let mut messages = prunable();
-        let mut ctx = ContextState {
-            messages: &mut messages,
-            agent: &agent,
-            utilization: 0.5,
-            overflow: false,
-            stash: Some(Arc::new(Stash::new(
-                Arc::new(InMemoryStorage::new()),
-                "s",
-                "a1",
-                false,
-            ))),
-        };
+        let mut ctx = ctx(&mut messages, &agent, 0.5);
         assert_eq!(prune.reason(&ctx), Some(PruneReason::Compaction));
         assert!(prune.apply(&mut ctx).await.unwrap());
         // Pruning lowered the count below the point (1k of the mock's assumed 200k window), though
@@ -648,17 +585,13 @@ mod tests {
 
     #[tokio::test]
     async fn prunes_on_the_first_call_after_the_cache_expired() {
-        let (prune, agent) = (CachePrune::new(None), agent());
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
         let mut messages = prunable();
         assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
 
-        let ago = |minutes: u64| {
-            let at = SystemTime::now() - Duration::from_secs(minutes * 60);
-            at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-        };
-        agent.state().set(LAST_CALL_KEY, ago(4));
+        agent.state().set(LAST_CALL_KEY, minutes_ago(4));
         assert!(!pass(&prune, &agent, &mut messages, 0.1).await, "still cached");
-        agent.state().set(LAST_CALL_KEY, ago(6));
+        agent.state().set(LAST_CALL_KEY, minutes_ago(6));
         assert!(pass(&prune, &agent, &mut messages, 0.1).await);
         assert!(pruned(&messages));
         assert!(
@@ -669,16 +602,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_one_hour_cache_is_still_warm_after_five_idle_minutes() {
-        let (prune, agent) = (CachePrune::new(None).with_cache_ttl(CACHE_TTL_1H), agent());
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL_1H), agent());
         let mut messages = prunable();
         assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
-        let ago = |minutes: u64| {
-            let at = SystemTime::now() - Duration::from_secs(minutes * 60);
-            at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-        };
-        agent.state().set(LAST_CALL_KEY, ago(30));
+        agent.state().set(LAST_CALL_KEY, minutes_ago(30));
         assert!(!pass(&prune, &agent, &mut messages, 0.1).await, "still cached");
-        agent.state().set(LAST_CALL_KEY, ago(61));
+        agent.state().set(LAST_CALL_KEY, minutes_ago(61));
         assert!(pass(&prune, &agent, &mut messages, 0.1).await);
     }
 
@@ -686,29 +615,23 @@ mod tests {
     async fn the_idle_clock_survives_a_restart() {
         let agent = agent();
         let mut messages = prunable();
-        assert!(!pass(&CachePrune::new(None), &agent, &mut messages, 0.1).await);
+        assert!(!pass(&CachePrune::new(None, CACHE_TTL), &agent, &mut messages, 0.1).await);
         let at = agent.state().get(LAST_CALL_KEY).unwrap().as_u64().unwrap();
         agent.state().set(LAST_CALL_KEY, at - 6 * 60 * 1_000);
         // A new process: no record of what was sent, only the persisted time.
-        assert!(pass(&CachePrune::new(None), &agent, &mut messages, 0.1).await);
+        assert!(pass(&CachePrune::new(None, CACHE_TTL), &agent, &mut messages, 0.1).await);
     }
 
     #[tokio::test]
     async fn prunes_once_it_would_remove_15_percent_of_the_history() {
-        let (prune, agent) = (CachePrune::new(None), agent());
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
         let mut messages = prunable();
         assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
         // Six more large results age the second turn's ones out of the kept window.
         for i in 10..10 + KEEP_RECENT_RESULTS {
             let id = format!("t{i}");
             messages.push(assistant(vec![tool_call(&id)]));
-            messages.push(Message::new(
-                Role::User,
-                vec![ContentBlock::ToolResult(ToolResultBlock::success(
-                    &id,
-                    vec![ToolResultContent::Text("y".repeat(6_000))],
-                ))],
-            ));
+            messages.push(result(&id, "y".repeat(6_000)));
         }
         assert!(removable_share(&messages) >= PRUNE_SHARE);
         assert!(pass(&prune, &agent, &mut messages, 0.1).await);
@@ -718,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn prunes_when_history_was_edited_since_the_last_call() {
-        let (prune, agent) = (CachePrune::new(None), agent());
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
         let mut messages = prunable();
         assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
         // The `context` tool offloaded a result between two calls: the prefix is gone already.
@@ -740,15 +663,10 @@ mod tests {
 
     #[tokio::test]
     async fn prunes_on_overflow() {
-        let (prune, agent) = (CachePrune::new(None), agent());
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
         let mut messages = prunable();
-        let mut ctx = ContextState {
-            messages: &mut messages,
-            agent: &agent,
-            utilization: 0.1,
-            overflow: true,
-            stash: None,
-        };
+        let mut ctx = ctx(&mut messages, &agent, 0.1);
+        ctx.overflow = true;
         assert_eq!(prune.reason(&ctx), Some(PruneReason::Overflow));
         assert!(prune.apply(&mut ctx).await.unwrap());
     }
