@@ -343,6 +343,7 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let (lines, thumbnails) = log_lines(view, app, tick);
     let (paragraph, offset) = log_paragraph(app, view, lines.clone(), area);
     frame.render_widget(paragraph, area);
+    unglue(frame.buffer_mut(), area);
     if !thumbnails.is_empty() {
         draw_thumbnails(frame, app, &lines, &thumbnails, offset, log_inner(area));
     }
@@ -425,8 +426,25 @@ pub fn log_text(app: &App, area: Rect) -> ratatui::buffer::Buffer {
         let (lines, _) = log_lines(view, app, 0);
         let (paragraph, _) = log_paragraph(app, view, lines, log);
         ratatui::widgets::Widget::render(paragraph, log, &mut buffer);
+        unglue(&mut buffer, log);
     }
     buffer
+}
+
+/// Keeps a tool line's mark, name and summary together when wrapping: the wrapper breaks a
+/// too-long word at the edge rather than leaving `✗ read` alone above a long path.
+const GLUE: char = '\u{a0}';
+
+/// Turn the [`GLUE`] in `area` back into spaces, so copies get plain text.
+fn unglue(buffer: &mut ratatui::buffer::Buffer, area: Rect) {
+    let glue = GLUE.to_string();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buffer.cell_mut((x, y)).filter(|cell| cell.symbol() == glue) {
+                cell.set_symbol(" ");
+            }
+        }
+    }
 }
 
 /// The log's lines, with blank rows reserved under each kept thumbnail's placeholder, and the
@@ -626,7 +644,7 @@ pub fn popup_scroll_limit(app: &App, screen: Rect) -> u16 {
 pub fn plain_log(view: &AgentView) -> String {
     let mut out = format!("{}\n\n", log_title(view).trim());
     for line in view.log.iter().flat_map(entry_lines) {
-        out.extend(line.spans.iter().map(|span| span.content.as_ref()));
+        out.extend(line.spans.iter().map(|span| span.content.replace(GLUE, " ")));
         out.push('\n');
     }
     out
@@ -647,7 +665,7 @@ fn entry_lines(entry: &LogEntry) -> Vec<Line<'static>> {
                 Some(false) => ("✗", Color::Red),
             };
             vec![Line::from(vec![
-                Span::styled(format!("{mark} {name} "), Style::new().fg(color)),
+                Span::styled(format!("{mark}{GLUE}{name}{GLUE}"), Style::new().fg(color)),
                 Span::styled(summary.clone(), Style::new().dim()),
             ])]
         }
@@ -1007,6 +1025,26 @@ mod tests {
         );
         app.status = None;
         assert_eq!(popup_scroll_limit(&app, size), 0);
+    }
+
+    #[test]
+    fn a_tool_line_breaks_a_long_summary_instead_of_orphaning_its_name() {
+        let mut app = app_with_an_image(None);
+        let path =
+            "/local/home/belvae/workplace/harness-sdk.swarm/self-improve/a19/strands-rs/crates/view.rs";
+        app.agents.get_mut("a1").unwrap().log.push_back(LogEntry::Tool {
+            name: "read".into(),
+            summary: path.into(),
+            ok: Some(false),
+        });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        let row = screen.lines().find(|row| row.contains("✗ read")).expect(&screen);
+        assert!(row.contains("✗ read /local/home/"), "{screen}");
+        assert!(!screen.contains('\u{a0}'), "the glue renders as spaces");
+        let plain = plain_log(&app.agents["a1"]);
+        assert!(plain.contains(&format!("✗ read {path}")), "{plain}");
     }
 
     #[test]
