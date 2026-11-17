@@ -354,8 +354,8 @@ fn log_paragraph(view: &AgentView, window: &LogWindow) -> Paragraph<'static> {
 }
 
 /// The end of a log that the pane shows: enough of its newest lines to fill the pane at the
-/// current scroll, not the whole log. The frame is redrawn several times a second, and wrapping
-/// every one of up to [`super::app::MAX_LOG_ENTRIES`] entries each time kept a core half busy.
+/// current scroll, not the whole log: the frame is redrawn several times a second, too often to
+/// wrap all of up to [`super::app::MAX_LOG_ENTRIES`] entries each time.
 struct LogWindow {
     /// The log's last lines, with blank rows reserved under each kept thumbnail's placeholder.
     lines: Vec<Line<'static>>,

@@ -275,7 +275,7 @@ async fn wait_all_on_timeout_returns_what_came_and_who_is_missing() {
 }
 
 /// A `wait` with `all` leaves the replies that came in the saved mailbox until it returns: a
-/// kill -9 while it still waits on others would otherwise lose them (an `interrupted` notice was).
+/// kill -9 while it still waits on others would otherwise lose them.
 #[tokio::test]
 async fn wait_all_keeps_the_replies_in_the_saved_mailbox_until_it_returns() {
     let dir = tempfile::tempdir().unwrap();
@@ -1568,8 +1568,8 @@ async fn a_hard_crash_mid_batch_keeps_its_calls_and_the_results_that_came_in() {
 }
 
 /// A model call's tokens are on disk while the turn goes on: a turn can make many calls with no
-/// status change or mail to save them, and a hard crash then lost them from the cost and the
-/// budget (in the soak, three of an agent's compactions' worth).
+/// status change or mail to save them, and a hard crash would lose them from the cost and the
+/// budget.
 #[tokio::test]
 async fn a_calls_tokens_are_saved_before_the_turn_ends() {
     let dir = tempfile::tempdir().unwrap();

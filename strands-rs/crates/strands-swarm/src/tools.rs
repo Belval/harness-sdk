@@ -266,8 +266,8 @@ fn list_jobs(swarm: &Swarm, me: &str, jobs: Vec<Job>) -> String {
 const JOB_COMMAND_CHARS: usize = 200;
 
 /// `me`'s jobs (newest first), then other agents' running ones. Other agents' ended jobs are only
-/// counted: the run keeps up to [`crate::jobs::KEEP_JOBS`] of them, which listed in full ran past
-/// 10k tokens for an agent that wanted the state of its own one job.
+/// counted: the run keeps up to [`crate::jobs::KEEP_JOBS`] of them, too many tokens to list for
+/// an agent that wants the state of its own job.
 fn render_jobs(
     me: &str,
     mut jobs: Vec<Job>,

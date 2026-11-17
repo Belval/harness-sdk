@@ -338,9 +338,7 @@ fn resumed_budget(flag: Option<u64>, state: &SwarmState) -> Option<u64> {
     }
 }
 
-/// The persistable view of one agent. Each lock is read on its own (see `Node::info`): guards
-/// taken inside the struct literal are all held until it is built, and holding `model` while
-/// waiting for `status` deadlocked against `Node::info`.
+/// The persistable view of one agent. Each lock is read on its own, as in `Node::info`.
 pub(super) fn node_state(node: &Node) -> AgentState {
     let usage = *node.usage.lock();
     let model = node.model.lock().clone();

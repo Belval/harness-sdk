@@ -658,8 +658,8 @@ impl Node {
     }
 
     /// Reads one lock at a time: guards taken inside the struct literal would all be held until
-    /// it is built, and holding `status` while waiting for `model` deadlocked against
-    /// [`persist::node_state`], which took them in the other order.
+    /// it is built, and holding one while waiting for another can deadlock against a reader
+    /// ([`persist::node_state`]) that takes them in another order.
     fn info(&self) -> AgentInfo {
         let status = self.status.lock().clone();
         let unread = self.mailbox.lock().len();
@@ -1223,8 +1223,7 @@ mod tests {
     const WAIT: Duration = Duration::from_millis(500);
 
     /// While `hold` holds one of a node's locks (and calls back), `read` runs on another thread
-    /// and blocks on it; every lock in `free` must stay takeable meanwhile. A reader that kept one
-    /// lock while waiting for another deadlocked against one taking them in the other order.
+    /// and blocks on it; every lock in `free` must stay takeable meanwhile.
     fn reads_one_lock_at_a_time(
         hold: impl FnOnce(&Node, &mut dyn FnMut()),
         read: impl Fn(&Node) + Sync,

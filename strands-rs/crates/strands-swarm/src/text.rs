@@ -53,8 +53,7 @@ pub fn clip(text: &str, max: usize) -> String {
 /// Terminal output as the text a terminal leaves on screen: without ANSI escape sequences
 /// (colours, cursor moves, OSC titles and hyperlinks) and with each `\r`-overwritten line (progress
 /// bars, spinners) reduced to what was written last. Test runners and build tools colour their
-/// output even into a pipe; in one run 11 results carried 710 such sequences, tokens the model pays
-/// for and has to read around.
+/// output even into a pipe, in tokens the model pays for and has to read around.
 pub fn plain(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains(['\x1b', '\r']) {
         return std::borrow::Cow::Borrowed(text);
