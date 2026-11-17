@@ -53,7 +53,7 @@ struct Cli {
     #[arg(long, default_value_t = 16)]
     max_agents: usize,
     /// Maximum number of model calls in flight across the swarm; more queue. 0 means no limit.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 32)]
     max_concurrent_calls: usize,
     /// Ring the terminal bell when an agent messages you (TUI only; tmux and most terminals turn
     /// it into a window flag or desktop notification).

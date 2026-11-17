@@ -395,6 +395,86 @@ async fn the_tree_tells_working_agents_from_waiting_ones() {
 }
 
 #[tokio::test]
+async fn max_calls_shows_and_changes_the_model_call_cap_and_status_shows_both_caps() {
+    let dir = tempfile::tempdir().unwrap();
+    let spawn = |name: &str, id: &str| {
+        ContentBlock::ToolUse(ToolUseBlock::new(
+            "spawn_agent",
+            id,
+            json!({"task": format!("run the {name}"), "name": name}),
+        ))
+    };
+    let wait = ContentBlock::ToolUse(ToolUseBlock::new(
+        "wait",
+        "t3",
+        json!({"from": ["parser", "linter"], "all": true, "timeout_seconds": 30}),
+    ));
+    let root = Message::new(
+        Role::Assistant,
+        vec![spawn("parser", "t1"), spawn("linter", "t2"), wait],
+    );
+    let scripts = HashMap::from([
+        ("a1", vec![MockResponse::message(root), say("root: done")]),
+        ("a2", vec![say("parser: all green")]),
+        ("a3", vec![say("linter: all green")]),
+    ]);
+    let gate = Arc::new(Semaphore::new(0));
+    let factory = gated_factory(scripts, &["a2", "a3"], &gate, &Sinks::default());
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.max_concurrent_calls = 1;
+    let (swarm, mut events) = Swarm::new(config);
+    let mut app = App::default();
+    let mut screen = Screen::new();
+    screen.type_line(&swarm, &mut app, "fix the bug").await;
+    screen
+        .until(&mut app, &mut events, "3 agents · 1 running · 2 waiting")
+        .await;
+
+    // The cap is shown, and `/status` says how full both caps are and who waits for a slot.
+    screen.type_line(&swarm, &mut app, "/max-calls").await;
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("up to 1 model calls at once (1 in flight)")
+    );
+    screen.type_line(&swarm, &mut app, "/status").await;
+    let shown = screen.draw(&mut app);
+    for expected in [
+        "agents 3/16 · calls 1/1",
+        "queued for a model slot (1/1 calls in flight; /max-calls to raise)",
+    ] {
+        assert!(shown.contains(expected), "missing {expected:?}\n{shown}");
+    }
+    screen.press(&swarm, &mut app, KeyCode::Char('x')).await;
+
+    // Raising it lets the waiting call through; a bad number changes nothing.
+    screen.type_line(&swarm, &mut app, "/max-calls two").await;
+    assert_eq!(app.notice.as_deref(), Some("error: Not a number: two"));
+    screen.type_line(&swarm, &mut app, "/max-calls 2").await;
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("up to 2 model calls at once (1 in flight)")
+    );
+    screen
+        .until(&mut app, &mut events, "3 agents · 2 running · 1 waiting")
+        .await;
+    assert_eq!(swarm.calls_in_flight(), 2);
+    screen.type_line(&swarm, &mut app, "/max-calls 0").await;
+    assert_eq!(app.notice.as_deref(), Some("model calls unlimited (2 in flight)"));
+    screen.type_line(&swarm, &mut app, "/status").await;
+    let shown = screen.draw(&mut app);
+    assert!(shown.contains("agents 3/16 · calls 2/unlimited"), "{shown}");
+    screen.press(&swarm, &mut app, KeyCode::Char('x')).await;
+    screen.type_line(&swarm, &mut app, "/max-calls default").await;
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("up to 1 model calls at once (2 in flight)")
+    );
+    gate.add_permits(2);
+    screen.until(&mut app, &mut events, "root: done").await;
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_tool_line_breaks_a_long_path_live_and_restored() {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("run");

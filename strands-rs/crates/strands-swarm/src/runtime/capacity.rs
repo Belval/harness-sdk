@@ -131,41 +131,6 @@ impl Swarm {
             },
         ));
     }
-
-    /// Refuse a model call of agent `id` once the budget is spent, else wait for a swarm-wide
-    /// permit (if calls are capped), to be held for the call's duration.
-    pub(super) async fn admit_model_call(
-        &self,
-        id: &str,
-        cancel: &CancellationToken,
-    ) -> Result<Option<OwnedSemaphorePermit>> {
-        if let Some(message) = self.budget_exhausted() {
-            let mut stopped = self.inner.over_budget.lock();
-            if !stopped.iter().any(|stopped| stopped == id) {
-                stopped.push(id.to_owned());
-            }
-            return Err(Error::other(message));
-        }
-        let Some(permits) = self.inner.model_calls.clone() else {
-            return Ok(None);
-        };
-        if let Ok(permit) = permits.clone().try_acquire_owned() {
-            return Ok(Some(permit));
-        }
-        self.emit(SwarmEvent::ModelQueued {
-            id: id.to_owned(),
-            queued: true,
-        });
-        let acquired = tokio::select! {
-            permit = permits.acquire_owned() => permit.ok(),
-            _ = cancel.cancelled() => None,
-        };
-        self.emit(SwarmEvent::ModelQueued {
-            id: id.to_owned(),
-            queued: false,
-        });
-        acquired.map(Some).ok_or(Error::Cancelled)
-    }
 }
 
 /// Agents holding a slot under [`SwarmConfig::max_agents`]: live and not queued. An idle agent

@@ -15,6 +15,7 @@ impl Swarm {
         let (swarm, events) = Self::build(config);
         swarm.inner.next_id.store(state.next_id, Ordering::SeqCst);
         *swarm.inner.max_agents.lock() = state.max_agents;
+        *swarm.inner.max_calls.lock() = state.max_calls;
         let budget = resumed_budget(swarm.inner.config.budget_tokens, &state);
         *swarm.inner.budget.lock() = budget;
         if budget.is_some() {
@@ -175,6 +176,7 @@ impl Swarm {
             budget_flag: self.inner.config.budget_tokens,
             task_flag: self.inner.config.task_flag.clone(),
             max_agents: *self.inner.max_agents.lock(),
+            max_calls: *self.inner.max_calls.lock(),
             commit: self.inner.config.commit.clone(),
             schedules: self.inner.schedules.lock().clone(),
         }

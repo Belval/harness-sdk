@@ -150,8 +150,8 @@ pub struct AgentView {
     pub log: VecDeque<LogEntry>,
     /// Log entries the user has not looked at.
     pub unseen: bool,
-    /// Waiting for a free model-call slot.
-    pub queued: bool,
+    /// Waiting for a free model-call slot: the calls in flight and the limit when it queued.
+    pub queued: Option<(usize, usize)>,
     /// Its next model call waits for a pending reload.
     pub held: bool,
 }
@@ -192,7 +192,10 @@ impl AgentView {
             AgentStatus::Queued => return Some("queued until an agent slot frees…".to_owned()),
             AgentStatus::Starting => return Some("starting…".to_owned()),
             AgentStatus::Running if self.held => return Some("waiting for the reload…".to_owned()),
-            AgentStatus::Running if self.queued => return Some("queued for a model slot…".to_owned()),
+            AgentStatus::Running if self.queued.is_some() => {
+                let (calls, limit) = self.queued.unwrap_or_default();
+                return Some(crate::text::queued_for_call(calls, limit));
+            }
             AgentStatus::Running => {}
             _ => return None,
         }
@@ -209,7 +212,7 @@ impl AgentView {
         if self.status != AgentStatus::Running {
             return None;
         }
-        if self.queued || self.held {
+        if self.queued.is_some() || self.held {
             return Some(Waiting::Slot);
         }
         match self.latest() {
@@ -413,7 +416,7 @@ impl App {
                     context: None,
                     log: VecDeque::from([LogEntry::Task(task)]),
                     unseen: true,
-                    queued: false,
+                    queued: None,
                     held: false,
                 };
                 self.agents.insert(id, view);
@@ -437,7 +440,12 @@ impl App {
                 let entry = self.image_entry(source, &bytes);
                 self.with(&id, |view| view.push(entry));
             }
-            SwarmEvent::ModelQueued { id, queued } => self.with(&id, |view| view.queued = queued),
+            SwarmEvent::ModelQueued {
+                id,
+                queued,
+                calls,
+                limit,
+            } => self.with(&id, |view| view.queued = queued.then_some((calls, limit))),
             SwarmEvent::HeldForReload { id, held } => self.with(&id, |view| view.held = held),
             SwarmEvent::Budget { tokens } => self.budget = tokens,
             SwarmEvent::ReloadPending { tool_calls } => self.reload_pending = Some(tool_calls),
@@ -996,12 +1004,19 @@ mod tests {
         app.apply(SwarmEvent::ModelQueued {
             id: "a1".into(),
             queued: true,
+            calls: 8,
+            limit: 8,
         });
-        assert_eq!(activity(&app).as_deref(), Some("queued for a model slot…"));
+        assert_eq!(
+            activity(&app).as_deref(),
+            Some("queued for a model slot (8/8 calls in flight; /max-calls to raise)")
+        );
         assert_eq!(app.agents["a1"].waiting(), Some(Waiting::Slot));
         app.apply(SwarmEvent::ModelQueued {
             id: "a1".into(),
             queued: false,
+            calls: 7,
+            limit: 8,
         });
         assert_eq!(activity(&app).as_deref(), Some("thinking…"));
         let held = |held| SwarmEvent::HeldForReload {

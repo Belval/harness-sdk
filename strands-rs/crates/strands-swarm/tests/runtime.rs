@@ -2808,6 +2808,126 @@ async fn model_calls_beyond_the_swarm_cap_queue() {
     assert!(queued >= 1, "no agent was queued");
 }
 
+/// Delegates to a mock once the test hands out a permit of `gate`.
+struct GatedModel {
+    inner: MockMessageModel,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl strands_agents::models::Model for GatedModel {
+    fn model_id(&self) -> Option<String> {
+        Some("gated".into())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        options: &'a strands_agents::models::StreamOptions,
+    ) -> futures::stream::BoxStream<'a, strands_agents::Result<strands_agents::models::ModelStreamEvent>>
+    {
+        use futures::StreamExt;
+        let open = futures::stream::once(async move { self.gate.acquire().await.unwrap().forget() });
+        Box::pin(
+            open.filter_map(|()| async { None })
+                .chain(self.inner.stream(messages, options)),
+        )
+    }
+}
+
+#[tokio::test]
+async fn raising_the_call_limit_releases_a_queued_call_and_survives_a_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let factory: AgentFactory = {
+        let gate = gate.clone();
+        Arc::new(move |spec: AgentSpec| {
+            let model = GatedModel {
+                inner: MockMessageModel::new(vec![say("hi")]),
+                gate: gate.clone(),
+            };
+            Box::pin(async move {
+                Agent::builder()
+                    .id(spec.id)
+                    .model(model)
+                    .system_prompt(spec.instructions)
+                    .tools(spec.tools)
+                    .no_sandbox()
+                    .build()
+            })
+        })
+    };
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.max_concurrent_calls = 1;
+    let (swarm, mut events) = Swarm::new(config.clone());
+    assert_eq!(swarm.max_calls(), 1);
+    spawn_root(&swarm, "one").await;
+    spawn_root(&swarm, "two").await;
+
+    // One call holds the only slot; the other agent queues and says why.
+    let mut queued = None;
+    let wait = async {
+        while queued.is_none() {
+            if let Some(SwarmEvent::ModelQueued {
+                id,
+                queued: true,
+                calls: 1,
+                limit: 1,
+            }) = events.recv().await
+            {
+                queued = Some(id);
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap();
+    let queued = queued.unwrap();
+    assert_eq!(
+        swarm.waiting_for_call(&queued).as_deref(),
+        Some("queued for a model slot (1/1 calls in flight; /max-calls to raise)")
+    );
+    assert_eq!(swarm.calls_in_flight(), 1);
+
+    // Raising the limit lets it through at once.
+    swarm.set_max_calls(Some(2));
+    let wait = async {
+        while !matches!(
+            events.recv().await,
+            Some(SwarmEvent::ModelQueued { queued: false, .. })
+        ) {}
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap();
+    assert_eq!(
+        (swarm.calls_in_flight(), swarm.waiting_for_call(&queued)),
+        (2, None)
+    );
+
+    // Lowering it below what is in flight cancels nothing: both calls still finish.
+    swarm.set_max_calls(Some(1));
+    assert_eq!(swarm.calls_in_flight(), 2);
+    gate.add_permits(2);
+    let mut replies = 0;
+    let collect = async {
+        while replies < 2 {
+            if let Some(SwarmEvent::Mail { to, mail }) = events.recv().await {
+                replies += usize::from(to == USER && mail.kind == "reply");
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), collect)
+        .await
+        .unwrap();
+
+    // The setting is saved; it wins over the flag after a resume, and `None` returns to the flag.
+    swarm.set_max_calls(Some(0));
+    let state = swarm.snapshot();
+    assert_eq!(state.max_calls, Some(0));
+    swarm.shutdown().await;
+    let (swarm, _events) = Swarm::resume(config, state).await.unwrap();
+    assert_eq!(swarm.max_calls(), 0);
+    swarm.set_max_calls(None);
+    assert_eq!(swarm.max_calls(), 1);
+    assert_eq!(swarm.snapshot().max_calls, None);
+}
+
 #[tokio::test]
 async fn a_spent_token_budget_stops_model_calls_until_it_is_raised() {
     let dir = tempfile::tempdir().unwrap();

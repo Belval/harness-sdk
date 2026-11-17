@@ -173,9 +173,23 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   - An idle agent that is only waiting on a schedule holds no slot.
   - `/max-agents N` changes the cap for the running swarm and is kept across restarts.
     `/max-agents default` returns to the flag.
-- **Model calls.** `--max-concurrent-calls N` (8, `0` = unlimited) caps model calls in flight
-  across the swarm. Extra calls queue ("queued for a model slot…") instead of tripping provider
-  throttling.
+- **Model calls.** `--max-concurrent-calls N` (32, `0` = unlimited) caps model calls in flight
+  across the swarm, separately from `--max-agents`; extra calls queue oldest first instead of
+  tripping provider throttling.
+  - A waiting agent says which cap is full: "queued for a model slot (8/8 calls in flight;
+    /max-calls to raise)", in its log line, in `/status` and in `list_agents`. `/status` also
+    starts with both caps and their usage, e.g. `agents 3/100 · calls 8/8`.
+  - `/max-calls N` changes the cap for the running swarm and is kept across restarts, ahead of the
+    flag, like `/max-agents`; `/max-calls default` returns to the flag and `/max-calls 0` lifts
+    it. Raising it lets queued calls through at once; lowering it cancels nothing in flight.
+  - Why 32: a call holds a slot for its whole stream (seconds to minutes), so the cap bounds
+    simultaneous streams, not request rate. Throttling is answered by the backoff in
+    `retry.rs` (10 attempts, jittered), which the cap only has to keep from stampeding. The old 8
+    queued most of a 16-agent swarm, which mostly waits for tool results and mail. 32 never
+    queues the default 16 agents (each has at most one call in flight, plus side calls) and
+    still bounds a 100-agent swarm to a third of its agents. It is not tied to `--max-agents`,
+    since a cap equal to the agent count would never bind; lower it with `/max-calls` if your
+    account throttles.
 - **Model errors.**
   - Throttling, server errors (5xx, Bedrock's `InternalServerException` and the like) and dropped
     connections are retried with backoff, up to 10 attempts (about eight minutes). A rejected
@@ -315,7 +329,7 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
 | `/cancel` | Stop the selected agent and its subtree for good. |
 | `/status` | Each live agent's state, activity, todos, unmerged commits and merge outlook, jobs and schedules, without a model call. |
 | `/cost` | Estimated spend (see [Cost](#cost)); its intro and footnote wrap, its table is clipped on narrow terminals. |
-| `/budget`, `/max-agents` | See [Limits](#limits). |
+| `/budget`, `/max-agents`, `/max-calls` | See [Limits](#limits). |
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
 | `/schedules` | All schedules. |
 | `/gc` | Retry reclaiming the disk of cancelled worktree agents. |

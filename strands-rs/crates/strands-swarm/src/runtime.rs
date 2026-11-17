@@ -21,7 +21,7 @@ use strands_agents::models::{ModelEventStream, StreamOptions};
 use strands_agents::tools::ToolRef;
 use strands_agents::types::{ImageBlock, ImageSource, Message, ToolResultContent, ToolResultStatus, Usage};
 use strands_agents::{Agent, Error, Model, Result};
-use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::gc::{self, Collected};
@@ -39,6 +39,7 @@ use crate::worktree;
 
 mod actor;
 mod background;
+mod calls;
 mod capacity;
 mod collect;
 mod disk;
@@ -308,13 +309,13 @@ pub struct SwarmConfig {
 }
 
 impl SwarmConfig {
-    /// Defaults: 16 live agents, 8 concurrent model calls and a random 8-character run id.
+    /// Defaults: 16 live agents, 32 concurrent model calls and a random 8-character run id.
     pub fn new(factory: AgentFactory, cwd: impl Into<PathBuf>) -> Self {
         Self {
             factory,
             cwd: cwd.into(),
             max_agents: 16,
-            max_concurrent_calls: 8,
+            max_concurrent_calls: 32,
             budget_tokens: None,
             task_flag: None,
             run_id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
@@ -525,13 +526,16 @@ pub enum SwarmEvent {
         /// New budget.
         tokens: Option<u64>,
     },
-    /// An agent started or stopped waiting for a free model-call slot
-    /// ([`SwarmConfig::max_concurrent_calls`]).
+    /// An agent started or stopped waiting for a free model-call slot ([`Swarm::max_calls`]).
     ModelQueued {
         /// Id.
         id: String,
         /// `true` while it waits.
         queued: bool,
+        /// Calls in flight when this was sent.
+        calls: usize,
+        /// The call limit then (`0`: none).
+        limit: usize,
     },
     /// An agent's model call started or stopped being held for a pending reload
     /// ([`Swarm::reload`] with [`ReloadWhen::Idle`]).
@@ -762,7 +766,10 @@ struct Inner {
     /// Held while a reload installs its binary; true once this process has installed one, so
     /// `<run>/bin/previous` already holds the binary that is running.
     reload_installed: tokio::sync::Mutex<bool>,
-    model_calls: Option<Arc<Semaphore>>,
+    /// The model-call gate: calls in flight and callers waiting for a slot.
+    calls: Arc<calls::CallGate>,
+    /// Model-call limit set at runtime with [`Swarm::set_max_calls`]; overrides the config.
+    max_calls: Mutex<Option<usize>>,
     budget: Mutex<Option<u64>>,
     /// Live-agent limit set at runtime with [`Swarm::set_max_agents`]; overrides the config.
     max_agents: Mutex<Option<usize>>,
@@ -820,8 +827,8 @@ impl Swarm {
             reload_generation: AtomicU64::new(0),
             reload_held: AtomicBool::new(false),
             reload_installed: tokio::sync::Mutex::new(false),
-            model_calls: (config.max_concurrent_calls > 0)
-                .then(|| Arc::new(Semaphore::new(config.max_concurrent_calls))),
+            calls: Arc::default(),
+            max_calls: Mutex::new(None),
             budget: Mutex::new(config.budget_tokens),
             max_agents: Mutex::new(None),
             over_budget: Mutex::new(Vec::new()),

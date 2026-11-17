@@ -42,6 +42,9 @@ pub struct SwarmState {
     /// Live-agent limit set at runtime, overriding `--max-agents`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_agents: Option<usize>,
+    /// Model-call limit set at runtime (`0`: none), overriding `--max-concurrent-calls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_calls: Option<usize>,
     /// Commit of the binary that saved it (`None` for older runs or builds outside git).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,

@@ -39,6 +39,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "show or change how many agents may run at once",
     },
     SlashCommand {
+        name: "/max-calls",
+        args: "[N|default]",
+        help: "show or change how many model calls may run at once (0: no limit)",
+    },
+    SlashCommand {
         name: "/budget",
         args: "[N|off]",
         help: "show, set or remove the swarm-wide token budget",
@@ -123,6 +128,8 @@ pub enum Command {
     Budget(Option<String>),
     /// `/max-agents [N|default]`: show or change the live-agent limit.
     MaxAgents(Option<String>),
+    /// `/max-calls [N|default]`: show or change the model-call limit (`0`: none).
+    MaxCalls(Option<String>),
     /// Add to the user's memory, or show it (`None`).
     Remember(Option<String>),
     /// Drop memory lines containing the text.
@@ -183,6 +190,9 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     if let Some(limit) = line.strip_prefix("/max-agents ") {
         return Some(Command::MaxAgents(Some(limit.trim().to_owned())));
     }
+    if let Some(limit) = line.strip_prefix("/max-calls ") {
+        return Some(Command::MaxCalls(Some(limit.trim().to_owned())));
+    }
     if let Some(budget) = line.strip_prefix("/budget ") {
         return Some(Command::Budget(Some(budget.trim().to_owned())));
     }
@@ -198,6 +208,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         "/model" => return Some(Command::ShowModel),
         "/budget" => return Some(Command::Budget(None)),
         "/max-agents" => return Some(Command::MaxAgents(None)),
+        "/max-calls" => return Some(Command::MaxCalls(None)),
         "/remember" => return Some(Command::Remember(None)),
         "/gc" => return Some(Command::Gc),
         "/schedules" => return Some(Command::Schedules),

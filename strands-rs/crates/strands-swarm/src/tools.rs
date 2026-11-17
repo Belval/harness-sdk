@@ -858,8 +858,12 @@ fn describe(swarm: &Swarm, info: &AgentInfo) -> String {
         .as_ref()
         .map(|b| format!(", branch {b}"))
         .unwrap_or_default();
+    let waiting = swarm
+        .waiting_for_call(&info.id)
+        .map(|text| format!(", {text}"))
+        .unwrap_or_default();
     format!(
-        "{} ({}): {}, parent {}, cwd {}{removed}{branch}",
+        "{} ({}): {}{waiting}, parent {}, cwd {}{removed}{branch}",
         info.name,
         info.id,
         info.status,

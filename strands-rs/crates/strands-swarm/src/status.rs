@@ -178,9 +178,36 @@ pub struct AgentReport {
     pub schedules: Vec<String>,
 }
 
+/// The two caps and how full they are.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limits {
+    /// Agents holding a slot, and the cap (`/max-agents`).
+    pub agents: (usize, usize),
+    /// Model calls in flight, and the cap (`/max-calls`; `0` is none).
+    pub calls: (usize, usize),
+}
+
+impl Limits {
+    /// `agents 3/100 · calls 8/8`.
+    pub fn describe(&self) -> String {
+        let (calls, limit) = self.calls;
+        let limit = if limit == 0 {
+            "unlimited".to_owned()
+        } else {
+            limit.to_string()
+        };
+        format!(
+            "agents {}/{} · calls {calls}/{limit}",
+            self.agents.0, self.agents.1
+        )
+    }
+}
+
 /// What [`crate::Swarm::status`] returns.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatusReport {
+    /// The caps and their usage; `None` in a hand-made report.
+    pub limits: Option<Limits>,
     /// The branch commits are compared against; `None` until known.
     pub base: Option<String>,
     /// Live agents in spawn order.
@@ -197,6 +224,7 @@ impl StatusReport {
         }
         let base = self.base.as_deref().unwrap_or("the base");
         let mut lines = vec![head];
+        lines.extend(self.limits.map(|limits| limits.describe()));
         for agent in &self.agents {
             let mut head = format!("{} · {}", agent.label, agent.status);
             if agent.unread > 0 {
@@ -561,6 +589,7 @@ mod tests {
     #[test]
     fn the_report_reads_as_one_block_per_agent() {
         let report = StatusReport {
+            limits: None,
             base: Some("main".into()),
             agents: vec![
                 AgentReport {
@@ -620,6 +649,7 @@ mod tests {
     #[test]
     fn an_unknown_branch_state_shows_as_checking() {
         let report = StatusReport {
+            limits: None,
             base: None,
             agents: vec![AgentReport {
                 id: "a1".into(),
@@ -781,6 +811,7 @@ mod tests {
             "1 not on main, fast-forward; also unmerged: swarm/r/a7"
         );
         let report = StatusReport {
+            limits: None,
             base,
             agents: vec![AgentReport {
                 id: "a7".into(),

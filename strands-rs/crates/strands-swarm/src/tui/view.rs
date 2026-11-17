@@ -592,6 +592,10 @@ fn popup(app: &App, body: Rect) -> Option<Paragraph<'static>> {
     let (title, lines, wrap) = if let Some(report) = &app.status {
         let doing = |id: &str| {
             let view = app.agents.get(id)?;
+            let queued = view.queued.filter(|_| view.status == AgentStatus::Running);
+            if let Some((calls, limit)) = queued {
+                return Some(crate::text::queued_for_call(calls, limit));
+            }
             matches!(view.status, AgentStatus::Starting | AgentStatus::Running).then(|| view.doing.clone())
         };
         let lines: Vec<Line> = report
@@ -950,6 +954,8 @@ mod tests {
         app.apply(SwarmEvent::ModelQueued {
             id: "a2".into(),
             queued: true,
+            calls: 8,
+            limit: 8,
         });
         let still = |app: &App, case: &str| {
             assert!(!app.animating(), "{case}");
@@ -1127,6 +1133,7 @@ mod tests {
             schedules: vec![],
         };
         app.status = Some(crate::status::StatusReport {
+            limits: None,
             base: None,
             agents: (1..=40).map(agent).collect(),
         });
@@ -1174,6 +1181,7 @@ mod tests {
         let mut app = app_with_an_image(None);
         let subject = "abc1234 feat: thumbnails for every image in the log pane, scaled to fit the cell grid";
         app.status = Some(crate::status::StatusReport {
+            limits: None,
             base: Some("main".into()),
             agents: vec![crate::status::AgentReport {
                 id: "a1".into(),

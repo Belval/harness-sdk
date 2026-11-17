@@ -789,6 +789,7 @@ mod tests {
             budget_flag: None,
             task_flag: None,
             max_agents: None,
+            max_calls: None,
             commit: None,
             schedules: Vec::new(),
         }
