@@ -64,10 +64,15 @@ fn swarm_with(
 
 /// Collect events until `to` receives a reply, returning that reply's text.
 async fn reply_to(events: &mut UnboundedReceiver<SwarmEvent>, to: &str) -> String {
+    mail_to(events, to, "reply").await
+}
+
+/// Collect events until `to` receives mail of `kind`, returning its text.
+async fn mail_to(events: &mut UnboundedReceiver<SwarmEvent>, to: &str, kind: &str) -> String {
     let wait = async {
         while let Some(event) = events.recv().await {
             if let SwarmEvent::Mail { to: receiver, mail } = event {
-                if receiver == to && mail.kind == "reply" {
+                if receiver == to && mail.kind == kind {
                     return mail.text;
                 }
             }
@@ -76,7 +81,7 @@ async fn reply_to(events: &mut UnboundedReceiver<SwarmEvent>, to: &str) -> Strin
     };
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
-        .expect("timed out waiting for a reply")
+        .unwrap_or_else(|_| panic!("timed out waiting for {kind} mail to {to}"))
 }
 
 fn sent_text(model: &MockMessageModel, call: usize) -> String {
@@ -2449,19 +2454,6 @@ async fn tool_started(events: &mut UnboundedReceiver<SwarmEvent>, tool: &str) {
         }
     };
     tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap();
-}
-
-async fn mail_to(events: &mut UnboundedReceiver<SwarmEvent>, to: &str, kind: &str) -> String {
-    let wait = async {
-        loop {
-            if let Some(SwarmEvent::Mail { to: receiver, mail }) = events.recv().await {
-                if receiver == to && mail.kind == kind {
-                    return mail.text;
-                }
-            }
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap()
 }
 
 #[tokio::test]
