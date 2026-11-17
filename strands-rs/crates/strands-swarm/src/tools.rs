@@ -95,7 +95,7 @@ struct SpawnInput {
     name: String,
     #[serde(default)]
     worktree: bool,
-    /// Model id instead of the default. Cost vs opus: sonnet ≈ 0.6×, haiku ≈ 0.2× (mechanical work).
+    /// Model id, or opus/sonnet/haiku, instead of the default. Cost vs opus: sonnet ≈ 0.6×, haiku ≈ 0.2× (mechanical work).
     #[serde(default)]
     model: Option<String>,
     /// Checkable completion criterion: a judge sends the agent back to work until it is met.

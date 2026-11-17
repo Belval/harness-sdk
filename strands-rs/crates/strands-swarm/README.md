@@ -245,7 +245,9 @@ Typing text without a command messages the selected agent.
 **Command details.**
 
 - **`/model`:** `/model default` returns to `--model`, and `/model` alone shows the current model.
-  The id is resolved like `--model`, and an invalid one is rejected.
+  The id is resolved like `--model`, and an invalid one is rejected. `opus`, `sonnet` and `haiku`
+  (here and in `spawn_agent`'s `model`) stand for that tier's Claude 5.5 id with `--model`'s
+  provider prefix, e.g. `bedrock/global.anthropic.claude-sonnet-5-5`.
 - **`/stop`:** an open tool call is closed as cancelled and the agent goes idle with its
   conversation intact. Its parent gets an `interrupted` message and its children keep running. A
   goal agent waits for its next message.

@@ -1555,6 +1555,27 @@ async fn spawn_root(swarm: &Swarm, task: &str) -> String {
 }
 
 #[tokio::test]
+async fn a_spawn_with_a_tier_alias_gets_the_full_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("ok")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.default_model = Some("bedrock/global.anthropic.claude-haiku-5-5".into());
+    let (swarm, _events) = Swarm::new(config);
+    let spawn = |model: &str| SpawnRequest {
+        task: "t".into(),
+        model: Some(model.into()),
+        ..Default::default()
+    };
+    let id = swarm.spawn(USER, spawn("sonnet")).await.unwrap();
+    let model = swarm.agent(&id).unwrap().model;
+    assert_eq!(
+        model.as_deref(),
+        Some("bedrock/global.anthropic.claude-sonnet-5-5")
+    );
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
 async fn switching_a_model_takes_effect_on_the_next_turn_and_rejects_unknown_ids() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = scripts_of(vec![

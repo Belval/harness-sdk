@@ -161,6 +161,24 @@ impl Mail {
     }
 }
 
+/// The Claude version a tier alias (`opus`, `sonnet`, `haiku`) stands for.
+const TIER_VERSION: &str = "5-5";
+
+/// A model id as given to `spawn_agent` or `/model`: a tier alias (`sonnet`) becomes that tier's
+/// id with the provider prefix of `default` (`bedrock/global.anthropic.claude-sonnet-5-5` for a
+/// Bedrock default) instead of reaching the provider as an id it rejects at the agent's first
+/// call. Everything else passes as given.
+pub fn expand_model(model: &str, default: Option<&str>) -> String {
+    let tier = model.trim().to_ascii_lowercase();
+    if !["opus", "sonnet", "haiku"].contains(&tier.as_str()) {
+        return model.to_owned();
+    }
+    let prefix = default
+        .and_then(|default| default.find("claude").map(|at| &default[..at]))
+        .unwrap_or("bedrock/global.anthropic.");
+    format!("{prefix}claude-{tier}-{TIER_VERSION}")
+}
+
 /// Render a batch of mail as one text block.
 pub fn render_mail(mail: &[Mail]) -> String {
     mail.iter().map(Mail::render).collect::<Vec<_>>().join("\n\n")
@@ -768,11 +786,13 @@ impl Swarm {
 
     /// Spawn an agent under `parent` ([`USER`] for a root agent). Returns its id. At the agent
     /// limit the agent is [`AgentStatus::Queued`] instead, and starts once a slot frees.
-    pub async fn spawn(&self, parent: &str, request: SpawnRequest) -> Result<String> {
+    pub async fn spawn(&self, parent: &str, mut request: SpawnRequest) -> Result<String> {
         let parent_node = self.node(parent);
         if parent != USER && parent_node.is_none() {
             return Err(Error::other(format!("Unknown agent id {parent}.")));
         }
+        let default = self.inner.config.default_model.as_deref();
+        request.model = request.model.map(|model| expand_model(&model, default));
 
         let id = format!("a{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let base_cwd = parent_node
@@ -925,6 +945,8 @@ impl Swarm {
         let agent = node
             .agent()
             .ok_or_else(|| Error::other(format!("Agent {id} is still starting; try again in a moment.")))?;
+        let default = self.inner.config.default_model.as_deref();
+        let model = model.map(|model| expand_model(&model, default));
         let wanted = model.as_deref().unwrap_or("the default model");
         let resolved = resolver(model.clone())
             .await
@@ -1090,6 +1112,34 @@ impl Swarm {
         });
         if freed {
             self.start_queued();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_model;
+
+    #[test]
+    fn a_tier_alias_takes_the_defaults_provider_prefix() {
+        let bedrock = Some("bedrock/global.anthropic.claude-haiku-5-5");
+        assert_eq!(
+            expand_model("sonnet", bedrock),
+            "bedrock/global.anthropic.claude-sonnet-5-5"
+        );
+        assert_eq!(
+            expand_model(" Opus ", Some("anthropic/claude-sonnet-4-5")),
+            "anthropic/claude-opus-5-5"
+        );
+        let bedrock_haiku = "bedrock/global.anthropic.claude-haiku-5-5";
+        assert_eq!(expand_model("haiku", Some("openai/gpt-5")), bedrock_haiku);
+        assert_eq!(expand_model("haiku", None), bedrock_haiku);
+    }
+
+    #[test]
+    fn other_ids_pass_as_given() {
+        for id in ["us.anthropic.claude-opus-4-6-v1", "openai/gpt-5", "b"] {
+            assert_eq!(expand_model(id, None), id);
         }
     }
 }
