@@ -591,6 +591,23 @@ mod tests {
     }
 
     #[test]
+    fn switching_agents_clears_the_footer_notice() {
+        let mut app = App::default();
+        spawn(&mut app, "a1", USER);
+        spawn(&mut app, "a2", "a1");
+        app.notice = Some("sent to name-a1 (a1)".into());
+        press(&mut app, KeyCode::Up);
+        assert!(
+            screen(&app).contains("sent to name-a1 (a1)"),
+            "no move, no change"
+        );
+        press(&mut app, KeyCode::Down);
+        let shown = screen(&app);
+        assert!(!shown.contains("sent to"), "{shown}");
+        assert!(shown.contains("/ commands · f1 keys"), "{shown}");
+    }
+
+    #[test]
     fn the_tree_shows_children_under_parents_and_arrows_select() {
         let mut app = App::default();
         spawn(&mut app, "a1", USER);

@@ -496,7 +496,12 @@ impl App {
         if len == 0 {
             return;
         }
-        self.selected = self.selected.saturating_add_signed(delta).min(len - 1);
+        let selected = self.selected.saturating_add_signed(delta).min(len - 1);
+        if selected != self.selected {
+            // A notice is about the agent it was shown for (`sent to …`, `press esc again`).
+            self.notice = None;
+        }
+        self.selected = selected;
         self.scroll = 0;
     }
 
