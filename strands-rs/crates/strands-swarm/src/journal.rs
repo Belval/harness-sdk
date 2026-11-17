@@ -24,8 +24,9 @@ use crate::runtime::SwarmEvent;
 pub const JOURNAL_FILE: &str = "journal.jsonl";
 /// Lifecycle events.
 pub const EVENTS_FILE: &str = "events.jsonl";
-/// Size at which a file is rotated to `<file>.1`.
-pub const MAX_FILE_BYTES: u64 = 8 << 20;
+/// Size at which a file is rotated to `<file>.1`: with a line per model call, about a day of a
+/// 250-agent swarm's events.
+pub const MAX_FILE_BYTES: u64 = 16 << 20;
 
 /// One line of `journal.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

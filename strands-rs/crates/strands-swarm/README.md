@@ -497,8 +497,8 @@ messages you.
   `supervisor.notice` and the `stop` marker.
 - **Bounds.** A run dir grows with the live agents' work since the last resume and with unreported
   jobs, not with the run's age:
-  - `journal.jsonl`, `events.jsonl` and `swarm.log` are rotated to `<file>.1` at 8 MB, so each
-    takes at most 16 MB.
+  - `journal.jsonl` and `events.jsonl` are rotated to `<file>.1` at 16 MB, so each takes at most
+    32 MB (a busy 250-agent swarm writes about 13 MB of events a day); `swarm.log` at 8 MB.
   - In `jobs/`, a running job's log is cut to its last 1 MB past 32 MB, and only the newest 200
     reported jobs keep their files (see **Background jobs**).
   - The stash (`sessions/<agent>/stash`) holds every tool result and text block of an agent's
@@ -512,12 +512,14 @@ messages you.
 - **Journal.**
   - A persistent run keeps `journal.jsonl` with every message to and from the user, and
     `events.jsonl` with compact lifecycle events: spawns, status changes, tool calls and their
-    ends, model switches, compactions (`before`/`after` tokens) and failed ones, side calls
+    ends, each own model call's tokens (`model_call`: model, `input` with cache reads and writes
+    included, `output`, `cache_read`, `cache_write`, so hit rates can be read per agent and hour),
+    model switches, compactions (`before`/`after` tokens) and failed ones, side calls
     (`side_call`: purpose, model and tokens of each judge or summarizer call), keep-warm
     refreshes, schedules, jobs, budget and agent-cap changes, resumes, reloads, version
     `changes`, shutdowns, disk reclaimed (`gc`) and stash entries pruned (`stash_pruned`).
   - Both are JSON lines with a UTC `ts`, written by a background thread and rotated to `<file>.1`
-    at 8 MB.
+    at 16 MB.
 - **Log.** Warnings and errors (or whatever `RUST_LOG` selects) go to `<run dir>/swarm.log` under
   the TUI (`$TMPDIR/strands-swarm-<pid>.log` without `--run`), and to stderr otherwise. When a
   process opens a log that has grown past 8 MB, it is first moved to `swarm.log.1`.

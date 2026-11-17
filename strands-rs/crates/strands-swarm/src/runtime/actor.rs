@@ -361,6 +361,20 @@ impl Swarm {
         let model = model.unwrap_or_else(|| "unknown".to_owned());
         let own = own_call.then(|| self.now().timestamp());
         node.ledger.lock().record(&model, counts, own);
+        if own_call {
+            // One line per call, so cache hits and misses can be read by time and agent later.
+            self.journal_event(
+                "model_call",
+                serde_json::json!({
+                    "id": node.id,
+                    "model": model,
+                    "input": counts.input,
+                    "output": counts.output,
+                    "cache_read": counts.cache_read,
+                    "cache_write": counts.cache_write,
+                }),
+            );
+        }
         self.add_totals(node, counts, own_call);
     }
 

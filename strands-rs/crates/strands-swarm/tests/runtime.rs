@@ -3890,6 +3890,23 @@ async fn the_goal_judge_runs_on_the_side_model_and_counts_toward_the_agents_toke
         (calls[0]["input"].as_u64(), calls[0]["output"].as_u64()),
         (Some(50), Some(5))
     );
+    // The agent's own call has a line of its own; the judge's is only a side call.
+    let own: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| event["event"] == "model_call")
+        .collect();
+    assert_eq!(own.len(), 1, "{log}");
+    assert_eq!(own[0]["id"], id.as_str());
+    assert_eq!(
+        [&own[0]["input"], &own[0]["output"], &own[0]["cache_read"]],
+        [&json!(100), &json!(10), &json!(0)]
+    );
+    assert!(
+        own[0]["ts"].is_string() && own[0]["model"].is_string(),
+        "{}",
+        own[0]
+    );
 }
 
 #[tokio::test]
