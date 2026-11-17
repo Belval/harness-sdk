@@ -108,6 +108,10 @@ installs the exporter).
   child process would inherit. A set profile also supplies the region and beats environment access
   keys. The harness takes them through `AwsSettings` (`ResolveModelOptions::aws`,
   `HarnessAgentOptions::aws`).
+- `OpenAIModel::connect` and `BedrockMantleConfig::{profile, config_file, credentials_file}` are
+  Rust-only: Bedrock Mantle takes the same `AwsSettings`, and `connect` mints a fresh bearer token
+  for every request from the AWS credentials (a SigV4-presigned `CallWithBearerToken` URL, as the TS
+  `@aws/bedrock-token-generator`), where `OpenAIModel::new` needs `AWS_BEARER_TOKEN_BEDROCK`.
 - `models::routing::ModelRouter` runs its per-invocation selection as **wrap-phase** middleware on
   `InvokeModelStage`, not TS's `InvokeModelStage.Input`: `add_input` is sync while
   `RoutingStrategy::select` is async, and wrap composes innermost so the stage still sees the

@@ -1,5 +1,14 @@
 //! Bedrock Mantle: an OpenAI-compatible Bedrock endpoint (`strands-ts/src/models/openai/mantle.ts`).
 
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SignatureLocation, SigningSettings};
+use aws_sigv4::sign::v4;
+use aws_smithy_runtime_api::client::identity::Identity;
+use base64::Engine;
+
 use crate::error::{Error, Result};
 
 /// Model id prefixes served under the `/openai/v1` base path.
@@ -14,10 +23,119 @@ const OPENAI_BASE_PATH_PREFIXES: &[&str] = &[
 /// Configuration for talking to Bedrock Mantle instead of api.openai.com.
 #[derive(Clone, Debug, Default)]
 pub struct BedrockMantleConfig {
-    /// AWS region; falls back to `AWS_REGION` / `AWS_DEFAULT_REGION`.
+    /// AWS region; falls back to `AWS_REGION` / `AWS_DEFAULT_REGION`, and with
+    /// [`OpenAIModel::connect`](super::OpenAIModel::connect) to the profile's and the AWS chain's.
     pub region: Option<String>,
-    /// Lifetime requested for the minted bearer token.
+    /// Lifetime requested for the minted bearer token (default 12 hours).
     pub expires_in_seconds: Option<u64>,
+    /// Profile for the credentials and, without `region`, the region, in place of `AWS_PROFILE`'s;
+    /// neither access keys nor `AWS_REGION` in the environment override it. Used by
+    /// [`OpenAIModel::connect`](super::OpenAIModel::connect).
+    pub profile: Option<String>,
+    /// Config file in place of `AWS_CONFIG_FILE`'s. Used by `connect`.
+    pub config_file: Option<PathBuf>,
+    /// Shared credentials file in place of `AWS_SHARED_CREDENTIALS_FILE`'s. Used by `connect`.
+    pub credentials_file: Option<PathBuf>,
+}
+
+/// How long a minted token lives when the config names no lifetime.
+const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// What mints a Mantle bearer token for each request: the AWS credentials of the chain (or
+/// profile) the model was connected with, which refresh themselves.
+#[derive(Clone, Debug)]
+pub(crate) struct MantleAuth {
+    credentials: SharedCredentialsProvider,
+    region: String,
+    lifetime: Duration,
+}
+
+impl MantleAuth {
+    /// Mint a token: a SigV4-presigned `CallWithBearerToken` URL, as `aws-bedrock-token-generator`.
+    pub(crate) async fn token(&self) -> Result<String> {
+        let fail = |e: &dyn std::fmt::Display| {
+            Error::model(format!("failed to mint Bedrock Mantle bearer token | {e}"))
+        };
+        let credentials = self
+            .credentials
+            .provide_credentials()
+            .await
+            .map_err(|e| fail(&e))?;
+        let identity = Identity::from(credentials);
+        let mut settings = SigningSettings::default();
+        settings.signature_location = SignatureLocation::QueryParams;
+        settings.expires_in = Some(self.lifetime);
+        let params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(&self.region)
+            .name("bedrock")
+            .time(SystemTime::now())
+            .settings(settings)
+            .build()
+            .map_err(|e| fail(&e))?
+            .into();
+        const HOST: &str = "bedrock.amazonaws.com";
+        let url = format!("https://{HOST}/?Action=CallWithBearerToken");
+        let request = SignableRequest::new(
+            "POST",
+            url.as_str(),
+            std::iter::once(("host", HOST)),
+            SignableBody::Bytes(&[]),
+        )
+        .map_err(|e| fail(&e))?;
+        let (instructions, _) = sign(request, &params).map_err(|e| fail(&e))?.into_parts();
+        let mut signed = http::Request::builder()
+            .method("POST")
+            .uri(url.as_str())
+            .body(())
+            .map_err(|e| fail(&e))?;
+        instructions.apply_to_request_http1x(&mut signed);
+        let signed = signed.uri().to_string();
+        let signed = signed.strip_prefix("https://").unwrap_or(&signed);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{signed}&Version=1"));
+        Ok(format!("bedrock-api-key-{encoded}"))
+    }
+}
+
+/// Resolve what `config` leaves to the AWS chain, loaded with its profile and files in place of
+/// the environment's: the region when unset (the profile's, else the environment's, else the
+/// chain's), and the credentials to mint tokens from. `None` when a token comes from elsewhere:
+/// `has_api_key`, or `AWS_BEARER_TOKEN_BEDROCK` with no profile named.
+pub(crate) async fn connect(
+    config: &mut BedrockMantleConfig,
+    has_api_key: bool,
+) -> Result<Option<MantleAuth>> {
+    let env_token = config.profile.is_none() && std::env::var_os("AWS_BEARER_TOKEN_BEDROCK").is_some();
+    if has_api_key || env_token && config.region.is_some() {
+        return Ok(None);
+    }
+    let sdk = super::super::aws::aws_loader(
+        config.profile.as_deref(),
+        config.config_file.as_deref(),
+        config.credentials_file.as_deref(),
+    )
+    .load()
+    .await;
+    if config.region.is_none() {
+        config.region = sdk.region().map(|region| region.to_string());
+    }
+    if env_token {
+        return Ok(None);
+    }
+    let region = resolve_region(config)?;
+    let credentials = sdk.credentials_provider().ok_or_else(|| {
+        Error::model("failed to mint Bedrock Mantle bearer token | no AWS credentials provider found")
+    })?;
+    let auth = MantleAuth {
+        credentials,
+        region,
+        lifetime: config
+            .expires_in_seconds
+            .map_or(DEFAULT_TOKEN_LIFETIME, Duration::from_secs),
+    };
+    // Fail now, not on the first request, when there are no credentials.
+    auth.token().await?;
+    Ok(Some(auth))
 }
 
 /// `/openai/v1` for the OpenAI-shaped model families, `/v1` otherwise.
@@ -84,11 +202,12 @@ fn is_valid_region(region: &str) -> bool {
 ///
 /// Gap vs TS: the TS provider lazily imports `@aws/bedrock-token-generator` and mints a fresh
 /// short-lived token per request. No Rust equivalent exists yet, so the token must be supplied
-/// out of band via `api_key` or `AWS_BEARER_TOKEN_BEDROCK`.
+/// out of band via `api_key` or `AWS_BEARER_TOKEN_BEDROCK`, unless the model is built with
+/// [`OpenAIModel::connect`](super::OpenAIModel::connect), which mints from AWS credentials.
 pub(crate) fn mint_bearer_token() -> Result<Option<String>> {
     std::env::var("AWS_BEARER_TOKEN_BEDROCK").map(Some).map_err(|_| {
         Error::model(
-            "failed to mint Bedrock Mantle bearer token | token minting is not implemented in Rust yet: set AWS_BEARER_TOKEN_BEDROCK or pass api_key explicitly",
+            "failed to mint Bedrock Mantle bearer token | OpenAIModel::new does not mint one: set AWS_BEARER_TOKEN_BEDROCK, pass api_key, or build the model with OpenAIModel::connect",
         )
     })
 }

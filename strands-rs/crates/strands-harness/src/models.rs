@@ -506,6 +506,33 @@ fn bedrock_builder(
     builder
 }
 
+/// An `openai/...` or `bedrock-mantle/...` model, the latter under `aws`.
+#[cfg(feature = "openai")]
+async fn connect_openai(
+    spec: &str,
+    effort: Effort,
+    web_search: bool,
+    caching: bool,
+    caching_explicit: bool,
+    aws: AwsSettings,
+) -> Result<OpenAIModel> {
+    let mut config = openai_config_for(spec, effort, web_search, caching, caching_explicit)?;
+    mantle_with_aws(config.mantle.as_mut(), aws);
+    OpenAIModel::connect(config).await
+}
+
+/// Apply `aws` to a Bedrock Mantle config, as to Bedrock's: its region wins, then, unless a profile
+/// is named (whose own region then wins), the environment's, which Mantle reads itself.
+#[cfg(feature = "openai")]
+fn mantle_with_aws(mantle: Option<&mut BedrockMantleConfig>, aws: AwsSettings) {
+    if let Some(mantle) = mantle {
+        mantle.region = aws.region;
+        mantle.profile = aws.profile;
+        mantle.config_file = aws.config_file;
+        mantle.credentials_file = aws.credentials_file;
+    }
+}
+
 /// The resolved provider, model name, effort level and effective caching flag for a spec.
 struct Resolved<'a> {
     provider: &'a str,
@@ -530,7 +557,7 @@ fn bedrock_config(name: &str, effort: Option<&str>, caching: bool) -> BedrockMod
     }
 }
 
-/// AWS settings for the Bedrock client in place of the process environment's, so a host can
+/// AWS settings for the Bedrock and Bedrock Mantle clients in place of the process environment's, so a host can
 /// call Bedrock under its own profile while the processes it starts keep the user's `AWS_*`.
 /// Unset fields fall back to the AWS chain. Rust-only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -562,7 +589,7 @@ pub struct ResolveModelOptions {
     /// TTL of the cache points (`"5m"`, `"1h"`) on Bedrock and Anthropic; `None` sends none,
     /// i.e. the provider default of 5 minutes. Rust-only.
     pub cache_ttl: Option<String>,
-    /// AWS settings for a Bedrock model. Rust-only.
+    /// AWS settings for a Bedrock or Bedrock Mantle model. Rust-only.
     pub aws: AwsSettings,
 }
 
@@ -618,7 +645,9 @@ pub async fn resolve_model(options: ResolveModelOptions) -> Result<Arc<dyn Model
     match provider_name {
         "bedrock" => build_bedrock(&spec, effort, web_search, caching, caching_explicit, ttl, aws).await,
         "anthropic" => build_anthropic(&spec, effort, web_search, caching, caching_explicit, ttl),
-        "openai" | "bedrock-mantle" => build_openai(&spec, effort, web_search, caching, caching_explicit),
+        "openai" | "bedrock-mantle" => {
+            build_openai(&spec, effort, web_search, caching, caching_explicit, aws).await
+        }
         _ => {
             resolve_spec(&spec, effort, web_search, caching, caching_explicit)?;
             Err(unsupported_provider(provider_name))
@@ -679,20 +708,23 @@ fn build_anthropic(
     }
 }
 
-fn build_openai(
+async fn build_openai(
     spec: &str,
     effort: Effort,
     web_search: bool,
     caching: bool,
     caching_explicit: bool,
+    aws: AwsSettings,
 ) -> Result<Arc<dyn Model>> {
     #[cfg(feature = "openai")]
     {
-        let config = openai_config_for(spec, effort, web_search, caching, caching_explicit)?;
-        Ok(Arc::new(OpenAIModel::new(config)?))
+        Ok(Arc::new(
+            connect_openai(spec, effort, web_search, caching, caching_explicit, aws).await?,
+        ))
     }
     #[cfg(not(feature = "openai"))]
     {
+        let _ = aws;
         let provider_name = split_provider(spec).0;
         resolve_spec(spec, effort, web_search, caching, caching_explicit)?;
         Err(missing_feature(provider_name, "openai"))
@@ -910,6 +942,10 @@ fn has_web_search(provider_name: &str, name: &str) -> bool {
         || name.starts_with("openai.gpt-6-")
 }
 
+/// The AWS environment variables are process-wide, so the tests that set them take this lock.
+#[cfg(all(test, any(feature = "bedrock", feature = "openai")))]
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(all(test, feature = "bedrock"))]
 mod tests {
     use super::*;
@@ -917,9 +953,6 @@ mod tests {
     use strands_agents::test_support::MockMessageModel;
 
     const DEFAULT: &str = "bedrock/global.anthropic.claude-opus-4-8";
-
-    /// `bedrock_region` reads process-wide env, so its tests take this lock.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// `reset_warn_once` clears a process-wide set, so the tests that assert on it take this lock.
     static WARN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -976,7 +1009,7 @@ mod tests {
 
     #[test]
     fn uses_aws_default_region_when_aws_region_is_absent_and_gives_aws_region_precedence() {
-        let _guard = ENV_LOCK.lock().expect("lock");
+        let _guard = ENV_LOCK.blocking_lock();
         let previous = (
             std::env::var("AWS_REGION").ok(),
             std::env::var("AWS_DEFAULT_REGION").ok(),
@@ -998,7 +1031,7 @@ mod tests {
 
     #[test]
     fn aws_settings_reach_the_bedrock_client_over_the_environment() {
-        let _guard = ENV_LOCK.lock().expect("lock");
+        let _guard = ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("config");
         std::fs::write(&config, "[profile host]\nregion = eu-north-1\n").expect("write");
@@ -1881,6 +1914,110 @@ mod openai_tests {
             let config = resolve(id, Effort::High, true);
             assert!(!config.params.contains_key("tools"), "{id}");
         }
+    }
+
+    const AWS_ENV: [&str; 4] = [
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_PROFILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    ];
+
+    /// A Mantle model under `aws` with the AWS environment cleared, and the URL it posts to.
+    async fn mantle_url(aws: AwsSettings, env: &[(&str, &str)]) -> Result<(String, Option<String>)> {
+        let _guard = ENV_LOCK.lock().await;
+        let saved: Vec<_> = AWS_ENV
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        for key in AWS_ENV {
+            std::env::remove_var(key);
+        }
+        for (key, value) in env {
+            std::env::set_var(key, value);
+        }
+        let model = connect_openai(
+            "bedrock-mantle/openai.gpt-6-astra",
+            Effort::Auto,
+            false,
+            false,
+            false,
+            aws,
+        )
+        .await;
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let model = model?;
+        let request = model.format_request(
+            &[strands_agents::types::Message::user("hi")],
+            &strands_agents::models::StreamOptions::default(),
+        )?;
+        Ok((request.url, request.bearer_token))
+    }
+
+    #[tokio::test]
+    async fn a_mantle_model_takes_its_region_and_credentials_from_the_aws_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        let credentials = dir.path().join("credentials");
+        std::fs::write(&config, "[profile swarm]\nregion = eu-north-1\n").expect("write");
+        std::fs::write(
+            &credentials,
+            "[swarm]\naws_access_key_id = AKIAEXAMPLE\naws_secret_access_key = secret\n",
+        )
+        .expect("write");
+        let profile = AwsSettings {
+            profile: Some("swarm".into()),
+            config_file: Some(config),
+            credentials_file: Some(credentials),
+            region: None,
+        };
+        // No `AWS_REGION` in the environment: the profile names it and supplies the credentials.
+        let (url, token) = mantle_url(profile.clone(), &[]).await.expect("builds");
+        assert_eq!(
+            url,
+            "https://bedrock-mantle.eu-north-1.api.aws/openai/v1/responses"
+        );
+        // Credentials, not a fixed token: one is minted per request.
+        assert_eq!(token, None);
+        // An explicit region beats the profile's, and the environment's region does not beat either.
+        let explicit = AwsSettings {
+            region: Some("ap-south-1".into()),
+            ..profile.clone()
+        };
+        let (url, _) = mantle_url(explicit, &[("AWS_REGION", "us-east-1")])
+            .await
+            .expect("builds");
+        assert_eq!(
+            url,
+            "https://bedrock-mantle.ap-south-1.api.aws/openai/v1/responses"
+        );
+        let (url, _) = mantle_url(profile, &[("AWS_REGION", "us-east-1")])
+            .await
+            .expect("builds");
+        assert_eq!(
+            url,
+            "https://bedrock-mantle.eu-north-1.api.aws/openai/v1/responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mantle_model_without_aws_settings_still_reads_the_environment() {
+        let (url, token) = mantle_url(
+            AwsSettings::default(),
+            &[("AWS_REGION", "us-east-1"), ("AWS_BEARER_TOKEN_BEDROCK", "token")],
+        )
+        .await
+        .expect("builds");
+        assert_eq!(
+            url,
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses"
+        );
+        assert_eq!(token.as_deref(), Some("token"));
     }
 
     /// The base URL comes from the SDK, driven by the model id this module resolves.

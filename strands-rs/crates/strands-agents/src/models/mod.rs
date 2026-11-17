@@ -2,6 +2,8 @@
 
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
+#[cfg(any(feature = "bedrock", feature = "openai"))]
+mod aws;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
 pub mod defaults;

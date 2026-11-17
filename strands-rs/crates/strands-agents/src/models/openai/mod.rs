@@ -124,6 +124,8 @@ pub struct OpenAIModel {
     model_id: String,
     base_url: String,
     api_key: Option<String>,
+    /// Mints a fresh bearer token per request, in place of `api_key`.
+    mantle_auth: Option<mantle::MantleAuth>,
     transport: Arc<dyn OpenAITransport>,
 }
 
@@ -135,6 +137,52 @@ impl OpenAIModel {
 
     /// Build a provider with an injected transport (offline tests, custom HTTP stacks).
     pub fn with_transport(config: OpenAIModelConfig, transport: Arc<dyn OpenAITransport>) -> Result<Self> {
+        let api_key = match (&config.api_key, &config.mantle) {
+            (Some(key), _) => Some(key.clone()),
+            (None, Some(_)) => mantle::mint_bearer_token()?,
+            (None, None) => Some(std::env::var("OPENAI_API_KEY").map_err(|_| {
+                Error::model(
+                    "OpenAI API key is required. Provide it via the 'apiKey' option (string or function) or set the OPENAI_API_KEY environment variable.",
+                )
+            })?),
+        };
+        Self::assemble(config, transport, api_key, None)
+    }
+
+    /// Like [`new`](Self::new), but a Bedrock Mantle model takes its region, and the credentials
+    /// it mints a fresh bearer token from for each request, from the AWS chain loaded with the
+    /// `profile` and files of [`BedrockMantleConfig`]. Rust-only.
+    ///
+    /// Without `api_key` and, when no profile is named, `AWS_BEARER_TOKEN_BEDROCK`, it fails here
+    /// when the chain has no credentials. Any other model is built as by `new`.
+    pub async fn connect(config: OpenAIModelConfig) -> Result<Self> {
+        Self::connect_with_transport(config, Arc::new(ReqwestTransport::default())).await
+    }
+
+    /// [`connect`](Self::connect) with an injected transport.
+    pub async fn connect_with_transport(
+        mut config: OpenAIModelConfig,
+        transport: Arc<dyn OpenAITransport>,
+    ) -> Result<Self> {
+        let has_api_key = config.api_key.is_some();
+        let Some(mantle) = config.mantle.as_mut() else {
+            return Self::with_transport(config, transport);
+        };
+        let auth = mantle::connect(mantle, has_api_key).await?;
+        let api_key = match (&config.api_key, &auth) {
+            (Some(key), _) => Some(key.clone()),
+            (None, Some(_)) => None,
+            (None, None) => mantle::mint_bearer_token()?,
+        };
+        Self::assemble(config, transport, api_key, auth)
+    }
+
+    fn assemble(
+        config: OpenAIModelConfig,
+        transport: Arc<dyn OpenAITransport>,
+        api_key: Option<String>,
+        mantle_auth: Option<mantle::MantleAuth>,
+    ) -> Result<Self> {
         let model_id = match &config.model_id {
             Some(id) => id.clone(),
             None => {
@@ -148,21 +196,13 @@ impl OpenAIModel {
             (None, Some(mantle)) => resolve_mantle_base_url(mantle, &model_id)?,
             (None, None) => "https://api.openai.com/v1".to_string(),
         };
-        let api_key = match (&config.api_key, &config.mantle) {
-            (Some(key), _) => Some(key.clone()),
-            (None, Some(_)) => mantle::mint_bearer_token()?,
-            (None, None) => Some(std::env::var("OPENAI_API_KEY").map_err(|_| {
-                Error::model(
-                    "OpenAI API key is required. Provide it via the 'apiKey' option (string or function) or set the OPENAI_API_KEY environment variable.",
-                )
-            })?),
-        };
         Self::warn_managed_params(&config);
         Ok(Self {
             config,
             model_id,
             base_url,
             api_key,
+            mantle_auth,
             transport,
         })
     }
@@ -222,12 +262,17 @@ impl Model for OpenAIModel {
         let api = self.config.api;
         let request = self.format_request(messages, options);
         let transport = self.transport.clone();
+        let auth = self.mantle_auth.clone();
         let cancel = options.cancel.clone();
         futures::stream::once(async move { request })
             .then(move |request| {
                 let transport = transport.clone();
+                let auth = auth.clone();
                 async move {
-                    let request = request?;
+                    let mut request = request?;
+                    if let Some(auth) = &auth {
+                        request.bearer_token = Some(auth.token().await?);
+                    }
                     transport.send(request).await
                 }
             })

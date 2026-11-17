@@ -654,6 +654,48 @@ mod tests {
         assert_eq!(harness.aws, expected);
     }
 
+    /// A swarm whose AWS settings are only `STRANDS_SWARM_AWS_*` (no `AWS_REGION` or `AWS_PROFILE`
+    /// in the environment) can still start a Bedrock Mantle agent: the model resolver gives its
+    /// region and credentials to Mantle as to Bedrock.
+    #[tokio::test]
+    async fn a_mantle_model_resolves_under_the_swarm_s_aws_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let credentials = dir.path().join("credentials");
+        std::fs::write(&config, "[profile swarm]\n").unwrap();
+        std::fs::write(
+            &credentials,
+            "[swarm]\naws_access_key_id = AKIAEXAMPLE\naws_secret_access_key = secret\n",
+        )
+        .unwrap();
+        let vars = [
+            ("STRANDS_SWARM_AWS_PROFILE", "swarm".to_owned()),
+            ("STRANDS_SWARM_AWS_CONFIG_FILE", config.display().to_string()),
+            (
+                "STRANDS_SWARM_AWS_SHARED_CREDENTIALS_FILE",
+                credentials.display().to_string(),
+            ),
+            ("STRANDS_SWARM_AWS_REGION", "us-west-2".to_owned()),
+        ];
+        let aws = swarm_aws_settings(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        });
+        let resolve = harness_model_resolver(HarnessFactoryOptions {
+            aws,
+            ..Default::default()
+        });
+        for id in [
+            "bedrock-mantle/openai.gpt-6-astra",
+            "bedrock-mantle/openai.gpt-5.6-sol",
+        ] {
+            resolve(Some(id.to_owned()))
+                .await
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
+    }
+
     #[test]
     fn tier_aliases_in_model_flags_resolve_to_full_ids() {
         let id = |options: &HarnessFactoryOptions, model: Option<&str>| match model_option(

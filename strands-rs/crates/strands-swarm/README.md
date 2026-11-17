@@ -61,8 +61,8 @@ TASK or `--goal`. Without a terminal, the TUI refuses to start (before resuming 
 points to `--headless`.
 
 **AWS credentials.** Every process the swarm starts (agent shells, `run_background` jobs, land
-checks, MCP servers) inherits its environment, `AWS_*` included, untouched. To call Bedrock under
-settings of its own without handing them to those, set `STRANDS_SWARM_AWS_PROFILE`,
+checks, MCP servers) inherits its environment, `AWS_*` included, untouched. To call Bedrock (and Bedrock Mantle, whose bearer tokens it mints from the same credentials)
+under settings of its own without handing them to those, set `STRANDS_SWARM_AWS_PROFILE`,
 `STRANDS_SWARM_AWS_CONFIG_FILE`, `STRANDS_SWARM_AWS_SHARED_CREDENTIALS_FILE` and/or
 `STRANDS_SWARM_AWS_REGION`: only the swarm's model client reads them, in place of the matching
 `AWS_*`, and no AWS tool knows these names. With a profile set, its credentials and region win

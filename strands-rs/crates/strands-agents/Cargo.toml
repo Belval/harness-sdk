@@ -18,7 +18,7 @@ macros = ["dep:strands-agents-macros"]
 telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 anthropic = ["dep:reqwest"]
 http = ["dep:reqwest"]
-openai = ["dep:reqwest"]
+openai = ["dep:reqwest", "dep:aws-config", "dep:aws-sigv4", "dep:aws-credential-types", "dep:aws-smithy-runtime-api", "dep:http"]
 mcp = ["dep:rmcp", "dep:http"]
 # Internal, test-only: builds the `mcp_echo_server` binary (a minimal stdio MCP server used by
 # this crate's own e2e tests). Not part of the supported public feature set; do not enable it
@@ -63,6 +63,8 @@ aws-sdk-s3 = { workspace = true, optional = true }
 aws-sdk-bedrockagent = { workspace = true, optional = true }
 aws-sdk-bedrockagentruntime = { workspace = true, optional = true }
 aws-smithy-types = { workspace = true, optional = true }
+aws-sigv4 = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
 aws-smithy-runtime-api = { workspace = true, optional = true }
 cedar-policy = { workspace = true, optional = true }
 cedar-policy-mcp-schema-generator = { workspace = true, optional = true }

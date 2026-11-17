@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine;
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::{json, Value};
 
@@ -532,7 +533,7 @@ fn mantle_config_derives_base_url() {
             model_id: Some("openai.gpt-5.4".into()),
             mantle: Some(BedrockMantleConfig {
                 region: Some("us-west-2".into()),
-                expires_in_seconds: None,
+                ..Default::default()
             }),
             ..Default::default()
         },
@@ -545,4 +546,100 @@ fn mantle_config_derives_base_url() {
         "https://bedrock-mantle.us-west-2.api.aws/openai/v1/responses"
     );
     assert_eq!(request.bearer_token.as_deref(), Some("token"));
+}
+
+/// Transport that records the requests it is given.
+#[derive(Debug, Default)]
+struct RecordingTransport {
+    requests: parking_lot::Mutex<Vec<OpenAIRequest>>,
+}
+
+#[async_trait]
+impl OpenAITransport for RecordingTransport {
+    async fn send(&self, request: OpenAIRequest) -> Result<BoxStream<'static, Result<Vec<u8>>>> {
+        self.requests.lock().push(request);
+        Ok(futures::stream::iter(Vec::<Result<Vec<u8>>>::new()).boxed())
+    }
+}
+
+#[tokio::test]
+async fn connect_takes_region_and_credentials_from_the_profile_not_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_file = dir.path().join("config");
+    let credentials_file = dir.path().join("credentials");
+    std::fs::write(&config_file, "[profile swarm]\nregion = eu-north-1\n").unwrap();
+    std::fs::write(
+        &credentials_file,
+        "[swarm]\naws_access_key_id = AKIAEXAMPLE\naws_secret_access_key = secret\naws_session_token = session\n",
+    )
+    .unwrap();
+    let transport = Arc::new(RecordingTransport::default());
+    let model = OpenAIModel::connect_with_transport(
+        OpenAIModelConfig {
+            model_id: Some("openai.gpt-5.4".into()),
+            mantle: Some(BedrockMantleConfig {
+                profile: Some("swarm".into()),
+                config_file: Some(config_file),
+                credentials_file: Some(credentials_file),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let messages = [user("hi")];
+    let options = stream_options();
+    let _ = model.stream(&messages, &options).collect::<Vec<_>>().await;
+    let request = transport.requests.lock().pop().expect("a request was sent");
+    assert_eq!(
+        request.url,
+        "https://bedrock-mantle.eu-north-1.api.aws/openai/v1/responses"
+    );
+    let token = request.bearer_token.expect("a minted token");
+    let encoded = token.strip_prefix("bedrock-api-key-").expect("token prefix");
+    let url = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(encoded).unwrap()).unwrap();
+    assert!(
+        url.starts_with("bedrock.amazonaws.com/?Action=CallWithBearerToken&"),
+        "{url}"
+    );
+    assert!(url.ends_with("&Version=1"), "{url}");
+    for part in [
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256",
+        "X-Amz-Expires=43200",
+        "X-Amz-Security-Token=session",
+        "X-Amz-Credential=AKIAEXAMPLE%2F",
+        "%2Feu-north-1%2Fbedrock%2Faws4_request",
+        "X-Amz-Signature=",
+    ] {
+        assert!(url.contains(part), "{part} missing from {url}");
+    }
+}
+
+#[tokio::test]
+async fn connect_without_credentials_fails_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::write(&empty, "[profile none]\nregion = us-west-2\n").unwrap();
+    let err = OpenAIModel::connect_with_transport(
+        OpenAIModelConfig {
+            model_id: Some("openai.gpt-5.4".into()),
+            mantle: Some(BedrockMantleConfig {
+                profile: Some("none".into()),
+                config_file: Some(empty),
+                credentials_file: Some("/dev/null".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Arc::new(RecordingTransport::default()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("failed to mint Bedrock Mantle bearer token"),
+        "{err}"
+    );
 }

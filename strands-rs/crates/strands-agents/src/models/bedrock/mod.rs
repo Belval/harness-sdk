@@ -9,7 +9,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aws_config::BehaviorVersion;
 use aws_sdk_bedrockruntime::config::http::HttpResponse;
 use aws_sdk_bedrockruntime::config::Token;
 use aws_sdk_bedrockruntime::error::ProvideErrorMetadata;
@@ -387,43 +386,12 @@ impl BedrockModelBuilder {
     }
 
     /// The AWS chain, with the profile and files set on the builder in place of the environment's.
-    // `ProfileFiles` is deprecated for `aws_runtime`'s `EnvConfigFiles`, which aws-config's own
-    // setters still take under this name.
-    #[allow(deprecated)]
     fn aws_loader(&self) -> aws_config::ConfigLoader {
-        use aws_config::meta::region::RegionProviderChain;
-        use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
-        use aws_config::profile::{ProfileFileCredentialsProvider, ProfileFileRegionProvider};
-
-        let mut loader = aws_config::defaults(BehaviorVersion::latest());
-        let files = (self.config_file.is_some() || self.credentials_file.is_some()).then(|| {
-            let mut files = ProfileFiles::builder();
-            files = match &self.config_file {
-                Some(path) => files.with_file(ProfileFileKind::Config, path),
-                None => files.include_default_config_file(true),
-            };
-            files = match &self.credentials_file {
-                Some(path) => files.with_file(ProfileFileKind::Credentials, path),
-                None => files.include_default_credentials_file(true),
-            };
-            files.build()
-        });
-        if let Some(files) = &files {
-            loader = loader.profile_files(files.clone());
-        }
-        if let Some(name) = &self.profile {
-            let mut credentials = ProfileFileCredentialsProvider::builder().profile_name(name);
-            let mut region = ProfileFileRegionProvider::builder().profile_name(name);
-            if let Some(files) = &files {
-                credentials = credentials.profile_files(files.clone());
-                region = region.profile_files(files.clone());
-            }
-            loader = loader
-                .profile_name(name)
-                .credentials_provider(credentials.build())
-                .region(RegionProviderChain::first_try(region.build()).or_default_provider());
-        }
-        loader
+        super::aws::aws_loader(
+            self.profile.as_deref(),
+            self.config_file.as_deref(),
+            self.credentials_file.as_deref(),
+        )
     }
 }
 
@@ -850,6 +818,8 @@ impl BedrockModel {
 
 #[cfg(test)]
 mod tests {
+    use aws_config::BehaviorVersion;
+
     use super::*;
 
     fn model(config: BedrockModelConfig) -> BedrockModel {
