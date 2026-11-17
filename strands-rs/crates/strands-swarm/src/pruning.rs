@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prunes_once_it_would_remove_15_percent_of_the_history() {
+    async fn prunes_once_it_would_remove_prune_share_of_the_history() {
         let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
         let mut messages = prunable();
         assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
