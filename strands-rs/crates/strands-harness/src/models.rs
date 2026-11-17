@@ -515,6 +515,9 @@ pub struct ResolveModelOptions {
     /// Prompt caching. [`CachingOption::Auto`] warns where the provider has none;
     /// [`CachingOption::On`] errors.
     pub caching: CachingOption,
+    /// TTL of the cache points (`"5m"`, `"1h"`) on Bedrock and Anthropic; `None` sends none,
+    /// i.e. the provider default of 5 minutes. Rust-only.
+    pub cache_ttl: Option<String>,
 }
 
 impl Default for ResolveModelOptions {
@@ -525,6 +528,7 @@ impl Default for ResolveModelOptions {
             effort: Effort::Auto,
             web_search: false,
             caching: CachingOption::default(),
+            cache_ttl: None,
         }
     }
 }
@@ -541,7 +545,9 @@ pub async fn resolve_model(options: ResolveModelOptions) -> Result<Arc<dyn Model
         effort,
         web_search,
         caching: caching_option,
+        cache_ttl,
     } = options;
+    let ttl = cache_ttl.as_deref();
     let caching = !matches!(caching_option, CachingOption::Off);
     let caching_explicit = matches!(caching_option, CachingOption::On);
     let spec = match model {
@@ -562,8 +568,8 @@ pub async fn resolve_model(options: ResolveModelOptions) -> Result<Arc<dyn Model
     };
     let (provider_name, _) = split_provider(&spec);
     match provider_name {
-        "bedrock" => build_bedrock(&spec, effort, web_search, caching, caching_explicit).await,
-        "anthropic" => build_anthropic(&spec, effort, web_search, caching, caching_explicit),
+        "bedrock" => build_bedrock(&spec, effort, web_search, caching, caching_explicit, ttl).await,
+        "anthropic" => build_anthropic(&spec, effort, web_search, caching, caching_explicit, ttl),
         "openai" | "bedrock-mantle" => build_openai(&spec, effort, web_search, caching, caching_explicit),
         _ => {
             resolve_spec(&spec, effort, web_search, caching, caching_explicit)?;
@@ -588,10 +594,11 @@ async fn build_bedrock(
     web_search: bool,
     caching: bool,
     caching_explicit: bool,
+    cache_ttl: Option<&str>,
 ) -> Result<Arc<dyn Model>> {
     #[cfg(feature = "bedrock")]
     {
-        let config = bedrock_config_for(spec, effort, web_search, caching, caching_explicit)?;
+        let config = bedrock_config_for(spec, effort, web_search, caching, caching_explicit, cache_ttl)?;
         let mut builder = BedrockModel::builder().config(config);
         if let Some(region) = bedrock_region() {
             builder = builder.region(region);
@@ -600,6 +607,7 @@ async fn build_bedrock(
     }
     #[cfg(not(feature = "bedrock"))]
     {
+        let _ = cache_ttl;
         resolve_spec(spec, effort, web_search, caching, caching_explicit)?;
         Err(missing_feature("bedrock", "bedrock"))
     }
@@ -611,14 +619,16 @@ fn build_anthropic(
     web_search: bool,
     caching: bool,
     caching_explicit: bool,
+    cache_ttl: Option<&str>,
 ) -> Result<Arc<dyn Model>> {
     #[cfg(feature = "anthropic")]
     {
-        let config = anthropic_config_for(spec, effort, web_search, caching, caching_explicit)?;
+        let config = anthropic_config_for(spec, effort, web_search, caching, caching_explicit, cache_ttl)?;
         Ok(Arc::new(AnthropicModel::new(config)?))
     }
     #[cfg(not(feature = "anthropic"))]
     {
+        let _ = cache_ttl;
         resolve_spec(spec, effort, web_search, caching, caching_explicit)?;
         Err(missing_feature("anthropic", "anthropic"))
     }
@@ -653,6 +663,7 @@ pub(crate) fn anthropic_config_for(
     web_search: bool,
     caching: bool,
     caching_explicit: bool,
+    cache_ttl: Option<&str>,
 ) -> Result<AnthropicModelConfig> {
     let resolved = resolve_spec(spec, effort, web_search, caching, caching_explicit)?;
     if resolved.provider != "anthropic" {
@@ -675,6 +686,7 @@ pub(crate) fn anthropic_config_for(
         }),
         cache_config: resolved.caching.then(|| AnthropicCacheConfig {
             strategy: Some(AnthropicCacheStrategy::Auto),
+            ttl: cache_ttl.map(str::to_owned),
             ..AnthropicCacheConfig::default()
         }),
         ..AnthropicModelConfig::default()
@@ -735,16 +747,17 @@ pub(crate) fn bedrock_config_for(
     web_search: bool,
     caching: bool,
     caching_explicit: bool,
+    cache_ttl: Option<&str>,
 ) -> Result<BedrockModelConfig> {
     let resolved = resolve_spec(spec, effort, web_search, caching, caching_explicit)?;
     if resolved.provider != "bedrock" {
         return Err(unsupported_provider(resolved.provider));
     }
-    Ok(bedrock_config(
-        resolved.name,
-        resolved.effort.as_deref(),
-        resolved.caching,
-    ))
+    let mut config = bedrock_config(resolved.name, resolved.effort.as_deref(), resolved.caching);
+    if let Some(cache) = &mut config.cache_config {
+        cache.ttl = cache_ttl.map(str::to_owned);
+    }
+    Ok(config)
 }
 
 fn unsupported_provider(provider_name: &str) -> Error {
@@ -867,7 +880,7 @@ mod tests {
     static WARN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn resolve(spec: &str, effort: Effort) -> Result<BedrockModelConfig> {
-        bedrock_config_for(spec, effort, false, false, false)
+        bedrock_config_for(spec, effort, false, false, false, None)
     }
 
     fn resolve_caching(
@@ -876,7 +889,7 @@ mod tests {
         caching: bool,
         explicit: bool,
     ) -> Result<BedrockModelConfig> {
-        bedrock_config_for(spec, effort, false, caching, explicit)
+        bedrock_config_for(spec, effort, false, caching, explicit, None)
     }
 
     fn fields(config: &BedrockModelConfig) -> Option<Value> {
@@ -1007,6 +1020,18 @@ mod tests {
             config.cache_config.and_then(|c| c.strategy),
             Some(CacheStrategy::Auto)
         );
+    }
+
+    #[test]
+    fn sends_the_requested_cache_ttl_only_where_caching_is_on() {
+        let cached =
+            bedrock_config_for(DEFAULT, Effort::Auto, false, true, false, Some("1h")).expect("resolves");
+        let cache = cached.cache_config.expect("cache config");
+        assert_eq!(cache.strategy, Some(CacheStrategy::Auto));
+        assert_eq!(cache.ttl.as_deref(), Some("1h"));
+        let off =
+            bedrock_config_for(DEFAULT, Effort::Auto, false, false, false, Some("1h")).expect("resolves");
+        assert_eq!(off.cache_config, None);
     }
 
     #[test]
@@ -1529,7 +1554,7 @@ mod anthropic_tests {
     use super::*;
 
     fn resolve(spec: &str, effort: Effort) -> AnthropicModelConfig {
-        anthropic_config_for(spec, effort, false, false, false).expect("resolves")
+        anthropic_config_for(spec, effort, false, false, false, None).expect("resolves")
     }
 
     #[test]
@@ -1580,6 +1605,7 @@ mod anthropic_tests {
             false,
             false,
             false,
+            None,
         )
         .expect_err("rejects");
         assert!(
@@ -1592,8 +1618,15 @@ mod anthropic_tests {
 
     #[test]
     fn adds_the_anthropic_web_search_server_tool_as_a_direct_call() {
-        let config = anthropic_config_for("anthropic/claude-opus-4-8", Effort::High, true, false, false)
-            .expect("resolves");
+        let config = anthropic_config_for(
+            "anthropic/claude-opus-4-8",
+            Effort::High,
+            true,
+            false,
+            false,
+            None,
+        )
+        .expect("resolves");
         assert_eq!(
             config.anthropic_tools,
             Some(vec![json!({
@@ -1607,18 +1640,39 @@ mod anthropic_tests {
 
     #[test]
     fn omits_anthropic_server_tools_when_web_search_is_off() {
-        let config = anthropic_config_for("anthropic/claude-opus-4-8", Effort::High, false, false, false)
-            .expect("resolves");
+        let config = anthropic_config_for(
+            "anthropic/claude-opus-4-8",
+            Effort::High,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("resolves");
         assert!(config.anthropic_tools.is_none());
     }
 
     #[test]
     fn enables_prompt_caching_for_anthropic_direct_when_requested() {
-        let config = anthropic_config_for("anthropic/claude-opus-4-8", Effort::Auto, false, true, true)
+        let config = anthropic_config_for("anthropic/claude-opus-4-8", Effort::Auto, false, true, true, None)
             .expect("resolves");
         let cache = config.cache_config.expect("cache config");
         assert_eq!(cache.strategy, Some(AnthropicCacheStrategy::Auto));
         assert!(cache.ttl.is_none());
+    }
+
+    #[test]
+    fn sends_the_requested_cache_ttl_to_anthropic_direct() {
+        let config = anthropic_config_for(
+            "anthropic/claude-opus-4-8",
+            Effort::Auto,
+            false,
+            true,
+            false,
+            Some("1h"),
+        )
+        .expect("resolves");
+        assert_eq!(config.cache_config.and_then(|c| c.ttl).as_deref(), Some("1h"));
     }
 
     #[test]

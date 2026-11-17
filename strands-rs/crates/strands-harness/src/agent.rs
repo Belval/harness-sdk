@@ -177,6 +177,9 @@ pub struct HarnessAgentOptions {
     pub background_tasks: BackgroundTasksOption,
     /// Prompt caching; [`CachingOption::Auto`] (on where supported, warn where not) by default.
     pub caching: CachingOption,
+    /// TTL of the prompt-cache points (`"5m"`, `"1h"`) where caching is on for Bedrock or
+    /// Anthropic; `None` leaves the provider default (5 minutes). Rust-only.
+    pub cache_ttl: Option<String>,
     /// Context management; [`ContextManagerOption::Auto`] by default.
     pub context_manager: ContextManagerOption,
     /// Session persistence; on by default.
@@ -227,6 +230,7 @@ pub async fn create_harness(options: HarnessAgentOptions) -> Result<Agent> {
         effort: options.effort,
         web_search: web_search == Some(WebSearchMode::Native),
         caching: options.caching,
+        cache_ttl: options.cache_ttl.clone(),
     })
     .await?;
 
