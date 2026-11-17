@@ -15,6 +15,8 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::worktree::git;
+
 /// What collecting one agent did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Collected {
@@ -399,12 +401,6 @@ pub fn human(bytes: u64) -> String {
         true => format!("{value:.1} {}", UNITS[unit]),
         false => format!("{value:.0} {}", UNITS[unit]),
     }
-}
-
-async fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    crate::worktree::git(cwd, args)
-        .await
-        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

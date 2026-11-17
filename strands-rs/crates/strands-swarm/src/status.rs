@@ -287,19 +287,22 @@ impl Applied {
 
 /// [`Applied`] for `rev` against `base`, in repository `dir`.
 pub async fn applied(dir: &Path, base: &str, rev: &str) -> Result<Applied, String> {
-    let git = |args: Vec<String>| async move {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        crate::worktree::git(dir, &args)
-            .await
-            .map_err(|error| error.to_string())
-    };
-    let owned = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    use crate::worktree::git;
     // The commits of `base..rev` no landing covered: not reachable from a landed source.
-    let mut uncovered = owned(&[rev, &format!("^{base}"), "--ignore-missing"]);
-    let landed = crate::land::landed_sources(dir, base).await;
-    uncovered.extend(landed.iter().map(|source| format!("^{source}")));
-    let cherry = git(owned(&["cherry", base, rev])).await?;
-    let merges = git([owned(&["rev-list", "--merges", "--count"]), uncovered.clone()].concat()).await?;
+    let not_base = format!("^{base}");
+    let landed: Vec<String> = crate::land::landed_sources(dir, base)
+        .await
+        .iter()
+        .map(|source| format!("^{source}"))
+        .collect();
+    let mut uncovered = vec![rev, &not_base, "--ignore-missing"];
+    uncovered.extend(landed.iter().map(String::as_str));
+    let cherry = git(dir, &["cherry", base, rev]).await?;
+    let merges = git(
+        dir,
+        &[&["rev-list", "--merges", "--count"][..], &uncovered].concat(),
+    )
+    .await?;
     let mut out = Applied {
         merges: merges
             .trim()
@@ -309,7 +312,7 @@ pub async fn applied(dir: &Path, base: &str, rev: &str) -> Result<Applied, Strin
     };
     let landed_too = match landed.is_empty() {
         true => None,
-        false => Some(git([owned(&["rev-list"]), uncovered].concat()).await?),
+        false => Some(git(dir, &[&["rev-list"][..], &uncovered].concat()).await?),
     };
     for line in cherry.lines() {
         let sha = line.get(2..).unwrap_or_default();

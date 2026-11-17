@@ -22,9 +22,9 @@ pub struct Worktree {
 
 /// Create a worktree for `agent_id` from the repository containing `base`.
 pub async fn create(base: &Path, run_id: &str, agent_id: &str) -> Result<Worktree> {
-    let toplevel = PathBuf::from(git(base, &["rev-parse", "--show-toplevel"]).await?);
-    let common =
-        PathBuf::from(git(base, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await?);
+    let git = |args| async move { git(base, args).await.map_err(Error::other) };
+    let toplevel = PathBuf::from(git(&["rev-parse", "--show-toplevel"]).await?);
+    let common = PathBuf::from(git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]).await?);
     let main_root = common
         .parent()
         .ok_or_else(|| Error::other("Cannot locate the main checkout of this repository."))?;
@@ -38,7 +38,7 @@ pub async fn create(base: &Path, run_id: &str, agent_id: &str) -> Result<Worktre
     let branch = format!("swarm/{run_id}/{agent_id}");
 
     let dir_arg = dir.to_string_lossy().into_owned();
-    git(base, &["worktree", "add", "-b", &branch, &dir_arg, "HEAD"]).await?;
+    git(&["worktree", "add", "-b", &branch, &dir_arg, "HEAD"]).await?;
 
     Ok(Worktree {
         cwd: same_subdir(&dir, &toplevel, base),
@@ -80,19 +80,15 @@ pub(crate) fn git_in(dir: &Path) -> Command {
 }
 
 /// `git <args>` in `cwd`: its trimmed stdout, or an error carrying its stderr.
-pub(crate) async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+pub(crate) async fn git(cwd: &Path, args: &[&str]) -> std::result::Result<String, String> {
     let output = git_in(cwd)
         .args(args)
         .output()
         .await
-        .map_err(|error| Error::other(format!("Failed to run git: {error}")))?;
+        .map_err(|error| format!("Failed to run git: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::other(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            stderr.trim()
-        )));
+        return Err(format!("git {} failed: {}", args.join(" "), stderr.trim()));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
