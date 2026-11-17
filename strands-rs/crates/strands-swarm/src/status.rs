@@ -242,22 +242,11 @@ impl Applied {
 
 /// [`Applied`] for `rev` against `base`, in repository `dir`.
 pub async fn applied(dir: &Path, base: &str, rev: &str) -> Result<Applied, String> {
-    let git = |args: Vec<String>| async move {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        crate::worktree::git(dir, &args)
-            .await
-            .map_err(|error| error.to_string())
-    };
-    let cherry = git(vec!["cherry".into(), base.into(), rev.into()]).await?;
     let range = format!("{base}..{rev}");
-    let merges = git(vec![
-        "rev-list".into(),
-        "--merges".into(),
-        "--count".into(),
-        range,
-        "--".into(),
-    ])
-    .await?;
+    let cherry = crate::worktree::git(dir, &["cherry", base, rev]).await;
+    let cherry = cherry.map_err(|error| error.to_string())?;
+    let merges = crate::worktree::git(dir, &["rev-list", "--merges", "--count", &range, "--"]).await;
+    let merges = merges.map_err(|error| error.to_string())?;
     let mut out = Applied {
         merges: merges
             .trim()
