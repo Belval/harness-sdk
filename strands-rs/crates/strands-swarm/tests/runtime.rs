@@ -1154,6 +1154,45 @@ async fn a_resumed_run_restores_conversations_and_wakes_interrupted_agents() {
     assert_eq!(resumed.agents().len(), 2);
 }
 
+/// The system prompt and tool specs an agent sends, serialized: the prompt cache is keyed on these
+/// bytes, so a resumed agent must send exactly what it sent before the restart.
+fn request_prefix(model: &MockMessageModel, call: usize) -> String {
+    let (_, options) = &model.calls()[call];
+    format!(
+        "{}\n{}",
+        serde_json::to_string(&options.system_prompt).unwrap(),
+        serde_json::to_string(&options.tool_specs).unwrap()
+    )
+}
+
+#[tokio::test]
+async fn a_resumed_agent_sends_the_same_system_prompt_and_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let memory = dir.path().join("memory.md");
+    std::fs::write(&memory, "- 2026-01-01: the user likes short replies\n").unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("done")])]);
+    let mut config = SwarmConfig::new(session_factory(&scripts, state_dir.join("sessions")), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    config.memory = Some(Arc::new(strands_swarm::Memory::new(&memory)));
+    let (swarm, mut events) = Swarm::new(config.clone());
+    spawn_root(&swarm, "hello").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let before = request_prefix(&scripts.lock()["a1"].clone(), 0);
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&state_dir).await.unwrap().unwrap();
+    scripts
+        .lock()
+        .insert("a1".into(), MockMessageModel::shared(vec![say("again")]));
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    resumed.send(USER, "a1", "next").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "again");
+    let after = request_prefix(&scripts.lock()["a1"].clone(), 0);
+    assert!(after.contains("likes short replies"), "{after}");
+    assert_eq!(after, before);
+}
+
 #[tokio::test]
 async fn reload_installs_the_binary_keeps_the_previous_one_and_signals_the_host() {
     let dir = tempfile::tempdir().unwrap();

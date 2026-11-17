@@ -107,6 +107,13 @@ impl Fixture {
     }
 }
 
+/// What agents are sent for these tools: their specs and the `find_tools` spec, serialized.
+fn sent_specs(mcp: &SharedMcp) -> String {
+    let specs: Vec<_> = mcp.tools.iter().map(|tool| tool.spec().clone()).collect();
+    let find = mcp.catalog().find_tool().spec().clone();
+    serde_json::to_string(&(specs, find)).unwrap()
+}
+
 fn names(mcp: &SharedMcp) -> Vec<&str> {
     mcp.tools.iter().map(|tool| tool.name()).collect()
 }
@@ -165,6 +172,7 @@ async fn a_cached_server_starts_on_first_call_and_restarts_after_dying() {
     assert_eq!(cold.connected().await, 1);
     assert_eq!(names(&cold), ["fake_echo", "fake_die"]);
     assert!(fixture.path(MCP_CACHE_FILE).is_file());
+    let listed = sent_specs(&cold);
     drop(cold);
 
     let warm = fixture.load(false).await;
@@ -175,6 +183,11 @@ async fn a_cached_server_starts_on_first_call_and_restarts_after_dying() {
     );
     assert_eq!(warm.connected().await, 0);
     assert_eq!(names(&warm), ["fake_echo", "fake_die"]);
+    assert_eq!(
+        sent_specs(&warm),
+        listed,
+        "cached specs are sent byte for byte as listed"
+    );
     let catalog = warm.catalog();
     assert!(catalog.get("fake_echo").is_some());
 

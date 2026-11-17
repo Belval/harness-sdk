@@ -15,7 +15,7 @@ use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
 use strands_agents::storage::{namespace, LocalFileStorage};
 use strands_agents::tools::ToolRef;
 use strands_agents::Plugin;
-use strands_agents::{FileStorage, Result, SessionManager};
+use strands_agents::{Agent, FileStorage, Result, SessionManager};
 use strands_harness::defaults::{DEFAULT_BUILTIN_TOOLS, DEFAULT_MODEL};
 use strands_harness::{
     create_harness, resolve_model, BuiltinToolsConfig, Effort, EnvironmentContext, EnvironmentContextConfig,
@@ -79,15 +79,17 @@ pub struct HarnessFactoryOptions {
 pub fn harness_factory(options: HarnessFactoryOptions) -> AgentFactory {
     Arc::new(move |spec: AgentSpec| {
         let options = options.clone();
-        Box::pin(async move {
-            let agent = create_harness(harness_options(&options, spec)?).await?;
-            // The harness has restored the session by now; give back the tools enabled before.
-            if let Some(catalog) = &options.catalog {
-                catalog.restore(&agent);
-            }
-            Ok(agent)
-        })
+        Box::pin(async move { build(&options, harness_options(&options, spec)?).await })
     })
+}
+
+async fn build(options: &HarnessFactoryOptions, harness: HarnessAgentOptions) -> Result<Agent> {
+    let agent = create_harness(harness).await?;
+    // The harness has restored the session by now; give back the tools enabled before.
+    if let Some(catalog) = &options.catalog {
+        catalog.restore(&agent);
+    }
+    Ok(agent)
 }
 
 /// The [`ModelResolver`] matching [`harness_factory`]: resolves an id (`None`: the factory's
@@ -264,7 +266,6 @@ mod tests {
     use strands_agents::types::{
         ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolUseBlock,
     };
-    use strands_agents::Agent;
 
     fn exchange(id: &str, chars: usize) -> [Message; 2] {
         let call = ToolUseBlock {
@@ -461,6 +462,103 @@ mod tests {
         let empty = ToolCatalog::new(Vec::new(), vec![("srv".into(), 0)]);
         assert_eq!(tool_names(Some(Arc::new(empty))), ["context"]);
         assert_eq!(tool_names(None), ["context"]);
+    }
+
+    /// What an agent sends besides its messages, serialized: the prompt cache is keyed on these
+    /// bytes, so they must not change between processes or across a resume.
+    fn request_prefix(options: &strands_agents::models::StreamOptions) -> String {
+        format!(
+            "{}\n{}",
+            serde_json::to_string(&options.system_prompt).unwrap(),
+            serde_json::to_string(&options.tool_specs).unwrap()
+        )
+    }
+
+    /// Builds the agent `harness_factory` would, on `model`, and runs one turn.
+    async fn run_turn(
+        options: &HarnessFactoryOptions,
+        spec: AgentSpec,
+        responses: Vec<strands_agents::testing::MockResponse>,
+    ) -> Vec<String> {
+        let mut harness = harness_options(options, spec).unwrap();
+        let model = MockMessageModel::shared(responses);
+        harness.model = Some(ModelOption::Instance(model.clone()));
+        let agent = build(options, harness).await.unwrap();
+        agent.invoke("go").await.unwrap();
+        model
+            .calls()
+            .iter()
+            .map(|(_, options)| request_prefix(options))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_system_prompt_and_tool_specs_are_identical_across_builds_and_resumes() {
+        use strands_agents::testing::MockResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |name: &str| -> ToolRef {
+            Arc::new(
+                FunctionTool::builder(name)
+                    .description(format!("Tool {name}."))
+                    .handler(|input: serde_json::Value, _ctx| async move { Result::Ok(input) }),
+            )
+        };
+        let names = ["srv_d", "srv_b", "srv_a", "srv_c", "other_x"];
+        let catalog = ToolCatalog::new(
+            names.iter().map(|name| tool(name)).collect(),
+            vec![("srv".into(), 4), ("other".into(), 1)],
+        );
+        let mut skill = Skill::new("review", "Review a change.", "Read the diff.");
+        skill.path = Some(dir.path().join("review"));
+        let options = HarnessFactoryOptions {
+            instructions: Some("Be brief.".into()),
+            tools: vec![tool("shared_one"), tool("shared_two")],
+            catalog: Some(Arc::new(catalog)),
+            skills: Arc::new(vec![skill]),
+            ..Default::default()
+        };
+        let spec = || AgentSpec {
+            instructions: "# Swarm\nYou are a1.".into(),
+            tools: vec![tool("spawn_agent"), tool("wait")],
+            ..spec()
+        };
+        let fresh = || async {
+            run_turn(
+                &options,
+                spec(),
+                vec![MockResponse::message(Message::assistant("done"))],
+            )
+            .await
+        };
+        assert_eq!(fresh().await, fresh().await, "two fresh builds");
+
+        let sessions = dir.path().join("sessions");
+        let saved = || AgentSpec {
+            session_dir: Some(sessions.clone()),
+            ..spec()
+        };
+        let enable = ToolUseBlock::new(
+            "find_tools",
+            "f1",
+            serde_json::json!({ "enable": ["srv_c", "srv_a", "other_x"] }),
+        );
+        let before = run_turn(
+            &options,
+            saved(),
+            vec![
+                MockResponse::message(Message::new(Role::Assistant, vec![ContentBlock::ToolUse(enable)])),
+                MockResponse::message(Message::assistant("done")),
+            ],
+        )
+        .await;
+        assert_ne!(before[0], before[1], "enabling tools changes the specs");
+        let after = run_turn(
+            &options,
+            saved(),
+            vec![MockResponse::message(Message::assistant("again"))],
+        )
+        .await;
+        assert_eq!(after[0], before[1], "a resumed agent sends what it sent last");
     }
 
     #[tokio::test]
