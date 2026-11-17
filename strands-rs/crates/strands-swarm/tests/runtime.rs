@@ -12,6 +12,7 @@ use strands_agents::testing::{MockMessageModel, MockResponse};
 use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
 use strands_agents::{Agent, Model};
 use strands_swarm::compaction::Compaction;
+use strands_swarm::status::Merge;
 use strands_swarm::{
     AgentFactory, AgentSpec, AgentStatus, LandRequest, ModelResolver, ReloadWhen, SpawnRequest, Swarm,
     SwarmConfig, SwarmEvent, GOAL_MAX_ATTEMPTS, USER,
@@ -2884,10 +2885,16 @@ async fn status_reports_todos_and_branch_commits_without_a_model_call() {
     };
 
     let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    for id in ["a1", "a2"] {
-        map.lock()
-            .insert(id.to_owned(), MockMessageModel::shared(vec![say("ok")]));
-    }
+    // The root answers its task, then the builder's report, then lists the agents.
+    let list = vec![
+        say("ok"),
+        say("ok"),
+        tool_call("list_agents", "l1", json!({})),
+        say("listed"),
+    ];
+    map.lock().insert("a1".to_owned(), MockMessageModel::shared(list));
+    map.lock()
+        .insert("a2".to_owned(), MockMessageModel::shared(vec![say("ok")]));
     let inner = mock_factory(&map);
     let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
         let build = inner(spec);
@@ -2901,7 +2908,7 @@ async fn status_reports_todos_and_branch_commits_without_a_model_call() {
             Ok(agent)
         })
     });
-    let (swarm, _events) = Swarm::new(SwarmConfig::new(factory, &repo));
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, &repo));
     let root = spawn_root(&swarm, "lead").await;
     let child = swarm
         .spawn(
@@ -2923,7 +2930,7 @@ async fn status_reports_todos_and_branch_commits_without_a_model_call() {
         if report
             .agents
             .iter()
-            .all(|a| a.branch.is_none() || a.unmerged.is_some())
+            .all(|a| a.branch.is_none() || a.git.is_some())
         {
             break report;
         }
@@ -2933,12 +2940,41 @@ async fn status_reports_todos_and_branch_commits_without_a_model_call() {
     let builder = report.agents.iter().find(|a| a.id == child).unwrap();
     assert_eq!(builder.label, format!("builder ({child})"));
     assert_eq!(builder.todos.len(), 2);
-    let unmerged = builder.unmerged.as_ref().unwrap();
-    assert_eq!(unmerged.len(), 1, "{unmerged:?}");
-    assert!(unmerged[0].ends_with(" feature"), "{unmerged:?}");
+    let state = builder.git.as_ref().unwrap();
+    assert_eq!(state.ahead.len(), 1, "{state:?}");
+    assert!(state.ahead[0].ends_with(" feature"), "{state:?}");
     let text = report.lines(&|_| None).join("\n");
     assert!(text.contains("  [>] Writing it\n  [ ] Test it"), "{text}");
-    assert!(text.contains("1 not on main:"), "{text}");
+    assert!(text.contains("1 not on main, fast-forward:"), "{text}");
+
+    // Main moves on and touches the same file: the integrator sees the conflict up front.
+    std::fs::write(repo.join("feature.txt"), "theirs").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "theirs"]);
+    let (base, states) = swarm.branch_states().await;
+    assert_eq!(base.as_deref(), Some("main"));
+    let state = &states[&child];
+    assert_eq!((state.ahead.len(), state.behind), (1, 1));
+    assert_eq!(state.merge, Merge::Conflicts(vec!["feature.txt".into()]));
+    assert!(swarm
+        .status()
+        .lines(&|_| None)
+        .join("\n")
+        .contains("conflicts in feature.txt:"));
+    // `list_agents` says so too.
+    while map.lock()["a1"].call_count() < 2 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wait_for_status(&swarm, &root, AgentStatus::Idle).await;
+    swarm.send(USER, &root, "who is there?").unwrap();
+    while reply_to(&mut events, USER).await != "listed" {}
+    let calls = map.lock()["a1"].calls();
+    let listing = format!("{:?}", calls.last().unwrap().0.last().unwrap());
+    let branch = format!(
+        "{}/{child} (1 not on main, 1 behind, conflicts in feature.txt)",
+        swarm.run_id()
+    );
+    assert!(listing.contains(&branch), "{listing}");
 
     swarm.cancel(&child).unwrap();
     let report = swarm.status();

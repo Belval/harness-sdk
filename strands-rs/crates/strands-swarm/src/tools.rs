@@ -3,6 +3,7 @@
 //! `--allow-land`) and `remember`/`forget` (with a memory file). Each instance is bound to the
 //! agent that owns it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use crate::runtime::{
     WaitOutcome, USER,
 };
 use crate::schedule::{self, Schedule};
+use crate::status::BranchState;
 
 const DEFAULT_WAIT_SECONDS: u64 = 600;
 const MAX_WAIT_SECONDS: u64 = 3600;
@@ -42,8 +44,9 @@ const WAIT_DESCRIPTION: &str = concat!(
 );
 
 const LIST_DESCRIPTION: &str = concat!(
-    "List the agents in the swarm with name, id, parent, status, working directory, branch, running ",
-    "background jobs, model and estimated spend (own, and with descendants). ",
+    "List the agents in the swarm with name, id, parent, status, working directory, branch (commits ",
+    "ahead of and behind the integration branch, and whether it would merge cleanly or which files ",
+    "would conflict), running background jobs, model and estimated spend (own, and with descendants). ",
     "Cancelled agents are only counted unless include_cancelled is set."
 );
 
@@ -529,7 +532,9 @@ fn list_tool(swarm: Swarm) -> ToolRef {
             let swarm = swarm.clone();
             async move {
                 let jobs = swarm.jobs().await;
-                Result::Ok(list_agents(&swarm, input.include_cancelled, &jobs))
+                let branches = swarm.branch_states().await;
+                let text = list_agents(&swarm, input.include_cancelled, &jobs, &branches);
+                Result::Ok(text)
             }
         });
     Arc::new(tool)
@@ -564,10 +569,16 @@ fn resolve(swarm: &Swarm, me: &str, who: &str) -> Result<String> {
     }
 }
 
-/// `parser (a2): running, parent root (a1), cwd /repo, branch swarm/run/a2, jobs j3 (gates), model
-/// claude-sonnet-4-5, est. $1.20 / 3.4M tokens`. One line per agent; cancelled ones are only counted
-/// unless `include_cancelled`; then the swarm's total.
-fn list_agents(swarm: &Swarm, include_cancelled: bool, jobs: &[Job]) -> String {
+/// `parser (a2): running, parent root (a1), cwd /repo, branch swarm/run/a2 (2 not on main, 1
+/// behind, merges cleanly), jobs j3 (gates), model claude-sonnet-4-5, est. $1.20 / 3.4M tokens`.
+/// One line per agent; cancelled ones are only counted unless `include_cancelled`; then the
+/// swarm's total.
+fn list_agents(
+    swarm: &Swarm,
+    include_cancelled: bool,
+    jobs: &[Job],
+    (base, branches): &(Option<String>, HashMap<String, BranchState>),
+) -> String {
     let agents = swarm.agents();
     let (shown, hidden): (Vec<_>, Vec<_>) = agents
         .iter()
@@ -583,6 +594,11 @@ fn list_agents(swarm: &Swarm, include_cancelled: bool, jobs: &[Job]) -> String {
             false => format!(", jobs {}", labels.join(", ")),
         }
     };
+    let merge = |id: &str| -> String {
+        let base = base.as_deref().unwrap_or("the base");
+        let state = branches.get(id).map(|state| state.describe(base));
+        state.map(|state| format!(" ({state})")).unwrap_or_default()
+    };
     let schedules = swarm.schedules();
     let cost = swarm.cost();
     let spend = |info: &AgentInfo| -> String {
@@ -593,7 +609,8 @@ fn list_agents(swarm: &Swarm, include_cancelled: bool, jobs: &[Job]) -> String {
     };
     let mut lines = Vec::new();
     for info in &shown {
-        lines.push(describe(swarm, info) + &running(&info.id) + &spend(info));
+        let line = describe(swarm, info) + &merge(&info.id) + &running(&info.id) + &spend(info);
+        lines.push(line);
         let upcoming = schedules.iter().filter(|s| s.to == info.id);
         lines.extend(upcoming.map(|s| format!("  scheduled: {}", s.describe(swarm.now()))));
     }

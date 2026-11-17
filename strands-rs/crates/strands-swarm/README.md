@@ -8,7 +8,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `spawn_agent` | Start an agent on a task (optionally in its own git worktree, with a model or a goal). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents). |
-| `list_agents` | The agent tree: status, directory, branch, running jobs, schedules, model and estimated spend. |
+| `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model and estimated spend. |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included. |
 | `reload_swarm` | Restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to a mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
@@ -200,7 +200,7 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
 | `/image <path> [text]` | Send the selected agent an image. |
 | `/stop` (or Esc twice) | Interrupt the selected agent's turn without cancelling it (`Swarm::interrupt`). |
 | `/cancel` | Stop the selected agent and its subtree for good. |
-| `/status` | Each live agent's state, activity, todos, unmerged commits, jobs and schedules, without a model call. |
+| `/status` | Each live agent's state, activity, todos, unmerged commits and merge outlook, jobs and schedules, without a model call. |
 | `/cost` | Estimated spend (see [Cost](#cost)). |
 | `/budget`, `/max-agents` | See [Limits](#limits). |
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
@@ -220,6 +220,11 @@ Typing text without a command messages the selected agent.
 - **`/status`:**
   - Unmerged commits are `git log <base>..<branch>`. The base is the branch checked out at start,
     or `--status-base`.
+  - Each branch also says how many base commits it lacks and how it would merge:
+    `3 not on main, 5 behind, merges cleanly` or `… conflicts in README.md, src/tui/view.rs`.
+    The trial merge is `git merge-tree --write-tree` (git ≥ 2.38), which touches no checkout or
+    ref, so the integrator sees conflicts before cherry-picking. `list_agents` shows the same,
+    fresh on every call.
   - It refreshes while open; git runs in the background and is cached for 5 s.
   - Programmatically: `Swarm::status`.
 

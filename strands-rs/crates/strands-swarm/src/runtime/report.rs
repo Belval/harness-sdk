@@ -42,7 +42,7 @@ impl Swarm {
                     status: info.status,
                     unread: info.unread,
                     branch: info.branch,
-                    unmerged: cache.commits.get(&node.id).cloned(),
+                    git: cache.branches.get(&node.id).cloned(),
                     todos: todos.unwrap_or_default(),
                     background,
                     schedules: schedules
@@ -70,6 +70,18 @@ impl Swarm {
             }
             cache.refreshing = true;
         }
+        let swarm = self.clone();
+        tokio::spawn(async move { swarm.branch_states().await });
+    }
+
+    /// The base branch and, per live agent with a branch, how it stands against it (commits
+    /// ahead, behind, trial merge), freshly from git; also refreshes the `/status` cache.
+    pub async fn branch_states(
+        &self,
+    ) -> (
+        Option<String>,
+        std::collections::HashMap<String, crate::status::BranchState>,
+    ) {
         let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
         let root = nodes
             .iter()
@@ -81,16 +93,13 @@ impl Swarm {
             .filter_map(|node| Some((node.id.clone(), node.cwd.clone(), node.branch.clone()?)))
             .collect();
         let base = self.inner.config.status_base.clone();
-        let swarm = self.clone();
-        tokio::spawn(async move {
-            let (base, commits) = crate::status::refresh(base, root, branches).await;
-            let mut cache = swarm.inner.branches.lock();
-            *cache = crate::status::BranchCache {
-                at: Some(tokio::time::Instant::now()),
-                refreshing: false,
-                base,
-                commits,
-            };
-        });
+        let (base, branches) = crate::status::refresh(base, root, branches).await;
+        *self.inner.branches.lock() = crate::status::BranchCache {
+            at: Some(tokio::time::Instant::now()),
+            refreshing: false,
+            base: base.clone(),
+            branches: branches.clone(),
+        };
+        (base, branches)
     }
 }

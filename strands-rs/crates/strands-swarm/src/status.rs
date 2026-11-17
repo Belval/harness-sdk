@@ -1,6 +1,7 @@
 //! A model-free status report of the swarm ([`crate::Swarm::status`], the TUI's `/status`): per
-//! live agent its state, todo list, branch commits not yet on the base, background jobs and
-//! schedules. The git part runs in the background and is cached for [`TTL`].
+//! live agent its state, todo list, branch commits not yet on the base (and whether the branch
+//! would merge into it cleanly), background jobs and schedules. The git part runs in the
+//! background and is cached for [`TTL`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,9 @@ pub const TTL: Duration = Duration::from_secs(5);
 /// Most commits listed per branch.
 pub const MAX_COMMITS: usize = 20;
 
+/// Most conflicted files named per branch.
+pub const MAX_CONFLICTS: usize = 10;
+
 /// Agent-state key of the harness todo list ([`strands_harness::plugins::Todos`] default).
 pub const TODOS_KEY: &str = "todos";
 
@@ -26,8 +30,58 @@ pub struct BranchCache {
     pub refreshing: bool,
     /// The branch the commits are compared against.
     pub base: Option<String>,
-    /// Agent id → `<short hash> <subject>` of its branch's commits not on the base, newest first.
-    pub commits: HashMap<String, Vec<String>>,
+    /// Agent id → how its branch stands against the base.
+    pub branches: HashMap<String, BranchState>,
+}
+
+/// How an agent's branch stands against the base branch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchState {
+    /// `<short hash> <subject>` of its commits not on the base, newest first, at most
+    /// [`MAX_COMMITS`].
+    pub ahead: Vec<String>,
+    /// Commits on the base not on the branch.
+    pub behind: usize,
+    /// Whether merging the branch into the base would conflict.
+    pub merge: Merge,
+}
+
+/// The outcome of a trial merge (`git merge-tree`) of a branch into the base.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Merge {
+    /// Nothing to merge, or the base can fast-forward to the branch.
+    #[default]
+    FastForward,
+    /// A real merge without conflicts.
+    Clean,
+    /// The files that would conflict (at most [`MAX_CONFLICTS`]).
+    Conflicts(Vec<String>),
+    /// The trial merge failed (e.g. git older than 2.38).
+    Unknown,
+}
+
+impl BranchState {
+    /// `3 not on main, 5 behind, conflicts in README.md`: the summary after the branch name.
+    pub fn describe(&self, base: &str) -> String {
+        let more = if self.ahead.len() >= MAX_COMMITS { "+" } else { "" };
+        let mut text = match self.ahead.len() {
+            0 => format!("nothing beyond {base}"),
+            n => format!("{n}{more} not on {base}"),
+        };
+        if self.behind > 0 {
+            text.push_str(&format!(", {} behind", self.behind));
+        }
+        if self.ahead.is_empty() {
+            return text;
+        }
+        match &self.merge {
+            Merge::FastForward => text.push_str(", fast-forward"),
+            Merge::Clean => text.push_str(", merges cleanly"),
+            Merge::Conflicts(files) => text.push_str(&format!(", conflicts in {}", files.join(", "))),
+            Merge::Unknown => {}
+        }
+        text
+    }
 }
 
 /// One live agent in a [`StatusReport`].
@@ -43,8 +97,8 @@ pub struct AgentReport {
     pub unread: usize,
     /// Its worktree branch, if any.
     pub branch: Option<String>,
-    /// Commits on `branch` not on the base; `None` while unknown.
-    pub unmerged: Option<Vec<String>>,
+    /// How `branch` stands against the base; `None` while unknown.
+    pub git: Option<BranchState>,
     /// Its todo list.
     pub todos: Vec<TodoItem>,
     /// Running background jobs: `tool (age)`.
@@ -84,15 +138,14 @@ impl StatusReport {
             lines.push(head);
             lines.extend(agent.todos.iter().map(todo_line));
             if let Some(branch) = &agent.branch {
-                lines.push(match agent.unmerged.as_deref() {
+                lines.push(match &agent.git {
                     None => format!("  branch {branch} · checking…"),
-                    Some([]) => format!("  branch {branch} · nothing beyond {base}"),
-                    Some(commits) => {
-                        let more = if commits.len() >= MAX_COMMITS { "+" } else { "" };
-                        format!("  branch {branch} · {}{more} not on {base}:", commits.len())
+                    Some(state) if state.ahead.is_empty() => {
+                        format!("  branch {branch} · {}", state.describe(base))
                     }
+                    Some(state) => format!("  branch {branch} · {}:", state.describe(base)),
                 });
-                let commits = agent.unmerged.iter().flatten();
+                let commits = agent.git.iter().flat_map(|state| &state.ahead);
                 lines.extend(commits.map(|commit| format!("    {commit}")));
             }
             lines.extend(agent.background.iter().map(|job| format!("  job {job}")));
@@ -111,26 +164,69 @@ fn todo_line(item: &TodoItem) -> String {
 }
 
 /// Look up the base (`base`, else the branch checked out at `root`) and, for each
-/// `(agent id, cwd, branch)`, the branch's commits not on it.
+/// `(agent id, cwd, branch)`, how the branch stands against it.
 pub async fn refresh(
     base: Option<String>,
     root: Option<PathBuf>,
     branches: Vec<(String, PathBuf, String)>,
-) -> (Option<String>, HashMap<String, Vec<String>>) {
+) -> (Option<String>, HashMap<String, BranchState>) {
     let base = match (base, root) {
         (Some(base), _) => Some(base),
         (None, Some(root)) => current_branch(&root).await,
         (None, None) => None,
     };
-    let mut commits = HashMap::new();
+    let mut states = HashMap::new();
     if let Some(base) = &base {
         for (id, cwd, branch) in branches {
-            if let Some(list) = unmerged(&cwd, base, &branch).await {
-                commits.insert(id, list);
+            if let Some(state) = branch_state(&cwd, base, &branch).await {
+                states.insert(id, state);
             }
         }
     }
-    (base, commits)
+    (base, states)
+}
+
+/// How `branch` stands against `base`, seen from the repository at `dir`; `None` when git fails.
+pub async fn branch_state(dir: &Path, base: &str, branch: &str) -> Option<BranchState> {
+    let ahead = unmerged(dir, base, branch).await?;
+    let behind = git(dir, &["rev-list", "--count", &format!("{branch}..{base}"), "--"]).await?;
+    let behind = behind.trim().parse().ok()?;
+    let merge = match ahead.is_empty() || behind == 0 {
+        true => Merge::FastForward,
+        false => trial_merge(dir, base, branch).await,
+    };
+    Some(BranchState { ahead, behind, merge })
+}
+
+/// Merge `branch` into `base` without touching any checkout or ref (`git merge-tree`).
+async fn trial_merge(dir: &Path, base: &str, branch: &str) -> Merge {
+    let args = [
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "--no-messages",
+        base,
+        branch,
+    ];
+    let Ok(output) = crate::worktree::git_in(dir).args(args).output().await else {
+        return Merge::Unknown;
+    };
+    match output.status.code() {
+        Some(0) => Merge::Clean,
+        // Exit 1: conflicts; stdout is the tree id, then one conflicted file per line.
+        Some(1) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut files: Vec<String> = Vec::new();
+            for file in stdout.lines().skip(1).filter(|line| !line.is_empty()) {
+                if !files.iter().any(|seen| seen == file) {
+                    files.push(file.to_owned());
+                }
+            }
+            files.truncate(MAX_CONFLICTS);
+            Merge::Conflicts(files)
+        }
+        _ => Merge::Unknown,
+    }
 }
 
 /// The branch checked out in `dir`; `None` when detached or not a repository.
@@ -176,7 +272,11 @@ mod tests {
                     status: crate::AgentStatus::Running,
                     unread: 1,
                     branch: Some("swarm/r/a2".into()),
-                    unmerged: Some(vec!["abc1234 feat: x".into()]),
+                    git: Some(BranchState {
+                        ahead: vec!["abc1234 feat: x".into()],
+                        behind: 2,
+                        merge: Merge::Conflicts(vec!["README.md".into(), "src/a.rs".into()]),
+                    }),
                     todos: vec![
                         todo("Test", TodoStatus::Completed),
                         todo("Commit", TodoStatus::InProgress),
@@ -191,7 +291,7 @@ mod tests {
                     status: crate::AgentStatus::Idle,
                     unread: 0,
                     branch: Some("swarm/r/a3".into()),
-                    unmerged: Some(vec![]),
+                    git: Some(BranchState::default()),
                     todos: vec![],
                     background: vec![],
                     schedules: vec![],
@@ -208,7 +308,7 @@ mod tests {
                 "  [x] Test",
                 "  [>] Commiting",
                 "  [ ] Report",
-                "  branch swarm/r/a2 · 1 not on main:",
+                "  branch swarm/r/a2 · 1 not on main, 2 behind, conflicts in README.md, src/a.rs:",
                 "    abc1234 feat: x",
                 "  job shell (2m)",
                 "  scheduled s1 every 30m, next in 12m (…): poll",
@@ -229,7 +329,7 @@ mod tests {
                 status: crate::AgentStatus::Queued,
                 unread: 0,
                 branch: Some("b".into()),
-                unmerged: None,
+                git: None,
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],
@@ -238,5 +338,75 @@ mod tests {
         let lines = report.lines(&|_| None);
         assert_eq!(lines[0], "1 live agent", "no base outside a repository");
         assert_eq!(lines[3], "  branch b · checking…");
+    }
+
+    #[test]
+    fn a_branch_summary_says_how_it_would_merge() {
+        let state = |ahead: usize, behind, merge| BranchState {
+            ahead: vec!["c".into(); ahead],
+            behind,
+            merge,
+        };
+        let cases = [
+            (state(0, 0, Merge::FastForward), "nothing beyond main"),
+            (state(0, 3, Merge::FastForward), "nothing beyond main, 3 behind"),
+            (state(2, 0, Merge::FastForward), "2 not on main, fast-forward"),
+            (
+                state(2, 3, Merge::Clean),
+                "2 not on main, 3 behind, merges cleanly",
+            ),
+            (state(2, 3, Merge::Unknown), "2 not on main, 3 behind"),
+            (
+                state(MAX_COMMITS, 1, Merge::Clean),
+                "20+ not on main, 1 behind, merges cleanly",
+            ),
+        ];
+        for (state, text) in cases {
+            assert_eq!(state.describe("main"), text);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_branch_state_comes_from_a_trial_merge_that_changes_nothing() {
+        use crate::worktree::test_git as git;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let write = |file: &str, text: &str| std::fs::write(repo.join(file), text).unwrap();
+        let commit = |message: &str| {
+            git(repo, &["add", "-A"]);
+            git(repo, &["commit", "-q", "-m", message]);
+        };
+        git(repo, &["init", "-q", "-b", "main"]);
+        write("a.txt", "a\n");
+        write("b.txt", "b\n");
+        commit("init");
+        git(repo, &["checkout", "-q", "-b", "work"]);
+        write("a.txt", "mine\n");
+        commit("edit a");
+        let state = branch_state(repo, "main", "work").await.unwrap();
+        assert_eq!((state.ahead.len(), state.behind), (1, 0));
+        assert!(state.ahead[0].ends_with(" edit a"), "{state:?}");
+        assert_eq!(state.merge, Merge::FastForward);
+
+        git(repo, &["checkout", "-q", "main"]);
+        write("b.txt", "theirs\n");
+        commit("edit b");
+        let state = branch_state(repo, "main", "work").await.unwrap();
+        assert_eq!((state.ahead.len(), state.behind), (1, 1));
+        assert_eq!(state.merge, Merge::Clean);
+
+        write("a.txt", "theirs\n");
+        commit("edit a too");
+        let main = git(repo, &["rev-parse", "main"]);
+        let state = branch_state(repo, "main", "work").await.unwrap();
+        assert_eq!(state.behind, 2);
+        assert_eq!(state.merge, Merge::Conflicts(vec!["a.txt".into()]));
+        assert_eq!(git(repo, &["rev-parse", "main"]), main, "no ref moved");
+        assert_eq!(
+            git(repo, &["status", "--porcelain"]),
+            "",
+            "the checkout is untouched"
+        );
+        assert_eq!(branch_state(repo, "main", "nope").await, None);
     }
 }

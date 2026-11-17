@@ -733,7 +733,10 @@ mod tests {
                 status: AgentStatus::Idle,
                 unread: 0,
                 branch: Some("swarm/r/a1".into()),
-                unmerged: Some(vec!["abc1234 feat: thumbnails".into()]),
+                git: Some(crate::status::BranchState {
+                    ahead: vec!["abc1234 feat: thumbnails".into()],
+                    ..Default::default()
+                }),
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],
