@@ -1686,12 +1686,30 @@ async fn mail_folded_into_a_turn_a_failed_call_left_open_survives_a_hard_crash()
     let (swarm, mut events) = Swarm::new(config);
     let id = spawn_root(&swarm, "go").await;
     mail_to(&mut events, USER, "error").await;
+    // The state is saved in the background, newer saves never overwritten by older ones. Once
+    // the error is saved, a running agent with an empty mailbox on disk is the save that took
+    // the mail in, not the first turn's.
+    let state_file = state_dir.join("swarm.json");
+    let saved_agent = |check: fn(&serde_json::Value) -> bool| {
+        let text = std::fs::read_to_string(&state_file).unwrap_or_default();
+        let state: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        check(&state["agents"][0])
+    };
+    eventually("the error is saved", || {
+        saved_agent(|agent| agent["status"] == "errored")
+    })
+    .await;
     swarm.send(USER, &id, "remember the milk").unwrap();
     eventually("the second call is running", || {
         calls.load(std::sync::atomic::Ordering::SeqCst) == 2
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    eventually("the drained mailbox is saved", || {
+        saved_agent(|agent| {
+            agent["status"] == "running" && agent["mailbox"].as_array().is_none_or(Vec::is_empty)
+        })
+    })
+    .await;
     let crashed = dir.path().join("crashed");
     crash_copy(&state_dir, &crashed);
     swarm.shutdown().await;
