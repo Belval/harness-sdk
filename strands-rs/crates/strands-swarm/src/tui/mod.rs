@@ -478,8 +478,8 @@ fn budget_notice(swarm: &Swarm) -> String {
     }
 }
 
-/// End-to-end: drive [`App`] with key events and swarm events, render into a [`TestBackend`]
-/// and assert on what is on screen.
+/// Drive [`App`] with key, mouse and hand-made swarm events, render into a [`TestBackend`] and
+/// assert on what is on screen (`e2e.rs` does the same with a real swarm).
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -556,6 +556,14 @@ mod tests {
         app.apply(SwarmEvent::Status {
             id: id.into(),
             status: AgentStatus::Idle,
+        });
+    }
+
+    /// `a1` writes `delta`.
+    fn say(app: &mut App, delta: &str) {
+        app.apply(SwarmEvent::Text {
+            id: "a1".into(),
+            delta: delta.into(),
         });
     }
 
@@ -639,14 +647,8 @@ mod tests {
     fn the_log_shows_text_tool_calls_and_mail() {
         let mut app = App::default();
         spawn(&mut app, "a1", USER);
-        app.apply(SwarmEvent::Text {
-            id: "a1".into(),
-            delta: "Reading the ".into(),
-        });
-        app.apply(SwarmEvent::Text {
-            id: "a1".into(),
-            delta: "code.".into(),
-        });
+        say(&mut app, "Reading the ");
+        say(&mut app, "code.");
         app.apply(SwarmEvent::ToolStarted {
             id: "a1".into(),
             name: "shell".into(),
@@ -796,10 +798,7 @@ mod tests {
     fn f2_asks_for_the_selected_log_as_plain_text() {
         let mut app = App::default();
         spawn(&mut app, "a1", USER);
-        app.apply(SwarmEvent::Text {
-            id: "a1".into(),
-            delta: "a long line that the pane would wrap\nsecond".into(),
-        });
+        say(&mut app, "a long line that the pane would wrap\nsecond");
         app.apply(SwarmEvent::ToolStarted {
             id: "a1".into(),
             name: "shell".into(),
@@ -822,10 +821,7 @@ mod tests {
     fn log_rows_carry_no_border_glyphs() {
         let mut app = App::default();
         spawn(&mut app, "a1", USER);
-        app.apply(SwarmEvent::Text {
-            id: "a1".into(),
-            delta: "copy me".into(),
-        });
+        say(&mut app, "copy me");
         let shown = screen(&app);
         let row = shown.lines().find(|l| l.contains("copy me")).unwrap();
         let log_part = &row[row.find("copy me").unwrap()..];
@@ -927,10 +923,7 @@ mod tests {
     fn a_drag_in_the_log_copies_only_log_text_and_is_highlighted() {
         let mut app = App::default();
         spawn(&mut app, "a1", USER);
-        app.apply(SwarmEvent::Text {
-            id: "a1".into(),
-            delta: "first line\nsecond line".into(),
-        });
+        say(&mut app, "first line\nsecond line");
         let log = log_pane(&app);
         let first = row_of(&app, "first line");
         let copied = drag(&mut app, (log.x, first), (log.x + 10, first + 1));
@@ -954,10 +947,7 @@ mod tests {
         spawn(&mut app, "a1", USER);
         let long: String = (0..40).map(|i| format!("word{i} ")).collect();
         let long = long.trim_end().to_owned();
-        app.apply(SwarmEvent::Text {
-            id: "a1".into(),
-            delta: long.clone(),
-        });
+        say(&mut app, &long);
         let log = log_pane(&app);
         let (start, end) = (row_of(&app, "word0 "), row_of(&app, "word39"));
         assert!(end > start, "the line wraps");
