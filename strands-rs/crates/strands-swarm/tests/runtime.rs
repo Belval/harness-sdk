@@ -492,6 +492,22 @@ async fn agents_get_unique_names_and_can_be_addressed_by_them() {
         "{pinged}"
     );
     let root = scripts.lock()["a1"].clone();
+    // A spawn result names the agent it made when that differs from the one asked for.
+    let spawned = |call: usize| {
+        let (messages, _) = &root.calls()[call];
+        let result = messages.last().unwrap().tool_results().next().unwrap();
+        match &result.content[..] {
+            [ToolResultContent::Text(text)] => text.clone(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert!(
+        spawned(3)
+            .contains(r#"(named "worker-2", not "worker" (the name was taken); address it as "worker-2")"#),
+        "{}",
+        spawned(3)
+    );
+    assert!(spawned(1).contains("lower-case words"), "{}", spawned(1));
     let after_unknown = sent_text(&root, 7);
     assert!(
         after_unknown.contains("No agent with id or name `nobody`"),

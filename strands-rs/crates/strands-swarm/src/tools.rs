@@ -486,6 +486,7 @@ fn spawn_tool(swarm: Swarm, me: String) -> ToolRef {
             let swarm = swarm.clone();
             let me = me.clone();
             async move {
+                let requested = input.name.clone();
                 let request = SpawnRequest {
                     task: input.task,
                     name: Some(input.name),
@@ -497,7 +498,10 @@ fn spawn_tool(swarm: Swarm, me: String) -> ToolRef {
                 let Some(info) = swarm.agent(&id) else {
                     return Result::Ok(format!("Spawned {id}."));
                 };
-                let described = describe(&swarm, &info);
+                let mut described = describe(&swarm, &info);
+                if let Some(note) = crate::names::renamed(&requested, &info.name) {
+                    described.push_str(&format!(" ({note})"));
+                }
                 if info.status != AgentStatus::Queued {
                     return Result::Ok(format!(
                         "Spawned {described}. Its replies will arrive as messages."

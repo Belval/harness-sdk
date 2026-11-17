@@ -89,6 +89,29 @@ pub fn choose<'a>(
         .expect("an unused suffix exists")
 }
 
+/// Why a spawner asking for `requested` got `given` instead, for the spawn result, so the
+/// spawner knows its agent's real address; `None` when it got what it asked for.
+pub fn renamed(requested: &str, given: &str) -> Option<String> {
+    if requested == given {
+        return None;
+    }
+    let (full, slug) = (words(requested).collect::<Vec<_>>().join("-"), slug(requested));
+    let why = if slug.is_empty() {
+        "no letters or digits".to_owned()
+    } else if matches!(slug.as_str(), "parent" | "user") || looks_like_id(&slug) {
+        "reserved or shaped like an id".to_owned()
+    } else if given != slug {
+        "the name was taken".to_owned()
+    } else if full.chars().count() > MAX_LEN {
+        format!("names are at most {MAX_LEN} chars, cut at a word")
+    } else {
+        "names are lower-case words joined by `-`".to_owned()
+    };
+    Some(format!(
+        "named {given:?}, not {requested:?} ({why}); address it as {given:?}"
+    ))
+}
+
 /// Whether `text` has the shape of an agent id (`a` followed by digits).
 pub fn looks_like_id(text: &str) -> bool {
     text.strip_prefix('a')
@@ -98,6 +121,25 @@ pub fn looks_like_id(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn says_why_a_requested_name_changed() {
+        assert_eq!(renamed("parser", "parser"), None);
+        let long = "file-lister-with-a-rather-long-descriptive-name";
+        assert_eq!(
+            renamed(long, &slug(long)).as_deref(),
+            Some(
+                "named \"file-lister-with-a\", not \"file-lister-with-a-rather-long-descriptive-name\" \
+                 (names are at most 24 chars, cut at a word); address it as \"file-lister-with-a\""
+            )
+        );
+        let why = |requested: &str, given: &str| renamed(requested, given).unwrap();
+        assert!(why("Lazy MCP", "lazy-mcp").contains("lower-case words joined by `-`"));
+        assert!(why("parser", "parser-2").contains("(the name was taken)"));
+        assert!(why("a7", "agent-a7").contains("(reserved or shaped like an id)"));
+        assert!(why("user", "user-agent").contains("(reserved or shaped like an id)"));
+        assert!(why("!!!", "fix-flaky-tui").contains("(no letters or digits)"));
+    }
 
     #[test]
     fn slugs_spawner_names() {
