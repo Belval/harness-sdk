@@ -60,7 +60,8 @@ points to `--headless` before it starts or resumes anything.
 ## Agents
 
 - **Names.** Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else
-  one derived from its task. Ids and names work interchangeably.
+  one derived from its task. Ids and names work interchangeably, and so do the `name (id)` labels
+  the swarm prints and a name as the spawner wrote it (`Fix-P12` for `fix-p12`).
 - **Replies.** Each agent's final reply per turn goes to its parent. Mail that arrives mid-turn is
   appended to the next tool result. A reply that is empty or just `[silent]` (e.g. a scheduled poll
   that found nothing) reaches no agent parent; the user's root always replies.

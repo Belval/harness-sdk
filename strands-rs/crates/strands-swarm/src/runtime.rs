@@ -1082,15 +1082,27 @@ impl Swarm {
         Some(PathBuf::from(format!("{}-worktrees", shared.display())))
     }
 
-    /// The id of the agent `who` names: an id, or else a unique agent name.
+    /// The id of the agent `who` names: an id, or else a unique agent name. Also accepted: the
+    /// `name (id)` label the swarm prints in messages and listings, and a name as the spawner
+    /// wrote it before it was normalized (`Fix-P123` for `fix-p123`).
     pub fn resolve(&self, who: &str) -> Result<String> {
+        let who = who.trim();
         let agents = self.inner.agents.lock();
-        if agents.contains_key(who) {
-            return Ok(who.to_owned());
+        let labelled = who
+            .strip_suffix(')')
+            .and_then(|rest| rest.rsplit_once(" ("))
+            .map(|(_, id)| id);
+        if let Some(id) = [Some(who), labelled]
+            .into_iter()
+            .flatten()
+            .find(|id| agents.contains_key(*id))
+        {
+            return Ok(id.to_owned());
         }
+        let slug = names::slug(who);
         let matches: Vec<&str> = agents
             .values()
-            .filter(|node| node.name == who)
+            .filter(|node| node.name == who || node.name == slug)
             .map(|node| node.id.as_str())
             .collect();
         match matches.as_slice() {

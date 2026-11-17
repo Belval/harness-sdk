@@ -493,6 +493,11 @@ async fn agents_get_unique_names_and_can_be_addressed_by_them() {
     assert_eq!(swarm.resolve("worker-2").unwrap(), "a4");
     assert_eq!(swarm.resolve("a4").unwrap(), "a4");
     assert!(swarm.resolve("nobody").is_err());
+    // As the spawner wrote the name, and as the swarm prints an agent: `name (id)`.
+    assert_eq!(swarm.resolve("Worker-2").unwrap(), "a4");
+    assert_eq!(swarm.resolve("Fix flaky tests").unwrap(), "a3");
+    assert_eq!(swarm.resolve("worker-2 (a4)").unwrap(), "a4");
+    assert_eq!(swarm.resolve(" worker (a2) ").unwrap(), "a2");
     let cancelled = async {
         while swarm.agent("a3").unwrap().status != AgentStatus::Cancelled {
             tokio::time::sleep(Duration::from_millis(10)).await;
