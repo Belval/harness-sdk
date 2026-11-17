@@ -79,9 +79,8 @@ const LIST_DESCRIPTION: &str = concat!(
 );
 
 const CANCEL_DESCRIPTION: &str = concat!(
-    "Stop an agent, its descendants and their jobs. A clean worktree is removed, and its branch ",
-    "too once the base has all its commits (merged or cherry-picked); anything else stays and the ",
-    "result says why."
+    "Stop an agent, its descendants and their jobs. A clean worktree is removed, its branch too once ",
+    "the base has all its commits (merged or cherry-picked); the result says what stays and why."
 );
 
 /// How long `cancel_agent` waits to report what reclaiming the cancelled worktrees did.
@@ -117,7 +116,7 @@ struct WaitInput {
     /// Default 600, max 3600.
     #[serde(default)]
     timeout_seconds: Option<u64>,
-    /// Block until every one of `from` has sent something (or the user writes), then return it all.
+    /// Wait for every one of `from` (or until the user writes), not just the first.
     #[serde(default)]
     all: bool,
 }
@@ -551,7 +550,7 @@ async fn wait_all(
     text
 }
 
-/// `<why> before every agent replied; still waiting on:` and their status lines.
+/// `<why> before all of them sent something; still waiting on:` and their status lines.
 fn still_waiting(swarm: &Swarm, remaining: &[String], why: &str) -> String {
     let lines: Vec<String> = swarm
         .agents()
