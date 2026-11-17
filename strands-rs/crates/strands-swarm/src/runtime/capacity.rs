@@ -93,9 +93,7 @@ impl Swarm {
         }
         *self.inner.max_agents.lock() = limit;
         self.persist();
-        if let Some(journal) = &self.inner.journal {
-            journal.event("max_agents", serde_json::json!({ "limit": self.max_agents() }));
-        }
+        self.journal_event("max_agents", serde_json::json!({ "limit": self.max_agents() }));
         self.start_queued();
         Ok(())
     }

@@ -1097,6 +1097,13 @@ impl Swarm {
         let _ = self.inner.events.send(event);
     }
 
+    /// Record `event` in the journal, if the run keeps one.
+    fn journal_event(&self, event: &str, fields: serde_json::Value) {
+        if let Some(journal) = &self.inner.journal {
+            journal.event(event, fields);
+        }
+    }
+
     /// Record a status change; `Cancelled` is terminal and never overwritten.
     fn set_status(&self, node: &Node, status: AgentStatus) {
         {

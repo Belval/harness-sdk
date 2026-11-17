@@ -25,12 +25,10 @@ impl Swarm {
         check_binary(binary).await?;
         selftest::check_binary(binary, dir, SELF_TEST_TIMEOUT).await?;
         install_binary(binary, &dir.join("bin")).await?;
-        if let Some(journal) = &self.inner.journal {
-            journal.event(
-                "reload",
-                serde_json::json!({ "binary": binary, "when": format!("{when:?}") }),
-            );
-        }
+        self.journal_event(
+            "reload",
+            serde_json::json!({ "binary": binary, "when": format!("{when:?}") }),
+        );
         let generation = self.inner.reload_generation.fetch_add(1, Ordering::SeqCst) + 1;
         match when {
             ReloadWhen::Now => self.inner.reload.cancel(),

@@ -302,20 +302,18 @@ impl Swarm {
         let counts = usage_counts(usage);
         let model = model.unwrap_or_else(|| "unknown".to_owned());
         node.ledger.lock().record_side(purpose, &model, counts);
-        if let Some(journal) = &self.inner.journal {
-            journal.event(
-                "side_call",
-                serde_json::json!({
-                    "id": node.id,
-                    "purpose": purpose.name(),
-                    "model": model,
-                    "input": counts.input,
-                    "output": counts.output,
-                    "cache_read": counts.cache_read,
-                    "cache_write": counts.cache_write,
-                }),
-            );
-        }
+        self.journal_event(
+            "side_call",
+            serde_json::json!({
+                "id": node.id,
+                "purpose": purpose.name(),
+                "model": model,
+                "input": counts.input,
+                "output": counts.output,
+                "cache_read": counts.cache_read,
+                "cache_write": counts.cache_write,
+            }),
+        );
         self.add_totals(node, counts, false);
     }
 

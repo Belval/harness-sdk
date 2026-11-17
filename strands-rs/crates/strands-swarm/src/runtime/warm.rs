@@ -110,9 +110,7 @@ impl Swarm {
                 cache_write_input_tokens: None,
             };
             self.add_usage(&node, &refresh, request.model.model_id(), false);
-            if let Some(journal) = &self.inner.journal {
-                journal.event("keep_warm", serde_json::json!({"id": node.id, "tokens": prefix}));
-            }
+            self.journal_event("keep_warm", serde_json::json!({"id": node.id, "tokens": prefix}));
         }
     }
 }

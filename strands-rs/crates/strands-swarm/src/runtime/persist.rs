@@ -16,9 +16,7 @@ impl Swarm {
             *swarm.inner.budget.lock() = Some(tokens);
             swarm.emit(SwarmEvent::Budget { tokens: Some(tokens) });
         }
-        if let Some(journal) = &swarm.inner.journal {
-            journal.event("resume", serde_json::json!({ "agents": state.agents.len() }));
-        }
+        swarm.journal_event("resume", serde_json::json!({ "agents": state.agents.len() }));
         if let (Some(from), Some(to)) = (state.commit.clone(), swarm.inner.config.commit.clone()) {
             if from != to {
                 let changes = crate::version::changes(&swarm.inner.config.source, &from, &to).await;

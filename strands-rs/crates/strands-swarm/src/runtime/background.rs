@@ -64,12 +64,10 @@ impl Swarm {
             .jobs
             .start(owner, name, command, &node.cwd, &node.env)
             .await?;
-        if let Some(journal) = &self.inner.journal {
-            journal.event(
-                "job",
-                serde_json::json!({ "id": job.meta.id, "agent": owner, "command": command }),
-            );
-        }
+        self.journal_event(
+            "job",
+            serde_json::json!({ "id": job.meta.id, "agent": owner, "command": command }),
+        );
         self.watch_jobs();
         Ok(job)
     }
@@ -139,9 +137,7 @@ impl Swarm {
         // Posted before it is marked: a crash in between repeats the report rather than lose it.
         // An owner that is gone (cancelled) cannot be told; the job counts as reported.
         let _ = self.post(JOBS_SENDER, &job.meta.owner, "job", text);
-        if let Some(journal) = &self.inner.journal {
-            journal.event("job_end", serde_json::json!({ "id": id, "status": job.status() }));
-        }
+        self.journal_event("job_end", serde_json::json!({ "id": id, "status": job.status() }));
         if let Err(error) = self.inner.jobs.mark_reported(id).await {
             tracing::warn!(job = %id, %error, "could not mark the job reported");
         }

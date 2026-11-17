@@ -65,10 +65,7 @@ impl Swarm {
             }
             schedule
         };
-        if let Some(journal) = &self.inner.journal {
-            let fields = serde_json::to_value(&schedule).unwrap_or_default();
-            journal.event("schedule", fields);
-        }
+        self.journal_event("schedule", serde_json::to_value(&schedule).unwrap_or_default());
         self.persist();
         self.start_scheduler();
         // An idle receiver now sleeps on its schedule, which frees its slot.
@@ -89,9 +86,7 @@ impl Swarm {
             index.map(|index| list.remove(index))
         };
         let removed = removed.ok_or_else(|| Error::other(format!("No schedule {id}.")))?;
-        if let Some(journal) = &self.inner.journal {
-            journal.event("unschedule", serde_json::json!({ "id": id }));
-        }
+        self.journal_event("unschedule", serde_json::json!({ "id": id }));
         self.persist();
         self.inner.schedules_changed.notify_one();
         Ok(removed)
