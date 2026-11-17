@@ -2,6 +2,7 @@
 //! input line that messages the selected agent (or starts a root agent).
 
 pub mod app;
+pub mod commands;
 mod edit;
 pub mod images;
 pub mod select;
