@@ -19,9 +19,9 @@ use strands_agents::Plugin;
 use strands_agents::{Agent, FileStorage, Result, SessionManager};
 use strands_harness::defaults::{DEFAULT_BUILTIN_TOOLS, DEFAULT_MODEL};
 use strands_harness::{
-    create_harness, resolve_model, AwsSettings, BackgroundTasksOption, BuiltinToolsConfig, Effort,
-    HarnessAgentOptions, MemoryOption, ModelOption, ResolveModelOptions, SandboxOption, SessionOption,
-    SkillsOption,
+    create_harness, resolve_model, AwsSettings, BackgroundTasksOption, BuiltinPluginName, BuiltinToolsConfig,
+    Effort, HarnessAgentOptions, MemoryOption, ModelOption, ResolveModelOptions, SandboxOption,
+    SessionOption, SkillsOption,
 };
 
 use crate::catalog::ToolCatalog;
@@ -387,6 +387,9 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         tools,
         plugins,
         builtin_tools: Some(BuiltinToolsConfig::list(builtins)),
+        // The swarm injects the environment itself (`plugins` above), for the agent's own working
+        // directory; the harness's would describe the process's, and repeat it on every call.
+        builtin_plugins: Some(vec![BuiltinPluginName::Todos]),
         sandbox: SandboxOption::Instance(Arc::new(sandbox)),
         session,
         memory: MemoryOption::Off,

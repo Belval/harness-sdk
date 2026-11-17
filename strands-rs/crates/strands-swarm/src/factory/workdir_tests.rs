@@ -147,6 +147,11 @@ async fn a_lone_cd_moves_the_agent_and_its_children_and_survives_a_restart() {
     );
     let first_turn = serde_json::to_string(&calls[0].0).unwrap();
     assert!(!first_turn.contains("Other rules."));
+    assert_eq!(
+        first_turn.matches("<environment>").count(),
+        1,
+        "only the agent's own environment, not also the process's: {first_turn}"
+    );
     let moved_turn = last(&calls[4]);
     assert!(moved_turn.contains("Other rules."), "the environment follows");
     let helper_calls = helper.calls();
