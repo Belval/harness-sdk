@@ -113,10 +113,7 @@ impl Swarm {
             branch: saved.branch,
             status: Mutex::new(status.clone()),
             mailbox: Mutex::new(mailbox),
-            notify: Notify::new(),
             cancel,
-            agent: Mutex::new(None),
-            last_model: Mutex::new(None),
             task: saved.task,
             model: Mutex::new(saved.model),
             goal: saved.goal,
@@ -129,12 +126,9 @@ impl Swarm {
             }),
             ledger: Mutex::new(saved.ledger),
             finished: AtomicBool::new(matches!(status, AgentStatus::Cancelled | AgentStatus::Queued)),
-            collected: AtomicBool::new(false),
-            reclaimed: Mutex::new(None),
             context: Mutex::new(saved.context),
-            turn: Mutex::new(None),
             paused: AtomicBool::new(saved.paused),
-            tool_calls: Mutex::new(BTreeMap::new()),
+            ..Node::default()
         });
         agents.insert(saved.id.clone(), node.clone());
         drop(agents);

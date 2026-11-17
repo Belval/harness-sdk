@@ -93,12 +93,13 @@ pub const RELOAD_EXIT_CODE: u8 = 75;
 pub const USER: &str = "user";
 
 /// Lifecycle of one agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum AgentStatus {
     /// Spawned while the agent limit was reached; it starts when a slot frees. It can already
     /// receive messages.
     Queued,
     /// The agent is being built.
+    #[default]
     Starting,
     /// A turn is in progress.
     Running,
@@ -573,6 +574,7 @@ pub enum WaitOutcome {
     Unreachable(String),
 }
 
+#[derive(Default)]
 struct Node {
     id: String,
     name: String,
@@ -834,25 +836,14 @@ impl Swarm {
                     true => AgentStatus::Queued,
                     false => AgentStatus::Starting,
                 }),
-                mailbox: Mutex::new(VecDeque::new()),
-                notify: Notify::new(),
                 cancel,
-                agent: Mutex::new(None),
-                last_model: Mutex::new(None),
                 task: request.task.clone(),
                 model: Mutex::new(request.model.clone()),
                 goal: request.goal.clone(),
                 env,
-                usage: Mutex::new(Tokens::default()),
-                ledger: Mutex::default(),
                 // No actor runs until a queued agent starts.
                 finished: AtomicBool::new(queued),
-                collected: AtomicBool::new(false),
-                reclaimed: Mutex::new(None),
-                context: Mutex::new(None),
-                turn: Mutex::new(None),
-                paused: AtomicBool::new(false),
-                tool_calls: Mutex::new(BTreeMap::new()),
+                ..Node::default()
             });
             agents.insert(id.clone(), node.clone());
             node
