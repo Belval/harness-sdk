@@ -83,10 +83,13 @@ impl Swarm {
         std::collections::HashMap<String, crate::status::BranchState>,
     ) {
         let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        // The main checkout: a root without a worktree of its own (a cancelled worktree root's
+        // checkout is gone, a live one has its own branch checked out).
         let root = nodes
             .iter()
-            .find(|node| node.parent == USER)
-            .map(|node| node.cwd.clone());
+            .find(|node| node.parent == USER && node.branch.is_none())
+            .map(|node| node.cwd.clone())
+            .or_else(|| Some(self.inner.config.cwd.clone()));
         let branches = nodes
             .iter()
             .filter(|node| node.status.lock().is_live())

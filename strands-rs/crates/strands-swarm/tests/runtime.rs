@@ -9,7 +9,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::json;
 use strands_agents::testing::{MockMessageModel, MockResponse};
-use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
+use strands_agents::types::{ContentBlock, Message, Role, ToolResultContent, ToolUseBlock};
 use strands_agents::{Agent, Model};
 use strands_swarm::compaction::Compaction;
 use strands_swarm::status::Merge;
@@ -2177,6 +2177,58 @@ async fn cancelling_says_what_it_kept_and_a_run_without_state_cleans_up_on_exit(
         branch_exists(&repo, &format!("swarm/{run}/a1")),
         "unmerged work stays"
     );
+}
+
+#[tokio::test]
+async fn cancelled_agents_are_listed_with_what_is_left_of_their_worktree_and_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);
+    let lister = vec![
+        tool_call("cancel_agent", "c1", json!({"id": "a1"})),
+        tool_call("cancel_agent", "c2", json!({"id": "a2"})),
+        tool_call("list_agents", "l1", json!({"include_cancelled": true})),
+        say("listed"),
+    ];
+    let scripts = scripts_of(vec![
+        ("a1", vec![say("ok")]),
+        ("a2", vec![say("ok")]),
+        ("a3", lister),
+    ]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(mock_factory(&scripts), &repo));
+    let worktree = || SpawnRequest {
+        task: "t".into(),
+        worktree: true,
+        ..Default::default()
+    };
+    let committed = swarm.spawn(USER, worktree()).await.unwrap();
+    swarm.spawn(USER, worktree()).await.unwrap();
+    reply_to(&mut events, USER).await;
+    reply_to(&mut events, USER).await;
+    let committed_dir = swarm.agent(&committed).unwrap().cwd;
+    std::fs::write(committed_dir.join("work.txt"), "done").unwrap();
+    git(&committed_dir, &["add", "."]);
+    git(&committed_dir, &["commit", "-qm", "work"]);
+
+    spawn_root(&swarm, "cancel and list").await;
+    while reply_to(&mut events, USER).await != "listed" {}
+    let calls = scripts.lock()["a3"].calls();
+    let result = calls[3].0.last().unwrap().tool_results().next().unwrap();
+    let listed = match &result.content[..] {
+        [ToolResultContent::Text(text)] => text.clone(),
+        other => panic!("{other:?}"),
+    };
+    let run = swarm.run_id().to_owned();
+    let line = |id: &str| listed.lines().find(|l| l.contains(&format!("({id})"))).unwrap();
+    assert!(line("a1").contains("(removed)"), "{listed}");
+    let kept = format!("branch swarm/{run}/a1 (kept: 1 not on main");
+    assert!(line("a1").contains(&kept), "{listed}");
+    let deleted = format!("branch swarm/{run}/a2 (deleted)");
+    assert!(
+        line("a2").contains("(removed)") && line("a2").contains(&deleted),
+        "{listed}"
+    );
+    assert!(!line("a3").contains("(removed)"), "{listed}");
+    swarm.shutdown().await;
 }
 
 fn system_prompt(model: &MockMessageModel, call: usize) -> String {

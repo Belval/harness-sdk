@@ -586,7 +586,11 @@ fn list_tool(swarm: Swarm) -> ToolRef {
             async move {
                 let jobs = swarm.jobs().await;
                 let branches = swarm.branch_states().await;
-                let text = list_agents(&swarm, input.include_cancelled, &jobs, &branches);
+                let left = match input.include_cancelled {
+                    true => cancelled_branches(&swarm, branches.0.as_deref()).await,
+                    false => HashMap::new(),
+                };
+                let text = list_agents(&swarm, input.include_cancelled, &jobs, &branches, &left);
                 Result::Ok(text)
             }
         });
@@ -641,6 +645,7 @@ fn list_agents(
     include_cancelled: bool,
     jobs: &[Job],
     (base, branches): &(Option<String>, HashMap<String, BranchState>),
+    cancelled: &HashMap<String, Option<BranchState>>,
 ) -> String {
     let agents = swarm.agents();
     let (shown, hidden): (Vec<_>, Vec<_>) = agents
@@ -659,8 +664,12 @@ fn list_agents(
     };
     let merge = |id: &str| -> String {
         let base = base.as_deref().unwrap_or("the base");
-        let state = branches.get(id).map(|state| state.describe(base));
-        state.map(|state| format!(" ({state})")).unwrap_or_default()
+        match (branches.get(id), cancelled.get(id)) {
+            (Some(state), _) => format!(" ({})", state.describe(base)),
+            (None, Some(Some(state))) => format!(" (kept: {})", state.describe(base)),
+            (None, Some(None)) => " (deleted)".to_owned(),
+            (None, None) => String::new(),
+        }
     };
     let schedules = swarm.schedules();
     let cost = swarm.cost();
@@ -713,14 +722,46 @@ fn idle_agents(swarm: &Swarm) -> String {
     }
 }
 
+/// How the branches of cancelled worktree agents stand, seen from the root's checkout: `None` for
+/// one that no longer exists (deleted once merged); absent when git could not tell.
+async fn cancelled_branches(swarm: &Swarm, base: Option<&str>) -> HashMap<String, Option<BranchState>> {
+    let agents = swarm.agents();
+    let root = agents
+        .iter()
+        .find(|info| info.parent == USER && info.branch.is_none() && info.cwd.exists());
+    let (Some(root), Some(base)) = (root, base) else {
+        return HashMap::new();
+    };
+    let mut states = HashMap::new();
+    for info in agents.iter().filter(|info| !info.status.is_live()) {
+        let Some(branch) = &info.branch else { continue };
+        let exists = [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ];
+        if crate::worktree::git(&root.cwd, &exists).await.is_err() {
+            states.insert(info.id.clone(), None);
+        } else if let Some(state) = crate::status::branch_state(&root.cwd, base, branch).await {
+            states.insert(info.id.clone(), Some(state));
+        }
+    }
+    states
+}
+
 fn describe(swarm: &Swarm, info: &AgentInfo) -> String {
+    let removed = match info.status.is_live() || info.cwd.exists() {
+        true => "",
+        false => " (removed)",
+    };
     let branch = info
         .branch
         .as_ref()
         .map(|b| format!(", branch {b}"))
         .unwrap_or_default();
     format!(
-        "{} ({}): {}, parent {}, cwd {}{branch}",
+        "{} ({}): {}, parent {}, cwd {}{removed}{branch}",
         info.name,
         info.id,
         info.status,

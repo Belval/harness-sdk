@@ -327,6 +327,8 @@ Typing text without a command messages the selected agent.
     (2 commits not on main)`. The ref is deleted only if it still points at the commit checked.
     A later pass (resume, `/gc`, `--gc`) deletes it once merged.
   - `cancel_agent` waits up to 10 s for this and its result says what was removed and kept.
+    `list_agents` with `include_cancelled` shows it later: `cwd … (removed)`, `branch … (deleted)`
+    or `branch … (kept: 2 not on main, merges cleanly)`.
   - A run without `--run` cannot be resumed, so on exit every worktree agent is treated as
     cancelled.
   - Nothing outside those exact paths and that branch is touched, and each removal is logged as a
