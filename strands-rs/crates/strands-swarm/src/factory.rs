@@ -40,8 +40,10 @@ const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search", "programmatic_too
 /// Tools whose calls in one batch run one after another in the model's order
 /// ([`OrderedToolExecutor`]): a test run waits for the edits before it, a read or a job for the
 /// command that writes its file, a worktree spawn for the commit it should branch from, a cancel
-/// (which removes the worktree only if it is clean) for the command that cleans it. Every other
-/// call (messages, MCP, fetches) still starts at once.
+/// (which removes the worktree only if it is clean) for the command that cleans it, a message for
+/// the commit it announces or the spawn of its recipient, and `wait`, `list_agents` and `jobs` for
+/// the spawns, jobs and cancels before them. Every other call (MCP, fetches, skills) still starts
+/// at once.
 const ORDERED_TOOLS: &[&str] = &[
     "read",
     "write",
@@ -51,6 +53,10 @@ const ORDERED_TOOLS: &[&str] = &[
     "land",
     "spawn_agent",
     "cancel_agent",
+    "send_message",
+    "wait",
+    "list_agents",
+    "jobs",
 ];
 
 /// Preview kept in context when a large tool result is offloaded to the stash.
@@ -640,10 +646,11 @@ mod tests {
         assert!(text.contains("written"), "{text}");
     }
 
-    /// A cancel removes a worktree only if it is clean, and a worktree spawn branches from HEAD:
-    /// both wait for the command before them that cleans the checkout or commits.
+    /// A cancel removes a worktree only if it is clean, a worktree spawn branches from HEAD, a
+    /// message may announce a commit, and `wait`, `list_agents` and `jobs` report on what came
+    /// before them: each waits for the command before it.
     #[tokio::test]
-    async fn spawn_and_cancel_wait_for_the_command_before_them() {
+    async fn swarm_tools_wait_for_the_command_before_them() {
         use strands_agents::testing::MockResponse;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("committed");
@@ -667,11 +674,24 @@ mod tests {
                 ),
                 call("spawn_agent", "t2", serde_json::json!({})),
                 call("cancel_agent", "t3", serde_json::json!({})),
+                call("send_message", "t4", serde_json::json!({})),
+                call("list_agents", "t5", serde_json::json!({})),
+                call("jobs", "t6", serde_json::json!({})),
+                call("wait", "t7", serde_json::json!({})),
             ],
         );
         let spec = AgentSpec {
             cwd: dir.path().to_owned(),
-            tools: vec![probe("spawn_agent"), probe("cancel_agent")],
+            tools: [
+                "spawn_agent",
+                "cancel_agent",
+                "send_message",
+                "list_agents",
+                "jobs",
+                "wait",
+            ]
+            .map(probe)
+            .into(),
             ..spec()
         };
         let options = HarnessFactoryOptions::default();
@@ -697,7 +717,7 @@ mod tests {
             .filter(|result| result.tool_use_id != "t1")
             .map(|result| serde_json::to_string(&result.content).unwrap())
             .collect();
-        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(results.len(), 6, "{results:?}");
         assert!(results.iter().all(|r| r.contains("true")), "{results:?}");
     }
 
