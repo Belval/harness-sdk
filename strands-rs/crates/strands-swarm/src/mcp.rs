@@ -266,16 +266,8 @@ impl ToolCache {
         };
         let mut entries = self.entries.lock().await;
         entries.insert(name.to_owned(), CacheEntry { config, tools });
-        let text = serde_json::to_string_pretty(&*entries).unwrap_or_default();
-        if let Some(dir) = self.path.parent() {
-            let _ = tokio::fs::create_dir_all(dir).await;
-        }
-        let staged = self.path.with_extension("json.tmp");
-        let written = async {
-            tokio::fs::write(&staged, text).await?;
-            tokio::fs::rename(&staged, &self.path).await
-        };
-        if let Err(error) = written.await {
+        let text = serde_json::to_vec_pretty(&*entries).unwrap_or_default();
+        if let Err(error) = crate::files::replace_async(&self.path, text, false).await {
             tracing::warn!(path = %self.path.display(), %error, "cannot write the MCP tool cache");
         }
     }

@@ -17,6 +17,7 @@ pub mod compaction;
 pub mod cost;
 pub mod dashboard;
 pub mod factory;
+pub mod files;
 pub mod gc;
 pub mod images;
 pub mod jobs;

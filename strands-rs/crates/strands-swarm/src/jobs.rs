@@ -198,11 +198,9 @@ impl Jobs {
         };
         // Reap the wrapper once it ends; the job reports through its files, not this handle.
         tokio::spawn(async move { child.wait().await });
-        // Through a rename: a crash mid-write must not leave a half `.json`, which no listing
-        // could read.
-        let staged = self.file(&id, "json.tmp");
-        tokio::fs::write(&staged, serde_json::to_vec_pretty(&meta)?).await?;
-        tokio::fs::rename(&staged, self.file(&id, "json")).await?;
+        // A crash mid-write must not leave a half `.json`, which no listing could read.
+        let json = serde_json::to_vec_pretty(&meta)?;
+        crate::files::replace_async(&self.file(&id, "json"), json, false).await?;
         Ok(Job {
             meta,
             state: JobState::Running,
@@ -542,7 +540,11 @@ mod tests {
         let log = tokio::fs::read_to_string(jobs.log_path("j1")).await.unwrap();
         assert_eq!(log, "orphan output\n");
         assert!(
-            !jobs.file("j3", "json.tmp").exists(),
+            !std::fs::read_dir(jobs.dir()).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("j3.json.")),
             "the description is renamed into place"
         );
     }

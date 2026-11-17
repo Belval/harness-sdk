@@ -108,13 +108,9 @@ impl Memory {
     }
 
     async fn replace(&self, contents: &str) -> Result<()> {
-        let io = |error| self.io_error("write", error);
-        if let Some(dir) = self.path.parent() {
-            tokio::fs::create_dir_all(dir).await.map_err(io)?;
-        }
-        let tmp = self.path.with_extension(format!("tmp-{}", std::process::id()));
-        tokio::fs::write(&tmp, contents).await.map_err(io)?;
-        tokio::fs::rename(&tmp, &self.path).await.map_err(io)
+        crate::files::replace_async(&self.path, contents.as_bytes().to_vec(), false)
+            .await
+            .map_err(|error| self.io_error("write", error))
     }
 
     fn io_error(&self, what: &str, error: std::io::Error) -> Error {

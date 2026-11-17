@@ -314,12 +314,7 @@ async fn record_landed(repo: &Path, source: &str, landed: &str) {
     lines.push(&line);
     let start = lines.len().saturating_sub(LANDED_KEPT);
     let text = lines[start..].join("\n") + "\n";
-    let tmp = path.with_extension("tmp");
-    let written = match tokio::fs::write(&tmp, text).await {
-        Ok(()) => tokio::fs::rename(&tmp, &path).await,
-        Err(error) => Err(error),
-    };
-    if let Err(error) = written {
+    if let Err(error) = crate::files::replace_async(&path, text.into_bytes(), false).await {
         tracing::warn!(%error, "could not record the landing");
     }
 }

@@ -238,7 +238,9 @@ impl Swarm {
             return;
         };
         let written = match batch.as_ref() {
-            Some(open) => write_atomically(&path, open),
+            Some(open) => serde_json::to_vec(open)
+                .map_err(Into::into)
+                .and_then(|json| crate::files::replace(&path, &json, false)),
             None => std::fs::remove_file(&path).or_else(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => Ok(()),
                 _ => Err(e),
@@ -313,18 +315,6 @@ impl Swarm {
             tracing::warn!(%error, "state save failed");
         }
     }
-}
-
-/// Write `value` as JSON to `path` through a temporary file and a rename, so a crash leaves the
-/// old file or the new one, never half of one.
-fn write_atomically(path: &Path, value: &impl serde::Serialize) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    std::fs::write(&tmp, serde_json::to_vec(value)?)?;
-    std::fs::rename(&tmp, path)
 }
 
 /// What a restored errored agent shows: the error itself is not persisted.
