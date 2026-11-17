@@ -167,6 +167,7 @@ async fn on_terminal_event(swarm: &Swarm, app: &mut App, event: Event, screen: &
             if let Some(command) = on_key(app, key) {
                 submit(swarm, app, command).await;
             }
+            app.status_scroll = app.status_scroll.min(view::popup_scroll_limit(app, screen.area));
         }
         Event::Mouse(mouse) => {
             if let Some(text) = on_mouse(app, mouse, screen) {

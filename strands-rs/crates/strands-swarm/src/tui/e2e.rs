@@ -230,6 +230,10 @@ async fn a_real_swarm_shows_spawns_replies_compaction_and_status_on_screen() {
     ] {
         assert!(shown.contains(expected), "missing {expected:?}\n{shown}");
     }
+    // The whole report fits, so scrolling down does not move it off screen.
+    let shown = screen.press(&swarm, &mut app, KeyCode::PageDown).await;
+    assert_eq!(app.status_scroll, 0);
+    assert!(shown.contains("2 live agents"), "{shown}");
     let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
     on_terminal_event(&swarm, &mut app, key, &screen.buffer).await;
     let shown = screen.draw(&mut app);

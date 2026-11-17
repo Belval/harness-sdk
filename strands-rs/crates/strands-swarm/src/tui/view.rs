@@ -128,13 +128,10 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
     if app.show_keys {
         draw_keys(frame, areas.body);
     }
-    if let Some(report) = &app.status {
-        draw_status(frame, areas.body, app, report);
-    }
-    if let Some(report) = &app.cost {
-        let lines = report.lines().into_iter().map(Line::from).collect();
-        let title = " estimated cost · ↑↓ scroll · any key close ";
-        draw_popup(frame, areas.body, title, lines, app.status_scroll, false);
+    if let Some(popup) = popup(app) {
+        let (area, _) = popup_area(areas.body, &popup);
+        frame.render_widget(Clear, area);
+        frame.render_widget(popup.scroll((app.status_scroll, 0)), area);
     }
     let footer_text = app.notice.clone().unwrap_or_else(|| HINT.to_owned());
     frame.render_widget(Paragraph::new(footer_text).dim(), areas.footer);
@@ -542,49 +539,52 @@ fn draw_keys(frame: &mut Frame, body: Rect) {
     frame.render_widget(popup, area);
 }
 
-fn draw_status(frame: &mut Frame, body: Rect, app: &App, report: &crate::status::StatusReport) {
-    let doing = |id: &str| {
-        let view = app.agents.get(id)?;
-        matches!(view.status, AgentStatus::Starting | AgentStatus::Running).then(|| view.doing.clone())
+/// The `/status` or `/cost` popup, when one is open, unscrolled.
+fn popup(app: &App) -> Option<Paragraph<'static>> {
+    let (title, lines, wrap) = if let Some(report) = &app.status {
+        let doing = |id: &str| {
+            let view = app.agents.get(id)?;
+            matches!(view.status, AgentStatus::Starting | AgentStatus::Running).then(|| view.doing.clone())
+        };
+        let lines: Vec<Line> = report
+            .lines(&doing)
+            .into_iter()
+            .map(|line| match line.strip_prefix("  ") {
+                Some(_) => Line::from(line).dim(),
+                None => Line::from(line).bold(),
+            })
+            .collect();
+        // Prose wraps; the cost table does not, so its columns stay aligned.
+        (" status · ↑↓ scroll · any key close ", lines, true)
+    } else {
+        let lines = app.cost.as_ref()?.lines().into_iter().map(Line::from).collect();
+        (" estimated cost · ↑↓ scroll · any key close ", lines, false)
     };
-    let lines: Vec<Line> = report
-        .lines(&doing)
-        .into_iter()
-        .map(|line| match line.strip_prefix("  ") {
-            Some(_) => Line::from(line).dim(),
-            None => Line::from(line).bold(),
-        })
-        .collect();
-    draw_popup(
-        frame,
-        body,
-        " status · ↑↓ scroll · any key close ",
-        lines,
-        app.status_scroll,
-        true,
-    );
+    let popup = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    Some(match wrap {
+        true => popup.wrap(Wrap { trim: false }),
+        false => popup,
+    })
 }
 
-/// A scrollable popup over most of `body`, as tall as `lines` need. `wrap` folds long lines
-/// (prose); tables are left unwrapped so their columns stay aligned.
-fn draw_popup(frame: &mut Frame, body: Rect, title: &str, lines: Vec<Line>, scroll: u16, wrap: bool) {
+/// Where `popup` goes: centred over most of `body`, as tall as its lines need. Also returns
+/// its height in rows when not clipped (borders included).
+fn popup_area(body: Rect, popup: &Paragraph) -> (Rect, u16) {
     let width = body.width.saturating_sub(4).max(body.width.min(20));
-    let mut popup = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
-    if wrap {
-        popup = popup.wrap(Wrap { trim: false });
-    }
     // `line_count` takes the inner width and counts both borders.
     let rows = to_u16(popup.line_count(width.saturating_sub(2)));
     let height = rows.min(body.height);
-    let area = Rect::new(
-        body.x + (body.width - width) / 2,
-        body.y + (body.height - height) / 2,
-        width,
-        height,
-    );
-    let popup = popup.scroll((scroll, 0));
-    frame.render_widget(Clear, area);
-    frame.render_widget(popup, area);
+    let x = body.x + (body.width - width) / 2;
+    let y = body.y + (body.height - height) / 2;
+    (Rect::new(x, y, width, height), rows)
+}
+
+/// How far the open popup can scroll on a `screen`-sized terminal: until its last line shows.
+pub fn popup_scroll_limit(app: &App, screen: Rect) -> u16 {
+    popup(app).map_or(0, |popup| {
+        let (area, rows) = popup_area(areas(app, screen).body, &popup);
+        rows - area.height
+    })
 }
 
 /// An agent's log as plain text: the same lines the log pane shows, without styling, borders or
@@ -931,6 +931,48 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
         }
+    }
+
+    #[test]
+    fn a_long_popup_scrolls_until_its_last_line_shows() {
+        let mut app = app_with_an_image(None);
+        let agent = |n: usize| crate::status::AgentReport {
+            id: format!("a{n}"),
+            label: format!("agent-{n} (a{n})"),
+            status: AgentStatus::Idle,
+            unread: 0,
+            branch: None,
+            git: None,
+            todos: vec![],
+            background: vec![],
+            schedules: vec![],
+        };
+        app.status = Some(crate::status::StatusReport {
+            base: None,
+            agents: (1..=40).map(agent).collect(),
+        });
+        let size = Rect::new(0, 0, 80, 24);
+        let limit = popup_scroll_limit(&app, size);
+        assert!(limit > 0);
+        app.status_scroll = limit;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        let last = screen
+            .lines()
+            .rfind(|row| row.contains("agent-"))
+            .unwrap_or_default();
+        assert!(last.contains("agent-40 (a40)"), "{screen}");
+        let below = screen
+            .lines()
+            .skip_while(|row| !row.contains("agent-40 (a40)"))
+            .nth(1);
+        assert!(
+            below.unwrap_or_default().contains('└'),
+            "nothing blank after the end:\n{screen}"
+        );
+        app.status = None;
+        assert_eq!(popup_scroll_limit(&app, size), 0);
     }
 
     #[test]
