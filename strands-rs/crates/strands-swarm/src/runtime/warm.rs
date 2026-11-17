@@ -99,6 +99,9 @@ impl Swarm {
             if !read {
                 return;
             }
+            if let Some(agent) = node.agent() {
+                crate::pruning::note_model_call(&agent);
+            }
             let refresh = Usage {
                 input_tokens: 0,
                 output_tokens: 1,

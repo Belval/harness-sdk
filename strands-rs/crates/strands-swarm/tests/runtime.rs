@@ -3667,8 +3667,11 @@ async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_cal
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(CachingModel::default());
     let shared = model.clone();
+    let built: Arc<Mutex<Option<Agent>>> = Arc::default();
+    let keep = built.clone();
     let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
         let model = shared.clone();
+        let keep = keep.clone();
         let pause = strands_agents::tools::FunctionTool::builder("pause")
             .description("Takes a while.")
             .handler(|_input: serde_json::Value, _ctx| async move {
@@ -3678,16 +3681,22 @@ async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_cal
         let mut tools = spec.tools;
         tools.push(Arc::new(pause));
         Box::pin(async move {
-            Agent::builder()
+            let agent = Agent::builder()
                 .id(spec.id)
                 .model(model)
                 .tools(tools)
                 .no_sandbox()
-                .build()
+                .build()?;
+            *keep.lock() = Some(agent.clone());
+            Ok(agent)
         })
     });
     let mut config = SwarmConfig::new(factory, dir.path());
     config.keep_warm = Some(Duration::from_millis(50));
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let (swarm, mut events) = Swarm::new(config);
     spawn_root(&swarm, "go").await;
     assert_eq!(reply_to(&mut events, USER).await, "done");
@@ -3698,6 +3707,14 @@ async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_cal
     );
     // Each refresh counts as a full cache read of the 1,000-token prompt (plus one output token).
     assert_eq!(swarm.tokens_used(), 2 * 1005 + refreshes as u64 * 1001);
+    // A refresh counts as a call for cache pruning: the call after the wait finds the cache warm.
+    let agent = built.lock().clone().unwrap();
+    let noted = agent.state().get(strands_swarm::pruning::LAST_CALL_KEY);
+    let noted = noted.and_then(|at| at.as_u64()).expect("refreshes note the call");
+    assert!(
+        noted >= started + 100,
+        "noted at a refresh during the pause: {noted} vs {started}"
+    );
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(

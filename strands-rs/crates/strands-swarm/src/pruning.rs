@@ -263,10 +263,17 @@ impl ContextStrategy for Mark {
 
     async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
         *self.0.sent.lock() = Some(ctx.messages.iter().map(hash).collect());
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-        ctx.agent.state().set(LAST_CALL_KEY, now.as_millis() as u64);
+        note_model_call(ctx.agent);
         Ok(false)
     }
+}
+
+/// Record that `agent`'s prompt was just sent (and so its cache refreshed), for
+/// [`PruneReason::Idle`]. Keep-warm refreshes call it too: otherwise the first call after a long
+/// wait would find the cache "expired", prune, and so rewrite the cache keep-warm kept.
+pub fn note_model_call(agent: &Agent) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    agent.state().set(LAST_CALL_KEY, now.as_millis() as u64);
 }
 
 fn last_call(agent: &Agent) -> Option<SystemTime> {
