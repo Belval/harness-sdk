@@ -234,14 +234,15 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
 
-    fn touch(path: &Path, ago: u64) {
+    /// Set `path`'s modification time to `ago` seconds before `now` (one instant for all the
+    /// files of a test, so the gaps between them are exact however slowly it runs).
+    fn touch(path: &Path, now: SystemTime, ago: u64) {
         let file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)
             .unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(ago))
-            .unwrap();
+        file.set_modified(now - Duration::from_secs(ago)).unwrap();
     }
 
     #[tokio::test]
@@ -255,17 +256,18 @@ mod tests {
                         "status": "running", "mailbox": [], "running_calls": {"t1": 10}}],
         });
         std::fs::write(dir.path().join(STATE_FILE), state.to_string()).unwrap();
-        touch(&dir.path().join(STATE_FILE), 100);
+        let now = SystemTime::now();
+        touch(&dir.path().join(STATE_FILE), now, 100);
         let ran = |state: Option<SwarmState>| state.unwrap().agents[0].running_calls["t1"];
         // Nothing written since the save: the saved time stands.
         assert_eq!(ran(load(dir.path()).await.unwrap()), 10);
         // Events went on for 30s after it, and swarmctl noted the exit 60s after it.
-        touch(&dir.path().join(crate::journal::EVENTS_FILE), 70);
+        touch(&dir.path().join(crate::journal::EVENTS_FILE), now, 70);
         assert_eq!(ran(load(dir.path()).await.unwrap()), 40);
-        touch(&dir.path().join("supervisor.log"), 40);
+        touch(&dir.path().join("supervisor.log"), now, 40);
         assert_eq!(ran(load(dir.path()).await.unwrap()), 70);
         // The resuming process's own log is no sign of the old one's life.
-        touch(&dir.path().join(crate::logging::LOG_FILE), 0);
+        touch(&dir.path().join(crate::logging::LOG_FILE), now, 0);
         assert_eq!(ran(load(dir.path()).await.unwrap()), 70);
     }
 }
