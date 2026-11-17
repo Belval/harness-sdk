@@ -823,7 +823,7 @@ mod tests {
     }
 
     /// The fixed prefix a root agent sends on every call, built the way a real run builds it
-    /// (persistent, swarm prompt and tools, memory, an MCP catalog, two skills), split
+    /// (persistent, swarm prompt and tools, memory, an MCP catalog, 20 skills), split
     /// into `(part, bytes)`: the system prompt sections, then one entry per tool spec.
     async fn fixed_prefix() -> Vec<(String, usize)> {
         use crate::runtime::{SpawnRequest, Swarm, SwarmConfig, USER};
@@ -846,14 +846,21 @@ mod tests {
             vec![tool("builder-mcp_x")],
             servers.iter().map(|(name, n)| (name.to_string(), *n)).collect(),
         );
-        let skills = ["review", "deploy"].map(|name| {
-            let mut skill = Skill::new(name, "Do the thing. Use when asked to.", "Steps.");
-            skill.path = Some(dir.path().join(name));
-            skill
-        });
+        // Shaped like real plugin skills: a long first sentence, then when to use it.
+        let description = "Diagnose failed, stuck or blocked deployments of a service pipeline, \
+                           including infrastructure stack failures and rollbacks. Use when a \
+                           deployment failed, a promotion is blocked or an alarm rolled it back.";
+        let skills: Vec<Skill> = (0..20)
+            .map(|n| {
+                let name = format!("skill-{n}");
+                let mut skill = Skill::new(&name, description, "Steps.");
+                skill.path = Some(dir.path().join(name));
+                skill
+            })
+            .collect();
         let options = HarnessFactoryOptions {
             catalog: Some(Arc::new(catalog)),
-            skills: Arc::new(skills.to_vec()),
+            skills: Arc::new(skills),
             ..Default::default()
         };
         let model = MockMessageModel::shared(vec![MockResponse::message(Message::assistant("ok"))]);
@@ -893,7 +900,10 @@ mod tests {
         let mut section = String::from("(preamble)");
         let mut text = String::new();
         for line in prompt.split_inclusive('\n') {
-            if let Some(title) = line.strip_prefix("# ") {
+            if let Some(title) = line
+                .strip_prefix("# ")
+                .or(line.strip_prefix("## Skills").map(|_| "Skills"))
+            {
                 parts.push((section, text.len()));
                 section = title.trim().to_owned();
                 text.clear();
@@ -914,9 +924,12 @@ mod tests {
     /// `STRANDS_SWARM_DUMP_PREFIX=<file>` also writes the prompt and tool specs out.
     #[tokio::test]
     async fn the_fixed_prefix_stays_within_its_budget() {
-        // About 4.6k tokens by Bedrock's count for Claude, down from 6.6k.
-        const BUDGET_BYTES: usize = 15_000;
+        // About 5.0k tokens by Bedrock's count for Claude with these 20 skills (each skill line
+        // ~25 tokens; a real run's 58 skills ~1.5k tokens).
+        const BUDGET_BYTES: usize = 17_000;
         const TOOL_BUDGET_BYTES: usize = 1_100;
+        // 20 skill lines of at most ~110 bytes plus the heading.
+        const SKILLS_BUDGET_BYTES: usize = 2_500;
         let parts = fixed_prefix().await;
         let total: usize = parts.iter().map(|(_, bytes)| bytes).sum();
         for (part, bytes) in &parts {
@@ -926,6 +939,11 @@ mod tests {
         assert!(
             total <= BUDGET_BYTES,
             "the fixed prefix grew to {total} bytes: {parts:#?}"
+        );
+        let skills = parts.iter().find(|(part, _)| part == "Skills").unwrap().1;
+        assert!(
+            skills <= SKILLS_BUDGET_BYTES,
+            "the skills list grew to {skills} bytes"
         );
         let big: Vec<_> = parts
             .iter()

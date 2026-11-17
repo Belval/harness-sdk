@@ -17,14 +17,14 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `context` | The agent's context dashboard: size against the compaction point, the biggest items, the stash; offload results or summarize now. |
 | `land` | With `--allow-land`: rebase a branch onto the root's branch, run the checks, fast-forward. |
 | `find_tools` | With MCP servers: search the shared MCP tools and enable some for the calling agent. |
-| `skills` | With skills: load a skill's `SKILL.md`, its location and bundled files. |
+| `skills` | With skills: load a skill's `SKILL.md` (and its full description), its location and bundled files. |
 | `remember` / `forget` | With memory: add a dated entry to the user's memory file, or drop matching lines. |
 
 Agents also get the harness's `shell`, `read`, `write`, `edit`, `web_fetch`, `todo_write` and
 `retrieve_context`, but not the SDK's background tasks (`_background_execution` on every tool):
 `run_background` covers slow commands. Tool specs and the swarm's prompt sections are sent on every
-model call, so a test (`the_fixed_prefix_stays_within_its_budget`) pins their size at 15 kB (about
-4.6k tokens).
+model call, so a test (`the_fixed_prefix_stays_within_its_budget`) pins their size: 17 kB (about
+5k tokens) with 20 skills, the skills list at 2.5 kB of it.
 
 ## Run
 
@@ -335,8 +335,9 @@ Typing text without a command messages the selected agent.
 - **Skills.**
   - Skills are `<name>/SKILL.md` files with `name` and `description` frontmatter, as in Claude Code
     and Codex. They are discovered at startup.
-  - The system prompt lists each as `name: description`, cut to 200 characters but keeping a later
-    "Use when…" sentence. The `skills` tool returns the rest.
+  - The system prompt lists each as `name: summary`: the description's leading whole sentences
+    that fit in 100 characters, or its first sentence cut there (about 25 tokens a skill). The
+    `skills` tool returns the full description with the instructions.
   - On a name clash the first source wins, in this order: `--skills-dir`; the project's
     `.claude/skills`, `.agents/skills`, `.agent/skills`; `~/.claude/skills`; enabled Claude Code
     plugins; `~/.codex/skills`; `~/.agents/skills`.

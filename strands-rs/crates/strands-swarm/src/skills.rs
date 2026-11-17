@@ -16,7 +16,7 @@ use strands_agents::{Error, Result};
 pub const SKILLS_TOOL_NAME: &str = "skills";
 
 /// Longest description line in the system prompt; the full skill loads on demand.
-const SUMMARY_CHARS: usize = 200;
+const SUMMARY_CHARS: usize = 100;
 
 /// Most bundled files listed when a skill loads.
 const MAX_LISTED_FILES: usize = 30;
@@ -106,7 +106,13 @@ fn load_skill(skills: &[Skill], name: &str) -> String {
         let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
         return format!("No skill named '{name}'. Available: {}", names.join(", "));
     };
-    let mut out = vec![skill.instructions.clone()];
+    let mut out = Vec::new();
+    // The system prompt lists only a summary; the rest (often the "Use when …") is here.
+    let description = skill.description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if summary(&description) != description {
+        out.push(format!("Description: {description}\n"));
+    }
+    out.push(skill.instructions.clone());
     if let Some(dir) = &skill.path {
         out.push(format!(
             "\n---\nLocation: {}/SKILL.md (relative paths in this skill are relative to {})",
@@ -305,34 +311,23 @@ pub fn load_skills(dirs: &[SkillDir]) -> Skills {
     out
 }
 
-/// The description on one line, at most [`SUMMARY_CHARS`]. When it is longer and a later
-/// "Use when/for …" sentence (the trigger for picking the skill) would be cut off, the summary
-/// is the first sentence plus that sentence instead, each shortened to fit.
+/// The description on one line: its leading whole sentences that fit in [`SUMMARY_CHARS`], or
+/// the first sentence shortened to it. The `skills` tool returns the rest.
 fn summary(description: &str) -> String {
     let text = description.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.chars().count() <= SUMMARY_CHARS {
-        return text;
+    let mut sentences = sentences(&text).into_iter();
+    let first = sentences.next().unwrap_or_default();
+    if first.chars().count() > SUMMARY_CHARS {
+        return shorten(&first, SUMMARY_CHARS);
     }
-    let sentences = sentences(&text);
-    let trigger = sentences.iter().skip(1).find(|sentence| {
-        let lower = sentence.to_lowercase();
-        lower.starts_with("use when") || lower.starts_with("use for")
-    });
-    let Some(trigger) = trigger else {
-        return shorten(&text, SUMMARY_CHARS);
-    };
-    let prefix = shorten(&text, SUMMARY_CHARS);
-    if prefix.contains(trigger.as_str()) {
-        return prefix;
+    let mut out = first;
+    for sentence in sentences {
+        if out.chars().count() + 1 + sentence.chars().count() > SUMMARY_CHARS {
+            break;
+        }
+        out = format!("{out} {sentence}");
     }
-    // Give the trigger what the first sentence leaves, but the first sentence at least half.
-    let trigger_len = trigger.chars().count();
-    let first_budget = SUMMARY_CHARS
-        .saturating_sub(trigger_len + 1)
-        .max(SUMMARY_CHARS / 2);
-    let first = shorten(&sentences[0], first_budget);
-    let rest = SUMMARY_CHARS.saturating_sub(first.chars().count() + 1);
-    format!("{first} {}", shorten(trigger, rest))
+    out
 }
 
 /// Sentences of `text`. A period ends one only before a space and after a word without another
@@ -511,34 +506,36 @@ mod tests {
     }
 
     #[test]
-    fn summaries_keep_the_description_and_its_use_when_trigger_within_the_limit() {
+    fn summaries_keep_the_leading_sentences_that_fit() {
         assert_eq!(
             summary("Review a CR. Use for reviews."),
             "Review a CR. Use for reviews."
         );
         assert_eq!(summary("First line\n  second line"), "First line second line");
         let filler = "padding ".repeat(30);
-        let long = summary(&format!(
-            "Review a CR, e.g. a PR. {filler}. Use when asked to review."
-        ));
-        assert_eq!(long, "Review a CR, e.g. a PR. Use when asked to review.");
-        let huge_first = summary(&format!("Review {filler}. Use when asked to review."));
-        assert!(
-            huge_first.ends_with("… Use when asked to review."),
-            "{huge_first}"
+        // A later sentence that does not fit is left out whole, not cut.
+        assert_eq!(
+            summary(&format!("Review a CR, e.g. a PR. Use when asked. {filler}.")),
+            "Review a CR, e.g. a PR. Use when asked."
         );
-        assert!(huge_first.chars().count() <= SUMMARY_CHARS, "{huge_first}");
-        let plain = summary(&"word ".repeat(100));
+        let long = summary(&format!("Review {filler}. Use when asked to review."));
         assert!(
-            plain.ends_with("word…") && plain.chars().count() <= SUMMARY_CHARS,
-            "{plain}"
+            long.starts_with("Review padding") && long.ends_with("padding…"),
+            "{long}"
         );
-        // A trigger that fits in the plain cut is kept in place.
-        let early = summary(&format!("Review. Use when asked. {filler}"));
-        assert!(
-            early.starts_with("Review. Use when asked. padding") && early.ends_with('…'),
-            "{early}"
-        );
+        assert!(long.chars().count() <= SUMMARY_CHARS, "{long}");
+    }
+
+    #[test]
+    fn a_cut_description_comes_back_in_full_with_the_skill() {
+        let tail = "Use when asked to review a change, a branch or a diff for defects.";
+        let long = format!("Review a CR, a PR or a branch for correctness and complexity. {tail}");
+        let short = Skill::new("short", "Review a CR.", "Steps.");
+        let skills = [Skill::new("review", &long, "Steps."), short];
+        assert_eq!(load_skill(&skills, "short"), "Steps.");
+        let loaded = load_skill(&skills, "review");
+        assert_eq!(loaded, format!("Description: {long}\n\nSteps."));
+        assert!(!skills_prompt(&skills).contains(tail));
     }
 
     #[test]
