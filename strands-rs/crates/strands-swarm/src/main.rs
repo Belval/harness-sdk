@@ -81,7 +81,7 @@ struct Cli {
     land: Option<PathBuf>,
     /// Swarm-wide token budget (input + output, e.g. `5M`); once spent, model calls stop until it
     /// is raised (TUI `/budget N`). A resumed run keeps its last budget unless given a different
-    /// `--budget-tokens` than it was last started with.
+    /// `--budget-tokens` than the last one given.
     #[arg(long, value_parser = strands_swarm::text::parse_tokens)]
     budget_tokens: Option<u64>,
     /// Tell the root agents (and the TUI) once free space on the run's, the worktrees' or the

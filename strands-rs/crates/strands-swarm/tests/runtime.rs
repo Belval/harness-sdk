@@ -5212,8 +5212,9 @@ async fn a_turn_posts_its_reply_or_error_before_its_agent_stops_running() {
 }
 
 /// A resume keeps the saved budget, which `/budget` may have changed, when `--budget-tokens` is
-/// absent or the same as the run was last started with (a supervisor replays its arguments); a
-/// different flag overrides it. Either way the budget is announced once, with the value in force.
+/// absent or the same as the last one given (a supervisor replays its arguments); a different flag
+/// overrides it. Either way the budget is announced once, with the value in force. A start without
+/// the flag keeps the last one as the reference, so replaying it later keeps the budget too.
 #[tokio::test]
 async fn a_resume_keeps_the_saved_budget_unless_given_a_new_budget_flag() {
     let dir = tempfile::tempdir().unwrap();
@@ -5233,6 +5234,7 @@ async fn a_resume_keeps_the_saved_budget_unless_given_a_new_budget_flag() {
         (Some(6_000_000), Some(6_000_000), Some(10_000_000)),
         (Some(6_000_000), Some(8_000_000), Some(8_000_000)),
         (None, Some(8_000_000), Some(8_000_000)),
+        (Some(6_000_000), None, Some(10_000_000)),
     ];
     for (last, flag, expected) in cases {
         let mut config = SwarmConfig::new(mock_factory(&scripts_of(vec![])), dir.path());
@@ -5246,8 +5248,21 @@ async fn a_resume_keeps_the_saved_budget_unless_given_a_new_budget_flag() {
             }
         }
         assert_eq!(announced, vec![expected], "last {last:?}, flag {flag:?}");
-        assert_eq!(swarm.snapshot().budget_flag, flag);
+        let snapshot = swarm.snapshot();
+        assert_eq!(
+            snapshot.budget_flag,
+            flag.or(last),
+            "last {last:?}, flag {flag:?}"
+        );
         swarm.shutdown().await;
+        if flag.is_none() {
+            // The supervisor replays the last flag given.
+            let mut config = SwarmConfig::new(mock_factory(&scripts_of(vec![])), dir.path());
+            config.budget_tokens = last;
+            let (swarm, _events) = Swarm::resume(config, snapshot).await.unwrap();
+            assert_eq!(swarm.budget(), expected, "replayed {last:?}");
+            swarm.shutdown().await;
+        }
     }
 }
 

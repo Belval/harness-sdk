@@ -178,9 +178,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     another error until the budget is raised.
   - `/budget N` raises it and tells every stopped agent to continue. `/budget off` lifts it and
     `/budget` shows usage.
-  - The budget is saved with the run. A resume keeps it unless given a `--budget-tokens` other
-    than the one the run was last started with (a supervisor that replays its arguments leaves
-    a `/budget` change in place).
+  - The budget is saved with the run. On a resume an explicit new flag wins; otherwise the
+    budget in force (a `/budget` change included) stays. A flag is new when it differs from the
+    last `--budget-tokens` given, which a start without the flag does not forget, so a supervisor
+    replaying its arguments leaves a `/budget` change in place. To reset it to the flag's value
+    again, use `/budget N`.
 
 ## Cost
 

@@ -30,9 +30,9 @@ pub struct SwarmState {
     /// Swarm-wide token budget (input + output), as last set; `None` for no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u64>,
-    /// The `--budget-tokens` the run was last started with. A resume given the same flag again
-    /// (a supervisor replays its arguments) keeps `budget_tokens`, which `/budget` may have
-    /// changed since; a different one overrides it.
+    /// The last `--budget-tokens` given (a start without it keeps the previous one). A resume
+    /// given the same flag again (a supervisor replays its arguments) keeps `budget_tokens`, which
+    /// `/budget` may have changed since; a different one overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_flag: Option<u64>,
     /// The TASK the run was last started with. A resume given the same one again (a supervisor

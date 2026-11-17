@@ -6,9 +6,12 @@ impl Swarm {
     /// Reopen a saved run: restore every agent with its conversation and unread mail, wake those
     /// that were mid-turn, and keep cancelled ones visible but inert.
     pub async fn resume(
-        config: SwarmConfig,
+        mut config: SwarmConfig,
         state: SwarmState,
     ) -> Result<(Self, mpsc::UnboundedReceiver<SwarmEvent>)> {
+        // Without `--budget-tokens` the last one given stays the reference, so a later start that
+        // replays it (a supervisor's saved arguments) does not undo a `/budget` change either.
+        config.budget_tokens = config.budget_tokens.or(state.budget_flag);
         let (swarm, events) = Self::build(config);
         swarm.inner.next_id.store(state.next_id, Ordering::SeqCst);
         *swarm.inner.max_agents.lock() = state.max_agents;
@@ -376,7 +379,7 @@ pub(super) fn status_name(status: &AgentStatus) -> &'static str {
 }
 
 /// The budget a resumed run starts with: the saved one, unless `--budget-tokens` was given with a
-/// value other than the run was last started with ([`SwarmState::budget_flag`]).
+/// value other than the last one given ([`SwarmState::budget_flag`]).
 fn resumed_budget(flag: Option<u64>, state: &SwarmState) -> Option<u64> {
     match flag {
         Some(tokens) if state.budget_flag != Some(tokens) => Some(tokens),
