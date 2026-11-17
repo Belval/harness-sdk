@@ -6,7 +6,7 @@
 # when a new one fails within its trial (the first 10 minutes after it is installed or reloaded
 # into). Repeated quick failures back off up to 5 minutes. Each rollback and crash loop is left in
 # <run>/supervisor.notice, which the swarm mails to its root agent when it next starts. Only
-# `swarmctl stop` ends it.
+# `swarmctl stop` ends it; `swarmctl restart` replaces it in place.
 set -euo pipefail
 
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
@@ -28,7 +28,12 @@ usage() {
 usage:
   swarmctl start <run> <binary> [strands-swarm args...]  start or resume <run> in tmux session swarm-<run>
   swarmctl resume <run>                                  start again with the saved binary and args
-  swarmctl stop <run>                                    stop gracefully (state is kept)
+  swarmctl stop <run>                                    stop gracefully (state is kept); the tmux session
+                                                         ends, so attached clients are detached
+  swarmctl restart <run>                                 stop gracefully, then start the supervisor again in
+                                                         the same tmux session and pane (re-reads args, env and
+                                                         this script); attached clients stay attached; safe to
+                                                         run from inside the swarm; resumes a stopped run
   swarmctl attach <run>                                  open the TUI (detach with C-b d)
   swarmctl status                                        list runs
   swarmctl boot <run> | unboot <run>                     resume <run> after every reboot (crontab @reboot)
@@ -202,11 +207,57 @@ stop() {
   local run="$1" dir; dir="$(run_dir "$run")"
   touch "$dir/stop"
   running "$run" || { echo "run $run is not running"; return; }
+  local n; n=$(clients "$run")
+  (( n == 0 )) || echo "$n client(s) attached to $(session "$run") will be detached"
   # Ctrl-C quits the TUI (and headless mode) cleanly: state is saved and agents stop.
   tmux send-keys -t "$(session "$run")" C-c
   for _ in $(seq 30); do running "$run" || { echo "run $run stopped"; return; }; sleep 1; done
   tmux kill-session -t "$(session "$run")"
   echo "run $run killed after 30s (state is saved continuously)"
+}
+
+# Attached clients of run $1's session.
+clients() { tmux list-clients -t "$(session "$1")" 2>/dev/null | wc -l; }
+
+# Restart the supervisor (and so the swarm) in the same tmux session and pane. The work is done by
+# the tmux server (`run-shell -b`), not by this process, which may be a job of the swarm that dies
+# when the swarm stops; this one only waits for the outcome.
+restart() {
+  local run="$1" dir; dir="$(run_dir "$run")"
+  if ! running "$run"; then
+    echo "run $run is not running; resuming it"
+    resume "$run"
+    return
+  fi
+  rm -f "$dir/restart.status"
+  tmux run-shell -b "XDG_STATE_HOME=$(printf %q "$STATE_HOME") $(printf %q "$SELF") do-restart $(printf %q "$run") >> $(printf %q "$dir/restart.log") 2>&1"
+  echo "restarting run $run in $(session "$run"); $(clients "$run") client(s) stay attached"
+  for _ in $(seq 400); do
+    [[ -f "$dir/restart.status" ]] && { echo "run $run restarted: $(cat "$dir/restart.status")"; return; }
+    sleep 0.2
+  done
+  echo "run $run is still restarting (see $dir/restart.log)"
+}
+
+# Runs in the tmux server (see `restart`): stop the swarm like `stop`, keep the dead pane, then
+# respawn the supervisor in it.
+do_restart() {
+  local run="$1" dir session pane; dir="$(run_dir "$run")"; session="$(session "$run")"
+  if ! running "$run"; then resume "$run" > /dev/null; echo resumed > "$dir/restart.status"; return; fi
+  pane=$(tmux display-message -p -t "$session" '#{pane_id}')
+  touch "$dir/stop"
+  tmux set-option -w -t "$pane" remain-on-exit on
+  tmux send-keys -t "$pane" C-c
+  local waited=killed
+  for _ in $(seq 150); do
+    [[ "$(tmux display-message -p -t "$pane" '#{pane_dead}')" == 1 ]] && { waited=stopped; break; }
+    sleep 0.2
+  done
+  # The stop file goes only now that the old supervisor is gone, so the new one does not see it.
+  rm -f "$dir/stop"
+  tmux respawn-pane -k -t "$pane" -e "XDG_STATE_HOME=$STATE_HOME" "$(printf %q "$SELF") supervise $(printf %q "$run")"
+  tmux set-option -w -u -t "$pane" remain-on-exit
+  echo "$(date -Is) $waited, supervisor respawned in pane $pane" | tee "$dir/restart.status"
 }
 
 status() {
@@ -247,6 +298,8 @@ case "$cmd" in
   supervise) supervise "$1" ;;
   log) capped_log "$1" ;;
   stop) stop "$1" ;;
+  restart) restart "$1" ;;
+  do-restart) do_restart "$1" ;;
   attach) tmux attach -t "$(session "$1")" ;;
   status) status ;;
   boot) boot "$1" ;;

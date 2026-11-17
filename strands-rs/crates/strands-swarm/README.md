@@ -485,6 +485,18 @@ supervisor's notes to `supervisor.log`, each rotated to `<log>.1` at 8 MB (`SWAR
 to `<run dir>/env` (mode 600), and every restart sources it. That file alone sets the AWS
 variables: those the tmux server has from the shell that started it are dropped first.
 
+**Restart.** `swarmctl restart NAME` makes the supervisor re-read `args`, `env` and the swarmctl
+script itself without losing the tmux session (`stop` then `resume` kills it, and with it the view
+of anyone attached; `stop` says when clients will be detached).
+
+- The tmux server does the work (`tmux run-shell -b`, logging to `<run dir>/restart.log`), so it
+  completes when called from inside the swarm, say a background job that dies with the swarm.
+- It sends Ctrl-C as `stop` does and waits up to 30 s for the supervisor to exit, with
+  `remain-on-exit` on so the pane stays. It removes the `stop` file, `respawn-pane -k`s the
+  supervisor in that pane and unsets `remain-on-exit`.
+- The session, the pane and attached clients stay; the clients see the new TUI. A run that is not
+  running is resumed instead.
+
 **Failures.**
 
 - A swarm that hangs exits instead, so the supervisor sees it: 70 when a deadlock is detected, 71
@@ -511,6 +523,7 @@ variables: those the tmux server has from the shell that started it are dropped 
 swarmctl start NAME ./target/release/strands-swarm --cwd REPO --goal "..."   # start or resume
 swarmctl attach NAME        # open the TUI (detach: C-b d)
 swarmctl stop NAME          # graceful stop (the session is killed after 30 s); state is kept
+swarmctl restart NAME       # stop, then start again in the same tmux session and pane
 swarmctl resume NAME        # start again with the saved binary and arguments
 swarmctl boot NAME          # resume after every reboot (crontab @reboot); unboot NAME undoes it
 swarmctl status

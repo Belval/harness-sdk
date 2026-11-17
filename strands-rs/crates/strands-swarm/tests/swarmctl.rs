@@ -429,3 +429,255 @@ fn start_in_tmux(args: &[&str], env: &[(&str, &str)]) -> Option<String> {
     assert!(started.status.success(), "{started:?}");
     Some(shown.trim().replace(&state.display().to_string(), "$STATE"))
 }
+
+/// A private tmux server for `swarmctl` with a fake swarm that records each start in `starts`
+/// (`pid args`), stays up until Ctrl-C and, on its first start, runs `first_start_extra`.
+struct Tmux {
+    tmp: tempfile::TempDir,
+}
+
+impl Tmux {
+    fn new() -> Option<Self> {
+        let works = std::process::Command::new("tmux").arg("-V").output();
+        if !works.is_ok_and(|output| output.status.success()) {
+            eprintln!("skipped: no tmux");
+            return None;
+        }
+        let tmux = Self {
+            tmp: tempfile::tempdir().unwrap(),
+        };
+        std::fs::create_dir_all(tmux.tmp.path().join("tmux")).unwrap();
+        Some(tmux)
+    }
+
+    fn state(&self) -> PathBuf {
+        self.tmp.path().join("state")
+    }
+
+    fn run_dir(&self) -> PathBuf {
+        self.state().join("strands-swarm/r")
+    }
+
+    fn command(&self, program: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(program);
+        command
+            .env("XDG_STATE_HOME", self.state())
+            .env("TMUX_TMPDIR", self.tmp.path().join("tmux"))
+            .env("HOME", self.tmp.path())
+            .env_remove("TMUX");
+        command
+    }
+
+    fn tmux(&self, args: &[&str]) -> String {
+        let output = self.command("tmux").args(args).output().unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn swarmctl(&self, args: &[&str]) -> std::process::Output {
+        self.command("bash")
+            .arg(SCRIPT)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    /// The fake swarm: appends `pid args` to `starts`, ignores everything but Ctrl-C, and on its
+    /// first start launches `first_start_extra` as a job that is killed with the swarm.
+    fn fake_swarm(&self, first_start_extra: &str) -> PathBuf {
+        let binary = self.tmp.path().join("fake-swarm");
+        let body = format!(
+            r#"#!/bin/sh
+RUN='{run}'
+echo "$$ $*" >> "$RUN/starts"
+trap 'kill $job 2>/dev/null; exit 0' INT TERM
+if [ ! -f "$RUN/first" ]; then
+  touch "$RUN/first"
+  {extra}
+fi
+while :; do sleep 0.1; done
+"#,
+            run = self.run_dir().display(),
+            extra = first_start_extra,
+        );
+        std::fs::write(&binary, body).unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&binary)
+            .status()
+            .unwrap();
+        binary
+    }
+
+    fn starts(&self) -> Vec<String> {
+        std::fs::read_to_string(self.run_dir().join("starts"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn wait_for<T>(&self, what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(found) = check() {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_for_starts(&self, count: usize) {
+        self.wait_for("the swarm to start", || {
+            (self.starts().len() >= count).then_some(())
+        });
+    }
+
+    /// `session_id pane_id pane_pid` of the run's session.
+    fn pane(&self) -> String {
+        self.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            "swarm-r",
+            "#{session_id} #{pane_id} #{pane_pid}",
+        ])
+    }
+}
+
+impl Drop for Tmux {
+    fn drop(&mut self) {
+        self.tmux(&["kill-server"]);
+    }
+}
+
+/// An attached client of the session (a control-mode client needs no terminal).
+fn attach(tmux: &Tmux) -> std::process::Child {
+    let client = tmux
+        .command("tmux")
+        .args(["-C", "attach", "-t", "swarm-r"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    tmux.wait_for("the client to attach", || {
+        (!tmux.tmux(&["list-clients", "-t", "swarm-r"]).is_empty()).then_some(())
+    });
+    client
+}
+
+/// `restart` stops the swarm and starts the supervisor again in the same session and pane: an
+/// attached client stays attached, the new supervisor and swarm are new processes, and they
+/// re-read the arguments.
+#[test]
+fn restart_keeps_the_session_and_its_clients_and_rereads_the_arguments() {
+    let Some(tmux) = Tmux::new() else { return };
+    let binary = tmux.fake_swarm("");
+    let started = tmux.swarmctl(&["start", "r", binary.to_str().unwrap(), "--one"]);
+    assert!(started.status.success(), "{started:?}");
+    tmux.wait_for_starts(1);
+    let mut client = attach(&tmux);
+    let before = tmux.pane();
+    std::fs::write(tmux.run_dir().join("args"), "--two\0").unwrap();
+
+    let restarted = tmux.swarmctl(&["restart", "r"]);
+
+    let shown = String::from_utf8_lossy(&restarted.stdout);
+    assert!(restarted.status.success(), "{restarted:?}");
+    assert!(
+        shown.contains("1 client(s) stay attached") && shown.contains("restarted"),
+        "{shown}"
+    );
+    tmux.wait_for_starts(2);
+    let starts = tmux.starts();
+    assert!(starts[0].ends_with("--run r --one"), "{starts:?}");
+    assert!(starts[1].ends_with("--run r --two"), "{starts:?}");
+    assert_ne!(starts[0].split(' ').next(), starts[1].split(' ').next());
+    let after = tmux.pane();
+    let (b, a): (Vec<_>, Vec<_>) = (before.split(' ').collect(), after.split(' ').collect());
+    assert_eq!((a[0], a[1]), (b[0], b[1]), "session and pane are kept");
+    assert_ne!(a[2], b[2], "a new supervisor process: {before} / {after}");
+    assert!(client.try_wait().unwrap().is_none(), "the client was detached");
+    assert!(!tmux.tmux(&["list-clients", "-t", "swarm-r"]).is_empty());
+    assert!(!tmux.run_dir().join("stop").exists());
+    // The remain-on-exit used for the restart is not left on.
+    assert_eq!(
+        tmux.tmux(&["show-options", "-wv", "-t", "swarm-r", "remain-on-exit"]),
+        ""
+    );
+    // The new supervisor keeps supervising: it is a live pane, not a dead one.
+    assert_eq!(
+        tmux.tmux(&["display-message", "-p", "-t", "swarm-r", "#{pane_dead}"]),
+        "0"
+    );
+    client.kill().unwrap();
+    client.wait().unwrap();
+}
+
+/// A restart started by a job of the swarm completes although the job dies with the swarm.
+#[test]
+fn restart_from_a_job_of_the_swarm_survives_the_job() {
+    let Some(tmux) = Tmux::new() else { return };
+    let script = format!(
+        r#"( sleep 1; bash '{SCRIPT}' restart r > "$RUN/job.out" 2>&1; touch "$RUN/job.survived" ) &
+  job=$!"#
+    );
+    let binary = tmux.fake_swarm(&script);
+    let started = tmux.swarmctl(&["start", "r", binary.to_str().unwrap()]);
+    assert!(started.status.success(), "{started:?}");
+    tmux.wait_for_starts(1);
+    let before = tmux.pane();
+
+    tmux.wait_for_starts(2);
+
+    let after = tmux.pane();
+    assert_eq!(
+        before.split(' ').take(2).collect::<Vec<_>>(),
+        after.split(' ').take(2).collect::<Vec<_>>()
+    );
+    assert_ne!(before, after);
+    assert!(!tmux.run_dir().join("stop").exists());
+    assert!(
+        !tmux.run_dir().join("job.survived").exists(),
+        "the job was meant to die with the swarm"
+    );
+    assert_eq!(
+        tmux.tmux(&["display-message", "-p", "-t", "swarm-r", "#{pane_dead}"]),
+        "0"
+    );
+}
+
+/// A run that is not running is resumed by `restart`; `stop` says who it detaches.
+#[test]
+fn restart_resumes_a_stopped_run_and_stop_tells_clients_they_are_detached() {
+    let Some(tmux) = Tmux::new() else { return };
+    let binary = tmux.fake_swarm("");
+    let started = tmux.swarmctl(&["start", "r", binary.to_str().unwrap()]);
+    assert!(started.status.success(), "{started:?}");
+    tmux.wait_for_starts(1);
+    let mut client = attach(&tmux);
+
+    let stopped = tmux.swarmctl(&["stop", "r"]);
+
+    let shown = String::from_utf8_lossy(&stopped.stdout);
+    assert!(
+        shown.contains("1 client(s) attached to swarm-r will be detached"),
+        "{shown}"
+    );
+    assert!(shown.contains("stopped"), "{shown}");
+    client.wait().unwrap();
+
+    let restarted = tmux.swarmctl(&["restart", "r"]);
+
+    let shown = String::from_utf8_lossy(&restarted.stdout);
+    assert!(
+        restarted.status.success() && shown.contains("not running; resuming"),
+        "{restarted:?}"
+    );
+    tmux.wait_for_starts(2);
+    assert_eq!(
+        tmux.tmux(&["display-message", "-p", "-t", "swarm-r", "#{pane_dead}"]),
+        "0"
+    );
+}
