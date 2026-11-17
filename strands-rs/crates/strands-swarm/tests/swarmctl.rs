@@ -89,6 +89,7 @@ impl Run {
             .env("XDG_STATE_HOME", self.home.path())
             .env("HOME", self.home.path())
             .env("SWARMCTL_RESTART_DELAY", "0")
+            .env("SWARMCTL_MEMORY_EVENTS", self.home.path().join("memory.events"))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -156,6 +157,76 @@ exit 1"#;
     assert!(notice.contains("The swarm failed 3 times in a row"), "{notice}");
     assert_eq!(notice.matches("in a row").count(), 1, "{notice}");
     assert!(shown.contains("restarting in"), "{shown}");
+}
+
+#[test]
+fn a_new_binary_killed_from_outside_is_restarted_on_trial_not_rolled_back() {
+    let run = Run::new();
+    std::fs::write(run.home.path().join("memory.events"), "oom 0\noom_kill 3\n").unwrap();
+    // SIGKILL, then SIGTERM, then a crash: still on trial, so that one is rolled back.
+    let killed = r#"echo new >> "$RUN/calls"
+case "$(wc -l < "$RUN/calls")" in 1) kill -9 $$ ;; 2) kill -15 $$ ;; esac
+exit 1"#;
+    run.binary(&run.bin("current"), killed, "now");
+    run.binary(
+        &run.bin("previous"),
+        r#"echo old >> "$RUN/calls"; touch "$RUN/stop""#,
+        "2 days ago",
+    );
+
+    let shown = run.supervise();
+
+    assert_eq!(run.read("calls"), "new\nnew\nnew\nold\n");
+    assert!(shown.contains("killed from outside (signal 9)"), "{shown}");
+    let notice = run.read("supervisor.notice");
+    assert!(notice.contains("The new binary exited with code 1"), "{notice}");
+    assert_eq!(notice.matches("rolled back").count(), 1, "{notice}");
+}
+
+#[test]
+fn a_new_binary_killed_by_the_oom_killer_is_rolled_back() {
+    let run = Run::new();
+    let events = run.home.path().join("memory.events");
+    std::fs::write(&events, "oom 0\noom_kill 3\n").unwrap();
+    let oom = format!(
+        r#"echo new >> "$RUN/calls"; echo 'oom_kill 4' > '{}'; kill -9 $$"#,
+        events.display()
+    );
+    run.binary(&run.bin("current"), &oom, "now");
+    run.binary(
+        &run.bin("previous"),
+        r#"echo old >> "$RUN/calls"; touch "$RUN/stop""#,
+        "2 days ago",
+    );
+
+    run.supervise();
+
+    assert_eq!(run.read("calls"), "new\nold\n");
+    let notice = run.read("supervisor.notice");
+    assert!(
+        notice.contains("The new binary was killed by the OOM killer"),
+        "{notice}"
+    );
+}
+
+#[test]
+fn a_new_binary_killed_when_oom_kills_cannot_be_counted_is_rolled_back() {
+    let run = Run::new();
+    run.binary(
+        &run.bin("current"),
+        r#"echo new >> "$RUN/calls"; kill -9 $$"#,
+        "now",
+    );
+    run.binary(
+        &run.bin("previous"),
+        r#"echo old >> "$RUN/calls"; touch "$RUN/stop""#,
+        "2 days ago",
+    );
+
+    run.supervise();
+
+    assert_eq!(run.read("calls"), "new\nold\n");
+    assert!(run.read("supervisor.notice").contains("killed by signal 9"));
 }
 
 #[test]

@@ -92,6 +92,14 @@ describe() {
   esac
 }
 
+# OOM kills so far in this process's cgroup (cgroup v2 memory.events, which the swarm shares);
+# empty when they cannot be counted.
+oom_kills() {
+  local events="${SWARMCTL_MEMORY_EVENTS:-}"
+  [[ -n "$events" ]] || events="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)/memory.events"
+  awk '$1 == "oom_kill" { print $2 }' "$events" 2>/dev/null || true
+}
+
 supervise() {
   local run="$1" dir; dir="$(run_dir "$run")"
   local args=() failures=0 i
@@ -103,9 +111,10 @@ supervise() {
   # Appended to supervisor.notice, for the swarm to mail its root agent when it next starts.
   notice() { { echo "$(date -Is) $*"; echo "Last lines of $dir/stderr.log:"; tail -n 8 "$dir/stderr.log" 2>/dev/null || true; echo; } >> "$dir/supervisor.notice"; }
   while [[ ! -f "$dir/stop" ]]; do
-    local started installed code
+    local started installed code ooms
     started=$(date +%s)
     installed=$(stat -c %Y "$dir/bin/current" 2>/dev/null || echo 0)
+    ooms=$(oom_kills)
     # stderr goes through capped_log (fd 3 keeps stdout on the terminal); the pipeline returns
     # only once the log has every line, so the tail below is complete.
     set +e
@@ -128,7 +137,17 @@ supervise() {
       sleep "$RESTART_DELAY"
       continue
     fi
+    # The swarm never sends itself SIGKILL or SIGTERM, so one is somebody else's doing and no
+    # verdict on the binary: it is restarted, its trial (if any) running on. SIGKILL from the
+    # OOM killer, or when OOM kills cannot be counted, still fails the binary.
+    if (( code == 128 + 15 )) || { (( code == 128 + 9 )) && [[ -n "$ooms" && "$(oom_kills)" == "$ooms" ]]; }; then
+      note "killed from outside (signal $((code - 128))); restarting"
+      echo "$(date -Is) strands-swarm was killed from outside (signal $((code - 128))) after ${elapsed}s; restarting"
+      sleep "$RESTART_DELAY"
+      continue
+    fi
     why=$(describe "$code")
+    (( code == 128 + 9 )) && [[ -n "$ooms" ]] && why="was killed by the OOM killer"
     if (( elapsed < QUICK_FAILURE )); then failures=$((failures + 1)); else failures=1; fi
     # Shown in the tmux pane, which is what `swarmctl attach` shows while the swarm is down.
     echo "$(date -Is) strands-swarm $why after ${elapsed}s; last lines of $dir/stderr.log:"

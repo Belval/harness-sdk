@@ -453,6 +453,10 @@ supervisor's notes to `supervisor.log`, each rotated to `<log>.1` at 8 MB (`SWAR
   the previous binary back and keeps the failed one as `bin/failed`. The previous binary is the
   one that ran: a reload that supersedes a pending one replaces only `bin/current`. A binary that
   ran longer is restarted, never rolled back, and a rolled-back one is not rolled back again.
+- SIGKILL and SIGTERM come from outside (the swarm never sends them itself), so they are no
+  verdict on a binary: it is restarted and stays on trial. SIGKILL by the OOM killer (the
+  `oom_kill` count in the cgroup's `memory.events` grew during the run), or when that count
+  cannot be read, is a failure like any other.
 - Quick failures in a row (each within 60 s of starting) back off from 5 s, doubling up to 5
   minutes. The tmux pane shows each failure with the tail of `stderr.log`, and `swarmctl status`
   the supervisor's last note.
