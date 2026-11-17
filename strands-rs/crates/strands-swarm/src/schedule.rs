@@ -77,18 +77,10 @@ impl Schedule {
             (Some(now), Some(last)) => {
                 let usd = (now - last).max(0.0);
                 let rate = usd * 3600.0 / every.max(1) as f64;
-                let render = |usd| {
-                    crate::cost::Estimate {
-                        usd,
-                        unknown: false,
-                        any: true,
-                    }
-                    .render()
-                };
                 format!(
                     "{tokens} tokens, est. {}, since this schedule last fired {ago} ago: about {}/h at this interval",
-                    render(usd),
-                    render(rate)
+                    crate::cost::dollars(usd),
+                    crate::cost::dollars(rate)
                 )
             }
             _ => format!("{tokens} tokens since this schedule last fired {ago} ago"),

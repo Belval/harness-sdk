@@ -339,7 +339,8 @@ impl Estimate {
     }
 }
 
-fn dollars(usd: f64) -> String {
+/// `$12.30`, `$123`, `$0.0012`.
+pub(crate) fn dollars(usd: f64) -> String {
     match usd {
         usd if usd >= 100.0 => format!("${usd:.0}"),
         usd if usd >= 0.01 || usd == 0.0 => format!("${usd:.2}"),
