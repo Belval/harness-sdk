@@ -389,7 +389,8 @@ messages you.
   - Every minute the swarm checks free space on the filesystems of the run dir, the agents'
     directories and the cargo target dirs. Below `--min-free-disk` (default `20G`, `0` turns it
     off) it mails the live root agents (or, with none, you) once, from `disk`, with the free space
-    and the biggest per-agent target dirs; the TUI shows the first line in its footer. It warns
+    and the biggest per-agent target dirs (and the land checks' shared `$CARGO_TARGET_DIR-land/<run>`,
+    which nothing reclaims); the TUI shows the first line in its footer. It warns
     again only after the space has recovered to 10% above the threshold, restarts included (a
     persistent run notes the warning in `<run dir>/disk-warned`).
 - **Memory.**

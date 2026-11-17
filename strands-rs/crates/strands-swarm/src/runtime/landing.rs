@@ -80,14 +80,7 @@ impl Swarm {
         let dir = jobs_dir(&self.inner.config).join("land");
         let stamp = Utc::now().format("%Y%m%d-%H%M%S%3f");
         let scratch = dir.join(format!("{owner}-{stamp}"));
-        let target_dir = match &self.inner.config.cargo_target_dir {
-            Some(shared) => {
-                let mut name = shared.as_os_str().to_owned();
-                name.push("-land");
-                PathBuf::from(name).join(&self.inner.config.run_id)
-            }
-            None => dir.join("target"),
-        };
+        let target_dir = land_target_dir(&self.inner.config);
         let plan = crate::land::LandPlan {
             repo: node.cwd.clone(),
             source,
@@ -139,6 +132,19 @@ impl Swarm {
             current = parent;
         }
         current
+    }
+}
+
+/// The `CARGO_TARGET_DIR` every land job's checks share (it stays, so the next landing builds
+/// incrementally): `$CARGO_TARGET_DIR-land/<run>`, or under the jobs dir without a shared one.
+pub(super) fn land_target_dir(config: &SwarmConfig) -> PathBuf {
+    match &config.cargo_target_dir {
+        Some(shared) => {
+            let mut name = shared.as_os_str().to_owned();
+            name.push("-land");
+            PathBuf::from(name).join(&config.run_id)
+        }
+        None => jobs_dir(config).join("land").join("target"),
     }
 }
 

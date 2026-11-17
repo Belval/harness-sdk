@@ -16,6 +16,9 @@ pub const DISK_CHECK_EVERY: Duration = Duration::from_secs(60);
 /// Free bytes on the filesystem holding a path; `None` when unknown.
 pub type FreeSpace = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 
+/// How a warning names the target dir of the land jobs' checks.
+const LAND_CHECKS: &str = "land checks (any land job's; safe to delete while none runs)";
+
 /// How many of the biggest target dirs a warning lists.
 const BIGGEST: usize = 5;
 
@@ -83,9 +86,12 @@ impl Swarm {
         paths
     }
 
-    /// Every agent's private target dir that exists, with the agent's label and state.
+    /// Every agent's private target dir that exists, with the agent's label and state, and the
+    /// land jobs' shared one.
     fn target_dirs(&self) -> Vec<(String, PathBuf)> {
         let run = &self.inner.config.run_id;
+        let land = super::landing::land_target_dir(&self.inner.config);
+        let land = land.exists().then(|| (LAND_CHECKS.to_owned(), land));
         self.nodes()
             .iter()
             .filter_map(|node| {
@@ -96,6 +102,7 @@ impl Swarm {
                 };
                 dir.exists().then(|| (format!("{}{status}", node.label()), dir))
             })
+            .chain(land)
             .collect()
     }
 

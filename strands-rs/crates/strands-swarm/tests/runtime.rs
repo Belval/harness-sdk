@@ -4462,6 +4462,38 @@ async fn low_disk_space_warns_the_root_once_per_episode() {
     swarm.shutdown().await;
 }
 
+/// The land jobs' shared target dir (`$CARGO_TARGET_DIR-land/<run>`) is swarm-owned too: a disk
+/// warning lists it with the agents' own.
+#[tokio::test]
+async fn a_disk_warning_lists_the_land_checks_target_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("noted"), say("noted")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.cargo_target_dir = Some(dir.path().join("target"));
+    config.run_id = "r1".into();
+    let land = dir.path().join("target-land/r1");
+    std::fs::create_dir_all(&land).unwrap();
+    std::fs::write(land.join("lib.rlib"), vec![0; 4096]).unwrap();
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "root").await;
+    reply_to(&mut events, USER).await;
+    let check: strands_swarm::runtime::FreeSpace = Arc::new(|_: &Path| Some(5 << 30));
+    tokio::spawn(
+        swarm
+            .clone()
+            .guard_disk(20 << 30, Duration::from_millis(10), check),
+    );
+
+    let warning = mail_to(&mut events, "a1", "disk").await;
+
+    let line = format!(
+        "  4.0 KB land checks (any land job's; safe to delete while none runs): {}",
+        land.display()
+    );
+    assert!(warning.lines().any(|l| l == line), "{warning}");
+    swarm.shutdown().await;
+}
+
 /// The guard's state outlives the process: a swarm restarted (reloaded, crashed) while space is
 /// still low does not warn its roots again, and one that finds it recovered warns anew.
 #[tokio::test]
