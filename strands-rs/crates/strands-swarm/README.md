@@ -1,250 +1,289 @@
 # strands-swarm
 
 A model-driven agent swarm on `strands-harness`. No planner, no scheduler: every agent is a harness
-agent with nine extra tools, and decides for itself whether and how to split the work.
+agent with the swarm tools below, and decides for itself whether and how to split the work.
 
 | Tool | What it does |
 | --- | --- |
 | `spawn_agent` | Start an agent on a task (optionally in its own git worktree, with a model or a goal). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents). |
-| `list_agents` | The agent tree with statuses, directories, branches, running background jobs, models and estimated spend. |
+| `list_agents` | The agent tree: status, directory, branch, running jobs, schedules, model and estimated spend. |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included. |
 | `reload_swarm` | Restart the whole swarm into a newly built binary; every agent resumes. |
-| `schedule` | Post a message to an agent's mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
-| `run_background` | Start a shell command as a background job and return its id at once; the agent gets a message with the exit code and the output's last 40 lines when it ends. |
+| `schedule` | Post a message to a mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
+| `run_background` | Run a shell command as a background job; its owner gets the exit code and last 40 output lines when it ends. |
 | `jobs` | List background jobs (status, log path), or kill one with everything it started. |
-| `context` | The agent's own context dashboard: size against the compaction point, the 10 biggest items with their age, what is stashed; offload chosen tool results to the stash or summarize older turns now. |
-| `land` | Only with `--allow-land`: rebase the caller's (or a descendant's) branch onto the root's checked-out branch, run the checks, and fast-forward it (see below). |
-| `find_tools` | Only with MCP servers: search the shared MCP tools by keyword and enable some for the calling agent. |
-| `skills` | Only with skills: load a skill's full `SKILL.md` instructions, its location and its bundled files. |
-| `remember` / `forget` | Only with memory: add a dated entry to the user's memory file, or drop the lines matching a text. |
-
-Background jobs run with `sh -c` in the agent's directory and environment (its private
-`CARGO_TARGET_DIR` included), in their own process group, so neither a reload nor a Ctrl-C stops
-them. Each one is a few files in `<run>/jobs` (a temp directory without `--run`): `<id>.json`,
-the output in `<id>.log` and, from a small `sh` wrapper, the exit code in `<id>.exit`. The swarm
-polls them and mails the owner when one ends, also for jobs started before a restart; a job
-whose process vanished without an exit code (a reboot) is reported as such. A killed job is not
-reported, and cancelling an agent kills the jobs of its whole subtree.
-
-`land` (opt-in with `--allow-land`) lets a worker merge its own work instead of handing it to an
-integrator: `{branch?, into?, check?: [commands]}` lands `branch` on `into`. `branch` defaults to
-the caller's own and may only be that or the branch of an agent below it, so nobody lands another
-agent's unfinished work. `into` defaults to the branch the caller's root agent has checked out;
-any other target must match a `--land-into GLOB` the user gave (repeatable, `*` and `?`), else it
-is refused, so `main` or someone else's branch stays out of reach. As a background job it
-creates a scratch worktree at the branch's tip, rebases it onto `into`, runs each check with `sh`
-from the same subdirectory as the caller's working directory (default checks: the `--gate CMD`
-commands, repeatable) with a private `CARGO_TARGET_DIR` (`<shared>-land/<run>`, or under the jobs
-directory), and only then fast-forwards `into`: `git merge --ff-only` in the worktree that has it
-checked out, else a compare-and-swap `update-ref`. It refuses when that worktree has uncommitted
-changes to tracked files, and gives up if `into` moved meanwhile. A conflict (with the conflicted
-files), a failing check (with its last 30 lines) or a refusal changes nothing; the scratch worktree
-is always removed, and the caller's own branch is never modified (`git rebase <into>` afterwards
-drops the landed commits from it). Programmatically: `Swarm::land`.
-
-Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else one derived
-from its task; ids and names work interchangeably. Each agent's final reply per turn goes to its parent. A `goal` (TUI `/goal`, CLI `--goal`, or on
-`spawn_agent`) puts a judge in the loop that sends the agent back to work until the goal is met.
-The judge runs after every turn the agent ends and sees the goal, the task, and the latest ~40k
-characters of the conversation. Side calls (the judge, context summarization) run on the agent's
-model or `--side-model ID`, count toward the agent's tokens and the budget, and queue under
-`--max-concurrent-calls`, like the agent's own calls.
+| `context` | The agent's context dashboard: size against the compaction point, the biggest items, the stash; offload results or summarize now. |
+| `land` | With `--allow-land`: rebase a branch onto the root's branch, run the checks, fast-forward. |
+| `find_tools` | With MCP servers: search the shared MCP tools and enable some for the calling agent. |
+| `skills` | With skills: load a skill's `SKILL.md`, its location and bundled files. |
+| `remember` / `forget` | With memory: add a dated entry to the user's memory file, or drop matching lines. |
 
 ## Run
 
 ```sh
 cargo build --release -p strands-swarm
-strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--side-model ID]
+strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model ID] [--effort E]
+              [--instructions FILE] [--memory FILE | --no-memory]
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
-              [--max-agents N] [--max-concurrent-calls N] [--compact-at TOKENS] [--memory FILE | --no-memory]
-              [--notify] [--status-base BRANCH] [--allow-land] [--land-into GLOB]... [--gate CMD]... [--headless] [--prices FILE] [--journal | --gc | --cost] [TASK]
+              [--max-agents N] [--max-concurrent-calls N] [--budget-tokens N] [--compact-at TOKENS]
+              [--allow-land] [--land-into GLOB]... [--gate CMD]...
+              [--notify] [--status-base BRANCH] [--prices FILE] [--headless]
+              [--journal | --gc | --cost] [TASK]
 ```
 
-Memory: one Markdown file shared by every agent and every run, for things you ask the swarm to
-remember (default `~/.config/strands-swarm/memory.md`, `--memory FILE` elsewhere, `--no-memory` to
-turn it off). Each entry is a dated bullet; edit the file by hand as you like. Its newest ~4k tokens
-are appended to every agent's system prompt under "# Memory (things the user asked to remember)",
-re-read from disk at the start of each turn, so a change reaches running agents on their next turn
-(not mid-turn). Agents add entries with `remember` and drop them with `forget`; you use
-`/remember <text>`, `/forget <text>` and `/remember` (where the file is). Writes are serialized
-across the swarm and replace the file atomically.
-
-`--max-agents` (16) caps live agents (spawns beyond it are `queued` and start, oldest first, as agents
-are cancelled; a queued agent can already be messaged, and cancelling it drops it); `--max-concurrent-calls` (8, `0` = unlimited) caps model calls in
-flight across the whole swarm, so a large swarm queues ("queued for a model slot…" in the log)
-instead of tripping provider throttling. `--budget-tokens N` (e.g. `5M`) caps the tokens (input +
-output) the whole swarm may use: once spent, model calls fail with a "budget exhausted" error that
-travels up to you, and `/budget N` in the TUI raises it (`/budget off` lifts it, `/budget` shows usage),
-which tells every stopped agent to continue. The budget is saved with the run.
-
-`--max-agents N` caps live agents (spawns beyond it queue). `/max-agents N` changes the cap for the
-running swarm, starts queued agents at once and is kept across restarts ahead of the flag;
-`/max-agents default` returns to the flag's value.
-
-`schedule {message, to?, every?: "30m", at?: "in 2h" | "2026-11-17T09:00Z", id?}` posts
-`[schedule sN] message` (kind `schedule`) to the receiver at the given times; `{cancel: id}` removes
-one and `{}` lists them (`list_agents` shows each agent's, the TUI `/schedules` all). Repeats are at
-least a minute apart. An agent that polls something schedules itself and ends its turn instead of
-holding a long `wait`; while it is idle with a schedule pending it does not count toward
-`--max-agents`. Schedules are saved with the run and survive reloads; a schedule whose time passed
-while the swarm was down fires once on resume, then keeps its interval. Schedules of a cancelled
-agent (as receiver or creator) are dropped.
-
-TUI: ↑/↓ select an agent, type to message it, `/to <agent> <message>` (by name or id, without selecting it), `/new <task>`, `/goal <goal>`, `/stop`, `/cancel`,
-`/gc`, `/schedules`, `/status`, `/cost`, Ctrl-C quits.
-`/status` answers "what is everyone doing?" without a model call: a popup with each live agent's
-state and current activity, its todo list, its branch's commits not yet on the base
-(`git log <base>..<branch>`; base is the branch checked out where the swarm started, or
-`--status-base BRANCH`), running background jobs and schedules. It refreshes while open (git runs in
-the background, cached for 5 s); ↑/↓ scroll, any other key closes it. Programmatically:
-`Swarm::status`. `--notify` rings the terminal bell when an agent messages you (tmux and most
-terminals turn it into a window flag or a desktop notification).
-`/stop` (or Esc twice within a second on an empty input) interrupts the selected agent's turn without
-cancelling it, like Esc in Claude Code: an open tool call is closed as cancelled, the agent goes idle
-with its conversation intact, its parent gets an `interrupted` message, its children keep running,
-and a goal agent waits for its next message instead of resuming (restarts included). The next
-message continues the same conversation. Programmatically: `Swarm::interrupt`. `/cancel` stops the
-agent and its whole subtree for good.
-Typing `/` opens a popup of the commands with one-line help, filtered as you type; ↑/↓ and
-Tab or Enter pick one; F1 lists the keys. Each agent is one line in the tree: status, name, model,
-input/output tokens and how close its last model call came to the compaction point, e.g.
-`● parser opus-5-5 1.2M/34.0k 34% a3`: at 100% its older turns are summarized before the next call
-(the log notes it at 90%). The compaction point is `--compact-at` (default `200k`) or 85% of the
-model's context window, whichever is smaller, so agents on 1M-token models do not carry ~850k
-tokens per call; it follows the window on a `/model` switch.
-Reasoning (thinking text and signatures) from turns before the current one, which models that keep
-prior thinking bill as input on every call, is dropped (the turn in progress keeps it, as Anthropic
-requires within a tool-use loop), and `shell` and `read` results over 2,000 characters are cut to
-their head and tail (~800 characters) once six newer ones exist; `retrieve_context` with the
-reference at the end returns the full output. Both edit history, and the prompt cache only matches
-an unchanged prefix, so they run together and only when the cache is lost anyway: in the pass that
-summarizes, after the context was edited (e.g. by the `context` tool), on the first call after five
-idle minutes (the cache's lifetime), on overflow, or once they would remove 15% of the history.
-Every other call re-sends history byte for byte. (Run on every turn they raised input cost per
-call by ~80%; a replay of that window with the gate saves 29%.)
-Beyond the fixed thresholds an agent manages its own context with the `context` tool: it lists
-the biggest items (tool results numbered), `offload: [n, …]` replaces those results with a
-one-line stub whose reference still reads the full output back, and `summarize: true` has the
-pipeline summarize all but the latest four messages before the next model call.
-The header totals the swarm's tokens as `in 84.8M (97% cached) · out 291k`: input counts cache reads
-and writes (the budget does too), and the share read from the prompt cache is shown beside it, as
-in each agent's log title, then the estimated cost so far, `est. $12.30`.
-`/cost` (or `strands-swarm --run NAME --cost` for a saved run) estimates spend per agent without a
-model call: input, output, cache-read and cache-write tokens, the model, an estimated `$`, and the
-median input per call and cache hit rate over its last 50 calls. Tokens are tracked per model, so
-an agent switched with `/model` is priced per model. Prices are a built-in table of Claude list
-prices per 1M tokens by tier (opus, sonnet, haiku, plus older versions), cache reads at 0.1× and
-writes at 1.25× the input price; `--prices FILE` adds or overrides entries, a JSON object keyed by
-model-id substring (`{"opus": {"input": 5, "output": 25}}`, optional `cache_read`/`cache_write`;
-these keys win over the built-in ones, the longest match within each). Models without a price
-show as `unknown` (`$3.10+?` when partly priced). These are estimates from reported usage, not a
-bill. Programmatically: `Swarm::cost`.
-Models see the same estimates: `list_agents` gives each agent's model and `est. $4.10 / 12.3M
-tokens`, plus its subtree's total when it has descendants (`with 3 descendants $9.80 / 30.1M`),
-and a swarm total, so a coordinator can spot an expensive worker and cancel it or respawn the work
-on a cheaper model; `spawn_agent`'s `model` notes the relative list prices (sonnet ≈ 0.6× opus,
-haiku ≈ 0.2×). Neither goes into the system prompt, which stays byte-stable.
-`/model <id>` switches the selected agent's model from its next model call on (`/model default`
-returns it to `--model`; `/model` alone shows the current one). The id is resolved like `--model`
-(`provider/name` or a Bedrock id, same effort), an invalid one is rejected without touching the
-agent, and the choice is saved with the run. Programmatically: `Swarm::set_model`.
-Images show inline in the log: a tool result with an image (e.g. `read` on a png) and a message
-sent with `/image <path> [text]` (the selected agent gets the image as a multimodal input; the
-mailbox and journal keep only its path) appear as an `[image: path WxH]` line with a thumbnail of
-at most 12 rows below it, drawn with kitty, iTerm2 or sixel graphics when the terminal answers the
-query, and with unicode halfblocks otherwise and always inside tmux. Only the newest 4 thumbnails
-stay decoded; older images keep just their placeholder, which is also what F2 and mouse copies
-show.
-The input box edits like a shell line: ←/→, Home/End (Ctrl-A/Ctrl-E), Ctrl-←/→ by word, Delete,
-Ctrl-W/Ctrl-U (Alt-Backspace too), Alt-Enter (or Shift-Enter where the terminal reports it) for a
-new line, and ↑/↓ through sent messages while it holds text (Ctrl-P/Ctrl-N from an empty one; on an
-empty input ↑/↓ select agents). Alt-←/→ narrows or widens the agent tree; narrow it past its
-minimum to hide it.
-Cancelled agents are hidden from the tree (the header counts them); F3 shows them.
-F2 prints the selected agent's log as plain text into the terminal's own scrollback (native
-scrolling, search and copy-paste); any key returns. A resumed run shows each agent's restored
-conversation.
-
-Mouse: drag to select text inside the log or the agent tree (the selection never crosses into the
-other pane); releasing copies it to the system clipboard with an OSC 52 escape, which works over
-ssh too. Under tmux this needs `set -g set-clipboard on`. The wheel scrolls the log, Esc clears the
-highlight. For the terminal's own selection, hold Shift while dragging (Option/Alt in iTerm2), or
-use F2.
-
 `--run NAME` makes the run persistent under `~/.local/state/strands-swarm/NAME`: the agent tree,
-unread messages and every conversation (saved after each message). Starting again with the same
-name resumes it. `--mcp-config` accepts any `mcp.json` (or `~/.claude.json`); the servers are
-shared by all agents and start lazily: with `--run`, each server's tool list (name, description,
-schema) is cached in `<run dir>/mcp-tools.json` under a hash of its config, so a start or reload with an
-unchanged config connects no server (about 6.5 s → 0.03 s for 5 servers / 274 tools). A server
-connects in the background when an agent enables one of its tools, or on the first call (60 s
-timeout), and reconnects on the next call if it died. A new or changed server is connected at
-startup to list its tools; `--mcp-eager` and `--list-tools` connect every server up front. Under the TUI each server's stderr goes to
-`<run dir>/logs/mcp-<server>.log` (a temp directory without `--run`); `--headless` keeps it on the
-terminal. Agents start without MCP tools, so their specs are not sent
-on every model call: `find_tools` (whose description lists the servers and their tool counts)
-searches the catalog and enables tools by name for the calling agent, from its next model call on.
-Enabled tools are kept in the agent's session state and come back on resume. `--mcp-eager` registers
-every MCP tool on every agent instead; `--mcp-deny` hides tools by name, and `--list-tools` prints
-what is allowed and denied.
+unread mail, schedules and every conversation (saved after each message). Starting again with the
+same name resumes it. With `--run`, `--journal`, `--gc` and `--cost` print a report on the saved run
+and exit.
 
-A persistent run also keeps an audit trail next to its state: `journal.jsonl` records every message
-to and from the user (tasks, messages, replies, errors) and `events.jsonl` compact lifecycle events
-(spawns, status changes, tool calls, model switches, resumes, reloads, shutdowns, disk reclaimed). Both are JSON
-lines with a UTC `ts`, written by a background thread and rotated to `<file>.1` at 8 MB.
-`strands-swarm --run NAME --journal` prints the journal and exits.
+## Agents
 
-A worktree agent owns its worktree at `<repo>.swarm/<run>/<agent>` and, when `CARGO_TARGET_DIR` is
-set, a private target dir at `$CARGO_TARGET_DIR-worktrees/<run>/<agent>` (several GB). Once it and
-everything it spawned have stopped after a cancel (or on resume, for agents cancelled earlier), the
-target dir is deleted and the worktree removed with `git worktree remove` if it has no uncommitted
-changes; its branch is never deleted. Nothing outside those two exact paths is touched, and each
-removal or kept directory is logged as a `gc` event. `/gc` in the TUI retries (e.g. after you commit
-in a kept worktree) and reports the space reclaimed; `strands-swarm --run NAME --gc` does the same
-for a saved run and exits.
+- **Names.** Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else
+  one derived from its task. Ids and names work interchangeably.
+- **Replies.** Each agent's final reply per turn goes to its parent. Mail that arrives mid-turn is
+  appended to the next tool result.
+- **Goals.** A `goal` (`spawn_agent`, `/goal`, `--goal`) puts a judge in the loop that sends the
+  agent back to work until the goal is met. It runs after every turn and sees the goal, the task
+  and the latest ~40k characters of the conversation.
+- **Side calls.** The judge and context summarization run on the agent's model or `--side-model ID`.
+  They count toward the agent's tokens and the budget, and queue like its own calls.
+- **Context.**
+  - An agent's older turns are summarized once a call's input reaches the compaction point:
+    `--compact-at` (default `200k`) or 85% of the model's window, whichever is smaller.
+  - The point follows the window on a `/model` switch. The log notes 90%.
+  - **Pruning.** Reasoning from earlier turns (thinking text and signatures, which some models bill
+    as input on every call) is dropped; the turn in progress keeps it, as Anthropic requires within
+    a tool-use loop. `shell` and `read` results over 2,000 characters are cut to their head and
+    tail (~800 characters) once six newer ones exist; `retrieve_context` with the reference at the
+    end returns the full output.
+  - Both edit history, and the prompt cache only matches an unchanged prefix, so they run only when
+    the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
+    the `context` tool), on the first call after five idle minutes (the cache's lifetime), on
+    overflow, or once they would remove 15% of the history. Every other call re-sends history byte
+    for byte. (Run on every turn they raised input cost per call by ~80%; a replay with the gate
+    saves 29%.)
+  - The `context` tool lets the agent manage its own context. It lists the biggest items with tool
+    results numbered. `offload: [n, …]` replaces results with a stub whose reference reads them
+    back. `summarize: true` summarizes all but the latest four messages before the next call.
+- **Worktrees.**
+  - A worktree agent works in `<repo>.swarm/<run>/<agent>` on branch `swarm/<run>/<agent>`.
+  - When `CARGO_TARGET_DIR` is set, it builds in its own `$CARGO_TARGET_DIR-worktrees/<run>/<agent>`.
+    Builds are not shared, so cargo cannot take another checkout's artifacts as fresh.
+- **Restarts.** An agent that was mid-turn resumes with a short notice instead of re-reading its
+  work. The notice lists the tool calls the restart cut short and `git status --short --branch` of
+  its directory.
 
-Skills (`<name>/SKILL.md` with `name` and `description` frontmatter, as in Claude Code and Codex)
-are discovered once at startup and offered to every agent with progressive disclosure: the system
-prompt lists each skill as `name: description` cut to 200 characters (keeping a later "Use when…"
-sentence, which is what picks the skill), and the `skills` tool returns the full instructions, the
-skill's location and its bundled files. On a name clash the first source wins:
-`--skills-dir` (repeatable), then the project's `.claude/skills`, `.agents/skills` and
-`.agent/skills`, then `~/.claude/skills`, then the skills of Claude Code plugins that are installed
-(user scope, or project scope for this directory) and not disabled in `enabledPlugins`, then
-`~/.codex/skills` and `~/.agents/skills`. `--no-default-skills` keeps only `--skills-dir`;
-`--list-skills` prints what agents get and what is shadowed.
+## Limits
+
+- **Agents.** `--max-agents N` (16) caps live agents.
+  - Spawns beyond the cap are `queued` and start oldest first as slots free.
+  - A queued agent can already be messaged; cancelling it drops it.
+  - An idle agent that is only waiting on a schedule holds no slot.
+  - `/max-agents N` changes the cap for the running swarm and is kept across restarts.
+    `/max-agents default` returns to the flag.
+- **Model calls.** `--max-concurrent-calls N` (8, `0` = unlimited) caps model calls in flight
+  across the swarm. Extra calls queue ("queued for a model slot…") instead of tripping provider
+  throttling.
+- **Tokens.** `--budget-tokens N` (e.g. `5M`) caps the swarm's input + output tokens.
+  - Once spent, model calls fail with a "budget exhausted" error that travels up to you.
+  - `/budget N` raises it and tells every stopped agent to continue. `/budget off` lifts it and
+    `/budget` shows usage.
+  - The budget is saved with the run.
+
+## Cost
+
+- **Estimates, not a bill.** Spend is estimated from reported usage, tracked per agent and model, so
+  a `/model` switch is priced per model.
+- **Prices.**
+  - A built-in table holds Claude list prices per 1M tokens by tier (opus, sonnet, haiku, plus older
+    versions). Cache reads cost 0.1× the input price and cache writes 1.25×.
+  - `--prices FILE` adds or overrides entries. It is a JSON object keyed by model-id substring:
+    `{"opus": {"input": 5, "output": 25}}`, with optional `cache_read`/`cache_write`.
+  - Its keys win over the built-in ones; within each, the longest match wins.
+  - Unpriced models show `unknown`, or `$3.10+?` when partly priced.
+- **Where it shows.**
+  - `/cost` (or `--run NAME --cost`) shows per agent: input, output, cache-read and cache-write
+    tokens, the model, an estimated `$`, and the median input per call and cache hit rate over the
+    last 50 calls.
+  - The TUI header shows `est. $12.30`.
+  - `list_agents` gives models the same numbers: `est. $4.10 / 12.3M tokens`, a subtree total
+    (`with 3 descendants $9.80 / 30.1M`) and a swarm total. A coordinator can spot an expensive
+    worker and cancel it or move the work to a cheaper model.
+  - `spawn_agent`'s `model` notes the relative prices (sonnet ≈ 0.6× opus, haiku ≈ 0.2×).
+  - None of this goes into the system prompt, which stays byte-stable.
+  - Programmatically: `Swarm::cost`.
+
+## Background jobs and schedules
+
+- **Background jobs.**
+  - Jobs run with `sh -c` in the agent's directory and environment, private `CARGO_TARGET_DIR`
+    included. Each runs in its own process group, so neither a reload nor Ctrl-C stops it.
+  - Each job is `<id>.json`, `<id>.log` and `<id>.exit` in `<run>/jobs` (a temp directory without
+    `--run`).
+  - The swarm polls jobs and mails the owner when one ends, also for jobs started before a restart.
+    A job whose process vanished without an exit code (a reboot) is reported as such.
+  - A killed job is not reported. Cancelling an agent kills its whole subtree's jobs.
+- **Schedules.**
+  - `schedule {message, to?, every?: "30m", at?: "in 2h" | "2026-11-17T09:00Z", id?}` posts
+    `[schedule sN] message` (kind `schedule`) at the given times.
+  - `{cancel: id}` removes one and `{}` lists them. Repeats are at least a minute apart.
+  - An agent that polls something schedules itself and ends its turn instead of a long `wait`.
+  - Schedules are saved with the run. One that came due while the swarm was down fires once on
+    resume, then keeps its interval.
+  - Schedules of a cancelled agent (receiver or creator) are dropped.
+
+## Landing
+
+`land` is opt-in with `--allow-land`. It lets a worker merge its own work instead of handing it to
+an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
+
+- **Which branches.**
+  - `branch` defaults to the caller's own. It may only be that or the branch of an agent below it.
+  - `into` defaults to the branch the caller's root agent has checked out. Any other target must
+    match a `--land-into GLOB` (repeatable, `*` and `?`).
+- **How it lands.** As a background job, it:
+  1. rebases a scratch worktree at the branch's tip onto `into`;
+  2. runs each check with `sh` from the caller's subdirectory, using a private `CARGO_TARGET_DIR`
+     (default checks: `--gate CMD`, repeatable);
+  3. only then fast-forwards `into`: `git merge --ff-only` where it is checked out, else a
+     compare-and-swap `update-ref`.
+- **Refusals.**
+  - It refuses when that checkout has uncommitted changes to tracked files. It gives up if `into`
+    moved meanwhile.
+  - A conflict (with the files), a failing check (with its last 30 lines) or a refusal changes
+    nothing.
+  - The scratch worktree is always removed, and the caller's branch is never modified.
+- Programmatically: `Swarm::land`.
+
+## TUI
+
+**Commands.** Typing `/` opens a filtered popup of the commands; F1 lists the keys.
+
+| Command | What it does |
+| --- | --- |
+| `/new <task>` | Start a new root agent. |
+| `/goal <goal>` | Start a root agent that works until the goal is met. |
+| `/to <agent> <message>` | Message an agent without selecting it. |
+| `/model [<id> \| default]` | Switch the selected agent's model from its next call on (saved with the run, `Swarm::set_model`). |
+| `/image <path> [text]` | Send the selected agent an image. |
+| `/stop` (or Esc twice) | Interrupt the selected agent's turn without cancelling it (`Swarm::interrupt`). |
+| `/cancel` | Stop the selected agent and its subtree for good. |
+| `/status` | Each live agent's state, activity, todos, unmerged commits, jobs and schedules, without a model call. |
+| `/cost` | Estimated spend (see [Cost](#cost)). |
+| `/budget`, `/max-agents` | See [Limits](#limits). |
+| `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
+| `/schedules` | All schedules. |
+| `/gc` | Retry reclaiming the disk of cancelled worktree agents. |
+| `/quit` (or Ctrl-C) | Quit. |
+
+Typing text without a command messages the selected agent.
+
+**Command details.**
+
+- **`/model`:** `/model default` returns to `--model`, and `/model` alone shows the current model.
+  The id is resolved like `--model`, and an invalid one is rejected.
+- **`/stop`:** an open tool call is closed as cancelled and the agent goes idle with its
+  conversation intact. Its parent gets an `interrupted` message and its children keep running. A
+  goal agent waits for its next message.
+- **`/status`:**
+  - Unmerged commits are `git log <base>..<branch>`. The base is the branch checked out at start,
+    or `--status-base`.
+  - It refreshes while open; git runs in the background and is cached for 5 s.
+  - Programmatically: `Swarm::status`.
+
+**Agent tree.**
+
+- Each agent is one line: status, name, model, input/output tokens and how close its last call
+  came to the compaction point, e.g. `● parser opus-5-5 1.2M/34.0k 34% a3`.
+- Cancelled agents are hidden (the header counts them); F3 shows them.
+- Alt-←/→ narrows or widens the tree. Narrow it past its minimum to hide it.
+
+**Header.**
+
+- It totals tokens as `in 84.8M (97% cached) · out 291k · est. $12.30`.
+- Input counts cache reads and writes, as the budget does.
+
+**Input.**
+
+- The input box edits like a shell line: ←/→, Home/End (Ctrl-A/E), Ctrl-←/→ by word, Delete,
+  Ctrl-W/Ctrl-U (Alt-Backspace).
+- Alt-Enter (or Shift-Enter where reported) inserts a new line.
+- ↑/↓ go through sent messages while the input holds text (Ctrl-P/N from an empty one). On an
+  empty input they select agents.
+
+**Images.**
+
+- Images from tool results (e.g. `read` on a png) and from `/image` show as an
+  `[image: path WxH]` line with a thumbnail of at most 12 rows.
+- Thumbnails use kitty, iTerm2 or sixel graphics when the terminal answers, else unicode halfblocks
+  (always inside tmux).
+- Only the newest 4 stay decoded. The mailbox and journal keep only the path.
+
+**Log and copying.**
+
+- F2 prints the selected agent's log as plain text into the terminal's scrollback; any key returns.
+- A resumed run shows each agent's restored conversation.
+- Drag to select text in the log or tree. Releasing copies it with OSC 52, which works over ssh;
+  tmux needs `set -g set-clipboard on`.
+- The wheel scrolls the log and Esc clears the highlight. Hold Shift (Option/Alt in iTerm2) for
+  the terminal's own selection.
+
+**Notifications.** `--notify` rings the bell when an agent messages you.
+
+## Persistence
+
+- **Journal.**
+  - A persistent run keeps `journal.jsonl` with every message to and from the user, and
+    `events.jsonl` with compact lifecycle events: spawns, status changes, tool calls, model
+    switches, resumes, reloads, shutdowns and disk reclaimed.
+  - Both are JSON lines with a UTC `ts`, written by a background thread and rotated to `<file>.1`
+    at 8 MB.
+- **Disk.**
+  - Once a cancelled worktree agent and its subtree have stopped (or on resume), its private target
+    dir is deleted.
+  - Its worktree is removed with `git worktree remove` unless it has uncommitted changes. Its
+    branch is never deleted.
+  - Nothing outside those two exact paths is touched, and each removal is logged as a `gc` event.
+- **Memory.**
+  - One Markdown file is shared by every agent and run: `~/.config/strands-swarm/memory.md`, or
+    `--memory FILE`, or off with `--no-memory`.
+  - Entries are dated bullets, and the file can be edited by hand.
+  - Its newest ~4k tokens are appended to every agent's system prompt, re-read at each turn's
+    start.
+  - Agents use `remember`/`forget`; you use `/remember <text>`, `/forget <text>` and `/remember`
+    (which shows where the file is).
+  - Writes are serialized and atomic.
+- **MCP.**
+  - `--mcp-config` accepts any `mcp.json` (or `~/.claude.json`). Servers are shared by all agents
+    and start lazily.
+  - With `--run`, each server's tool list is cached in `<run dir>/mcp-tools.json` under a hash of
+    its config. A start with an unchanged config connects no server (about 6.5 s → 0.03 s for 274
+    tools).
+  - A server connects when an agent enables one of its tools, or on the first call (60 s timeout),
+    and reconnects if it died.
+  - Agents start without MCP tools. `find_tools` (whose description lists the servers) searches the
+    catalog and enables tools from the next call on. Enabled tools come back on resume.
+  - `--mcp-eager` registers every tool on every agent, `--mcp-deny` hides tools by name, and
+    `--list-tools` prints what is allowed and denied.
+  - Under the TUI a server's stderr goes to `<run dir>/logs/mcp-<server>.log`; `--headless` keeps
+    it on the terminal.
+- **Skills.**
+  - Skills are `<name>/SKILL.md` files with `name` and `description` frontmatter, as in Claude Code
+    and Codex. They are discovered at startup.
+  - The system prompt lists each as `name: description`, cut to 200 characters but keeping a later
+    "Use when…" sentence. The `skills` tool returns the rest.
+  - On a name clash the first source wins, in this order: `--skills-dir`; the project's
+    `.claude/skills`, `.agents/skills`, `.agent/skills`; `~/.claude/skills`; enabled Claude Code
+    plugins; `~/.codex/skills`; `~/.agents/skills`.
+  - `--no-default-skills` keeps only `--skills-dir`, and `--list-skills` prints the result.
 
 ## Operate 24/7
 
-`scripts/swarmctl` keeps a run alive in tmux: restarts on exit, restarts into the new binary on
-`reload_swarm`, and rolls back if a new binary crashes within 30 s.
-
-Before a reload installs anything, the running swarm has the new binary prove itself:
-`NEW --self-test <copy>` resumes a temporary copy of the run directory (state and sessions, no
-`bin/` or logs) on a stub model that answers `ok`, messages every live agent, requires a reply from
-each and every saved conversation restored within 20 s, renders the TUI into a test backend and
-checks the deadlock watchdog. If it fails or takes over 60 s, `reload_swarm` returns the error with
-the tail of its stderr and the swarm keeps its binary. The copy's saved paths are the live run's, so
-its agents lose their branches, private env and working directories, disk reclamation is off
-(`SwarmConfig::reclaim_disk`), the stub never calls tools and agents get no sandbox: the real run,
-its worktrees, target dirs and sessions are never touched. The copy is deleted after.
-
-The new binary is installed as soon as it passes; `reload_swarm` restarts into it right away with
-`when: "now"`, or by default (`"idle"`) once no agent has a tool call in flight, so a running test
-or build is not cut short. `wait` calls do not count, and after 10 minutes
-(`SwarmConfig::reload_idle_timeout`) it restarts anyway. Meanwhile the TUI header shows
-`reload pending (waiting for N tool calls)`; a newer reload replaces the pending one.
-An agent that was mid-turn resumes with a short notice instead of re-reading its work: the tool
-calls the restart cut short (name and input) and `git status --short --branch` of its working
-directory. Its todo list is re-surfaced before every call anyway.
-
-Each binary embeds the git commit it was built from (`build.rs`) and saves it with the run. When
-a run resumes under another commit, the TUI shows a notice with the subjects of the commits in
-between (`git log old..new` in the checkout the binary was built from) and `events.jsonl` gets a
-`changes` entry with the full list.
+`scripts/swarmctl` keeps a run alive in tmux. It restarts the run on exit, restarts into the new
+binary on `reload_swarm`, and rolls back if a new binary crashes within 30 s.
 
 ```sh
 swarmctl start NAME ./target/release/strands-swarm --cwd REPO --goal "..."   # start or resume
@@ -254,3 +293,28 @@ swarmctl resume NAME        # start again with the saved binary and arguments
 swarmctl boot NAME          # resume after every reboot (crontab @reboot)
 swarmctl status
 ```
+
+**Self-test.**
+
+- Before a reload installs a binary, `NEW --self-test <copy>` resumes a temporary copy of the run
+  directory on a stub model that answers `ok`.
+- It messages every live agent and requires each to reply and every saved conversation to be
+  restored within 20 s. It also renders the TUI into a test backend and checks the deadlock
+  watchdog.
+- The copy's agents lose their branches, private env and directories, disk reclamation is off
+  (`SwarmConfig::reclaim_disk`), and the stub calls no tools. The real run is never touched, and
+  the copy is deleted after.
+- On failure or after 60 s, `reload_swarm` returns the error with its stderr tail and the swarm
+  keeps its binary.
+
+**Reload timing.**
+
+- A binary that passes is installed at once. `when: "now"` restarts right away.
+- The default, `"idle"`, waits until no agent has a tool call in flight (`wait` excluded), at most
+  10 minutes (`SwarmConfig::reload_idle_timeout`). The header shows
+  `reload pending (waiting for N tool calls)`.
+- A newer reload replaces a pending one.
+
+**Version tracking.** Each binary embeds its git commit (`build.rs`), saved with the run. When a run
+resumes under another commit, the TUI notes the commit subjects in between (`git log old..new` in
+the source checkout), and `events.jsonl` gets a `changes` entry.
