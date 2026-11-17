@@ -56,7 +56,8 @@ const BEDROCK_XAI_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
 const GOOGLE_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
 const NO_THINKING_LEVELS: &[&str] = &[];
 /// `family → [major, minor]` floor at which Claude serves adaptive thinking.
-const ADAPTIVE_THINKING_SINCE: &[(&str, (u32, u32))] = &[("opus", (4, 6)), ("sonnet", (4, 6))];
+const ADAPTIVE_THINKING_SINCE: &[(&str, (u32, u32))] =
+    &[("opus", (4, 6)), ("sonnet", (4, 6)), ("haiku", (5, 0))];
 /// `family → [major, minor]` floor at which Claude serves extended thinking.
 const EXTENDED_THINKING_SINCE: &[(&str, (u32, u32))] =
     &[("opus", (4, 5)), ("sonnet", (4, 5)), ("haiku", (4, 5))];
@@ -1296,6 +1297,7 @@ mod tests {
             "global.anthropic.claude-opus-4-8",
             "global.anthropic.claude-opus-5",
             "global.anthropic.claude-sonnet-5",
+            "global.anthropic.claude-haiku-5-5",
             "global.anthropic.claude-fable-5",
             "global.anthropic.claude-fable-5-1",
             "anthropic.claude-mythos-preview",
@@ -1323,16 +1325,16 @@ mod tests {
     }
 
     #[test]
-    fn falls_open_to_extended_not_adaptive_for_unversioned_haiku() {
+    fn treats_unversioned_haiku_as_the_latest_one_which_is_adaptive() {
         for id in ["claude-haiku-latest", "claude-haiku"] {
             let config = resolve(&format!("bedrock/global.anthropic.{id}"), Effort::Auto).expect("resolves");
-            assert_eq!(fields(&config), Some(extended(16_384)), "{id}");
+            assert_eq!(fields(&config), Some(adaptive("high")), "{id}");
         }
     }
 
     #[test]
     fn clamps_the_budget_below_a_small_max_tokens() {
-        let config = resolve("bedrock/anthropic.claude-haiku", Effort::Max).expect("resolves");
+        let config = resolve("bedrock/anthropic.claude-4-5-haiku", Effort::Max).expect("resolves");
         assert_eq!(config.max_tokens, None);
         assert_eq!(fields(&config), Some(extended(31_999)));
     }
