@@ -3700,6 +3700,7 @@ async fn a_call_cut_by_a_restart_is_listed_with_how_long_it_ran() {
     let mut config = SwarmConfig::new(factory(), dir.path());
     config.state_dir = Some(run.clone());
     let (swarm, mut events) = Swarm::new(config);
+    let before = std::time::Instant::now();
     spawn_root(&swarm, "work").await;
     tool_started(&mut events, "slow").await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -3709,10 +3710,12 @@ async fn a_call_cut_by_a_restart_is_listed_with_how_long_it_ran() {
         .await
         .unwrap()
         .expect("state saved");
-    assert_eq!(
-        saved.agents[0].running_calls,
-        std::collections::BTreeMap::from([("t1".to_owned(), 1)])
-    );
+    // Whole seconds of wall time: at least the 1.1s slept, at most the whole run (a loaded
+    // machine can take a while to shut down).
+    let calls = &saved.agents[0].running_calls;
+    assert_eq!(calls.keys().collect::<Vec<_>>(), ["t1"]);
+    let ran = calls["t1"];
+    assert!((1..=before.elapsed().as_secs()).contains(&ran), "{ran}");
     scripts
         .lock()
         .insert("a1".into(), MockMessageModel::shared(vec![say("resumed")]));
@@ -3721,7 +3724,10 @@ async fn a_call_cut_by_a_restart_is_listed_with_how_long_it_ran() {
     let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
     assert_eq!(reply_to(&mut events, USER).await, "resumed");
     let sent = sent_text(&scripts.lock()["a1"].clone(), 0);
-    assert!(sent.contains("- slow (cut after 1s) {}"), "{sent}");
+    assert!(
+        sent.contains(&format!("- slow (cut after {ran}s) {{}}")),
+        "{sent}"
+    );
     resumed.shutdown().await;
 }
 
