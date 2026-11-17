@@ -61,6 +61,10 @@ const SLICE_SHARE: f64 = 0.5;
 const MIN_SLICE: u64 = 1_000;
 /// How often a slice the summarizer rejects as too long is halved before compaction fails.
 const MAX_HALVINGS: u32 = 4;
+/// Tries of one summarizer call that fails transiently, the first included…
+const SUMMARY_ATTEMPTS: u32 = 3;
+/// …the first retry after this, each next one after twice the last.
+const SUMMARY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why automatic compaction is holding off: the input it last failed at, and the calls left.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -440,17 +444,35 @@ fn take_slice(rest: &mut VecDeque<ContentBlock>, budget: u64) -> Vec<ContentBloc
     slice
 }
 
-/// One summarizer call over `content`, on the agent's auxiliary model.
+/// One summary of `content`, on the agent's auxiliary model. A call that fails transiently
+/// (throttling, a dropped stream) is tried again, [`SUMMARY_ATTEMPTS`] times in all: the agent's
+/// own calls are retried by its event loop, side calls are not, and a failed compaction holds off
+/// for ten calls, each sent at the full size.
 async fn summarize(model: &Arc<dyn Model>, content: Vec<ContentBlock>) -> Result<String> {
     let mut blocks = vec![ContentBlock::text("<content>")];
     blocks.extend(content);
     blocks.push(ContentBlock::text("</content>"));
     let messages = [Message::new(Role::User, blocks)];
+    let mut attempt = 1;
+    loop {
+        match summarize_once(model, &messages).await {
+            Err(error) if attempt < SUMMARY_ATTEMPTS && crate::retry::is_transient(&error) => {
+                let delay = SUMMARY_RETRY_DELAY * 2u32.pow(attempt - 1);
+                tracing::warn!("attempt=<{attempt}>, delay=<{delay:?}>, error=<{error}> | summarizer call failed, retrying");
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn summarize_once(model: &Arc<dyn Model>, messages: &[Message]) -> Result<String> {
     let options = StreamOptions {
         system_prompt: Some(SystemPrompt::Text(SUMMARIZATION_SYSTEM_PROMPT.to_owned())),
         ..Default::default()
     };
-    let mut stream = model.stream_aggregated(&messages, &options);
+    let mut stream = model.stream_aggregated(messages, &options);
     let mut text = String::new();
     while let Some(item) = stream.next().await {
         if let AggregatedItem::Result(result) = item? {
@@ -1039,6 +1061,79 @@ mod tests {
         let mut rest = VecDeque::from([call, text("after")]);
         assert_eq!(take_slice(&mut rest, 1_000).len(), 1);
         assert_eq!(rest.len(), 1);
+    }
+
+    /// `inner` behind `failures` throttled calls.
+    struct Throttled {
+        inner: Arc<MockMessageModel>,
+        failures: Mutex<usize>,
+    }
+
+    impl Model for Throttled {
+        fn model_id(&self) -> Option<String> {
+            self.inner.model_id()
+        }
+
+        fn stream<'a>(&'a self, messages: &'a [Message], options: &'a StreamOptions) -> ModelEventStream<'a> {
+            let throttle = {
+                let mut failures = self.failures.lock();
+                let throttle = *failures > 0;
+                *failures = failures.saturating_sub(1);
+                throttle
+            };
+            if throttle {
+                let error = Error::ModelThrottled {
+                    message: "Too many requests".into(),
+                    source: None,
+                };
+                return Box::pin(futures::stream::iter([Err(error)]));
+            }
+            self.inner.stream(messages, options)
+        }
+    }
+
+    fn throttled(failures: usize) -> (Agent, Arc<MockMessageModel>) {
+        let (_, model) = agent(&["SUMMARY after throttling"]);
+        let throttled = Throttled {
+            inner: Arc::clone(&model),
+            failures: Mutex::new(failures),
+        };
+        (Agent::builder().model(throttled).build().unwrap(), model)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_summarizer_is_tried_again_before_compaction_backs_off() {
+        let (agent, model) = throttled(SUMMARY_ATTEMPTS as usize - 1);
+        let (manager, events) = manager(Some(10_000), None);
+        let mut messages = tool_loop(45);
+        let tokens = heuristic(&messages);
+        let started = tokio::time::Instant::now();
+
+        assert!(pass(&manager, &agent, &mut messages, tokens, false).await);
+
+        assert_eq!(model.call_count(), 1);
+        assert!(messages[0].text().contains("SUMMARY after throttling"));
+        assert!(matches!(events.lock()[..], [Compaction::Done { .. }]));
+        assert_eq!(started.elapsed(), SUMMARY_RETRY_DELAY * 3, "5 s, then 10 s");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_summarizer_throttled_on_every_try_fails_the_compaction() {
+        let (agent, model) = throttled(SUMMARY_ATTEMPTS as usize);
+        let (manager, events) = manager(Some(10_000), None);
+        let mut messages = tool_loop(45);
+        let original = messages.clone();
+        let tokens = heuristic(&messages);
+
+        assert!(!pass(&manager, &agent, &mut messages, tokens, false).await);
+
+        assert_eq!(model.call_count(), 0);
+        assert_eq!(messages, original);
+        let reported = events.lock().clone();
+        assert!(
+            matches!(&reported[..], [Compaction::Failed { error, .. }] if error.contains("Too many requests")),
+            "{reported:?}"
+        );
     }
 
     #[tokio::test]

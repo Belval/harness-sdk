@@ -115,7 +115,8 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     notes `context compacted: older turns summarized, 305.0k → 98.1k tokens`. The summarizer
     gets the turns in slices of at most half its own window (one call at 850k of a 1M window;
     a 200k-window `--side-model` gets 100k slices), each with the summary so far; a slice it
-    still rejects as too long is halved and sent again. If the summarizer
+    still rejects as too long is halved and sent again, and a call that fails transiently
+    (throttling, a dropped stream) is tried twice more, 5 s and 10 s later. If the summarizer
     fails, the context is sent as it is, and the log, the footer and `events.jsonl`
     (`compact_failed`) say why.
   - When a compaction changes nothing (the summarizer failed, or nothing could be cut), automatic
