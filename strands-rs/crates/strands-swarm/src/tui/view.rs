@@ -332,36 +332,97 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         frame.render_widget(hint, area);
         return;
     };
-    let (lines, thumbnails) = log_lines(view, app, tick);
-    let (paragraph, offset) = log_paragraph(app, view, lines.clone(), area);
-    frame.render_widget(paragraph, area);
+    let window = log_window(view, app, tick, log_inner(area));
+    frame.render_widget(log_paragraph(view, &window), area);
     unglue(frame.buffer_mut(), area);
-    if !thumbnails.is_empty() {
-        draw_thumbnails(frame, app, &lines, &thumbnails, offset, log_inner(area));
+    if !window.thumbnails.is_empty() {
+        draw_thumbnails(frame, app, &window, log_inner(area));
     }
 }
 
-/// The scrolled log paragraph for `area` and its first visible row.
-fn log_paragraph(
-    app: &App,
-    view: &AgentView,
-    lines: Vec<Line<'static>>,
-    area: Rect,
-) -> (Paragraph<'static>, u16) {
-    let paragraph = Paragraph::new(Text::from(lines))
+/// The scrolled log paragraph drawn in the log pane.
+fn log_paragraph(view: &AgentView, window: &LogWindow) -> Paragraph<'static> {
+    Paragraph::new(Text::from(window.lines.clone()))
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::TOP)
                 .padding(Padding::left(1))
                 .title(log_title(view)),
-        );
-    // `line_count` takes the inner width but counts the block's top border as a line.
-    let count = paragraph
-        .line_count(area.width.saturating_sub(1))
-        .saturating_sub(1);
-    let offset = log_offset(app, count, area.height.saturating_sub(1));
-    (paragraph.scroll((offset, 0)), offset)
+        )
+        .scroll((window.offset, 0))
+}
+
+/// The end of a log that the pane shows: enough of its newest lines to fill the pane at the
+/// current scroll, not the whole log. The frame is redrawn several times a second, and wrapping
+/// every one of up to [`super::app::MAX_LOG_ENTRIES`] entries each time kept a core half busy.
+struct LogWindow {
+    /// The log's last lines, with blank rows reserved under each kept thumbnail's placeholder.
+    lines: Vec<Line<'static>>,
+    /// Rows each of `lines` takes when wrapped.
+    rows: Vec<usize>,
+    /// The index in `lines` of each reserved block's first row, with its image.
+    thumbnails: Vec<(usize, u64)>,
+    /// The first visible row of `lines`.
+    offset: u16,
+}
+
+/// The [`LogWindow`] of `view`'s log for the text area `inner`.
+fn log_window(view: &AgentView, app: &App, tick: usize, inner: Rect) -> LogWindow {
+    let wanted = usize::from(inner.height) + usize::from(app.scroll);
+    // Newest first: each entry's lines, their wrapped rows and its thumbnail.
+    let mut groups: Vec<(Vec<Line<'static>>, Option<u64>)> = Vec::new();
+    let mut total = 0;
+    if let Some(activity) = view.activity() {
+        let glyph = SPINNER[tick % SPINNER.len()];
+        let line = Line::styled(format!("{glyph} {activity}"), Style::new().fg(Color::Cyan));
+        groups.push((vec![line], None));
+    }
+    for entry in view.log.iter().rev() {
+        if total >= wanted {
+            break;
+        }
+        let mut lines = entry_lines(entry);
+        let mut thumbnail = None;
+        if let LogEntry::Image {
+            decoded: Some(decoded),
+            ..
+        } = entry
+        {
+            let rows = app.images.rows(decoded.id);
+            if rows > 0 {
+                thumbnail = Some(decoded.id);
+                lines.extend(std::iter::repeat_n(Line::raw(""), usize::from(rows)));
+            }
+        }
+        total += lines
+            .iter()
+            .map(|line| wrapped_rows(line, inner.width))
+            .sum::<usize>();
+        groups.push((lines, thumbnail));
+    }
+    let mut window = LogWindow {
+        lines: Vec::new(),
+        rows: Vec::new(),
+        thumbnails: Vec::new(),
+        offset: 0,
+    };
+    for (lines, thumbnail) in groups.into_iter().rev() {
+        if let Some(id) = thumbnail {
+            // The placeholder is the entry's lines before the reserved rows.
+            let reserved = usize::from(app.images.rows(id));
+            window
+                .thumbnails
+                .push((window.lines.len() + lines.len() - reserved, id));
+        }
+        window
+            .rows
+            .extend(lines.iter().map(|line| wrapped_rows(line, inner.width)));
+        window.lines.extend(lines);
+    }
+    let shown = window.rows.iter().sum();
+    window.offset = log_offset(app, shown, inner.height);
+    window
 }
 
 /// The log's text area inside `area` (below the title border, after the left padding).
@@ -376,21 +437,15 @@ fn log_inner(area: Rect) -> Rect {
 
 /// Draw each kept thumbnail over the blank rows reserved for it, when they are fully in view
 /// (a graphics protocol cannot be cut at the top).
-fn draw_thumbnails(
-    frame: &mut Frame,
-    app: &App,
-    lines: &[Line<'static>],
-    thumbnails: &[(usize, u64)],
-    offset: u16,
-    inner: Rect,
-) {
+fn draw_thumbnails(frame: &mut Frame, app: &App, window: &LogWindow, inner: Rect) {
     let mut row = 0usize;
-    let mut starts = Vec::with_capacity(lines.len());
-    for line in lines {
+    let mut starts = Vec::with_capacity(window.rows.len());
+    for rows in &window.rows {
         starts.push(row);
-        row += wrapped_rows(line, inner.width);
+        row += rows;
     }
-    for (line, id) in thumbnails {
+    let offset = window.offset;
+    for (line, id) in &window.thumbnails {
         let Some(protocol) = app.images.get(*id) else {
             continue;
         };
@@ -412,9 +467,8 @@ pub fn log_text(app: &App, area: Rect) -> ratatui::buffer::Buffer {
     let log = areas(app, area).log;
     let mut buffer = ratatui::buffer::Buffer::empty(area);
     if let Some(view) = app.selected_view() {
-        let (lines, _) = log_lines(view, app, 0);
-        let (paragraph, _) = log_paragraph(app, view, lines, log);
-        ratatui::widgets::Widget::render(paragraph, log, &mut buffer);
+        let window = log_window(view, app, 0, log_inner(log));
+        ratatui::widgets::Widget::render(log_paragraph(view, &window), log, &mut buffer);
         unglue(&mut buffer, log);
     }
     buffer
@@ -434,35 +488,6 @@ fn unglue(buffer: &mut ratatui::buffer::Buffer, area: Rect) {
             }
         }
     }
-}
-
-/// The log's lines, with blank rows reserved under each kept thumbnail's placeholder, and the
-/// index of each reserved block's first row with its image.
-fn log_lines(view: &AgentView, app: &App, tick: usize) -> (Vec<Line<'static>>, Vec<(usize, u64)>) {
-    let mut lines: Vec<Line> = Vec::new();
-    let mut thumbnails = Vec::new();
-    for entry in &view.log {
-        lines.extend(entry_lines(entry));
-        if let LogEntry::Image {
-            decoded: Some(decoded),
-            ..
-        } = entry
-        {
-            let rows = app.images.rows(decoded.id);
-            if rows > 0 {
-                thumbnails.push((lines.len(), decoded.id));
-                lines.extend(std::iter::repeat_n(Line::raw(""), usize::from(rows)));
-            }
-        }
-    }
-    if let Some(activity) = view.activity() {
-        let glyph = SPINNER[tick % SPINNER.len()];
-        lines.push(Line::styled(
-            format!("{glyph} {activity}"),
-            Style::new().fg(Color::Cyan),
-        ));
-    }
-    (lines, thumbnails)
 }
 
 /// First visible row of a log of `rows` wrapped rows in a pane `height` rows tall.
@@ -485,14 +510,14 @@ pub fn log_continuations(app: &App, inner: Rect) -> Vec<bool> {
     let Some(view) = app.selected_view() else {
         return Vec::new();
     };
+    let window = log_window(view, app, 0, inner);
     let mut rows = Vec::new();
-    for line in &log_lines(view, app, 0).0 {
+    for wrapped in &window.rows {
         rows.push(false);
-        rows.extend(std::iter::repeat_n(true, wrapped_rows(line, inner.width) - 1));
+        rows.extend(std::iter::repeat_n(true, wrapped - 1));
     }
-    let offset = usize::from(log_offset(app, rows.len(), inner.height));
     rows.into_iter()
-        .skip(offset)
+        .skip(usize::from(window.offset))
         .take(usize::from(inner.height))
         .collect()
 }
@@ -1247,5 +1272,73 @@ mod tests {
             log_title(view),
             " parser (a2) · starting · opus-5-5 · 1.2M/34.0k tok (97% cached) · 34% · …/a2/repo "
         );
+    }
+
+    /// An app whose agent `a1` has a log of `entries` entries: wrapped text, tool calls and mail.
+    fn app_with_a_long_log(entries: usize) -> App {
+        let mut app = App::default();
+        app.apply(crate::runtime::SwarmEvent::Spawned {
+            id: "a1".into(),
+            parent: USER.into(),
+            name: "root".into(),
+            task: "t".into(),
+            cwd: "/w".into(),
+            branch: None,
+        });
+        let log = &mut app.agents.get_mut("a1").unwrap().log;
+        for i in 0..entries {
+            log.push_back(match i % 3 {
+                0 => LogEntry::Text(format!("{i} {}", "words that wrap ".repeat(i % 9))),
+                1 => LogEntry::Tool {
+                    name: "shell".into(),
+                    summary: format!("cargo test {i}"),
+                    ok: Some(true),
+                },
+                _ => mail("p1 (a2)"),
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn the_log_pane_shows_the_same_rows_as_the_whole_log_would() {
+        let app = app_with_a_long_log(300);
+        let area = Rect::new(0, 0, 40, 12);
+        let inner = log_inner(area);
+        let view = &app.agents["a1"];
+        let mut all: Vec<Line> = view.log.iter().flat_map(entry_lines).collect();
+        let activity = view.activity().expect("a starting agent shows its activity");
+        all.push(Line::styled(
+            format!("{} {activity}", SPINNER[0]),
+            Style::new().fg(Color::Cyan),
+        ));
+        let whole = Paragraph::new(Text::from(all.clone())).wrap(Wrap { trim: false });
+        let rows = whole.line_count(inner.width);
+        for scroll in [0, 1, 7, 37, 200, u16::MAX] {
+            let app = App {
+                scroll,
+                ..app_with_a_long_log(300)
+            };
+            let window = log_window(&app.agents["a1"], &app, 0, inner);
+            let mut shown = ratatui::buffer::Buffer::empty(inner);
+            let windowed = Paragraph::new(Text::from(window.lines.clone()))
+                .wrap(Wrap { trim: false })
+                .scroll((window.offset, 0));
+            ratatui::widgets::Widget::render(windowed, inner, &mut shown);
+            let mut expected = ratatui::buffer::Buffer::empty(inner);
+            let offset = log_offset(&app, rows, inner.height);
+            let scrolled = whole.clone().scroll((offset, 0));
+            ratatui::widgets::Widget::render(scrolled, inner, &mut expected);
+            assert_eq!(buffer_text(&shown), buffer_text(&expected), "scrolled {scroll}");
+        }
+    }
+
+    #[test]
+    fn a_frame_lays_out_only_the_end_of_a_long_log() {
+        let app = app_with_a_long_log(super::super::app::MAX_LOG_ENTRIES);
+        let inner = log_inner(Rect::new(0, 0, 40, 12));
+        let window = log_window(&app.agents["a1"], &app, 0, inner);
+        assert!(window.lines.len() < 40, "{} lines laid out", window.lines.len());
+        assert!(window.rows.iter().sum::<usize>() >= usize::from(inner.height));
     }
 }
