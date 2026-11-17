@@ -3720,6 +3720,57 @@ async fn a_job_started_before_a_restart_reports_to_the_resumed_agent() {
 }
 
 #[tokio::test]
+async fn a_long_sleep_while_a_job_runs_is_told_how_to_wait_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("shell", "s0", json!({ "command": "sleep 240; tail log" })),
+            tool_call("run_background", "r1", json!({ "command": "sleep 30" })),
+            tool_call("shell", "s1", json!({ "command": "sleep 240; tail log" })),
+            tool_call("shell", "s2", json!({ "command": "sleep 5; tail log" })),
+            say("done"),
+        ],
+    )]);
+    // A `shell` that returns at once: the hint depends on the command, not on how long it ran.
+    let inner = mock_factory(&scripts);
+    let factory: AgentFactory = Arc::new(move |mut spec: AgentSpec| {
+        let shell = strands_agents::tools::FunctionTool::builder("shell")
+            .description("Runs a command.")
+            .handler(|_input: serde_json::Value, _ctx| async move {
+                strands_agents::Result::<String>::Ok("log line".into())
+            });
+        spec.tools.push(Arc::new(shell));
+        inner(spec)
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.state_dir = Some(dir.path().join("run"));
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let model = scripts.lock()["a1"].clone();
+    let last_result = |call: usize| format!("{:?}", model.calls()[call].0.last().unwrap());
+    let hint = "still running. `wait` with from: [\\\"jobs\\\"] returns as soon as a job ends";
+    assert!(
+        !last_result(1).contains("still running"),
+        "no job yet: {}",
+        last_result(1)
+    );
+    assert!(
+        last_result(3).contains("[Job j1 is still running."),
+        "{}",
+        last_result(3)
+    );
+    assert!(last_result(3).contains(hint), "{}", last_result(3));
+    assert!(
+        !last_result(4).contains("still running"),
+        "a short sleep: {}",
+        last_result(4)
+    );
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
 async fn cancelling_an_agent_kills_its_background_jobs() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = scripts_of(vec![(

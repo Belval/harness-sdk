@@ -185,6 +185,9 @@ error.
   - The swarm polls jobs and mails the owner when one ends, also for jobs started before a restart.
     A job whose process vanished without an exit code (a reboot) is reported as such.
   - A killed job is not reported. Cancelling an agent kills its whole subtree's jobs.
+  - A `shell` call that sleeps 30 s or more (`sleep 240; tail job.log`) while its agent has a job
+    running gets one line appended to its result: the job is still running, and `wait` with
+    `from: ["jobs"]` returns as soon as it ends, whereas a sleep can't be cut short by mail or a reload.
   - A running job's log over 32 MB is cut to its last 1 MB. Only the newest 200 reported jobs keep
     their files.
 - **Schedules.**

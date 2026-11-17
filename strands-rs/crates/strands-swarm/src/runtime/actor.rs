@@ -95,6 +95,7 @@ impl Swarm {
             Err(error) => return self.fail_construction(&node, error),
         };
         self.install_mail_hook(&agent, &node.id);
+        self.install_poll_hint(&agent, &node.id);
         self.install_model_gate(&agent, &node);
         self.install_keep_warm(&agent, &node);
         agent.set_aux_model(Some(Arc::new(SideModel {
