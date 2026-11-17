@@ -50,6 +50,8 @@ const BEDROCK_REGION_PREFIXES: &[&str] = &["global.", "apac.", "us.", "eu.", "au
 const ANTHROPIC_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const OPENAI_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "none"];
 const BEDROCK_GPT_LEVELS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+/// GPT-6 Astra's levels on Bedrock and Mantle alike: both reject `none` and `minimal`.
+const ASTRA_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const BEDROCK_GPT_OSS_LEVELS: &[&str] = &["low", "medium", "high"];
 const BEDROCK_QWEN_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const BEDROCK_XAI_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
@@ -401,7 +403,10 @@ fn bedrock_levels(id: &str) -> &'static [&'static str] {
             NO_THINKING_LEVELS
         };
     }
-    if family.starts_with("openai.gpt-5.6-") || family == "openai.gpt-6-astra" {
+    if is_astra(family) {
+        return ASTRA_LEVELS;
+    }
+    if family.starts_with("openai.gpt-5.6-") {
         return BEDROCK_GPT_LEVELS;
     }
     if family.starts_with("openai.gpt-oss-") {
@@ -414,6 +419,11 @@ fn bedrock_levels(id: &str) -> &'static [&'static str] {
         return BEDROCK_XAI_LEVELS;
     }
     NO_THINKING_LEVELS
+}
+
+/// A GPT-6 Astra model id, without its cross-region prefix.
+fn is_astra(family: &str) -> bool {
+    family == "openai.gpt-6-astra"
 }
 
 fn bedrock_effort(id: &str, effort: Effort) -> Result<Option<String>> {
@@ -432,7 +442,7 @@ fn bedrock_thinking(id: &str, effort: Option<&str>) -> Option<JsonValue> {
             claude_max_tokens(id).unwrap_or(ANTHROPIC_MAX_TOKENS),
         ));
     }
-    if family.starts_with("openai.gpt-5.6-") || family == "openai.gpt-6-astra" {
+    if family.starts_with("openai.gpt-5.6-") || is_astra(family) {
         return Some(json!({ "reasoning": { "effort": effort } }));
     }
     if family.starts_with("openai.gpt-oss-") || family.starts_with("qwen.") || family.starts_with("xai.") {
@@ -889,6 +899,13 @@ fn resolve_spec<'a>(
     let claude_direct_without_adaptive = provider_name == "anthropic" && claude_thinking_mode(name).is_none();
     let effort = if provider_name == "bedrock" {
         bedrock_effort(name, effort)?
+    } else if provider_name == "bedrock-mantle" && is_astra(name) {
+        resolve_effort(
+            effort,
+            provider.recommended,
+            ASTRA_LEVELS,
+            &format!("model {name}"),
+        )?
     } else if claude_direct_without_adaptive {
         resolve_effort(effort, None, NO_THINKING_LEVELS, &format!("model {name}"))?
     } else {
@@ -1192,6 +1209,7 @@ mod tests {
         assert_eq!(fields(&config), Some(json!({ "reasoning": { "effort": "max" } })));
     }
 
+    /// Bedrock rejects `none` and `minimal` for Astra, so `off` sends no reasoning field at all.
     #[test]
     fn resolves_astra_effort() {
         for id in [
@@ -1200,12 +1218,7 @@ mod tests {
             "us.openai.gpt-6-astra",
         ] {
             let spec = format!("bedrock/{id}");
-            for (effort, level) in [
-                (Effort::Auto, "high"),
-                (Effort::Low, "low"),
-                (Effort::Max, "max"),
-                (Effort::Off, "none"),
-            ] {
+            for (effort, level) in [(Effort::Auto, "high"), (Effort::Low, "low"), (Effort::Max, "max")] {
                 let config = resolve(&spec, effort).expect("resolves");
                 assert_eq!(
                     fields(&config),
@@ -1213,6 +1226,8 @@ mod tests {
                     "{id} {effort}"
                 );
             }
+            let off = resolve(&spec, Effort::Off).expect("resolves");
+            assert_eq!(fields(&off), None, "{id}");
             let error = resolve(&spec, Effort::Minimal).expect_err("rejects");
             assert!(
                 error
@@ -1845,6 +1860,32 @@ mod openai_tests {
         assert!(!config.params.contains_key("tools"));
     }
 
+    /// Mantle serves Astra with Bedrock's levels, not OpenAI's: `max` works, `none`/`minimal` fail.
+    #[test]
+    fn resolves_astra_effort_on_bedrock_mantle() {
+        let spec = "bedrock-mantle/openai.gpt-6-astra";
+        for (effort, level) in [
+            (Effort::Auto, "high"),
+            (Effort::Max, "max"),
+            (Effort::Xhigh, "xhigh"),
+        ] {
+            let config = resolve(spec, effort, false);
+            assert_eq!(
+                config.params.get("reasoning"),
+                Some(&json!({ "effort": level })),
+                "{effort}"
+            );
+        }
+        assert!(!resolve(spec, Effort::Off, false).params.contains_key("reasoning"));
+        let error = openai_config_for(spec, Effort::Minimal, false, false, false).expect_err("rejects");
+        assert!(
+            error
+                .to_string()
+                .contains("Supported levels: low, medium, high, xhigh, max (or 'auto', 'off')."),
+            "{error}"
+        );
+    }
+
     #[test]
     fn builds_bedrock_mantle_via_the_openai_provider() {
         let config = resolve("bedrock-mantle/openai.gpt-oss-120b", Effort::Auto, false);
@@ -1883,19 +1924,16 @@ mod openai_tests {
 
     #[test]
     fn adds_the_bedrock_web_search_tool_with_effort_off() {
-        for id in [
-            "bedrock-mantle/openai.gpt-5.6-luna",
-            "bedrock-mantle/openai.gpt-6-astra",
+        let tools = json!([{ "type": "web_search", "external_web_access": true }]);
+        for (id, expected) in [
+            (
+                "bedrock-mantle/openai.gpt-5.6-luna",
+                json!({ "reasoning": { "effort": "none" }, "tools": tools }),
+            ),
+            ("bedrock-mantle/openai.gpt-6-astra", json!({ "tools": tools })),
         ] {
             let config = resolve(id, Effort::Off, true);
-            assert_eq!(
-                JsonValue::Object(config.params),
-                json!({
-                    "reasoning": { "effort": "none" },
-                    "tools": [{ "type": "web_search", "external_web_access": true }],
-                }),
-                "{id}"
-            );
+            assert_eq!(JsonValue::Object(config.params), expected, "{id}");
         }
     }
 
