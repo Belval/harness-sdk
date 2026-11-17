@@ -20,8 +20,14 @@ fn main() {
     let short = commit.get(..9).unwrap_or(&commit);
     println!("cargo:rustc-env=STRANDS_SWARM_VERSION={version} ({short})");
     println!("cargo:rustc-env=STRANDS_SWARM_COMMIT={commit}");
-    // Rebuild when HEAD moves: its file, the branch it points at, and packed refs.
-    let mut refs = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
+    // Rebuild when HEAD moves: its file, the branch it points at, packed refs, and HEAD's reflog,
+    // which every commit, merge and checkout appends to (a branch ref packed when this ran has no
+    // file to watch, and the loose one written by the next commit would go unnoticed).
+    let mut refs = vec![
+        "HEAD".to_owned(),
+        "packed-refs".to_owned(),
+        "logs/HEAD".to_owned(),
+    ];
     refs.extend(git(&["symbolic-ref", "-q", "HEAD"]));
     for name in refs {
         if let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", &name]) {
