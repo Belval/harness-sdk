@@ -136,7 +136,12 @@ use F2.
 `--run NAME` makes the run persistent under `~/.local/state/strands-swarm/NAME`: the agent tree,
 unread messages and every conversation (saved after each message). Starting again with the same
 name resumes it. `--mcp-config` accepts any `mcp.json` (or `~/.claude.json`); the servers are
-connected once and shared by all agents. Under the TUI each server's stderr goes to
+shared by all agents and start lazily: with `--run`, each server's tool list (name, description,
+schema) is cached in `<run dir>/mcp-tools.json` under a hash of its config, so a start or reload with an
+unchanged config connects no server (about 6.5 s → 0.03 s for 5 servers / 274 tools). A server
+connects in the background when an agent enables one of its tools, or on the first call (60 s
+timeout), and reconnects on the next call if it died. A new or changed server is connected at
+startup to list its tools; `--mcp-eager` and `--list-tools` connect every server up front. Under the TUI each server's stderr goes to
 `<run dir>/logs/mcp-<server>.log` (a temp directory without `--run`); `--headless` keeps it on the
 terminal. Agents start without MCP tools, so their specs are not sent
 on every model call: `find_tools` (whose description lists the servers and their tool counts)

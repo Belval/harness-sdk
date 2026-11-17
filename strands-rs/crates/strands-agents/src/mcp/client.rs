@@ -248,6 +248,15 @@ impl McpClient {
         *self.inner.state.read()
     }
 
+    /// Whether the connection is up: connected and the transport still open (a stdio server that
+    /// exited closes it). Rust-only: lets a long-lived host reconnect a server that died.
+    pub async fn is_alive(&self) -> bool {
+        let service = self.inner.service.lock().await;
+        service
+            .as_ref()
+            .is_some_and(|service| !service.is_closed() && !service.peer().is_transport_closed())
+    }
+
     /// What the server reported at `initialize`, once connected.
     pub async fn server_info(&self) -> Option<McpServerInfo> {
         let peer = self.inner.service.lock().await.as_ref()?.peer_info()?;

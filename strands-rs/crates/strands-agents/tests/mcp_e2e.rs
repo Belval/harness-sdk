@@ -99,3 +99,24 @@ async fn an_agent_calls_the_mcp_tool_and_gets_the_echo_back() {
     assert!(tool_result.text().contains("ping"), "{:?}", tool_result.content);
     client.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn is_alive_turns_false_when_the_server_exits_or_is_disconnected() {
+    let client = McpClient::connect(echo_server()).await.unwrap();
+    assert!(client.is_alive().await);
+    client.disconnect().await.unwrap();
+    assert!(!client.is_alive().await);
+
+    // `timeout` kills the server after a second, as if it crashed.
+    let dying = McpServerConfig::stdio("timeout", ["1", env!("CARGO_BIN_EXE_mcp_echo_server")]);
+    let client = McpClient::connect(dying).await.unwrap();
+    assert!(client.is_alive().await);
+    let died = async {
+        while client.is_alive().await {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), died)
+        .await
+        .expect("still alive after the server exited");
+}

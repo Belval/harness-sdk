@@ -41,7 +41,7 @@ pub use catalog::ToolCatalog;
 pub use factory::{
     agent_session_manager, bounded_goal, harness_factory, harness_model_resolver, HarnessFactoryOptions,
 };
-pub use mcp::{load_shared_mcp, SharedMcp};
+pub use mcp::{load_shared_mcp, McpOptions, SharedMcp};
 pub use memory::Memory;
 pub use runtime::{
     AgentFactory, AgentInfo, AgentSpec, AgentStatus, Mail, ModelResolver, ReloadWhen, ScheduleRequest,

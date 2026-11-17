@@ -8,12 +8,13 @@ use std::time::Duration;
 use clap::Parser;
 use strands_agents::tools::Tool;
 use strands_harness::Effort;
+use strands_swarm::mcp::MCP_CACHE_FILE;
 use strands_swarm::state;
 use strands_swarm::tui::Exit;
 use strands_swarm::RELOAD_EXIT_CODE;
 use strands_swarm::{
-    discover_skills, harness_factory, harness_model_resolver, load_shared_mcp, HarnessFactoryOptions, Memory,
-    Skills, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
+    discover_skills, harness_factory, harness_model_resolver, load_shared_mcp, HarnessFactoryOptions,
+    McpOptions, Memory, Skills, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, USER,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -187,11 +188,20 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         (Some(dir), false) => Some(dir.join("logs")),
         (None, false) => Some(std::env::temp_dir().join(format!("strands-swarm-{}", std::process::id()))),
     };
-    let mcp = load_shared_mcp(&cli.mcp_configs, &cli.mcp_deny, mcp_logs.as_deref()).await?;
+    let started = std::time::Instant::now();
+    let mcp_options = McpOptions {
+        deny: cli.mcp_deny.clone(),
+        stderr_dir: mcp_logs.clone(),
+        cache: run_dir.as_ref().map(|dir| dir.join(MCP_CACHE_FILE)),
+        connect: cli.mcp_eager || cli.list_tools,
+    };
+    let mcp = load_shared_mcp(&cli.mcp_configs, mcp_options).await?;
     if !cli.mcp_configs.is_empty() {
         eprintln!(
-            "strands-swarm: {} MCP servers, {} tools shared ({}), {} denied",
-            mcp.clients.len(),
+            "strands-swarm: {} MCP servers ({} connected in {:.1}s, the rest on first use), {} tools shared ({}), {} denied",
+            mcp.servers.len(),
+            mcp.connected().await,
+            started.elapsed().as_secs_f64(),
             mcp.tools.len(),
             if cli.mcp_eager {
                 "eager"

@@ -19,16 +19,31 @@ const DEFAULT_LIMIT: usize = 15;
 const MAX_LIMIT: usize = 50;
 const SUMMARY_CHARS: usize = 160;
 
+/// Called with the names an agent just enabled through `find_tools`.
+pub type OnEnable = Arc<dyn Fn(&[String]) + Send + Sync>;
+
 /// The MCP tools agents can enable, and how many each server offers.
 pub struct ToolCatalog {
     tools: Vec<ToolRef>,
     servers: Vec<(String, usize)>,
+    on_enable: Option<OnEnable>,
 }
 
 impl ToolCatalog {
     /// A catalog of `tools`; `servers` lists `(server name, tool count)` for the tool description.
     pub fn new(tools: Vec<ToolRef>, servers: Vec<(String, usize)>) -> Self {
-        Self { tools, servers }
+        Self {
+            tools,
+            servers,
+            on_enable: None,
+        }
+    }
+
+    /// Call `on_enable` whenever an agent enables tools through `find_tools` (not on
+    /// [`ToolCatalog::restore`]), e.g. to start their server in the background.
+    pub fn with_on_enable(mut self, on_enable: OnEnable) -> Self {
+        self.on_enable = Some(on_enable);
+        self
     }
 
     /// Whether the catalog has no tools (then `find_tools` is not worth registering).
@@ -116,6 +131,9 @@ impl ToolCatalog {
             if !tools.is_empty() {
                 let names: Vec<String> = tools.iter().map(|tool| tool.name().to_owned()).collect();
                 add_tools(agent, tools);
+                if let Some(on_enable) = &self.on_enable {
+                    on_enable(&names);
+                }
                 out.push(format!("Enabled: {}.", names.join(", ")));
             }
             if !unknown.is_empty() {
