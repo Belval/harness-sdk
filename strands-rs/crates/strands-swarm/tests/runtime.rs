@@ -4278,13 +4278,20 @@ async fn a_job_is_marked_reported_only_once_its_report_is_saved() {
     let scripts = scripts_of(vec![(
         "a1",
         vec![
-            tool_call("run_background", "r1", json!({ "command": "sleep 0.3" })),
-            // A wait for someone else: the report stays in the mailbox.
-            tool_call("wait", "w1", json!({ "from": ["nobody"], "timeout_seconds": 30 })),
+            // Ends once the test sees the wait start.
+            tool_call(
+                "run_background",
+                "r1",
+                json!({ "command": "until [ -e go ]; do sleep 0.01; done" }),
+            ),
+            // A wait for someone else (the user, who stays silent): the report stays in the
+            // mailbox. An unknown sender would fail the wait and leave the agent errored, to be
+            // woken (and its mailbox emptied) by the report it should keep.
+            tool_call("wait", "w1", json!({ "from": ["parent"], "timeout_seconds": 30 })),
         ],
     )]);
     let run = dir.path().join("run");
-    let (swarm, _events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
     // What a crash right after the mark leaves: swarm.json at that moment.
     let watcher = std::thread::spawn({
         let run = run.clone();
@@ -4296,6 +4303,17 @@ async fn a_job_is_marked_reported_only_once_its_report_is_saved() {
         }
     });
     spawn_root(&swarm, "go").await;
+    let waiting = async {
+        while let Some(event) = events.recv().await {
+            if matches!(&event, SwarmEvent::ToolStarted { name, .. } if name == "wait") {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the agent never waited");
+    std::fs::write(dir.path().join("go"), "").unwrap();
     let saved = tokio::task::spawn_blocking(move || watcher.join().unwrap());
     let saved = tokio::time::timeout(Duration::from_secs(10), saved)
         .await
@@ -4305,6 +4323,7 @@ async fn a_job_is_marked_reported_only_once_its_report_is_saved() {
         saved.contains("Job j1"),
         "the report is saved before the mark: {saved}"
     );
+    assert_eq!(scripts.lock()["a1"].calls().len(), 2, "still in the wait");
     swarm.shutdown().await;
 }
 
