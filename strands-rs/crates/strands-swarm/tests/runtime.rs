@@ -134,6 +134,83 @@ async fn a_spawned_agents_reply_reaches_the_parent_through_wait() {
     assert!(sent_text(&child, 0).contains("count to 3"));
 }
 
+/// Children that reply one after another: a child that waits `seconds` first, then says `text`.
+fn slow_child(seconds: u64, text: &str) -> Vec<MockResponse> {
+    match seconds {
+        0 => vec![say(text)],
+        _ => vec![
+            tool_call("wait", "w", json!({"timeout_seconds": seconds})),
+            say(text),
+        ],
+    }
+}
+
+fn spawn_three_then(wait: serde_json::Value) -> Vec<MockResponse> {
+    let spawn = |n: u32| {
+        tool_call(
+            "spawn_agent",
+            &format!("s{n}"),
+            json!({"task": "t", "name": format!("c{n}")}),
+        )
+    };
+    vec![
+        spawn(1),
+        spawn(2),
+        spawn(3),
+        tool_call("wait", "w", wait),
+        say("done"),
+    ]
+}
+
+#[tokio::test]
+async fn wait_all_returns_once_every_named_agent_has_replied() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = json!({"from": ["c1", "c2", "c3"], "all": true, "timeout_seconds": 30});
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            ("a1", spawn_three_then(from)),
+            ("a2", slow_child(0, "first")),
+            ("a3", slow_child(1, "second")),
+            ("a4", slow_child(2, "third")),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let root = scripts.lock()["a1"].clone();
+    let result = sent_text(&root, 4);
+    for reply in ["first", "second", "third"] {
+        assert!(result.contains(reply), "{result}");
+    }
+    assert!(!result.contains("still waiting"), "{result}");
+}
+
+#[tokio::test]
+async fn wait_all_on_timeout_returns_what_came_and_who_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = json!({"from": ["c1", "c2", "c3"], "all": true, "timeout_seconds": 1});
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            ("a1", spawn_three_then(from)),
+            ("a2", slow_child(0, "first")),
+            ("a3", slow_child(0, "second")),
+            ("a4", slow_child(5, "third")),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let root = scripts.lock()["a1"].clone();
+    let result = sent_text(&root, 4);
+    assert!(result.contains("first") && result.contains("second"), "{result}");
+    assert!(!result.contains("third"), "{result}");
+    assert!(
+        result.contains("still waiting on:\\nc3 (a4): running"),
+        "{result}"
+    );
+    swarm.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_silent_or_empty_final_reply_reaches_no_agent_parent() {
     let dir = tempfile::tempdir().unwrap();

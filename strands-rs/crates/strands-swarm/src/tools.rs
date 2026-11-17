@@ -18,6 +18,7 @@ use crate::runtime::{
 };
 use crate::schedule::{self, Schedule};
 use crate::status::BranchState;
+use tokio_util::sync::CancellationToken;
 
 /// `T`'s input schema without what tells a model nothing: the root `title` and `description`
 /// (the tool description says it) and per-field `format` and trivial `default`s (null, false,
@@ -116,6 +117,9 @@ struct WaitInput {
     /// Default 600, max 3600.
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    /// Block until every one of `from` has sent something (or the user writes), then return it all.
+    #[serde(default)]
+    all: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -552,6 +556,14 @@ fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
                 {
                     return Result::Ok(NO_JOBS.to_owned());
                 }
+                if input.all {
+                    if from.is_empty() {
+                        return Err(strands_agents::Error::other(
+                            "`all` needs `from`: the agents to wait for.",
+                        ));
+                    }
+                    return Result::Ok(wait_all(&swarm, &me, from, seconds, &ctx.cancel).await);
+                }
                 let wait = swarm.wait(&me, &from, &ctx.cancel);
                 let text = match tokio::time::timeout(Duration::from_secs(seconds), wait).await {
                     Ok(WaitOutcome::Mail(mail)) => render_mail(&mail),
@@ -563,6 +575,63 @@ fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
             }
         });
     Arc::new(tool)
+}
+
+/// `wait` with `all`: collect mail until each of `from` has sent something, the user writes, or
+/// `seconds` pass; every message taken on the way is returned, with a note on who is missing.
+async fn wait_all(
+    swarm: &Swarm,
+    me: &str,
+    mut remaining: Vec<String>,
+    seconds: u64,
+    cancel: &CancellationToken,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    let mut mail = Vec::new();
+    let note = loop {
+        let wait = swarm.wait(me, &remaining, cancel);
+        match tokio::time::timeout_at(deadline, wait).await {
+            Ok(WaitOutcome::Mail(batch)) => {
+                remaining.retain(|id| !batch.iter().any(|m| &m.from == id));
+                let from_user = batch.iter().any(|m| m.from == USER);
+                mail.extend(batch);
+                match (remaining.is_empty(), from_user) {
+                    (true, _) => break None,
+                    (false, true) => break Some(still_waiting(swarm, &remaining, "The user wrote")),
+                    (false, false) => {}
+                }
+            }
+            Ok(WaitOutcome::Cancelled) => break Some("Wait cancelled.".to_owned()),
+            Ok(WaitOutcome::Unreachable(notice)) => break Some(notice),
+            Err(_) => {
+                let why = format!("No messages within {seconds}s");
+                break Some(still_waiting(swarm, &remaining, &why));
+            }
+        }
+    };
+    let mut text = render_mail(&mail);
+    if let Some(note) = note {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&note);
+    }
+    text
+}
+
+/// `<why> before every agent replied; still waiting on:` and their status lines.
+fn still_waiting(swarm: &Swarm, remaining: &[String], why: &str) -> String {
+    let lines: Vec<String> = swarm
+        .agents()
+        .iter()
+        .filter(|info| remaining.contains(&info.id))
+        .map(|info| describe(swarm, info))
+        .chain(remaining.iter().filter(|id| *id == JOBS_SENDER).cloned())
+        .collect();
+    format!(
+        "{why} before all of them sent something; still waiting on:\n{}",
+        lines.join("\n")
+    )
 }
 
 /// What `wait` from `jobs` says when the agent has no job left to report.
