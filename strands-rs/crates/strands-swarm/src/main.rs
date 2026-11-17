@@ -59,9 +59,9 @@ struct Cli {
     /// it into a window flag or desktop notification).
     #[arg(long)]
     notify: bool,
-    /// Branch the TUI's `/status` compares agent branches against, and that a cancelled agent's
-    /// branch must be merged into to be deleted; default: the branch checked out where the swarm
-    /// started.
+    /// Branch that `/status` and `list_agents` compare agent branches against, and that a
+    /// cancelled agent's branch must be merged into to be deleted; default: the branch checked
+    /// out where the swarm started.
     #[arg(long)]
     status_base: Option<String>,
     /// Give agents the `land` tool: rebase their commits onto a branch they do not own in a
@@ -95,7 +95,8 @@ struct Cli {
     #[arg(long)]
     instructions: Option<PathBuf>,
     /// The user's memory file, shown to every agent and written by `remember` / `/remember`
-    /// (default `~/.config/strands-swarm/memory.md`).
+    /// (default `$XDG_CONFIG_HOME/strands-swarm/memory.md`, `XDG_CONFIG_HOME` defaulting to
+    /// `~/.config`).
     #[arg(long, conflicts_with = "no_memory")]
     memory: Option<PathBuf>,
     /// Run without the memory file and the `remember`/`forget` tools.
@@ -133,11 +134,14 @@ struct Cli {
     /// Print the skills agents would get (and those shadowed by an earlier one), then exit.
     #[arg(long)]
     list_skills: bool,
-    /// Name of a persistent run. State lives in `~/.local/state/strands-swarm/<name>`; starting
-    /// again with the same name resumes it (agents, conversations, unread messages).
+    /// Name of a persistent run. State lives in `$XDG_STATE_HOME/strands-swarm/<name>`
+    /// (`XDG_STATE_HOME` defaulting to `~/.local/state`); starting again with the same name
+    /// resumes it (agents, conversations, unread messages).
     #[arg(long)]
     run: Option<String>,
-    /// No TUI: stream events to stderr and exit when the swarm goes quiet.
+    /// No TUI: print events to stderr and messages to the user to stdout; exit once the root has
+    /// replied and no agent is busy (non-zero when that reply is an error). Needs a task or
+    /// `--goal` unless resuming.
     #[arg(long)]
     headless: bool,
     /// Print the run's journal (every message to and from the user) and exit. Needs `--run`.
