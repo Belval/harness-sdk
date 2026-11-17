@@ -1,12 +1,12 @@
 //! Inline images in the log: decoded thumbnails for the terminal's graphics protocol (kitty,
-//! iTerm2, sixel) or unicode halfblocks. Only the newest few stay decoded; older ones, and any
-//! without a picker (tests, the reload self-test), show just their `[image: …]` placeholder.
+//! iTerm2, sixel). Only the newest few stay decoded; older ones, and any without a picker (no
+//! graphics protocol, tests, the reload self-test), show just their `[image: …]` placeholder.
 
 use std::collections::VecDeque;
 use std::fmt;
 
 use ratatui::layout::Size;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::Resize;
 
@@ -57,15 +57,22 @@ impl Images {
         }
     }
 
-    /// The picker for the terminal on stdout: halfblocks inside tmux (whose passthrough of
-    /// graphics protocols is unreliable) or when the terminal does not answer the query.
+    /// Thumbnails for the terminal on stdout, if it has a graphics protocol.
     pub fn detect() -> Self {
         let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
-        let picker = match in_tmux {
-            true => Picker::halfblocks(),
-            false => Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
-        };
-        Self::with_picker(picker)
+        // Inside tmux (how swarmctl runs the TUI, often with no client attached at start) the
+        // query cannot reach the terminal that will show the image, so it is not made at all.
+        Self::for_terminal((!in_tmux).then(|| Picker::from_query_stdio().ok()).flatten())
+    }
+
+    /// Thumbnails with the `detected` picker when it speaks a graphics protocol. Halfblocks give
+    /// a 60x12-cell image 60x24 pixels, an unreadable blur of a screenshot or diagram, so
+    /// without a protocol images are just their placeholder line (the path to open them by).
+    pub fn for_terminal(detected: Option<Picker>) -> Self {
+        match detected {
+            Some(picker) if picker.protocol_type() != ProtocolType::Halfblocks => Self::with_picker(picker),
+            _ => Self::default(),
+        }
     }
 
     /// Decode `bytes` (png, jpeg, gif or webp) and, with a picker, keep its thumbnail.
@@ -123,6 +130,20 @@ mod tests {
         assert!(images.get(decoded.id).is_none());
         assert_eq!(images.rows(decoded.id), 0);
         assert!(images.add(b"not an image").is_err());
+    }
+
+    #[test]
+    fn halfblocks_or_no_answer_mean_placeholders_only() {
+        for detected in [None, Some(Picker::halfblocks())] {
+            let mut images = Images::for_terminal(detected);
+            let decoded = images.add(&png(400, 300)).unwrap();
+            assert_eq!(images.rows(decoded.id), 0);
+        }
+        let mut kitty = Picker::halfblocks();
+        kitty.set_protocol_type(ProtocolType::Kitty);
+        let mut images = Images::for_terminal(Some(kitty));
+        let decoded = images.add(&png(400, 300)).unwrap();
+        assert!(images.rows(decoded.id) > 0);
     }
 
     #[test]

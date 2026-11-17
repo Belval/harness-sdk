@@ -1183,12 +1183,21 @@ mod tests {
     }
 
     #[test]
-    fn without_a_picker_an_image_is_only_its_placeholder() {
-        let app = app_with_an_image(None);
+    fn without_a_graphics_protocol_an_image_is_only_its_placeholder() {
+        let mut app = app_with_an_image(None);
+        // A terminal (or tmux) that only manages halfblocks gets the placeholder line alone.
+        app.images =
+            super::super::images::Images::for_terminal(Some(ratatui_image::picker::Picker::halfblocks()));
+        app.apply(crate::runtime::SwarmEvent::Image {
+            id: "a1".into(),
+            source: "/w/diagram.png".into(),
+            bytes: std::sync::Arc::new(super::super::images::png(1024, 768)),
+        });
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
         terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
         let screen = screen_text(terminal.backend().buffer());
         assert!(screen.contains("[image: /w/shot.png 40x30]"), "{screen}");
+        assert!(screen.contains("[image: /w/diagram.png 1024x768]"), "{screen}");
         assert!(!screen.contains('▀') && !screen.contains('▄'), "{screen}");
         assert_eq!(
             LogEntry::placeholder("x.png", None),

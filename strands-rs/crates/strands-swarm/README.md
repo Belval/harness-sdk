@@ -287,9 +287,10 @@ Typing text without a command messages the selected agent.
 **Images.**
 
 - Images from tool results (e.g. `read` on a png) and from `/image` show as an
-  `[image: path WxH]` line with a thumbnail of at most 12 rows.
-- Thumbnails use kitty, iTerm2 or sixel graphics when the terminal answers, else unicode halfblocks
-  (always inside tmux).
+  `[image: path WxH]` line.
+- Below it comes a thumbnail of at most 12 rows when the terminal answers with kitty, iTerm2 or
+  sixel graphics. Inside tmux (so under `swarmctl`), and on terminals without graphics, there is
+  no thumbnail: unicode halfblocks would blur it beyond reading. Open the path to see the image.
 - Only the newest 4 stay decoded. The mailbox and journal keep only the path.
 
 **Log and copying.**
