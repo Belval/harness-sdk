@@ -22,6 +22,7 @@ pub mod images;
 pub mod jobs;
 pub mod journal;
 pub mod land;
+pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod names;

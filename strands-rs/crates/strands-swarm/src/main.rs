@@ -8,6 +8,7 @@ use std::time::Duration;
 use clap::Parser;
 use strands_agents::tools::Tool;
 use strands_harness::Effort;
+use strands_swarm::logging;
 use strands_swarm::mcp::MCP_CACHE_FILE;
 use strands_swarm::state;
 use strands_swarm::tui::Exit;
@@ -223,6 +224,21 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         .as_ref()
         .map(std::fs::read_to_string)
         .transpose()?;
+    let run_dir = cli.run.as_deref().map(state::run_dir).transpose()?;
+    // The TUI owns the terminal, so warnings go to a file; other modes keep them on stderr.
+    let tui = !(cli.headless || cli.list_tools || cli.list_skills);
+    let log = tui.then(|| match &run_dir {
+        Some(dir) => dir.join(logging::LOG_FILE),
+        None => std::env::temp_dir().join(format!("strands-swarm-{}.log", std::process::id())),
+    });
+    logging::init(
+        log.as_deref()
+            .map(|path| logging::open_log(path, logging::MAX_LOG_BYTES))
+            .transpose()?,
+    );
+    if let Some(path) = &log {
+        eprintln!("strands-swarm: warnings in {}", path.display());
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let skills = discover_skills(&cli.skills_dirs, !cli.no_default_skills, &cwd, home.as_deref())?;
     if cli.list_skills {
@@ -234,7 +250,6 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         skills.skills.len(),
         skills.shadowed.len()
     );
-    let run_dir = cli.run.as_deref().map(state::run_dir).transpose()?;
     // Server logs would paint over the TUI; headless mode keeps them on our stderr.
     let mcp_logs = match (&run_dir, cli.headless || cli.list_tools) {
         (_, true) => None,
@@ -339,10 +354,6 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     if !cli.headless {
         return Ok(strands_swarm::tui::run(swarm, events, root, cli.notify).await?);
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
     match root {
         Some(root) => drop(swarm.spawn(USER, root).await?),
         None if !resumed => return Err("--headless needs a task or a --goal".into()),

@@ -241,6 +241,9 @@ Typing text without a command messages the selected agent.
     switches, resumes, reloads, shutdowns and disk reclaimed.
   - Both are JSON lines with a UTC `ts`, written by a background thread and rotated to `<file>.1`
     at 8 MB.
+- **Log.** Warnings and errors (or whatever `RUST_LOG` selects) go to `<run dir>/swarm.log` under
+  the TUI (a temp file without `--run`), and to stderr otherwise. When a process opens a log that
+  has grown past 8 MB, it is first moved to `swarm.log.1`.
 - **Disk.**
   - Once a cancelled worktree agent and its subtree have stopped (or on resume), its private target
     dir is deleted.
