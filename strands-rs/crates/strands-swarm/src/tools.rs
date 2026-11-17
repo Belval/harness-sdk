@@ -14,7 +14,7 @@ use strands_agents::Result;
 use crate::jobs::{Job, JobState};
 use crate::runtime::{
     render_mail, AgentInfo, AgentStatus, LandRequest, ReloadWhen, ScheduleRequest, SpawnRequest, Swarm,
-    WaitOutcome, USER,
+    WaitOutcome, JOBS_SENDER, USER,
 };
 use crate::schedule::{self, Schedule};
 use crate::status::BranchState;
@@ -110,7 +110,7 @@ struct SendInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct WaitInput {
-    /// Return only once one of these agents has written; default anyone.
+    /// Only return for mail from these (agents, or `jobs`); default anyone.
     #[serde(default)]
     from: Vec<String>,
     /// Default 600, max 3600.
@@ -175,9 +175,9 @@ fn reload_tool(swarm: Swarm) -> ToolRef {
 }
 
 const RUN_BACKGROUND_DESCRIPTION: &str = concat!(
-    "Run a shell command in your cwd, detached (it survives swarm restarts); returns its job id. When it ends you ",
-    "get a message with the exit code and last output lines, waking you if idle: use it for builds, tests ",
-    "and anything slow instead of polling. Output goes to a log file you can read meanwhile."
+    "Run a shell command in your cwd, detached (survives swarm restarts); returns its job id. When it ends you ",
+    "get a message from `jobs` with the exit code and output tail, waking you if idle. For builds, tests, ",
+    "anything slow: start it here, then `wait` or end your turn; do not sleep-poll its log."
 );
 
 const JOBS_DESCRIPTION: &str = "List background jobs (yours first) with status and log path, or kill one.";
@@ -541,8 +541,17 @@ fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
                 let from = input
                     .from
                     .iter()
-                    .map(|who| resolve(&swarm, &me, who))
+                    .map(|who| match who.as_str() {
+                        JOBS_SENDER => Ok(JOBS_SENDER.to_owned()),
+                        _ => resolve(&swarm, &me, who),
+                    })
                     .collect::<Result<Vec<_>>>()?;
+                if from == [JOBS_SENDER]
+                    && !swarm.has_mail_from(&me, &from)
+                    && !has_unreported_jobs(&swarm, &me).await
+                {
+                    return Result::Ok(NO_JOBS.to_owned());
+                }
                 let wait = swarm.wait(&me, &from, &ctx.cancel);
                 let text = match tokio::time::timeout(Duration::from_secs(seconds), wait).await {
                     Ok(WaitOutcome::Mail(mail)) => render_mail(&mail),
@@ -554,6 +563,18 @@ fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
             }
         });
     Arc::new(tool)
+}
+
+/// What `wait` from `jobs` says when the agent has no job left to report.
+const NO_JOBS: &str = "You have no running or unreported background jobs, so no job message will come.";
+
+/// Whether `me` has a job still running or whose end it has not been told yet.
+async fn has_unreported_jobs(swarm: &Swarm, me: &str) -> bool {
+    swarm
+        .jobs()
+        .await
+        .iter()
+        .any(|job| job.meta.owner == me && (job.state == JobState::Running || !job.reported))
 }
 
 fn list_tool(swarm: Swarm) -> ToolRef {

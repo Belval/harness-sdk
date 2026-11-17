@@ -3261,6 +3261,35 @@ async fn a_background_job_mails_its_exit_code_and_output_tail_to_the_idle_agent_
 }
 
 #[tokio::test]
+async fn wait_from_jobs_returns_the_job_message_and_says_when_none_will_come() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call(
+                "run_background",
+                "r1",
+                json!({ "command": "sleep 1; echo built" }),
+            ),
+            tool_call("wait", "w1", json!({ "from": ["jobs"] })),
+            tool_call("wait", "w2", json!({ "from": ["jobs"] })),
+            say("done"),
+        ],
+    )]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    spawn_root(&swarm, "build it").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let model = scripts.lock()["a1"].clone();
+    let ended = sent_text(&model, 2);
+    assert!(
+        ended.contains("from=\\\"jobs\\\" kind=\\\"job\\\"") && ended.contains("built"),
+        "{ended}"
+    );
+    let none = sent_text(&model, 3);
+    assert!(none.contains("no job message will come"), "{none}");
+}
+
+#[tokio::test]
 async fn running_jobs_show_in_list_agents_and_a_killed_job_does_not_report() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = scripts_of(vec![(

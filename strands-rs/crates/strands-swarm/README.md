@@ -7,7 +7,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | --- | --- |
 | `spawn_agent` | Start an agent on a task (optionally in its own git worktree, with a model or a goal). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
-| `wait` | Block until messages arrive (optionally from specific agents). |
+| `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports). |
 | `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model and estimated spend. |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |

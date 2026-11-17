@@ -64,6 +64,11 @@ impl Swarm {
             .await
     }
 
+    /// Whether `id` has unread mail from one of `from` (from anyone when empty).
+    pub fn has_mail_from(&self, id: &str, from: &[String]) -> bool {
+        self.node(id).is_some_and(|node| has_matching_mail(&node, from))
+    }
+
     pub(super) async fn wait_until(
         &self,
         id: &str,
@@ -93,7 +98,9 @@ impl Swarm {
     /// Why `node` cannot get mail from `from` any more, if so.
     pub(super) fn unreachable(&self, node: &Node, from: &[String]) -> Option<String> {
         let agents = self.inner.agents.lock();
-        let live = |id: &str| id == USER || agents.get(id).is_some_and(|n| n.status.lock().is_live());
+        let live = |id: &str| {
+            id == USER || id == JOBS_SENDER || agents.get(id).is_some_and(|n| n.status.lock().is_live())
+        };
         if from.is_empty() {
             let mut children = agents.values().filter(|n| n.parent == node.id).peekable();
             if children.peek().is_none() || children.any(|n| live(&n.id)) {
