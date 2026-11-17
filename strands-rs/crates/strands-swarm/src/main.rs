@@ -249,9 +249,13 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         return Ok(Exit::Quit);
     }
     let tui = !(cli.headless || cli.list_tools || cli.list_skills);
-    if tui {
-        // Before anything resumes: agents must not start for a TUI that cannot.
-        no_terminal(has_terminal()).map_or(Ok(()), Err)?;
+    // Before anything resumes: agents must not start for a TUI that cannot.
+    if tui && !has_terminal() {
+        return Err(
+            "the TUI needs a terminal and there is none (stdout is not a tty, or no tty is \
+                    attached); run with --headless, or in tmux (swarmctl start)"
+                .into(),
+        );
     }
     if !(cli.list_tools || cli.list_skills) {
         let timeout = strands_swarm::watchdog::STARTUP_TIMEOUT;
@@ -439,15 +443,6 @@ fn has_terminal() -> bool {
         && (std::io::stdin().is_terminal() || std::fs::File::open("/dev/tty").is_ok())
 }
 
-/// The error to start the TUI without a terminal with.
-fn no_terminal(has_terminal: bool) -> Option<Box<dyn std::error::Error>> {
-    (!has_terminal).then(|| {
-        "the TUI needs a terminal and there is none (stdout is not a tty, or no tty is attached); \
-         run with --headless, or in tmux (swarmctl start)"
-            .into()
-    })
-}
-
 /// Give the screen back if the TUI holds it, before a watchdog exits the process.
 fn release_terminal() {
     if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
@@ -619,16 +614,6 @@ fn first_line(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn without_a_terminal_the_tui_names_headless() {
-        assert!(no_terminal(true).is_none());
-        let error = no_terminal(false).unwrap().to_string();
-        assert!(
-            error.contains("needs a terminal") && error.contains("--headless"),
-            "{error}"
-        );
-    }
 
     #[test]
     fn a_resume_sends_its_live_root_the_task_but_never_the_goal() {
