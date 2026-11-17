@@ -1255,8 +1255,27 @@ mod tests {
         });
         let notice = app.notice.clone().unwrap();
         assert!(
-            notice.starts_with("gc: reclaimed 3.0 GB from 1 cancelled agents"),
+            notice.starts_with("gc: reclaimed 3.0 GB from 1 cancelled agent"),
             "{notice}"
+        );
+        // The land dir's leftovers are not a cancelled agent.
+        let land = crate::gc::Collected {
+            id: crate::gc::LAND_ID.into(),
+            removed: vec![(PathBuf::from("/run/jobs/land/x"), 1 << 30)],
+            ..Default::default()
+        };
+        app.apply(SwarmEvent::Reclaimed {
+            collected: vec![land],
+            requested: true,
+        });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|frame| super::super::view::draw(frame, &app, "r", 0))
+            .unwrap();
+        let shown = super::super::view::buffer_text(terminal.backend().buffer());
+        assert!(
+            shown.contains("gc: reclaimed 1.0 GB from the land dir"),
+            "{shown}"
         );
         app.apply(SwarmEvent::Reclaimed {
             collected: Vec::new(),

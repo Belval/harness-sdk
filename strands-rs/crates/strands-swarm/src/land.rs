@@ -220,7 +220,7 @@ pub async fn tidy_when_idle(jobs: &crate::jobs::Jobs, target: Option<&Path>) -> 
 ///   otherwise it stays for the next landing.
 pub async fn tidy(land_dir: &Path, target: Option<&Path>) -> crate::gc::Collected {
     let mut out = crate::gc::Collected {
-        id: "land".into(),
+        id: crate::gc::LAND_ID.into(),
         ..Default::default()
     };
     let mut scratches = Vec::new();

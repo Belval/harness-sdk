@@ -94,16 +94,30 @@ impl Collected {
     }
 }
 
+/// The id of the [`Collected`] for the swarm's `jobs/land` dir ([`crate::land::tidy`]), which is
+/// not an agent.
+pub const LAND_ID: &str = "land";
+
 /// A summary line for several agents, e.g. `reclaimed 8.1 GB from 2 agents; 1 worktree kept`.
+/// What [`crate::land::tidy`] reclaimed counts as the land dir, not as an agent.
 pub fn summary(collected: &[Collected]) -> String {
     let bytes: u64 = collected.iter().map(Collected::bytes).sum();
-    let agents = collected.iter().filter(|c| !c.removed.is_empty()).count();
+    let reclaimed = |c: &&Collected| !c.removed.is_empty();
+    let (land, agents): (Vec<&Collected>, Vec<&Collected>) =
+        collected.iter().filter(reclaimed).partition(|c| c.id == LAND_ID);
     let kept: usize = collected
         .iter()
         .map(|c| c.kept.len() + usize::from(c.kept_branch.is_some()))
         .sum();
     let deleted = collected.iter().filter(|c| c.deleted_branch.is_some()).count();
-    let mut text = format!("reclaimed {} from {agents} cancelled agents", human(bytes));
+    let from = match (agents.len(), land.is_empty()) {
+        (0, false) => "the land dir".to_owned(),
+        (1, true) => "1 cancelled agent".to_owned(),
+        (n, true) => format!("{n} cancelled agents"),
+        (1, false) => "1 cancelled agent and the land dir".to_owned(),
+        (n, false) => format!("{n} cancelled agents and the land dir"),
+    };
+    let mut text = format!("reclaimed {} from {from}", human(bytes));
     if deleted > 0 {
         let plural = if deleted == 1 { "" } else { "es" };
         text.push_str(&format!("; deleted {deleted} merged branch{plural}"));
@@ -562,6 +576,36 @@ mod tests {
         assert_eq!(merged.deleted_branch, Some(deleted), "{merged:?}");
         assert!(!branch_exists(&repo, "swarm/r1/a2"));
         assert!(summary(&[merged]).contains("deleted 1 merged branch"));
+    }
+
+    /// The land dir's entry adds its bytes but is not counted as a cancelled agent.
+    #[test]
+    fn the_summary_counts_the_land_dir_apart_from_agents() {
+        let removed = |id: &str, bytes| Collected {
+            id: id.into(),
+            removed: vec![(PathBuf::from(format!("/x/{id}")), bytes)],
+            ..Default::default()
+        };
+        let (a2, a3, land) = (
+            removed("a2", 1 << 30),
+            removed("a3", 1 << 30),
+            removed(LAND_ID, 1 << 30),
+        );
+        let cases = [
+            (vec![land.clone()], "reclaimed 1.0 GB from the land dir"),
+            (vec![a2.clone()], "reclaimed 1.0 GB from 1 cancelled agent"),
+            (
+                vec![a2.clone(), land.clone()],
+                "reclaimed 2.0 GB from 1 cancelled agent and the land dir",
+            ),
+            (
+                vec![a2, a3, land],
+                "reclaimed 3.0 GB from 2 cancelled agents and the land dir",
+            ),
+        ];
+        for (collected, expected) in cases {
+            assert_eq!(summary(&collected), expected);
+        }
     }
 
     #[tokio::test]
