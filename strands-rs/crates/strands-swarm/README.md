@@ -54,7 +54,8 @@ only seeds a new root. With `--run`, `--journal`, `--gc` and
 `--headless` prints events to stderr and messages to you to stdout instead of the TUI, and exits
 once the root has replied and no agent is busy (a resume without a task: once no agent is busy)
 or every agent has stopped, with a non-zero status when that reply is an error. A new run needs a
-TASK or `--goal`.
+TASK or `--goal`. Without a terminal (stdout not a tty), the TUI exits with an error that
+points to `--headless` before it starts or resumes anything.
 
 ## Agents
 

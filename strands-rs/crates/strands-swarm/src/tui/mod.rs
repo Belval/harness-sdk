@@ -43,7 +43,10 @@ pub async fn run(
     root: Option<SpawnRequest>,
     notify: bool,
 ) -> Result<Exit> {
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init().map_err(|error| {
+        ratatui::restore();
+        strands_agents::Error::other(format!("Cannot start the TUI: {error}; try --headless"))
+    })?;
     set_mouse_capture(true);
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
