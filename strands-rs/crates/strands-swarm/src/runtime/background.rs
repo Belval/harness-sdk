@@ -74,11 +74,14 @@ impl Swarm {
 
     /// Every background job of the run, oldest first.
     pub async fn jobs(&self) -> Vec<Job> {
+        // A job whose report is posted counts as reported while the mark waits for the save. The
+        // set is read before the listing too: a mark that lands after the listing read the job's
+        // files would otherwise be missed by both, and its ended job look unreported.
+        let before = self.inner.reports_posted.lock().clone();
         let mut jobs = self.inner.jobs.list().await;
-        // A job whose report is posted counts as reported while the mark waits for the save.
         let posted = self.inner.reports_posted.lock();
         for job in &mut jobs {
-            job.reported |= posted.contains(&job.meta.id);
+            job.reported |= before.contains(&job.meta.id) || posted.contains(&job.meta.id);
         }
         jobs
     }
@@ -227,5 +230,52 @@ mod tests {
         assert!(one.contains("[Job j109 is still running."), "{one}");
         assert!(one.contains("from: [\"jobs\"]"), "{one}");
         assert!(poll_hint(&["j1".into(), "j2".into()]).contains("Job j1, j2 are still"));
+    }
+
+    /// A report's mark that lands while `jobs` reads the other jobs' files, after it read this
+    /// one's: the job still counts as reported, or a `wait` from jobs would wait for mail that
+    /// already came. The listing's progress cannot be observed, so the mark lands at a range of
+    /// delays; one of them hits that window.
+    #[tokio::test]
+    async fn a_report_marked_while_the_jobs_are_listed_still_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory: AgentFactory = Arc::new(|_| Box::pin(async { Err(Error::other("no agents")) }));
+        let mut config = SwarmConfig::new(factory, dir.path());
+        config.state_dir = Some(dir.path().join("run"));
+        let (swarm, _events) = Swarm::new(config);
+        let files = dir.path().join("run/jobs");
+        std::fs::create_dir_all(&files).unwrap();
+        for n in 1..=100 {
+            let meta = jobs::JobMeta {
+                id: format!("j{n}"),
+                owner: "a1".into(),
+                name: None,
+                command: "true".into(),
+                cwd: dir.path().into(),
+                pid: 0,
+                started: n,
+            };
+            std::fs::write(
+                files.join(format!("j{n}.json")),
+                serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(files.join(format!("j{n}.exit")), "0").unwrap();
+        }
+        for delay in 0..30 {
+            let _ = std::fs::remove_file(files.join("j1.reported"));
+            swarm.inner.reports_posted.lock().insert("j1".into());
+            let listing = tokio::spawn({
+                let swarm = swarm.clone();
+                async move { swarm.jobs().await }
+            });
+            tokio::time::sleep(Duration::from_micros(500 * delay)).await;
+            // What report_job does once the report is saved.
+            swarm.inner.jobs.mark_reported("j1").await.unwrap();
+            swarm.inner.reports_posted.lock().remove("j1");
+            let jobs = listing.await.unwrap();
+            let j1 = jobs.iter().find(|job| job.meta.id == "j1").unwrap();
+            assert!(j1.reported, "j1 looked unreported with the mark {delay}/2 ms in");
+        }
     }
 }
