@@ -130,17 +130,28 @@ impl Swarm {
             Start::Resume { interrupted, ran } => self.resume_input(&node, &agent, interrupted, &ran).await,
         };
         let mut backoff = RETRY_INITIAL;
+        // Failed turns in a row that the agent retried on its own, and when the first started.
+        let mut streak: Option<(u32, tokio::time::Instant)> = None;
         while let Some(text) = self.next_input(&node, input.take()).await {
-            // Only the first failure of a retry streak reaches the parent: each one would wake it.
-            // So does only the first refusal for want of budget, however often mail (a schedule)
-            // wakes the agent until the budget is raised.
-            let retrying = backoff > RETRY_INITIAL;
+            // Of a retry streak only the first failure and then every doubling from the 8th on
+            // reach the parent: each would wake it, but a retry loop that went quiet after its
+            // first report looks to the parent like one that recovered. Only the first refusal
+            // for want of budget is reported, however often mail (a schedule) wakes the agent
+            // until the budget is raised.
+            let (failures, since) =
+                streak.map_or((1, tokio::time::Instant::now()), |(n, since)| (n + 1, since));
             let refused = self.inner.over_budget.lock().contains(&node.id);
-            let report = !retrying && !refused;
+            let report = (!refused && reports_failure(failures)).then(|| FailureReport {
+                failures,
+                since,
+                retries: node.goal.is_some(),
+            });
             let Some(error) = self.run_turn(&node, &agent, text, report).await else {
                 backoff = RETRY_INITIAL;
+                streak = None;
                 continue;
             };
+            streak = None;
             // A goal-driven agent must survive transient failures (throttling, outages) unattended.
             // Out of budget, it waits for the mail that `set_budget` sends instead of retrying.
             if node.goal.is_some()
@@ -151,6 +162,7 @@ impl Swarm {
                     "Your previous turn failed with: {error}\nContinue working toward your goal."
                 )));
                 backoff = (backoff * 2).min(RETRY_MAX);
+                streak = Some((failures, since));
             }
         }
         if !self.inner.shutting_down.load(Ordering::SeqCst) {
@@ -188,7 +200,13 @@ impl Swarm {
 
     /// Run one turn; returns the error message when it failed (not when it was cancelled). A
     /// failure is posted to the parent when `report` is set.
-    async fn run_turn(&self, node: &Node, agent: &Agent, input: InvokeInput, report: bool) -> Option<String> {
+    async fn run_turn(
+        &self,
+        node: &Node,
+        agent: &Agent,
+        input: InvokeInput,
+        report: Option<FailureReport>,
+    ) -> Option<String> {
         let turn = node.cancel.child_token();
         *node.turn.lock() = Some(turn.clone());
         node.paused.store(false, Ordering::SeqCst);
@@ -229,8 +247,8 @@ impl Swarm {
         }
         if let Some(error) = failure {
             let message = error.to_string();
-            if report {
-                let _ = self.post(&node.id, &node.parent, "error", message.clone());
+            if let Some(report) = report {
+                let _ = self.post(&node.id, &node.parent, "error", report.render(&message));
             }
             self.set_status(node, AgentStatus::Errored(message.clone()));
             return Some(message);
@@ -471,6 +489,40 @@ pub(super) fn is_silent(reply: &str) -> bool {
 pub(super) const RETRY_INITIAL: Duration = Duration::from_secs(15);
 
 pub(super) const RETRY_MAX: Duration = Duration::from_secs(600);
+
+/// Whether the `failures`th failed turn in a row is reported: the first, then the 8th, 16th,
+/// 32nd… (with the backoff about 26 min, 1h45m, 4h25m… into the streak).
+pub(super) fn reports_failure(failures: u32) -> bool {
+    failures == 1 || (failures >= 8 && failures.is_power_of_two())
+}
+
+/// What the parent is told of a failed turn.
+pub(super) struct FailureReport {
+    /// Failed turns in a row, this one included.
+    pub failures: u32,
+    /// When the first of them started.
+    pub since: tokio::time::Instant,
+    /// The agent retries on its own (it has a goal).
+    pub retries: bool,
+}
+
+impl FailureReport {
+    pub(super) fn render(&self, error: &str) -> String {
+        let retry = format!(
+            "It retries on its own, backing off up to {} between turns, and reports again if it \
+             keeps failing.",
+            crate::schedule::human(RETRY_MAX)
+        );
+        match (self.failures, self.retries) {
+            (1, false) => error.to_owned(),
+            (1, true) => format!("{error}\n{retry}"),
+            (n, _) => format!(
+                "Still failing: {n} turns in a row over {}. {retry} Last error: {error}",
+                crate::schedule::human(self.since.elapsed())
+            ),
+        }
+    }
+}
 
 /// How an actor begins.
 pub(super) enum Start {

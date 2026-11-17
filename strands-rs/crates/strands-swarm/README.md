@@ -176,8 +176,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     connections are retried with backoff, up to 10 attempts (about eight minutes). A rejected
     request is not retried.
   - If retrying doesn't help, the turn fails and the parent gets an `error` message. A goal agent
-    tries again (15 s, doubling to 10 min) and reports only the first failure. The judge sees only
-    replies, not failed turns.
+    tries again (15 s, doubling to 10 min). Of a streak of failed turns it reports the first
+    (adding that it retries on its own), then the 8th, 16th, 32nd… in a row (about 26 min, 1h45m
+    and 4h25m in) as `Still failing: 8 turns in a row over 26m. … Last error: …`, so a parent can
+    tell a retry loop that went quiet from one that recovered without being woken on every retry.
+    The judge sees only replies, not failed turns.
   - The next message picks up where the failed call stopped.
 - **Tokens.** `--budget-tokens N` (e.g. `5M`) caps the swarm's input + output tokens.
   - Once spent, model calls fail with a "budget exhausted" error that travels up to you.

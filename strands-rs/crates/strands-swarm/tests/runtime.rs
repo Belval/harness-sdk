@@ -1287,8 +1287,9 @@ async fn a_goal_the_judge_keeps_rejecting_ends_the_turn_after_the_attempt_cap() 
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_failing_goal_agent_backs_off_and_reports_a_streak_once() {
+/// A root that spawns a goal agent whose first `failures` turns fail; the error mails the root
+/// got, the goal agent's reply once it recovers, and the (paused) time that took.
+async fn failing_goal_child(failures: usize) -> (Vec<String>, String, Duration) {
     use strands_agents::plugins::vended::{GoalLoop, ValidationOutcome};
     let dir = tempfile::tempdir().unwrap();
     let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
@@ -1302,13 +1303,13 @@ async fn a_failing_goal_agent_backs_off_and_reports_a_streak_once() {
                 json!({"task": "sub", "name": "sub", "goal": "work"}),
             )]
             .into_iter()
-            .chain((0..6).map(|_| say("noted")))
+            .chain((0..failures + 3).map(|_| say("noted")))
             .collect(),
         ),
     );
     map.lock().insert(
         "a2".into(),
-        MockMessageModel::shared(vec![fail(), fail(), fail(), say("recovered")]),
+        MockMessageModel::shared((0..failures).map(|_| fail()).chain([say("recovered")]).collect()),
     );
     let scripts = map.clone();
     let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
@@ -1331,21 +1332,42 @@ async fn a_failing_goal_agent_backs_off_and_reports_a_streak_once() {
     spawn_root(&swarm, "go").await;
 
     let started = tokio::time::Instant::now();
-    let mut errors = 0;
+    let mut errors = Vec::new();
     let reply = loop {
         match events.recv().await.expect("events") {
-            SwarmEvent::Mail { to, mail } if to == "a1" && mail.kind == "error" => errors += 1,
+            SwarmEvent::Mail { to, mail } if to == "a1" && mail.kind == "error" => errors.push(mail.text),
             SwarmEvent::Mail { to, mail } if to == "a1" && mail.kind == "reply" => break mail.text,
             _ => {}
         }
     };
+    (errors, reply, started.elapsed())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_goal_agent_backs_off_and_reports_a_streak_once() {
+    let (errors, reply, elapsed) = failing_goal_child(3).await;
     assert_eq!(reply, "recovered");
-    assert_eq!(errors, 1, "one error mail for the whole streak");
-    // Backoff before retries 1, 2 and 3: 15 s + 30 s + 60 s.
+    assert_eq!(errors.len(), 1, "one error mail for the whole streak: {errors:?}");
     assert!(
-        started.elapsed() >= Duration::from_secs(105),
-        "{:?}",
-        started.elapsed()
+        errors[0].starts_with("throttled\nIt retries on its own"),
+        "{}",
+        errors[0]
+    );
+    // Backoff before retries 1, 2 and 3: 15 s + 30 s + 60 s.
+    assert!(elapsed >= Duration::from_secs(105), "{elapsed:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_goal_agent_that_keeps_failing_reports_again_at_the_8th_failure_in_a_row() {
+    let (errors, reply, _) = failing_goal_child(9).await;
+    assert_eq!(reply, "recovered");
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    // Backoff 15 s, 30 s, … 600 s between the first 8 failures: 25m45s.
+    assert!(
+        errors[1].starts_with("Still failing: 8 turns in a row over 26m.")
+            && errors[1].ends_with("Last error: throttled"),
+        "{}",
+        errors[1]
     );
 }
 
