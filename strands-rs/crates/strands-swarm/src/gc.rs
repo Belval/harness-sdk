@@ -647,22 +647,25 @@ mod tests {
         assert!(worktree.exists());
     }
 
-    #[tokio::test]
-    async fn a_saved_run_is_collected_for_its_cancelled_agents_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (_repo, worktree) = repo_with_worktree(tmp.path());
-        let agent = |id: &str, status: &str| crate::state::AgentState {
+    fn saved_agent(
+        id: &str,
+        cwd: &Path,
+        branch: Option<&str>,
+        status: &str,
+        env: BTreeMap<String, String>,
+    ) -> crate::state::AgentState {
+        crate::state::AgentState {
             id: id.into(),
             name: None,
-            parent: "user".into(),
-            cwd: worktree.clone(),
-            branch: Some(format!("swarm/r1/{id}")),
+            parent: crate::USER.into(),
+            cwd: cwd.to_path_buf(),
+            branch: branch.map(str::to_owned),
             task: String::new(),
             model: None,
             goal: None,
             status: status.into(),
             mailbox: Vec::new(),
-            env: env(&tmp.path().join(format!("target-worktrees/r1/{id}"))),
+            env,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -671,19 +674,34 @@ mod tests {
             context: None,
             paused: false,
             running_calls: Default::default(),
-        };
-        fs::create_dir_all(tmp.path().join("target-worktrees/r1/a1")).unwrap();
-        fs::create_dir_all(tmp.path().join("target-worktrees/r1/a2")).unwrap();
-        let state = crate::state::SwarmState {
+        }
+    }
+
+    fn saved_run(cwd: &Path, agents: Vec<crate::state::AgentState>) -> crate::state::SwarmState {
+        crate::state::SwarmState {
             run_id: "r1".into(),
-            cwd: tmp.path().to_path_buf(),
-            next_id: 3,
-            agents: vec![agent("a1", "idle"), agent("a2", "cancelled")],
+            cwd: cwd.to_path_buf(),
+            next_id: agents.len() as u64 + 1,
+            agents,
             budget_tokens: None,
             max_agents: None,
             commit: None,
             schedules: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saved_run_is_collected_for_its_cancelled_agents_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, worktree) = repo_with_worktree(tmp.path());
+        let agent = |id: &str, status: &str| {
+            let target = tmp.path().join(format!("target-worktrees/r1/{id}"));
+            fs::create_dir_all(&target).unwrap();
+            let branch = format!("swarm/r1/{id}");
+            saved_agent(id, &worktree, Some(&branch), status, env(&target))
         };
+        let agents = vec![agent("a1", "idle"), agent("a2", "cancelled")];
+        let state = saved_run(tmp.path(), agents);
         let collected = collect_run(&state, None).await;
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].removed.len(), 2, "{collected:?}");
@@ -716,40 +734,11 @@ mod tests {
                 "swarm/r1/a2",
             ],
         );
-        let agent = |id: &str, cwd: &Path, branch: Option<&str>, status: &str| crate::state::AgentState {
-            id: id.into(),
-            parent: crate::USER.into(),
-            cwd: cwd.to_path_buf(),
-            branch: branch.map(str::to_owned),
-            status: status.into(),
-            name: None,
-            task: String::new(),
-            model: None,
-            goal: None,
-            mailbox: Vec::new(),
-            env: BTreeMap::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            ledger: Default::default(),
-            context: None,
-            paused: false,
-            running_calls: Default::default(),
-        };
-        let state = crate::state::SwarmState {
-            run_id: "r1".into(),
-            cwd: repo.clone(),
-            next_id: 3,
-            agents: vec![
-                agent("a1", &root, None, "idle"),
-                agent("a2", &worktree, Some("swarm/r1/a2"), "cancelled"),
-            ],
-            budget_tokens: None,
-            max_agents: None,
-            commit: None,
-            schedules: Vec::new(),
-        };
+        let agents = vec![
+            saved_agent("a1", &root, None, "idle", BTreeMap::new()),
+            saved_agent("a2", &worktree, Some("swarm/r1/a2"), "cancelled", BTreeMap::new()),
+        ];
+        let state = saved_run(&repo, agents);
         let collected = collect_run(&state, None).await;
         let deleted = ("swarm/r1/a2".to_owned(), "merged".to_owned());
         assert_eq!(collected[0].deleted_branch, Some(deleted), "{collected:?}");
