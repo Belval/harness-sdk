@@ -161,9 +161,7 @@ impl Swarm {
 
     /// The persistable view of the swarm.
     pub fn snapshot(&self) -> SwarmState {
-        // Release the agents lock before taking per-agent locks.
-        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
-        let agents = nodes.iter().map(|node| node_state(node)).collect();
+        let agents = self.nodes().iter().map(|node| node_state(node)).collect();
         SwarmState {
             run_id: self.inner.config.run_id.clone(),
             cwd: self.inner.config.cwd.clone(),

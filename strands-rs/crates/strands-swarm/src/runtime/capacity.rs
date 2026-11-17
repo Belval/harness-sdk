@@ -43,8 +43,7 @@ impl Swarm {
 
     /// Tokens (input + output) used by every agent so far, saved runs included.
     pub fn tokens_used(&self) -> u64 {
-        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
-        nodes
+        self.nodes()
             .iter()
             .map(|node| {
                 let usage = *node.usage.lock();

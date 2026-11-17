@@ -6,7 +6,7 @@ impl Swarm {
     /// Every agent's tokens with an estimated cost from [`SwarmConfig::prices`], cancelled
     /// agents included (their tokens were spent too). No model call.
     pub fn cost(&self) -> crate::cost::CostReport {
-        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        let nodes = self.nodes();
         let default = self.inner.config.default_model.clone();
         let agents = nodes
             .iter()

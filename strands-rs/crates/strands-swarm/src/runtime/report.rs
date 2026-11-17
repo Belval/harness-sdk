@@ -12,8 +12,8 @@ impl Swarm {
         let cache = self.inner.branches.lock().clone();
         let schedules = self.schedules();
         let now = self.now();
-        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
-        let agents = nodes
+        let agents = self
+            .nodes()
             .iter()
             .filter(|node| node.status.lock().is_live())
             .map(|node| {
@@ -82,7 +82,7 @@ impl Swarm {
         Option<String>,
         std::collections::HashMap<String, crate::status::BranchState>,
     ) {
-        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        let nodes = self.nodes();
         let root = Some(self.base_root());
         let branches = nodes
             .iter()

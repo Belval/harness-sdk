@@ -123,9 +123,8 @@ impl Swarm {
     /// reclaimed, the rest resume into their worktrees.
     pub(super) async fn collect_on_exit(&self) {
         let ephemeral = self.inner.config.state_dir.is_none();
-        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
         let mut collected = Vec::new();
-        for node in nodes.iter().filter(|node| node.branch.is_some()) {
+        for node in self.nodes().iter().filter(|node| node.branch.is_some()) {
             let cancelled = *node.status.lock() == AgentStatus::Cancelled;
             if !(ephemeral || cancelled) || node.collected.swap(true, Ordering::SeqCst) {
                 continue;

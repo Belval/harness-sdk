@@ -1083,6 +1083,12 @@ impl Swarm {
         self.inner.agents.lock().get(id).cloned()
     }
 
+    /// Every node in spawn order, copied out so per-agent locks are not taken under the agents
+    /// lock.
+    fn nodes(&self) -> Vec<Arc<Node>> {
+        self.inner.agents.lock().values().cloned().collect()
+    }
+
     fn emit(&self, event: SwarmEvent) {
         if let Some(journal) = &self.inner.journal {
             journal.record(&event);
@@ -1105,8 +1111,7 @@ impl Swarm {
         }
         if status == AgentStatus::Cancelled {
             // Waits on this agent may now be pointless; let them re-check.
-            let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
-            nodes.iter().for_each(|node| node.notify.notify_waiters());
+            self.nodes().iter().for_each(|node| node.notify.notify_waiters());
         }
         self.persist();
         let freed = status == AgentStatus::Cancelled;

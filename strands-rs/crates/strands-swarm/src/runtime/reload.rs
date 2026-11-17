@@ -87,8 +87,7 @@ impl Swarm {
 
     /// Tool calls in flight across running agents, not counting tools that only wait (`wait`).
     pub fn tool_calls_in_flight(&self) -> usize {
-        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
-        nodes
+        self.nodes()
             .iter()
             .filter(|node| *node.status.lock() == AgentStatus::Running)
             .map(|node| node.tool_calls.lock().len())
