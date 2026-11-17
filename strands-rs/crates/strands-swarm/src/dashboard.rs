@@ -29,7 +29,8 @@ const DESCRIPTION: &str = concat!(
     "Your context window. No arguments: its size against the auto-summary point, the biggest items ",
     "(numbered tool results) and the stash. `offload` swaps listed results for a stub (the text stays ",
     "in `retrieve_context`); `summarize` summarizes all but the latest messages before your next call. ",
-    "Each edit re-reads the prompt cache from that point on, so batch them."
+    "An edit makes your next call rewrite the prompt cache from it on (1.25x input, not 0.1x): ",
+    "offload big results, in one batch."
 );
 
 /// Shared between an agent's `context` tool and its context pipeline: the stash, a pending
@@ -180,8 +181,12 @@ impl ContextControl {
             }
         }
         let mut messages = agent.messages();
-        let (mut done, mut freed, mut offloaded) = (0, 0, Vec::new());
-        for message in messages.iter_mut().filter(|m| m.role == Role::User) {
+        let (mut done, mut freed, mut offloaded, mut first) = (0, 0, Vec::new(), None);
+        for (at, message) in messages
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, m)| m.role == Role::User)
+        {
             for block in &mut message.content {
                 let ContentBlock::ToolResult(result) = block else {
                     continue;
@@ -189,12 +194,12 @@ impl ContextControl {
                 if !ids.contains(&result.tool_use_id) {
                     continue;
                 }
-                let before = result_tokens(&result.content);
-                let mut refs = stash_refs(&result.tool_use_id, &result.content);
                 if is_stub(&result.content) {
                     // Rewriting a stub frees nothing and costs the cached prefix after it.
                     continue;
                 }
+                let before = result_tokens(&result.content);
+                let mut refs = stash_refs(&result.tool_use_id, &result.content);
                 if refs.is_empty() {
                     // Stashed when the result arrived; stored again only if missing, so the
                     // original is never overwritten.
@@ -217,13 +222,24 @@ impl ContextControl {
                 result.content = vec![ToolResultContent::Text(stub)];
                 freed += before.saturating_sub(result_tokens(&result.content));
                 done += 1;
+                first.get_or_insert(at);
                 offloaded.extend(refs);
             }
         }
-        if done > 0 {
+        let mut note = format!("Offloaded {done} tool results (~{} tokens).", group(freed as u64));
+        if let Some(first) = first {
+            // Everything from the first edit on is written to the cache again on the next call.
+            let rewritten: usize = messages[first..]
+                .iter()
+                .flat_map(|m| &m.content)
+                .map(block_tokens)
+                .sum();
+            note.push_str(&format!(
+                " Your next call writes the ~{} tokens from the first of them on to the prompt cache again.",
+                group(rewritten as u64)
+            ));
             agent.set_messages(messages);
         }
-        let mut note = format!("Offloaded {done} tool results (~{} tokens).", group(freed as u64));
         if !offloaded.is_empty() {
             note.push_str(&format!(
                 " `retrieve_context` reads them back by reference: {}.",
@@ -567,6 +583,11 @@ mod tests {
         // The next model call sees the stub instead of the output.
         let report = result_text(&model, 4, "c2");
         assert!(report.contains("Offloaded 1 tool results"), "{report}");
+        assert!(
+            report.contains("Your next call writes the ~1,1")
+                && report.contains("tokens from the first of them on to the prompt cache again"),
+            "the stub, the small result and the listing after it: {report}"
+        );
         assert!(report.contains("by reference: big_0."), "{report}");
         assert!(
             report.contains("shell result `cargo test` [ref: big_0]"),
@@ -668,6 +689,7 @@ mod tests {
         *control.listed.lock() = vec!["big".into(), "c1".into()];
         let note = control.offload(&agent, &[1, 2]).await;
         assert!(note.starts_with("Offloaded 0 tool results"), "{note}");
+        assert!(!note.contains("next call writes"), "{note}");
         assert_eq!(format!("{:?}", agent.messages()), format!("{before:?}"));
     }
 
