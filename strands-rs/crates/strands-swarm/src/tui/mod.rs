@@ -537,12 +537,7 @@ mod tests {
     }
 
     fn screen(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
-        terminal.draw(|frame| view::draw(frame, app, "run1", 0)).unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..HEIGHT)
-            .map(|y| (0..WIDTH).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
-            .collect()
+        view::buffer_text(&render(app))
     }
 
     fn press(app: &mut App, code: KeyCode) -> Option<Command> {

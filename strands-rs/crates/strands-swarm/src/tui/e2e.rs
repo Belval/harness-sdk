@@ -64,6 +64,25 @@ fn say(text: &str) -> MockResponse {
     MockResponse::message(Message::assistant(text))
 }
 
+/// The root (`a1`) spawns `parser` (`a2`), waits for its reply and then says each of `answers`.
+fn root_spawns_parser(answers: &[&str]) -> HashMap<&'static str, Vec<MockResponse>> {
+    let spawn = json!({"task": "check the parser", "name": "parser"});
+    let wait = json!({"from": ["parser"], "timeout_seconds": 10});
+    let root = [
+        tool_call("spawn_agent", "t1", spawn),
+        tool_call("wait", "t2", wait),
+    ];
+    HashMap::from([
+        (
+            "a1",
+            root.into_iter()
+                .chain(answers.iter().map(|text| say(text)))
+                .collect(),
+        ),
+        ("a2", vec![say("parser: all green")]),
+    ])
+}
+
 /// The TUI as the user sees it: draws `app` and keeps the frame, like the event loop does.
 struct Screen {
     terminal: Terminal<TestBackend>,
@@ -85,14 +104,7 @@ impl Screen {
             .draw(|frame| view::draw(frame, app, "run1", 0))
             .unwrap();
         self.buffer.clone_from(frame.buffer);
-        (0..HEIGHT)
-            .map(|y| {
-                (0..WIDTH)
-                    .map(|x| self.buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    + "\n"
-            })
-            .collect()
+        view::buffer_text(&self.buffer)
     }
 
     /// Press `code`, through the TUI's terminal-event handler.
@@ -102,13 +114,10 @@ impl Screen {
         self.draw(app)
     }
 
-    /// Type `line` and press enter, each key going through the TUI's terminal-event handler.
+    /// Type `line` and press enter.
     async fn type_line(&mut self, swarm: &Swarm, app: &mut App, line: &str) {
-        let keys = line.chars().map(KeyCode::Char).chain([KeyCode::Enter]);
-        for code in keys {
-            let key = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
-            on_terminal_event(swarm, app, key, &self.buffer).await;
-            self.draw(app);
+        for code in line.chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+            self.press(swarm, app, code).await;
         }
     }
 
@@ -140,22 +149,7 @@ impl Screen {
 async fn a_real_swarm_shows_spawns_replies_compaction_and_status_on_screen() {
     let dir = tempfile::tempdir().unwrap();
     let sinks = Sinks::default();
-    let scripts = HashMap::from([
-        (
-            "a1",
-            vec![
-                tool_call(
-                    "spawn_agent",
-                    "t1",
-                    json!({"task": "check the parser", "name": "parser"}),
-                ),
-                tool_call("wait", "t2", json!({"from": ["parser"], "timeout_seconds": 10})),
-                say("root: the parser is fine"),
-                say("root: second answer"),
-            ],
-        ),
-        ("a2", vec![say("parser: all green")]),
-    ]);
+    let scripts = root_spawns_parser(&["root: the parser is fine", "root: second answer"]);
     let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory(scripts, &sinks), dir.path()));
     let mut app = App::default();
     let mut screen = Screen::new();
@@ -234,9 +228,7 @@ async fn a_real_swarm_shows_spawns_replies_compaction_and_status_on_screen() {
     let shown = screen.press(&swarm, &mut app, KeyCode::PageDown).await;
     assert_eq!(app.status_scroll, 0);
     assert!(shown.contains("2 live agents"), "{shown}");
-    let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-    on_terminal_event(&swarm, &mut app, key, &screen.buffer).await;
-    let shown = screen.draw(&mut app);
+    let shown = screen.press(&swarm, &mut app, KeyCode::Char('x')).await;
     assert!(!shown.contains("┌ status"), "any key closes the overlay");
     assert!(!shown.contains("any other key closes"), "and its hint\n{shown}");
     swarm.shutdown().await;
@@ -247,21 +239,7 @@ async fn after_a_restart_every_agent_shows_its_past_including_cancelled_ones() {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("run");
     let sinks = Sinks::default();
-    let scripts = HashMap::from([
-        (
-            "a1",
-            vec![
-                tool_call(
-                    "spawn_agent",
-                    "t1",
-                    json!({"task": "check the parser", "name": "parser"}),
-                ),
-                tool_call("wait", "t2", json!({"from": ["parser"], "timeout_seconds": 10})),
-                say("root: the parser is fine"),
-            ],
-        ),
-        ("a2", vec![say("parser: all green")]),
-    ]);
+    let scripts = root_spawns_parser(&["root: the parser is fine"]);
     let mut config = SwarmConfig::new(factory(scripts, &sinks), dir.path());
     config.state_dir = Some(state_dir.clone());
     let (swarm, mut events) = Swarm::new(config.clone());

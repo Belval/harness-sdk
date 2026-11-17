@@ -778,6 +778,20 @@ fn draw_completions(frame: &mut Frame, input: Rect, app: &App) {
 }
 
 #[cfg(test)]
+/// `buffer` as text, one line per row.
+pub fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+    let area = buffer.area;
+    (area.top()..area.bottom())
+        .map(|y| {
+            (area.left()..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
@@ -815,16 +829,10 @@ mod tests {
         app
     }
 
-    fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
-        let area = buffer.area;
-        (area.top()..area.bottom())
-            .map(|y| {
-                (area.left()..area.right())
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+    fn render(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app, "r", 0)).unwrap();
+        buffer_text(terminal.backend().buffer())
     }
 
     #[test]
@@ -841,10 +849,7 @@ mod tests {
             });
         }
         app.agents.get_mut("a1").unwrap().unseen = false;
-        let backend = ratatui::backend::TestBackend::new(80, 12);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 80, 12);
         let rows: Vec<&str> = screen.lines().collect();
         let tree = usize::from(tree_width(&app, 80)) - 1;
         let row = |y: usize| rows[y].chars().take(tree).collect::<String>();
@@ -858,10 +863,7 @@ mod tests {
             input: "/".into(),
             ..Default::default()
         };
-        let backend = ratatui::backend::TestBackend::new(120, 30);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 120, 30);
         let columns: HashSet<usize> = SLASH_COMMANDS
             .iter()
             .map(|command| {
@@ -901,9 +903,7 @@ mod tests {
         app.agents.get_mut("a1").unwrap().input_tokens = 14_100_000;
         app.budget = Some(50_000_000);
         let header = |width: u16| {
-            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 10)).unwrap();
-            terminal.draw(|frame| draw(frame, &app, "r", 0)).unwrap();
-            screen_text(terminal.backend().buffer())
+            render(&app, width, 10)
                 .lines()
                 .next()
                 .unwrap()
@@ -941,9 +941,7 @@ mod tests {
             name: "wait".into(),
             summary: "{\"from\":[\"parser\"]}".into(),
         });
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 80, 12);
         assert_eq!(screen.matches("parser").count(), 1, "{screen}");
         assert!(screen.contains("running wait…"), "{screen}");
     }
@@ -954,9 +952,7 @@ mod tests {
             show_keys: true,
             ..Default::default()
         };
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 100, 30);
         for (_, help) in KEYS {
             assert!(screen.contains(help), "{help}:\n{screen}");
         }
@@ -973,9 +969,7 @@ mod tests {
             prices: crate::cost::Prices::default(),
         });
         for (width, height) in [(1, 1), (5, 3), (20, 5), (40, 10)] {
-            let backend = ratatui::backend::TestBackend::new(width, height);
-            let mut terminal = ratatui::Terminal::new(backend).unwrap();
-            terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+            render(&app, width, height);
         }
     }
 
@@ -1001,9 +995,7 @@ mod tests {
         let limit = popup_scroll_limit(&app, size);
         assert!(limit > 0);
         app.status_scroll = limit;
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 80, 24);
         let last = screen
             .lines()
             .rfind(|row| row.contains("agent-"))
@@ -1031,9 +1023,7 @@ mod tests {
             summary: path.into(),
             ok: Some(false),
         });
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 80, 24);
         let row = screen.lines().find(|row| row.contains("✗ read")).expect(&screen);
         assert!(row.contains("✗ read /local/home/"), "{screen}");
         assert!(!screen.contains('\u{a0}'), "the glue renders as spaces");
@@ -1042,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn the_status_popup_wraps_long_lines() {
+    fn the_status_popup_lists_agents_over_the_log_and_wraps_long_lines() {
         let mut app = app_with_an_image(None);
         let subject = "abc1234 feat: thumbnails for every image in the log pane, scaled to fit the cell grid";
         app.status = Some(crate::status::StatusReport {
@@ -1062,44 +1052,14 @@ mod tests {
                 schedules: vec![],
             }],
         });
-        let backend = ratatui::backend::TestBackend::new(60, 20);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
-        assert!(screen.contains("scaled to fit the cell grid"), "{screen}");
-    }
-
-    #[test]
-    fn the_status_popup_lists_agents_over_the_log() {
-        let mut app = app_with_an_image(None);
-        app.status = Some(crate::status::StatusReport {
-            base: Some("main".into()),
-            agents: vec![crate::status::AgentReport {
-                id: "a1".into(),
-                label: "shots (a1)".into(),
-                status: AgentStatus::Idle,
-                unread: 0,
-                branch: Some("swarm/r/a1".into()),
-                git: Some(crate::status::BranchState {
-                    ahead: vec!["abc1234 feat: thumbnails".into()],
-                    ..Default::default()
-                }),
-                todos: vec![],
-                background: vec![],
-                schedules: vec![],
-            }],
-        });
-        for width in [100, 30] {
-            let backend = ratatui::backend::TestBackend::new(width, 20);
-            let mut terminal = ratatui::Terminal::new(backend).unwrap();
-            terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-            let screen = screen_text(terminal.backend().buffer());
-            assert!(screen.contains("shots (a1) · idle"), "{screen}");
-            if width == 100 {
-                assert!(screen.contains("abc1234 feat: thumbnails"), "{screen}");
-                assert!(screen.contains("1 not on main"), "{screen}");
-            }
+        let wide = render(&app, 100, 20);
+        for expected in ["shots (a1) · idle", "abc1234 feat: thumbnails", "1 not on main"] {
+            assert!(wide.contains(expected), "{expected}:\n{wide}");
         }
+        let narrow = render(&app, 60, 20);
+        assert!(narrow.contains("scaled to fit the cell grid"), "{narrow}");
+        let tiny = render(&app, 30, 20);
+        assert!(tiny.contains("shots (a1) · idle"), "{tiny}");
     }
 
     #[test]
@@ -1127,10 +1087,7 @@ mod tests {
         };
         app.spend = Some(report.total());
         app.cost = Some(report);
-        let backend = ratatui::backend::TestBackend::new(120, 20);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 120, 20);
         assert!(screen.contains("est. $6.00"), "{screen}");
         assert!(screen.contains("estimated cost"), "{screen}");
         assert!(screen.contains("Estimated cost: $6.00"), "{screen}");
@@ -1138,9 +1095,7 @@ mod tests {
         assert!(screen.contains("claude-sonnet-4-5"), "{screen}");
 
         // An 80-column terminal clips the table, but not the estimate.
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 80, 20);
         let row = screen
             .lines()
             .find(|row| row.contains("│shots (a1)"))
@@ -1163,14 +1118,12 @@ mod tests {
     #[test]
     fn an_image_shows_as_a_thumbnail_under_its_placeholder_but_copies_as_text() {
         let app = app_with_an_image(Some(ratatui_image::picker::Picker::halfblocks()));
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 100, 30);
         assert!(screen.contains("[image: /w/shot.png 40x30]"), "{screen}");
         let halfblock = |text: &str| text.contains('▀') || text.contains('▄');
         assert!(halfblock(&screen), "no halfblock thumbnail:\n{screen}");
 
-        let copy = screen_text(&log_text(&app, Rect::new(0, 0, 100, 30)));
+        let copy = buffer_text(&log_text(&app, Rect::new(0, 0, 100, 30)));
         assert!(copy.contains("[image: /w/shot.png 40x30]"), "{copy}");
         assert!(!halfblock(&copy), "{copy}");
         assert!(plain_log(&app.agents["a1"]).contains("[image: /w/shot.png 40x30]\n"));
@@ -1187,9 +1140,7 @@ mod tests {
             source: "/w/diagram.png".into(),
             bytes: std::sync::Arc::new(super::super::images::png(1024, 768)),
         });
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 100, 30);
         assert!(screen.contains("[image: /w/shot.png 40x30]"), "{screen}");
         assert!(screen.contains("[image: /w/diagram.png 1024x768]"), "{screen}");
         assert!(!screen.contains('▀') && !screen.contains('▄'), "{screen}");
@@ -1203,9 +1154,7 @@ mod tests {
     fn a_pending_reload_shows_in_the_header() {
         let mut app = App::default();
         app.apply(crate::runtime::SwarmEvent::ReloadPending { tool_calls: 2 });
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 10)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen = screen_text(terminal.backend().buffer());
+        let screen = render(&app, 140, 10);
         assert!(
             screen.contains("reload pending (waiting for 2 tool calls)"),
             "{screen}"
@@ -1223,19 +1172,11 @@ mod tests {
 
     #[test]
     fn typing_a_slash_shows_the_matching_commands_above_the_input() {
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
         let app = App {
             input: "/c".into(),
             ..Default::default()
         };
-        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
-        let screen: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let screen = render(&app, 100, 20);
         assert!(screen.contains("/cancel"), "{screen}");
         assert!(!screen.contains("/model"), "{screen}");
     }
