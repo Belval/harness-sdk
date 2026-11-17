@@ -99,12 +99,23 @@ impl Swarm {
             None => std::env::current_exe()?,
         };
         let command = format!(
-            "{} --land {}",
+            "{}{}{}",
             crate::land::sh_quote(&exe.to_string_lossy()),
+            crate::land::LAND_FLAG,
             crate::land::sh_quote(&plan_path.to_string_lossy())
         );
         self.start_job(owner, &command, Some(format!("land {label} → {into}")))
             .await
+    }
+
+    /// [`crate::land::tidy`]: what land jobs killed outright left behind, once no land job runs
+    /// (`None` while one does).
+    pub(super) async fn tidy_landings(&self) -> Option<Collected> {
+        let land = |job: &crate::jobs::JobMeta| job.command.contains(crate::land::LAND_FLAG);
+        if self.inner.jobs.any_running(land).await {
+            return None;
+        }
+        Some(crate::land::tidy(&jobs_dir(&self.inner.config).join("land")).await)
     }
 
     /// Branches `node` may land: its own (a root agent's is the one it has checked out), then

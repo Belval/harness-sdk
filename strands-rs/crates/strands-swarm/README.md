@@ -244,7 +244,9 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
     nothing.
   - The scratch worktree is always removed, and the caller's branch is never modified. A land job
     that is stopped (killed with `jobs`, or its agent cancelled) kills the check in flight with its
-    children and removes the scratch worktree too.
+    children and removes the scratch worktree too. One killed outright (`kill -9`, a reboot)
+    leaves it behind; the next resume, `/gc` or `--gc` that finds no land job running removes it
+    (a `gc` event for `land`).
 - Programmatically: `Swarm::land`.
 
 ## TUI

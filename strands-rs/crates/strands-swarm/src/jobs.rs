@@ -319,6 +319,16 @@ impl Jobs {
         ended
     }
 
+    /// Whether a job that `matches` still runs (its process alive, whatever its files say).
+    pub async fn any_running(&self, matches: impl Fn(&JobMeta) -> bool) -> bool {
+        for job in self.list().await {
+            if job.state == JobState::Running && matches(&job.meta) && alive(job.meta.pid).await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Kill job `id`'s process group, mark it killed and reported (whoever kills it knows).
     pub async fn kill(&self, id: &str) -> Result<Job> {
         let job = self.get(id).await?;

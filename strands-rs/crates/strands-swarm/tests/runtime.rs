@@ -2567,6 +2567,54 @@ async fn a_worktree_still_kept_on_resume_is_not_journaled_again() {
 }
 
 #[tokio::test]
+async fn gc_and_resume_remove_a_killed_land_job_s_scratch_once_no_land_job_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[("a.txt", "a")]);
+    let state_dir = dir.path().join("run");
+    let land = state_dir.join("jobs/land");
+    std::fs::create_dir_all(&land).unwrap();
+    let scratch = land.join("a2-20260101-000000000");
+    let plan = strands_swarm::land::LandPlan {
+        repo: repo.clone(),
+        source: "main".into(),
+        label: "main".into(),
+        into: "main".into(),
+        checks: Vec::new(),
+        scratch: scratch.clone(),
+        target_dir: dir.path().join("target"),
+    };
+    std::fs::write(scratch.with_extension("json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    git(
+        &repo,
+        &["worktree", "add", "-q", "--detach", scratch.to_str().unwrap()],
+    );
+    let scripts = scripts_of(vec![("a1", vec![say("ok")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config.clone());
+    spawn_root(&swarm, "root").await;
+    reply_to(&mut events, USER).await;
+
+    // Another land job is running: it might be using the directory.
+    let job = swarm
+        .start_job("a1", "sleep 30 # --land plan", None)
+        .await
+        .unwrap();
+    let collected = swarm.gc().await;
+    assert!(collected.iter().all(|c| c.id != "land"), "{collected:?}");
+    assert!(scratch.exists());
+    swarm.kill_job(&job.meta.id).await.unwrap();
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&state_dir).await.unwrap().unwrap();
+    let (resumed, _events) = Swarm::resume(config, saved).await.unwrap();
+    eventually("resume removes the scratch worktree", || !scratch.exists()).await;
+    let listed = git(&repo, &["worktree", "list", "--porcelain"]);
+    assert_eq!(listed.matches("worktree ").count(), 1, "{listed}");
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
 async fn cancelling_says_what_it_kept_and_a_run_without_state_cleans_up_on_exit() {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);

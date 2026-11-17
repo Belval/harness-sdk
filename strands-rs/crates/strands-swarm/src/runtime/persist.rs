@@ -40,6 +40,7 @@ impl Swarm {
         swarm.deliver_supervisor_notice().await;
         swarm.persist();
         swarm.collect_in_background();
+        swarm.tidy_landings_in_background();
         swarm.watch_jobs();
         Ok((swarm, events))
     }

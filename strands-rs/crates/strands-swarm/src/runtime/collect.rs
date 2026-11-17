@@ -25,6 +25,19 @@ impl Swarm {
             .collect()
     }
 
+    /// On resume: [`Swarm::tidy_landings`] in the background, published if it did anything.
+    pub(super) fn tidy_landings_in_background(&self) {
+        let swarm = self.clone();
+        tokio::spawn(async move {
+            if let Some(tidied) = swarm.tidy_landings().await.filter(|tidied| !tidied.is_empty()) {
+                swarm.emit(SwarmEvent::Reclaimed {
+                    collected: vec![tidied],
+                    requested: false,
+                });
+            }
+        });
+    }
+
     /// Reclaim the disk of newly collectable agents without waiting (see [`Swarm::gc`]).
     pub(super) fn collect_in_background(&self) {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
@@ -56,6 +69,7 @@ impl Swarm {
         for node in self.collectable(false) {
             collected.push(self.collect_node(&node).await);
         }
+        collected.extend(self.tidy_landings().await.filter(|tidied| !tidied.is_empty()));
         self.emit(SwarmEvent::Reclaimed {
             collected: collected.clone(),
             requested: true,

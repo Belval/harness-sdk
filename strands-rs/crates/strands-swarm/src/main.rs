@@ -204,7 +204,12 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     }
     if cli.gc {
         let (dir, saved) = load_run(cli.run.as_deref().unwrap_or_default()).await?;
-        let collected = strands_swarm::gc::collect_run(&saved, cli.status_base.as_deref()).await;
+        let mut collected = strands_swarm::gc::collect_run(&saved, cli.status_base.as_deref()).await;
+        let jobs = strands_swarm::jobs::Jobs::new(dir.join("jobs"));
+        let land = |job: &strands_swarm::jobs::JobMeta| job.command.contains(strands_swarm::land::LAND_FLAG);
+        if !jobs.any_running(land).await {
+            collected.push(strands_swarm::land::tidy(&dir.join("jobs/land")).await);
+        }
         let journal = strands_swarm::journal::Journal::open(&dir);
         for agent in collected.iter().filter(|c| !c.is_empty()) {
             journal.event("gc", agent.journal_fields());

@@ -30,6 +30,9 @@ pub const LANDED_FILE: &str = "swarm-landed";
 /// once (two `git merge`s race for the checkout's `index.lock`).
 pub const LOCK_FILE: &str = "swarm-land.lock";
 
+/// What sets a land job's command apart: `<exe> --land <plan>`.
+pub const LAND_FLAG: &str = " --land ";
+
 /// Most landings [`LANDED_FILE`] keeps (the latest).
 const LANDED_KEPT: usize = 500;
 
@@ -178,6 +181,48 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
         short(old),
         short(&new)
     ))
+}
+
+/// What a land job killed outright (`kill -9`, a reboot) left in `land_dir` (the swarm's
+/// `jobs/land`): scratch worktrees, unregistered from their repository and deleted, as
+/// [`crate::gc::Collected`] under the id `land`. Call it only while no land job runs; the
+/// shared target dir (`target`, without `CARGO_TARGET_DIR`) is left alone.
+pub async fn tidy(land_dir: &Path) -> crate::gc::Collected {
+    let mut out = crate::gc::Collected {
+        id: "land".into(),
+        ..Default::default()
+    };
+    let Ok(mut entries) = tokio::fs::read_dir(land_dir).await else {
+        return out;
+    };
+    let mut scratches = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let is_dir = entry.file_type().await.is_ok_and(|kind| kind.is_dir());
+        if is_dir && entry.file_name() != "target" {
+            scratches.push(entry.path());
+        }
+    }
+    scratches.sort();
+    for scratch in scratches {
+        let plan = tokio::fs::read(scratch.with_extension("json")).await.ok();
+        let plan = plan.and_then(|bytes| serde_json::from_slice::<LandPlan>(&bytes).ok());
+        let bytes = crate::gc::dir_size(&scratch);
+        if let Some(plan) = &plan {
+            let path = scratch.to_string_lossy();
+            let _ = git(&plan.repo, &["worktree", "remove", "--force", "--force", &path]).await;
+        }
+        if scratch.exists() {
+            if let Err(error) = tokio::fs::remove_dir_all(&scratch).await {
+                out.kept.push((scratch, format!("delete failed: {error}")));
+                continue;
+            }
+        }
+        if let Some(plan) = &plan {
+            let _ = git(&plan.repo, &["worktree", "prune"]).await;
+        }
+        out.removed.push((scratch, bytes));
+    }
+    out
 }
 
 /// The landed-commit record of the repository at `dir`.
@@ -711,6 +756,35 @@ mod tests {
             error.contains("moved from") && error.contains("meanwhile"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn tidying_removes_the_scratch_worktree_of_a_killed_land_job_and_keeps_the_target() {
+        let fx = fixture().await;
+        let plan = plan(&fx, &[]);
+        std::fs::create_dir_all(&fx.land).unwrap();
+        std::fs::write(fx.land.join("scratch.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+        // What `kill -9` leaves: the job's scratch worktree, mid-rebase or mid-check.
+        let path = plan.scratch.to_string_lossy().into_owned();
+        git(&fx.main, &["worktree", "add", "-q", "--detach", &path, "feature"])
+            .await
+            .unwrap();
+        std::fs::write(plan.scratch.join("built.o"), "x").unwrap();
+        std::fs::create_dir_all(fx.land.join("target/debug")).unwrap();
+
+        let tidied = tidy(&fx.land).await;
+
+        assert_eq!(tidied.id, "land");
+        assert_eq!(tidied.removed.len(), 1, "{tidied:?}");
+        assert_eq!(tidied.removed[0].0, plan.scratch);
+        assert!(tidied.kept.is_empty(), "{tidied:?}");
+        assert!(!plan.scratch.exists());
+        assert_eq!(worktrees(&fx.main).await, 2, "main and feature only");
+        assert!(
+            fx.land.join("target/debug").exists(),
+            "the shared target dir stays"
+        );
+        assert!(tidy(&fx.land).await.is_empty());
     }
 
     #[tokio::test]
