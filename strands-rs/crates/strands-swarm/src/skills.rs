@@ -21,10 +21,8 @@ const SUMMARY_CHARS: usize = 200;
 /// Most bundled files listed when a skill loads.
 const MAX_LISTED_FILES: usize = 30;
 
-const SKILLS_TOOL_DESCRIPTION: &str = concat!(
-    "Load a skill: its full instructions, its directory, and the files bundled with it. ",
-    "The available skills are listed in the Skills section of your system prompt."
-);
+const SKILLS_TOOL_DESCRIPTION: &str =
+    "Load a skill from the Skills section of your system prompt: its instructions, directory and files.";
 
 /// A directory of skills (or a single skill directory) and where it comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +93,7 @@ struct SkillInput {
 pub fn skills_tool(skills: Arc<Vec<Skill>>) -> ToolRef {
     let tool = FunctionTool::builder(SKILLS_TOOL_NAME)
         .description(SKILLS_TOOL_DESCRIPTION)
+        .input_schema(crate::tools::lean_schema::<SkillInput>())
         .typed_handler(move |input: SkillInput, _ctx: ToolContext| {
             let skills = skills.clone();
             async move { Result::Ok(load_skill(&skills, &input.skill_name)) }

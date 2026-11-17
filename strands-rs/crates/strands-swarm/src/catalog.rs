@@ -90,6 +90,7 @@ impl ToolCatalog {
         let catalog = self.clone();
         let tool = FunctionTool::builder(FIND_TOOLS_NAME)
             .description(self.description())
+            .input_schema(crate::tools::lean_schema::<FindInput>())
             .typed_handler(move |input: FindInput, ctx: ToolContext| {
                 let catalog = catalog.clone();
                 async move { Result::Ok(catalog.run(&ctx.agent, input)) }
@@ -115,10 +116,9 @@ impl ToolCatalog {
             .map(|(name, count)| format!("{name} ({count})"))
             .collect();
         format!(
-            "Search and enable MCP tools. {} MCP tools are available but not loaded, from these servers: {}. \
-             Pass `query` (keywords) to search tool names and descriptions; pass `enable` (exact tool names) \
-             to load them for yourself: they become callable from your next step on and stay enabled across \
-             restarts. Tool names are `<server>_<tool>`.",
+            "Search and enable MCP tools ({} not loaded, named `<server>_<tool>`) from: {}. `query` \
+             searches names and descriptions; `enable` loads tools by exact name, callable from your next \
+             step and kept across restarts.",
             self.tools.len(),
             servers.join(", ")
         )
@@ -197,13 +197,13 @@ impl ToolCatalog {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct FindInput {
-    /// Keywords to search for in tool names and descriptions, e.g. "slack search messages".
+    /// Keywords, e.g. "slack search messages".
     #[serde(default)]
     query: Option<String>,
-    /// Exact tool names to enable for yourself.
+    /// Tool names to enable.
     #[serde(default)]
     enable: Vec<String>,
-    /// Maximum search results (default 15, max 50).
+    /// Max results (default 15, max 50).
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn description_lists_servers_with_counts() {
         let description = catalog().description();
-        assert!(description.contains("4 MCP tools"), "{description}");
+        assert!(description.contains("(4 not loaded,"), "{description}");
         assert!(description.contains("slack (2), wiki (1), tickets (1)"));
     }
 

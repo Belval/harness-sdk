@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use strands_agents::context_manager::retrieval_tool::RETRIEVAL_TOOL_NAME;
 use strands_agents::context_manager::strategies::{
     Offload, OffloadConditions, OffloadTarget, TruncateConfig,
 };
@@ -13,14 +14,15 @@ use strands_agents::plugins::vended::{GoalLoop, JudgeConfig, Skill};
 use strands_agents::sandbox::LocalSandbox;
 use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
 use strands_agents::storage::{namespace, LocalFileStorage};
-use strands_agents::tools::ToolRef;
+use strands_agents::tools::{Tool, ToolContext, ToolRef};
+use strands_agents::types::{ToolResultBlock, ToolSpec};
 use strands_agents::Plugin;
 use strands_agents::{Agent, FileStorage, Result, SessionManager};
 use strands_harness::defaults::{DEFAULT_BUILTIN_TOOLS, DEFAULT_MODEL};
 use strands_harness::{
-    create_harness, resolve_model, BuiltinToolsConfig, Effort, EnvironmentContext, EnvironmentContextConfig,
-    HarnessAgentOptions, MemoryOption, ModelOption, ResolveModelOptions, SandboxOption, SessionOption,
-    SkillsOption,
+    create_harness, resolve_model, BackgroundTasksOption, BuiltinToolsConfig, Effort, EnvironmentContext,
+    EnvironmentContextConfig, HarnessAgentOptions, MemoryOption, ModelOption, ResolveModelOptions,
+    SandboxOption, SessionOption, SkillsOption,
 };
 
 use crate::catalog::ToolCatalog;
@@ -87,11 +89,57 @@ pub fn harness_factory(options: HarnessFactoryOptions) -> AgentFactory {
 
 async fn build(options: &HarnessFactoryOptions, harness: HarnessAgentOptions) -> Result<Agent> {
     let agent = create_harness(harness).await?;
+    agent.with_tool_registry(|registry| {
+        let Some(tool) = registry.get(RETRIEVAL_TOOL_NAME) else {
+            return Ok(());
+        };
+        registry.add_or_replace([Reworded::tool(tool, RETRIEVAL_DESCRIPTION)])
+    })?;
     // The harness has restored the session by now; give back the tools enabled before.
     if let Some(catalog) = &options.catalog {
         catalog.restore(&agent);
     }
     Ok(agent)
+}
+
+/// `retrieve_context`'s description without the SDK's options list and examples, which repeat
+/// its input schema; every call pays for it.
+const RETRIEVAL_DESCRIPTION: &str = concat!(
+    "Read back content offloaded from your context (truncated, dropped or summarized) by the ref ",
+    "left in its place: all of it, the lines matching `pattern`, or a `line_range`."
+);
+
+/// A tool with its description replaced.
+struct Reworded {
+    inner: ToolRef,
+    spec: ToolSpec,
+}
+
+impl Reworded {
+    fn tool(inner: ToolRef, description: &str) -> ToolRef {
+        let mut spec = inner.spec().clone();
+        spec.description = description.to_owned();
+        Arc::new(Self { inner, spec })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for Reworded {
+    fn name(&self) -> &str {
+        &self.spec.name
+    }
+
+    fn description(&self) -> &str {
+        &self.spec.description
+    }
+
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(&self, ctx: ToolContext) -> Result<ToolResultBlock> {
+        self.inner.invoke(ctx).await
+    }
 }
 
 /// The [`ModelResolver`] matching [`harness_factory`]: resolves an id (`None`: the factory's
@@ -256,6 +304,9 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         sandbox: SandboxOption::Instance(Arc::new(sandbox)),
         session,
         memory: MemoryOption::Off,
+        // `run_background` covers slow shell commands and agents run concurrently anyway; the SDK's
+        // per-tool `_background_execution` flag and its manage tool cost every call ~700 tokens.
+        background_tasks: BackgroundTasksOption::Off,
         // Discovery happens once at startup (crate::skills); the harness's own `./.agent/skills`
         // lookup, relative to the process rather than the agent, stays off.
         skills: SkillsOption::Off,
@@ -767,5 +818,177 @@ mod tests {
                 "anthropic/{id}"
             );
         }
+    }
+
+    /// The fixed prefix a root agent sends on every call, built the way a real run builds it
+    /// (persistent, swarm prompt and tools, memory, an MCP catalog, two skills), split
+    /// into `(part, bytes)`: the system prompt sections, then one entry per tool spec.
+    async fn fixed_prefix() -> Vec<(String, usize)> {
+        use crate::runtime::{SpawnRequest, Swarm, SwarmConfig, USER};
+        use strands_agents::testing::MockResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |name: &str| -> ToolRef {
+            Arc::new(
+                FunctionTool::builder(name)
+                    .description("x")
+                    .handler(|input: serde_json::Value, _ctx| async move { Result::Ok(input) }),
+            )
+        };
+        let servers = [
+            ("builder-mcp", 55),
+            ("chorus-mcp", 8),
+            ("slack-mcp", 115),
+            ("quick-evals", 95),
+        ];
+        let catalog = ToolCatalog::new(
+            vec![tool("builder-mcp_x")],
+            servers.iter().map(|(name, n)| (name.to_string(), *n)).collect(),
+        );
+        let skills = ["review", "deploy"].map(|name| {
+            let mut skill = Skill::new(name, "Do the thing. Use when asked to.", "Steps.");
+            skill.path = Some(dir.path().join(name));
+            skill
+        });
+        let options = HarnessFactoryOptions {
+            catalog: Some(Arc::new(catalog)),
+            skills: Arc::new(skills.to_vec()),
+            ..Default::default()
+        };
+        let model = MockMessageModel::shared(vec![MockResponse::message(Message::assistant("ok"))]);
+        let shared = model.clone();
+        let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+            let options = options.clone();
+            let model = shared.clone();
+            Box::pin(async move {
+                let mut harness = harness_options(&options, spec)?;
+                harness.model = Some(ModelOption::Instance(model));
+                build(&options, harness).await
+            })
+        });
+        let mut config = SwarmConfig::new(factory, dir.path());
+        config.memory = Some(Arc::new(crate::Memory::new(dir.path().join("memory.md"))));
+        config.state_dir = Some(dir.path().join("run"));
+        let (swarm, _events) = Swarm::new(config);
+        let request = SpawnRequest {
+            task: "go".into(),
+            ..Default::default()
+        };
+        swarm.spawn(USER, request).await.unwrap();
+        while model.call_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        swarm.shutdown().await;
+        let calls = model.calls();
+        let options = &calls[0].1;
+        let prompt = options.system_prompt.as_ref().unwrap().text();
+        let path = dir.path().display().to_string();
+        let prompt = prompt.replace(&path, "/home/user/project");
+        if let Ok(out) = std::env::var("STRANDS_SWARM_DUMP_PREFIX") {
+            let specs = serde_json::to_string_pretty(&options.tool_specs).unwrap();
+            std::fs::write(&out, format!("{prompt}\n\n=== TOOLS ===\n{specs}")).unwrap();
+        }
+        let mut parts = Vec::new();
+        let mut section = String::from("(preamble)");
+        let mut text = String::new();
+        for line in prompt.split_inclusive('\n') {
+            if let Some(title) = line.strip_prefix("# ") {
+                parts.push((section, text.len()));
+                section = title.trim().to_owned();
+                text.clear();
+            }
+            text.push_str(line);
+        }
+        parts.push((section, text.len()));
+        for spec in &options.tool_specs {
+            let json = serde_json::to_string(spec).unwrap();
+            parts.push((format!("tool {}", spec.name), json.len()));
+        }
+        parts
+    }
+
+    /// The prefix is paid on every model call of every agent; this pins its size so it cannot
+    /// regrow unnoticed. Raise a budget only for something agents need on every call.
+    /// `cargo test -p strands-swarm --lib fixed_prefix -- --nocapture` prints the breakdown;
+    /// `STRANDS_SWARM_DUMP_PREFIX=<file>` also writes the prompt and tool specs out.
+    #[tokio::test]
+    async fn the_fixed_prefix_stays_within_its_budget() {
+        // About 4.6k tokens by Bedrock's count for Claude, down from 6.6k.
+        const BUDGET_BYTES: usize = 15_000;
+        const TOOL_BUDGET_BYTES: usize = 1_100;
+        let parts = fixed_prefix().await;
+        let total: usize = parts.iter().map(|(_, bytes)| bytes).sum();
+        for (part, bytes) in &parts {
+            println!("{bytes:>6}  {part}");
+        }
+        println!("{total:>6}  total");
+        assert!(
+            total <= BUDGET_BYTES,
+            "the fixed prefix grew to {total} bytes: {parts:#?}"
+        );
+        let big: Vec<_> = parts
+            .iter()
+            .filter(|(part, bytes)| part.starts_with("tool ") && *bytes > TOOL_BUDGET_BYTES)
+            .collect();
+        assert!(
+            big.is_empty(),
+            "tool specs over {TOOL_BUDGET_BYTES} bytes: {big:?}"
+        );
+        let names: Vec<&str> = parts
+            .iter()
+            .filter_map(|(part, _)| part.strip_prefix("tool "))
+            .collect();
+        assert!(
+            !names.contains(&"strands_manage_background_task"),
+            "the SDK's background tasks stay off: {names:?}"
+        );
+        assert!(
+            names.contains(&"reload_swarm") && names.contains(&"find_tools"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn lean_schemas_drop_what_tells_a_model_nothing() {
+        /// Input doc.
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Input {
+            /// Kept.
+            text: String,
+            #[serde(default)]
+            flag: bool,
+            #[serde(default)]
+            limit: Option<u64>,
+            #[serde(default)]
+            names: Vec<String>,
+        }
+        let schema = crate::tools::lean_schema::<Input>();
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Kept."},
+                    "flag": {"type": "boolean"},
+                    "limit": {"type": ["integer", "null"], "minimum": 0},
+                    "names": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["text"],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_context_keeps_its_schema_under_the_shorter_description() {
+        let options = HarnessFactoryOptions::default();
+        let mut harness = harness_options(&options, spec()).unwrap();
+        harness.model = Some(ModelOption::Instance(MockMessageModel::shared(vec![])));
+        let agent = build(&options, harness).await.unwrap();
+        let tool = agent
+            .with_tool_registry(|registry| registry.get(RETRIEVAL_TOOL_NAME))
+            .unwrap();
+        assert_eq!(tool.description(), RETRIEVAL_DESCRIPTION);
+        let schema = tool.spec().input_schema.clone().unwrap();
+        assert!(schema["properties"]["line_range"].is_object(), "{schema}");
     }
 }

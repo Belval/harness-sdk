@@ -19,112 +19,136 @@ use crate::runtime::{
 use crate::schedule::{self, Schedule};
 use crate::status::BranchState;
 
+/// `T`'s input schema without what tells a model nothing: the root `title` and `description`
+/// (the tool description says it) and per-field `format` and trivial `default`s (null, false,
+/// empty). Every tool on every call pays for its schema.
+pub(crate) fn lean_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    fn lean(schema: &mut serde_json::Value) {
+        let serde_json::Value::Object(map) = schema else {
+            return;
+        };
+        map.remove("format");
+        let trivial = |value: &serde_json::Value| match value {
+            serde_json::Value::Null | serde_json::Value::Bool(false) => true,
+            serde_json::Value::Array(items) => items.is_empty(),
+            serde_json::Value::String(text) => text.is_empty(),
+            _ => false,
+        };
+        if map.get("default").is_some_and(trivial) {
+            map.remove("default");
+        }
+        if let Some(serde_json::Value::Object(properties)) = map.get_mut("properties") {
+            properties.values_mut().for_each(lean);
+        }
+        if let Some(items) = map.get_mut("items") {
+            lean(items);
+        }
+    }
+    let mut schema = strands_agents::tools::input_schema_for::<T>();
+    if let serde_json::Value::Object(map) = &mut schema {
+        map.remove("title");
+        map.remove("description");
+    }
+    lean(&mut schema);
+    schema
+}
+
 const DEFAULT_WAIT_SECONDS: u64 = 600;
 const MAX_WAIT_SECONDS: u64 = 3600;
 
 const SPAWN_DESCRIPTION: &str = concat!(
-    "Start a new agent that works on `task` concurrently with you, and return its id immediately. ",
-    "It has the same tools you have, including spawning its own agents. Its final reply at the end of each ",
-    "turn is sent to you as a message; you can message it at any time with send_message and it continues ",
-    "with its full context. The task is its only context, so include what it needs to know. ",
-    "Set worktree=true to give it its own git worktree and branch, cut from your HEAD (uncommitted changes ",
-    "are not included), so parallel edits do not collide; integrate its branch yourself with git. ",
-    "At the agent limit the agent is queued (status `queued`; it can already be messaged or cancelled) and ",
-    "starts when a slot frees."
+    "Start an agent working on `task` concurrently; returns its id at once. It has your tools. Its final ",
+    "reply each turn comes to you as a message; message it any time and it continues with its context. ",
+    "The task is all it knows. worktree=true gives it its own git worktree and branch off your HEAD ",
+    "(uncommitted changes excluded); you integrate the branch. At the agent limit it is `queued` until a ",
+    "slot frees."
 );
 
 const SEND_DESCRIPTION: &str = concat!(
-    "Send a message to another agent by id or name, or to `parent` (whoever spawned you; the user for the root ",
-    "agent). A busy agent sees it after its current tool call; an idle one starts a new turn."
+    "Message an agent (id or name) or `parent` (who spawned you; the user for the root agent). A busy agent ",
+    "sees it after its current tool call; an idle one starts a turn."
 );
 
-const WAIT_DESCRIPTION: &str = concat!(
-    "Block until a message arrives, then return every unread message. With `from`, keep waiting until one ",
-    "of those agents has written. Returns early with a status summary on timeout."
-);
+const WAIT_DESCRIPTION: &str =
+    "Block until a message arrives and return all unread ones; on timeout, a status summary.";
 
 const LIST_DESCRIPTION: &str = concat!(
-    "List the agents in the swarm with name, id, parent, status, working directory, branch (commits ",
-    "ahead of and behind the integration branch, and whether it would merge cleanly or which files ",
-    "would conflict), running background jobs, model and estimated spend (own, and with descendants). ",
-    "Cancelled agents are only counted unless include_cancelled is set."
+    "List agents: status, cwd, branch (ahead/behind the base, clean merge or conflicting files), ",
+    "jobs, model, estimated spend."
 );
 
 const CANCEL_DESCRIPTION: &str =
-    "Stop an agent and every agent it spawned, and kill their background jobs. Its worktree and branch are left in place.";
+    "Stop an agent, its descendants and their jobs. Worktrees and branches stay.";
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SpawnInput {
-    /// Everything the new agent needs to know: goal, context, constraints, what to report back.
+    /// Goal, context, constraints, what to report back.
     task: String,
-    /// Short role name shown to the user and other agents, e.g. `lazy-mcp` or `tui-tests`. Agents can
-    /// be addressed by it; a suffix is added if it is taken.
+    /// Short role name, e.g. `tui-tests`; usable as its address.
     name: String,
-    /// Give the agent its own git worktree and branch.
     #[serde(default)]
     worktree: bool,
-    /// Model to use instead of the default (`provider/name` or a Bedrock model id). List-price cost
-    /// relative to opus: sonnet ≈ 0.6×, haiku ≈ 0.2×; cheaper models suit mechanical subtasks.
+    /// Model id instead of the default. Cost vs opus: sonnet ≈ 0.6×, haiku ≈ 0.2× (mechanical work).
     #[serde(default)]
     model: Option<String>,
-    /// A checkable completion criterion. When set, a judge reviews each finished turn and sends the
-    /// agent back to work until the criterion is met.
+    /// Checkable completion criterion: a judge sends the agent back to work until it is met.
     #[serde(default)]
     goal: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SendInput {
-    /// Receiver: an agent id or name, or `parent`.
     to: String,
-    /// Message text.
     message: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct WaitInput {
-    /// Only return once one of these agents (ids or names) has written. Omit to wait for anyone.
+    /// Return only once one of these agents has written; default anyone.
     #[serde(default)]
     from: Vec<String>,
-    /// Give up after this many seconds (default 600, max 3600).
+    /// Default 600, max 3600.
     #[serde(default)]
     timeout_seconds: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct CancelInput {
-    /// Id or name of the agent to stop.
+    /// Id or name.
     id: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListInput {
-    /// Also list cancelled agents.
     #[serde(default)]
     include_cancelled: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ReloadInput {
-    /// Absolute path of the freshly built `strands-swarm` binary.
+    /// Absolute path of the built `strands-swarm` binary.
     binary: String,
-    /// `idle` (default): restart once no agent has a tool call in flight (`wait` does not count),
-    /// at most 10 minutes later. `now`: restart right away, interrupting in-flight tool calls.
+    /// `idle` (default): once no tool call but `wait` is in flight, at most 10 min later. `now`:
+    /// at once, interrupting tool calls.
     #[serde(default)]
+    #[schemars(schema_with = "reload_when_schema")]
     when: ReloadWhen,
 }
 
 const RELOAD_DESCRIPTION: &str = concat!(
-    "Restart the whole swarm into a new strands-swarm binary (hot reload). The binary must already be ",
-    "built; it is checked (--version, --self-test) and installed right away, and the restart follows ",
-    "per `when`. A newer reload supersedes a pending one. Every agent is stopped, saved, and resumed ",
-    "under the new binary with its conversation and unread messages; agents that were mid-turn get a ",
-    "restart notice. If the new binary crashes on startup the supervisor rolls back to the previous one."
+    "Hot-reload the whole swarm into a built strands-swarm binary: it is self-tested and installed now, ",
+    "then every agent is saved and resumed under it with its conversation and mail (mid-turn agents get ",
+    "a restart notice). A newer reload supersedes a pending one; a binary that crashes on start is rolled back."
 );
+
+fn reload_when_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "string", "enum": ["idle", "now"] })
+}
 
 fn reload_tool(swarm: Swarm) -> ToolRef {
     let tool = FunctionTool::builder("reload_swarm")
         .description(RELOAD_DESCRIPTION)
+        .input_schema(lean_schema::<ReloadInput>())
         .typed_handler(move |input: ReloadInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             async move {
@@ -145,19 +169,16 @@ fn reload_tool(swarm: Swarm) -> ToolRef {
 }
 
 const RUN_BACKGROUND_DESCRIPTION: &str = concat!(
-    "Run a shell command in the background, in your working directory and environment, and return its ",
-    "job id at once. It runs detached from the swarm, so it survives swarm restarts. When it ends you get ",
-    "a message with its exit code and the last lines of its output (an idle agent wakes up for it): ",
-    "use it for builds, test suites and anything slow instead of polling with sleep. Output goes to a log ",
-    "file you can read meanwhile; `jobs` lists or kills jobs."
+    "Run a shell command in your cwd, detached (it survives swarm restarts); returns its job id. When it ends you ",
+    "get a message with the exit code and last output lines, waking you if idle: use it for builds, tests ",
+    "and anything slow instead of polling. Output goes to a log file you can read meanwhile."
 );
 
-const JOBS_DESCRIPTION: &str =
-    "List the background jobs of the swarm (yours first) with status and log path, or kill one by id.";
+const JOBS_DESCRIPTION: &str = "List background jobs (yours first) with status and log path, or kill one.";
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RunBackgroundInput {
-    /// Shell command (run with `sh -c`).
+    /// Run with `sh -c`.
     command: String,
     /// Short label, e.g. `gates`.
     #[serde(default)]
@@ -200,6 +221,7 @@ struct LandInput {
 fn land_tool(swarm: Swarm, me: String) -> ToolRef {
     let tool = FunctionTool::builder("land")
         .description(LAND_DESCRIPTION)
+        .input_schema(lean_schema::<LandInput>())
         .typed_handler(move |input: LandInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             let me = me.clone();
@@ -223,6 +245,7 @@ fn land_tool(swarm: Swarm, me: String) -> ToolRef {
 fn run_background_tool(swarm: Swarm, me: String) -> ToolRef {
     let tool = FunctionTool::builder("run_background")
         .description(RUN_BACKGROUND_DESCRIPTION)
+        .input_schema(lean_schema::<RunBackgroundInput>())
         .typed_handler(move |input: RunBackgroundInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             let me = me.clone();
@@ -242,6 +265,7 @@ fn run_background_tool(swarm: Swarm, me: String) -> ToolRef {
 fn jobs_tool(swarm: Swarm, me: String) -> ToolRef {
     let tool = FunctionTool::builder("jobs")
         .description(JOBS_DESCRIPTION)
+        .input_schema(lean_schema::<JobsInput>())
         .typed_handler(move |input: JobsInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             let me = me.clone();
@@ -280,20 +304,19 @@ fn list_jobs(swarm: &Swarm, me: &str, mut jobs: Vec<Job>) -> String {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ScheduleInput {
-    /// Text to post when it fires. Omit (and `cancel`) to list every schedule.
+    /// Text to post; omit (with `cancel`) to list schedules.
     #[serde(default)]
     message: Option<String>,
-    /// Receiver: an agent id or name, or `parent`. Default: yourself.
+    /// Agent id or name, or `parent`; default yourself.
     #[serde(default)]
     to: Option<String>,
-    /// Repeat interval, e.g. `30m`, `2h`, `1d` (at least `1m`). Omit for a one-shot.
+    /// Repeat interval, e.g. `30m`, `1d` (min `1m`); omit for a one-shot.
     #[serde(default)]
     every: Option<String>,
-    /// First (or only) time: `in 2h`, or ISO 8601 such as `2026-11-17T09:00Z` (UTC unless an offset
-    /// is given). Default: one `every` from now.
+    /// First time: `in 2h` or ISO 8601 (UTC unless offset); default one `every` from now.
     #[serde(default)]
     at: Option<String>,
-    /// Id to create, or to replace an existing schedule. Default: a new `sN`.
+    /// Id to create or replace; default a new `sN`.
     #[serde(default)]
     id: Option<String>,
     /// Id of a schedule to remove.
@@ -302,17 +325,15 @@ struct ScheduleInput {
 }
 
 const SCHEDULE_DESCRIPTION: &str = concat!(
-    "Post `message` to an agent's mailbox (default: your own) later, repeatedly, or both: e.g. ",
-    "`every: \"30m\"` to poll something, `at: \"in 2h\"` for a reminder. For periodic work, schedule ",
-    "yourself and end your turn instead of sitting in a long `wait`: each fire starts a new turn, and an ",
-    "idle agent waiting only on a schedule does not count toward the agent limit. Schedules survive ",
-    "restarts; a fire missed while the swarm was down is delivered once on resume. `cancel: id` removes ",
-    "one; no arguments lists them all. Schedules of a cancelled agent are dropped."
+    "Post `message` to a mailbox later and/or repeatedly. For periodic work, schedule yourself and end ",
+    "your turn rather than a long `wait`: each fire starts a turn, and an agent idle on a schedule holds ",
+    "no agent slot. Survives restarts (a missed fire is delivered once)."
 );
 
 fn schedule_tool(swarm: Swarm, me: String) -> ToolRef {
     let tool = FunctionTool::builder("schedule")
         .description(SCHEDULE_DESCRIPTION)
+        .input_schema(lean_schema::<ScheduleInput>())
         .typed_handler(move |input: ScheduleInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             let me = me.clone();
@@ -377,29 +398,26 @@ pub fn list_schedules(swarm: &Swarm) -> String {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RememberInput {
-    /// The fact, preference or instruction to keep, as one self-contained sentence.
+    /// One self-contained sentence.
     text: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ForgetInput {
-    /// Text identifying the entries to drop; every memory line containing it (case-insensitive)
-    /// is removed.
     text: String,
 }
 
 const REMEMBER_DESCRIPTION: &str = concat!(
-    "Save something the user asked you to remember to the user's memory file, shared by every agent ",
-    "and every future run (shown under \"# Memory\" in the system prompt from the next turn on). Use it ",
-    "only for things the user wants kept, not for your own notes."
+    "Save what the user asked you to remember to their memory file (\"# Memory\" in every agent's ",
+    "system prompt, this run and future ones). Not for your own notes."
 );
 
-const FORGET_DESCRIPTION: &str =
-    "Remove outdated or wrong entries from the user's memory file: every line containing the text.";
+const FORGET_DESCRIPTION: &str = "Remove every memory-file line containing `text` (case-insensitive).";
 
 fn remember_tool(swarm: Swarm) -> ToolRef {
     let tool = FunctionTool::builder("remember")
         .description(REMEMBER_DESCRIPTION)
+        .input_schema(lean_schema::<RememberInput>())
         .typed_handler(move |input: RememberInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             async move {
@@ -413,6 +431,7 @@ fn remember_tool(swarm: Swarm) -> ToolRef {
 fn forget_tool(swarm: Swarm) -> ToolRef {
     let tool = FunctionTool::builder("forget")
         .description(FORGET_DESCRIPTION)
+        .input_schema(lean_schema::<ForgetInput>())
         .typed_handler(move |input: ForgetInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             async move {
@@ -423,7 +442,8 @@ fn forget_tool(swarm: Swarm) -> ToolRef {
     Arc::new(tool)
 }
 
-/// The swarm tools bound to agent `id`; `remember` and `forget` only when memory is on.
+/// The swarm tools bound to agent `id`; `reload_swarm` only in a persistent run, `land` only
+/// when allowed, `remember` and `forget` only when memory is on.
 pub fn swarm_tools(swarm: Swarm, id: &str) -> Vec<ToolRef> {
     let mut tools = vec![
         spawn_tool(swarm.clone(), id.to_owned()),
@@ -431,11 +451,13 @@ pub fn swarm_tools(swarm: Swarm, id: &str) -> Vec<ToolRef> {
         wait_tool(swarm.clone(), id.to_owned()),
         list_tool(swarm.clone()),
         cancel_tool(swarm.clone(), id.to_owned()),
-        reload_tool(swarm.clone()),
         schedule_tool(swarm.clone(), id.to_owned()),
         run_background_tool(swarm.clone(), id.to_owned()),
         jobs_tool(swarm.clone(), id.to_owned()),
     ];
+    if swarm.can_reload() {
+        tools.push(reload_tool(swarm.clone()));
+    }
     if swarm.allows_land() {
         tools.push(land_tool(swarm.clone(), id.to_owned()));
     }
@@ -449,6 +471,7 @@ pub fn swarm_tools(swarm: Swarm, id: &str) -> Vec<ToolRef> {
 fn spawn_tool(swarm: Swarm, me: String) -> ToolRef {
     let tool = FunctionTool::builder("spawn_agent")
         .description(SPAWN_DESCRIPTION)
+        .input_schema(lean_schema::<SpawnInput>())
         .typed_handler(move |input: SpawnInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             let me = me.clone();
@@ -484,6 +507,7 @@ fn spawn_tool(swarm: Swarm, me: String) -> ToolRef {
 fn send_tool(swarm: Swarm, me: String) -> ToolRef {
     let tool = FunctionTool::builder("send_message")
         .description(SEND_DESCRIPTION)
+        .input_schema(lean_schema::<SendInput>())
         .typed_handler(move |input: SendInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             let me = me.clone();
@@ -499,6 +523,7 @@ fn send_tool(swarm: Swarm, me: String) -> ToolRef {
 fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
     let tool = FunctionTool::builder("wait")
         .description(WAIT_DESCRIPTION)
+        .input_schema(lean_schema::<WaitInput>())
         .typed_handler(move |input: WaitInput, ctx: ToolContext| {
             let swarm = swarm.clone();
             let me = me.clone();
@@ -528,6 +553,7 @@ fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
 fn list_tool(swarm: Swarm) -> ToolRef {
     let tool = FunctionTool::builder("list_agents")
         .description(LIST_DESCRIPTION)
+        .input_schema(lean_schema::<ListInput>())
         .typed_handler(move |input: ListInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             async move {
@@ -543,6 +569,7 @@ fn list_tool(swarm: Swarm) -> ToolRef {
 fn cancel_tool(swarm: Swarm, me: String) -> ToolRef {
     let tool = FunctionTool::builder("cancel_agent")
         .description(CANCEL_DESCRIPTION)
+        .input_schema(lean_schema::<CancelInput>())
         .typed_handler(move |input: CancelInput, _ctx: ToolContext| {
             let swarm = swarm.clone();
             let me = me.clone();

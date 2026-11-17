@@ -3,6 +3,11 @@
 use super::*;
 
 impl Swarm {
+    /// Whether the run is persistent, which [`Swarm::reload`] needs (agents get `reload_swarm`).
+    pub fn can_reload(&self) -> bool {
+        self.inner.config.state_dir.is_some()
+    }
+
     /// Install `binary` as the run's next binary and ask the host process to restart into it:
     /// right away, or with [`ReloadWhen::Idle`] once no agent has a tool call in flight (at most
     /// [`SwarmConfig::reload_idle_timeout`] later). A newer reload supersedes a pending one.

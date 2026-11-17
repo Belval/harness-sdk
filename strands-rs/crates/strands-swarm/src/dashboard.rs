@@ -26,14 +26,10 @@ const MEDIA_TOKENS: usize = 1_600;
 pub const SUMMARY_KEEPS: usize = 4;
 
 const DESCRIPTION: &str = concat!(
-    "Inspect and manage your own context window. Without arguments it shows your context size ",
-    "against the point where older turns get summarized automatically, the biggest items in it ",
-    "(numbered tool results with their age) and what is stashed. `offload: [numbers]` replaces ",
-    "those tool results (numbers from the latest listing) with a one-line stub; the full text stays ",
-    "retrievable with `retrieve_context` and the stub's ref. `summarize: true` summarizes all but your ",
-    "latest messages before your next model call. Use it when old, large outputs (logs, file reads, ",
-    "diffs) are done with; every edit to old context re-reads the prompt cache from there on, so do ",
-    "it in batches."
+    "Your context window. No arguments: its size against the auto-summary point, the biggest items ",
+    "(numbered tool results) and the stash. `offload` swaps listed results for a stub (the text stays ",
+    "in `retrieve_context`); `summarize` summarizes all but the latest messages before your next call. ",
+    "Each edit re-reads the prompt cache from that point on, so batch them."
 );
 
 /// Shared between an agent's `context` tool and its context pipeline: the stash, a pending
@@ -77,6 +73,7 @@ impl ContextControl {
         let control = Arc::clone(self);
         let tool = FunctionTool::builder("context")
             .description(DESCRIPTION)
+            .input_schema(crate::tools::lean_schema::<ContextInput>())
             .typed_handler(move |input: ContextInput, ctx: ToolContext| {
                 let control = Arc::clone(&control);
                 async move { Result::Ok(control.run(&ctx.agent, input).await) }
@@ -229,10 +226,9 @@ impl ContextControl {
 /// Input of the `context` tool.
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ContextInput {
-    /// Numbers of tool results from the latest listing to replace with a stashed stub.
+    /// Numbers from the latest listing.
     #[serde(default)]
     offload: Vec<usize>,
-    /// Summarize older turns before the next model call.
     #[serde(default)]
     summarize: bool,
 }

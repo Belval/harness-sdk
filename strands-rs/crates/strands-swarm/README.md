@@ -10,7 +10,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `wait` | Block until messages arrive (optionally from specific agents). |
 | `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model and estimated spend. |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included. |
-| `reload_swarm` | Restart the whole swarm into a newly built binary; every agent resumes. |
+| `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to a mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
 | `run_background` | Run a shell command as a background job; its owner gets the exit code and last 40 output lines when it ends. |
 | `jobs` | List background jobs (status, log path), or kill one with everything it started. |
@@ -19,6 +19,12 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `find_tools` | With MCP servers: search the shared MCP tools and enable some for the calling agent. |
 | `skills` | With skills: load a skill's `SKILL.md`, its location and bundled files. |
 | `remember` / `forget` | With memory: add a dated entry to the user's memory file, or drop matching lines. |
+
+Agents also get the harness's `shell`, `read`, `write`, `edit`, `web_fetch`, `todo_write` and
+`retrieve_context`, but not the SDK's background tasks (`_background_execution` on every tool):
+`run_background` covers slow commands. Tool specs and the swarm's prompt sections are sent on every
+model call, so a test (`the_fixed_prefix_stays_within_its_budget`) pins their size at 15 kB (about
+4.6k tokens).
 
 ## Run
 
