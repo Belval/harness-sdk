@@ -1,17 +1,16 @@
 //! Strands swarm: a model-driven agent swarm on top of [`strands_harness`].
 //!
-//! There is no planner, scheduler or fixed topology. Every agent is a harness agent that also
-//! carries the swarm tools — `spawn_agent`, `send_message`, `wait`, `list_agents`, `cancel_agent`,
-//! `reload_swarm`, `schedule`, `run_background`, `jobs` — and decides for itself whether to split work, how
-//! deep to go, and how to coordinate.
+//! There is no planner or fixed topology. Every agent is a harness agent that also carries the
+//! swarm tools ([`tools`]) and decides for itself whether to split work, how deep to go, and how
+//! to coordinate.
 //!
 //! Each agent is an actor: it runs a turn, reports its final reply to its parent, then sleeps until
 //! a message arrives. Messages that arrive mid-turn are appended to the agent's next tool result,
 //! so nothing is interrupted and nothing is lost. An agent can ask for its own git worktree, which
-//! keeps parallel edits apart; merging is left to the agents, using plain git.
+//! keeps parallel edits apart; merging is left to the agents, using plain git (or `land`).
 //!
-//! The runtime enforces only resource limits (live agent count) and cancellation, which cascades
-//! down the spawn tree.
+//! The runtime enforces only resource limits (live agents, concurrent model calls, a token budget)
+//! and cancellation, which cascades down the spawn tree.
 
 pub mod catalog;
 pub mod compaction;

@@ -1,6 +1,7 @@
 //! The swarm tools every agent carries: `spawn_agent`, `send_message`, `wait`, `list_agents`,
-//! `cancel_agent`, `reload_swarm`, `schedule`, `run_background`, `jobs`. Each instance is bound to
-//! the agent that owns it.
+//! `cancel_agent`, `reload_swarm`, `schedule`, `run_background`, `jobs`, plus `land` (with
+//! `--allow-land`) and `remember`/`forget` (with a memory file). Each instance is bound to the
+//! agent that owns it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,19 +16,6 @@ use crate::runtime::{
     WaitOutcome, USER,
 };
 use crate::schedule::{self, Schedule};
-
-/// Tool names, in registration order.
-pub const SWARM_TOOL_NAMES: &[&str] = &[
-    "spawn_agent",
-    "send_message",
-    "wait",
-    "list_agents",
-    "cancel_agent",
-    "reload_swarm",
-    "schedule",
-    "run_background",
-    "jobs",
-];
 
 const DEFAULT_WAIT_SECONDS: u64 = 600;
 const MAX_WAIT_SECONDS: u64 = 3600;
