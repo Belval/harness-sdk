@@ -180,10 +180,19 @@ pub fn flatten_messages_to_content(messages: &[Message]) -> Vec<ContentBlock> {
                 ContentBlock::ToolResult(result) => {
                     out.extend(tool_result_to_content_blocks(&result.content))
                 }
+                // The flattened content goes out as one user message, which may not carry tool
+                // calls (Bedrock rejects it) or reasoning: render the call as text, drop reasoning.
+                ContentBlock::ToolUse(call) => out.push(ContentBlock::Text(format!(
+                    "[tool call {}] {}",
+                    call.name, call.input
+                ))),
+                ContentBlock::Reasoning(_) => {}
                 other => out.push(other.clone()),
             }
         }
     }
+    // Providers reject blank text blocks (an empty tool result, say).
+    out.retain(|block| !matches!(block, ContentBlock::Text(text) if text.trim().is_empty()));
     out
 }
 
@@ -419,6 +428,44 @@ mod tests {
         assert!(preview.starts_with("[Truncated: 1 block, ~50 tokens]\n\n"));
         assert!(preview.contains("[... 160 chars elided ...]"));
         assert!(preview.ends_with(&"b".repeat(16)));
+    }
+
+    #[test]
+    fn flattened_content_fits_one_user_message() {
+        use crate::types::{ReasoningBlock, ToolResultBlock, ToolUseBlock};
+        let call = ToolUseBlock::new("shell", "t1", serde_json::json!({ "command": "ls" }));
+        let reasoning = ReasoningBlock {
+            text: Some("thinking".into()),
+            signature: Some("sig".into()),
+            redacted_content: None,
+        };
+        let messages = vec![
+            Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Reasoning(reasoning), ContentBlock::ToolUse(call)],
+            ),
+            Message::new(
+                Role::User,
+                vec![ContentBlock::ToolResult(ToolResultBlock::success(
+                    "t1",
+                    vec![ToolResultContent::Text(String::new())],
+                ))],
+            ),
+        ];
+        let content = flatten_messages_to_content(&messages);
+        let texts: Vec<&str> = content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => text.as_str(),
+                other => panic!("only text goes to the summarizer: {other:?}"),
+            })
+            .collect();
+        assert!(texts.iter().all(|text| !text.trim().is_empty()), "{texts:?}");
+        assert!(
+            texts.contains(&r#"[tool call shell] {"command":"ls"}"#),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|text| text.contains("thinking")));
     }
 
     #[test]

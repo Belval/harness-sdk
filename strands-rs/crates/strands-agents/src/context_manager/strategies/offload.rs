@@ -386,7 +386,7 @@ impl OffloadStrategy {
         match call_summarizer(content, model, &system_prompt).await {
             Ok(summary) => summary,
             Err(error) => {
-                tracing::debug!("error=<{error}> | summarization failed");
+                tracing::warn!("error=<{error}> | summarization failed");
                 let text_only: Vec<ContentBlock> = content
                     .iter()
                     .filter(|b| matches!(b, ContentBlock::Text(_)))
@@ -397,6 +397,7 @@ impl OffloadStrategy {
                 }
                 call_summarizer(&text_only, model, &system_prompt)
                     .await
+                    .inspect_err(|error| tracing::warn!("error=<{error}> | text-only summarization failed"))
                     .ok()
                     .flatten()
             }
