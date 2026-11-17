@@ -1330,6 +1330,13 @@ async fn a_resumed_run_restores_conversations_and_wakes_interrupted_agents() {
         history.contains_key("a2"),
         "interrupted agents report their history too"
     );
+    let a2_texts: Vec<String> = history["a2"].iter().map(Message::text).collect();
+    assert!(
+        a2_texts
+            .last()
+            .is_some_and(|t| t == "Interrupted: the swarm restarted."),
+        "the cut turn reads as a restart, not a user stop: {a2_texts:?}"
+    );
     let a2_call = sent_text(&scripts.lock()["a2"].clone(), 0);
     assert!(a2_call.contains("The swarm was restarted"), "{a2_call}");
     assert!(a2_call.contains("No tool call was in flight."), "{a2_call}");

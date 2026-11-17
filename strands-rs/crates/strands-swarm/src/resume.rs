@@ -14,6 +14,9 @@ use strands_agents::InvokeInput;
 
 /// How every restart notice starts, so context strategies can tell it from a new task.
 pub const NOTICE_PREFIX: &str = "[The swarm was restarted";
+/// What a turn the restart cut ends with, in place of the SDK's [`CANCELLED_MESSAGE`], which
+/// reads as if the user had stopped it.
+pub const RESTARTED_MESSAGE: &str = "Interrupted: the swarm restarted.";
 /// Longest tool input shown, in characters.
 const INPUT_CHARS: usize = 300;
 /// Most `git status` lines shown.
@@ -51,10 +54,19 @@ pub fn in_flight(messages: &[Message]) -> Vec<ToolUseBlock> {
         .collect()
 }
 
-/// The assistant message the SDK closes a cancelled turn with.
+/// The assistant message the SDK closes a cancelled turn with, reworded or not.
 fn is_cancel_marker(message: &Message) -> bool {
     message.role == Role::Assistant
-        && matches!(message.content.as_slice(), [ContentBlock::Text(text)] if text == CANCELLED_MESSAGE)
+        && matches!(message.content.as_slice(), [ContentBlock::Text(text)]
+            if text == CANCELLED_MESSAGE || text == RESTARTED_MESSAGE)
+}
+
+/// Reword the closing message of a turn the restart cut ([`RESTARTED_MESSAGE`]). It ends the
+/// conversation and was never sent, so the cached prefix is unchanged.
+pub fn reword_cancel(messages: &mut [Message]) {
+    if let Some(last) = messages.last_mut().filter(|last| is_cancel_marker(last)) {
+        last.content = vec![ContentBlock::text(RESTARTED_MESSAGE)];
+    }
 }
 
 /// `git status --short --branch` of `cwd`, capped; `None` outside a repository or on failure.
@@ -225,6 +237,12 @@ mod tests {
             ["t2"],
             "the SDK's cancel marker is skipped"
         );
+        reword_cancel(&mut closed);
+        assert_eq!(closed.last().unwrap().text(), RESTARTED_MESSAGE);
+        assert_eq!(ids(in_flight(&closed)), ["t2"], "and so is the reworded one");
+        let mut done = vec![Message::user("go"), Message::assistant("done")];
+        reword_cancel(&mut done);
+        assert_eq!(done[1].text(), "done", "only the marker is reworded");
 
         let completed = vec![Message::user("go"), calls(&["t1"]), results(vec![ok("t1")])];
         assert!(in_flight(&completed).is_empty(), "cut off during the model call");

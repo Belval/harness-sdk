@@ -26,6 +26,9 @@ impl Swarm {
         if let Err(error) = agent.initialize().await {
             tracing::warn!(agent = %node.id, %error, "session restore failed");
         }
+        if interrupted {
+            agent.with_messages(|messages| resume::reword_cancel(messages));
+        }
         if let Some(history) = agent.with_messages(|messages| history_event(&node.id, messages)) {
             self.emit(history);
         }

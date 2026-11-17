@@ -196,6 +196,14 @@ async fn every_call_resends_the_cached_prefix_unchanged_across_turns_mail_and_a_
         "the memory is in the system prompt"
     );
     let sent = serde_json::to_string(&calls[14].0).unwrap();
+    assert!(
+        sent.contains(crate::resume::RESTARTED_MESSAGE),
+        "the cut turn says why"
+    );
+    assert!(
+        !sent.contains(strands_agents::agent::CANCELLED_MESSAGE),
+        "not as a user stop"
+    );
     assert!(sent.contains("helped"), "the helper's reply reached a1");
     assert!(
         sent.contains("The swarm was restarted"),

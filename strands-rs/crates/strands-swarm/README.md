@@ -105,8 +105,10 @@ error.
 - **Restarts.** An agent that was mid-turn resumes with a short notice instead of re-reading its
   work. The notice lists the tool calls the restart cut short, each with how long it had run, and
   `git status --short --branch` of its directory. When a cut call had run a minute or more, it
-  also says that background jobs survive restarts. An agent that had finished its turn rests until its next message; a goal agent
-  whose turn failed retries.
+  also says that background jobs survive restarts. The cut turn ends with "Interrupted: the swarm
+  restarted." rather than the SDK's "Cancelled by user", which a real `/stop` keeps. An agent
+  that had finished its turn rests until its next message; a goal agent whose turn failed
+  retries.
 
 ## Limits
 
