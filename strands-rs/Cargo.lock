@@ -4898,6 +4898,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
+ "process-wrap",
  "rand 0.9.5",
  "regex",
  "reqwest 0.12.28",

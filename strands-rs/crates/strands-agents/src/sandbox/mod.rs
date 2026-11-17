@@ -28,6 +28,7 @@ use crate::tools::ToolRef;
 pub use docker::DockerSandbox;
 pub use local::LocalSandbox;
 pub use ssh::SshSandbox;
+pub use stream_process::detach_from_terminal;
 
 /// Which standard stream a [`StreamChunk`] came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

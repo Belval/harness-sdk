@@ -15,8 +15,8 @@ use super::{
 /// Runs commands and file operations directly on the host — **no isolation whatsoever**.
 ///
 /// The alarming TS name (`NotASandboxLocalEnvironment`) is a deliberate safety signal; this is
-/// the same thing. Commands run through `sh -c` in their own process group, so a timeout or a
-/// cancelled call kills the whole tree.
+/// the same thing. Commands run through `sh -c` in a session (and process group) of their own, so
+/// a timeout or a cancelled call kills the whole tree and nothing reaches the terminal.
 #[derive(Clone, Debug, Default)]
 pub struct LocalSandbox {
     base_dir: Option<PathBuf>,

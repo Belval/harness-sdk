@@ -16,6 +16,7 @@ use futures::stream::BoxStream;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use strands_agents::models::{ContentBlockDelta, Model, ModelStreamEvent, StreamOptions};
+use strands_agents::sandbox::detach_from_terminal;
 use strands_agents::types::{Message, Role, StopReason};
 use strands_agents::{Agent, Error, Result};
 
@@ -277,7 +278,7 @@ pub async fn check_binary(binary: &Path, state_dir: &Path, timeout: Duration) ->
 }
 
 async fn run_self_test(binary: &Path, copy: &Path, timeout: Duration) -> Result<()> {
-    let child = tokio::process::Command::new(binary)
+    let child = detach_from_terminal(&mut tokio::process::Command::new(binary))
         .arg("--self-test")
         .arg(copy)
         .stdin(std::process::Stdio::null())

@@ -147,7 +147,7 @@ and exit.
 
 - **Background jobs.**
   - Jobs run with `sh -c` in the agent's directory and environment, private `CARGO_TARGET_DIR`
-    included. Each runs in its own process group, so neither a reload nor Ctrl-C stops it.
+    included. Each runs in a session of its own, so neither a reload nor Ctrl-C stops it.
   - Each job is `<id>.json`, `<id>.log` and `<id>.exit` in `<run>/jobs` (a temp directory without
     `--run`).
   - The swarm polls jobs and mails the owner when one ends, also for jobs started before a restart.
@@ -281,6 +281,9 @@ Typing text without a command messages the selected agent.
 - **Log.** Warnings and errors (or whatever `RUST_LOG` selects) go to `<run dir>/swarm.log` under
   the TUI (a temp file without `--run`), and to stderr otherwise. When a process opens a log that
   has grown past 8 MB, it is first moved to `swarm.log.1`.
+- **Terminal.** Every child the swarm starts (shell commands, jobs, git, land gates, MCP servers)
+  runs in a session of its own, without a controlling terminal. Nothing it writes to `/dev/tty`
+  reaches the TUI, and a prompt (git credentials, an ssh host key) fails at once instead of hanging.
 - **Disk.**
   - Once a cancelled worktree agent and its subtree have stopped (or on resume), its private target
     dir is deleted.

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use strands_agents::sandbox::detach_from_terminal;
 use strands_agents::{Error, Result};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -149,8 +150,8 @@ impl Jobs {
     }
 
     /// Start `command` with `sh` in `cwd`, with `env` on top of this process's environment, in
-    /// its own process group so that neither the swarm exiting nor a Ctrl-C in its terminal
-    /// stops it.
+    /// a session of its own so that neither the swarm exiting nor a Ctrl-C in its terminal stops
+    /// it, and nothing it runs can write to that terminal.
     pub async fn start(
         &self,
         owner: &str,
@@ -162,7 +163,7 @@ impl Jobs {
         let _guard = self.start.lock().await;
         tokio::fs::create_dir_all(&self.dir).await?;
         let id = self.next_id().await?;
-        let mut child = tokio::process::Command::new("sh")
+        let mut child = detach_from_terminal(&mut tokio::process::Command::new("sh"))
             .arg("-c")
             .arg(WRAPPER)
             .arg("job")
@@ -174,7 +175,6 @@ impl Jobs {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .process_group(0)
             .spawn()
             .map_err(|e| Error::other(format!("Could not start the job: {e}")))?;
         let meta = JobMeta {
@@ -479,6 +479,24 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert!(!marker.exists(), "the command's children were killed too");
         assert!(jobs.unreported(true).await.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_job_runs_in_a_session_of_its_own_without_a_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path());
+        let command = "read -r pid comm state ppid group session rest < /proc/$$/stat
+            echo \"$group $session\"
+            if (: > /dev/tty) 2>/dev/null; then echo tty; else echo no tty; fi";
+        let job = jobs
+            .start("a1", None, command, dir.path(), &BTreeMap::new())
+            .await
+            .unwrap();
+        until_ended(&jobs, "j1").await;
+        let log = tokio::fs::read_to_string(jobs.log_path("j1")).await.unwrap();
+        let leader = job.meta.pid;
+        assert_eq!(log, format!("{leader} {leader}\nno tty\n"));
     }
 
     #[tokio::test]

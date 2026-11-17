@@ -11,6 +11,8 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use strands_agents::sandbox::detach_from_terminal;
+
 use crate::worktree::{git, git_in, same_subdir};
 
 /// Lines of a failing check's output that the report keeps.
@@ -142,7 +144,7 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
 /// Run `check` with `sh` in `dir`; on failure the error carries the tail of its output.
 async fn check_passes(dir: &Path, check: &str, target_dir: &Path) -> Result<(), String> {
     let mut command = tokio::process::Command::new("sh");
-    command
+    detach_from_terminal(&mut command)
         .arg("-c")
         .arg(format!("exec 2>&1\n{check}"))
         .current_dir(dir)

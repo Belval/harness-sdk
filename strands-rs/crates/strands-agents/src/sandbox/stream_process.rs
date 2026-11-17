@@ -2,9 +2,9 @@
 //!
 //! Shared by every process-backed sandbox: [`LocalSandbox`](super::LocalSandbox) spawns `sh -c`,
 //! [`DockerSandbox`](super::DockerSandbox) spawns `docker exec`, [`SshSandbox`](super::SshSandbox)
-//! spawns `ssh`. The process runs in its own group, so a timeout or a cancelled call kills the
-//! whole *local* tree; a command already running in a container or on a remote host keeps
-//! running, exactly as in TS.
+//! spawns `ssh`. The process runs in a session (and group) of its own, so a timeout or a cancelled
+//! call kills the whole *local* tree, and nothing it starts can reach the controlling terminal; a
+//! command already running in a container or on a remote host keeps running, exactly as in TS.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -160,9 +160,8 @@ fn launch(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Own process group, so the whole tree (not just the program) can be signalled.
-    #[cfg(unix)]
-    cmd.process_group(0);
+    // Own session and group, so the whole tree (not just the program) can be signalled.
+    detach_from_terminal(&mut cmd);
     if let Some(cwd) = &spawn.cwd {
         cmd.current_dir(cwd);
     }
@@ -372,6 +371,26 @@ impl Drop for GroupKill {
     }
 }
 
+/// Start `command` in a new session (`setsid`): its own process group, led by the child, and no
+/// controlling terminal.
+///
+/// Redirecting stdio is not enough to keep a child off the terminal: anything it starts can still
+/// open `/dev/tty`, which is how `git` and `ssh` prompt for credentials and how some tools print
+/// progress. Under a full-screen UI that output corrupts the screen and the prompt hangs the
+/// call; in a session of its own, opening `/dev/tty` fails, so such a program errors out at once.
+/// Signal the whole tree with `killpg(child pid)`. Do not also set `process_group`: a group
+/// leader cannot start a session. A no-op off Unix.
+pub fn detach_from_terminal(command: &mut Command) -> &mut Command {
+    #[cfg(unix)]
+    {
+        use process_wrap::tokio::{CommandWrap, CommandWrapper, ProcessSession};
+        // `pre_spawn` only installs the `setsid` hook on `command`; the wrapper is not used.
+        let unused = CommandWrap::from(Command::new("sh"));
+        let _ = ProcessSession.pre_spawn(command, &unused);
+    }
+    command
+}
+
 /// SIGKILL the whole process group led by `pid`; children of the command die with it.
 #[cfg(unix)]
 fn kill_group(pid: Option<u32>) {
@@ -418,6 +437,20 @@ mod tests {
         assert_eq!(result.stdout, "out\n");
         assert_eq!(result.stderr, "err\n");
         assert_eq!(result.exit_code, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runs_in_a_session_of_its_own_without_a_terminal() {
+        let script = "read -r pid comm state ppid group session rest < /proc/$$/stat
+            echo \"$pid $group $session\"
+            if (: > /dev/tty) 2>/dev/null; then echo tty; else echo no tty; fi";
+        let result = run(sh(script), ExecuteOptions::default()).await.unwrap();
+        let mut lines = result.stdout.lines();
+        let ids: Vec<&str> = lines.next().unwrap().split(' ').collect();
+        assert_eq!(ids, [ids[0]; 3], "pid, group and session: {ids:?}");
+        assert_ne!(ids[0], std::process::id().to_string());
+        assert_eq!(lines.next(), Some("no tty"));
     }
 
     #[tokio::test]

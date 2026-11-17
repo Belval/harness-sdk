@@ -24,6 +24,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "process"] }
 tokio-util = "0.7"
 nix = { version = "0.30", features = ["signal"] }
+process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-session"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7"] }
 schemars = "1"

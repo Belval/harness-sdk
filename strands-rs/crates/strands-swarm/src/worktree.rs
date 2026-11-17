@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use strands_agents::sandbox::detach_from_terminal;
 use strands_agents::{Error, Result};
 use tokio::process::Command;
 
@@ -64,10 +65,14 @@ pub const GIT_LOCATION_VARS: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
 ];
 
-/// `git -C <dir>` with no stdin, blind to [`GIT_LOCATION_VARS`].
+/// `git -C <dir>` with no stdin and off the terminal (a credential prompt fails instead of
+/// drawing over the TUI and hanging), blind to [`GIT_LOCATION_VARS`].
 pub(crate) fn git_in(dir: &Path) -> Command {
     let mut command = Command::new("git");
-    command.arg("-C").arg(dir).stdin(std::process::Stdio::null());
+    detach_from_terminal(&mut command)
+        .arg("-C")
+        .arg(dir)
+        .stdin(std::process::Stdio::null());
     for var in GIT_LOCATION_VARS {
         command.env_remove(var);
     }

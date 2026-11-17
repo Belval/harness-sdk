@@ -452,6 +452,9 @@ impl McpClient {
                 cwd,
             } => {
                 let mut cmd = tokio::process::Command::new(command);
+                // Off the terminal: a server that opens `/dev/tty` (a login prompt, progress
+                // output) would otherwise draw over a full-screen UI.
+                crate::sandbox::detach_from_terminal(&mut cmd);
                 cmd.args(args);
                 cmd.envs(env);
                 if let Some(cwd) = cwd {

@@ -70,6 +70,7 @@ mcp-tools-sdk = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+process-wrap = { workspace = true }
 
 [dev-dependencies]
 strands-agents = { path = ".", features = ["test-support", "mcp-echo-server"] }
