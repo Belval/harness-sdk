@@ -38,6 +38,7 @@ pub async fn run(
     swarm: Swarm,
     mut events: UnboundedReceiver<SwarmEvent>,
     root: Option<SpawnRequest>,
+    notify: bool,
 ) -> Result<Exit> {
     let mut terminal = ratatui::init();
     set_mouse_capture(true);
@@ -51,6 +52,7 @@ pub async fn run(
     // Ask the terminal which graphics protocol it speaks: after raw mode, before reading events.
     let mut app = App {
         images: images::Images::detect(),
+        notify,
         ..Default::default()
     };
     if let Some(request) = root {
@@ -65,6 +67,12 @@ pub async fn run(
     let mut plain = false;
     let outcome = loop {
         app.mark_seen();
+        if app.status.is_some() {
+            app.status = Some(swarm.status());
+        }
+        if std::mem::take(&mut app.bell) {
+            ring_bell();
+        }
         if !plain {
             match terminal.draw(|frame| view::draw(frame, &app, swarm.run_id(), tick)) {
                 Ok(frame) => screen.clone_from(frame.buffer),
@@ -123,6 +131,13 @@ fn enter_plain(app: &App) -> std::io::Result<()> {
     write!(out, "\n{text}\n— press any key to return to the swarm —")?;
     out.flush()?;
     crossterm::terminal::enable_raw_mode()
+}
+
+/// BEL: terminals (and tmux) flag the window or raise a notification.
+fn ring_bell() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x07").and_then(|()| out.flush());
 }
 
 fn leave_plain(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
@@ -230,6 +245,18 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let up_down = |code: KeyCode| if code == KeyCode::Up { -1 } else { 1 };
+    if app.status.is_some() {
+        // The status popup is modal: it scrolls, any other key closes it.
+        match key.code {
+            KeyCode::Up => app.status_scroll = app.status_scroll.saturating_sub(1),
+            KeyCode::Down => app.status_scroll = app.status_scroll.saturating_add(1),
+            KeyCode::PageUp => app.status_scroll = app.status_scroll.saturating_sub(10),
+            KeyCode::PageDown => app.status_scroll = app.status_scroll.saturating_add(10),
+            KeyCode::Char('c') if ctrl => app.quit = true,
+            _ => app.status = None,
+        }
+        return None;
+    }
     match key.code {
         KeyCode::Char('c') if ctrl => app.quit = true,
         KeyCode::Char('a') if ctrl => app.home(),
@@ -378,6 +405,11 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             .await
             .map(|removed| format!("forgot {} line(s): {}", removed.len(), removed.join(" | "))),
         (Command::Schedules, _) => Ok(schedules_notice(swarm)),
+        (Command::Status, _) => {
+            app.status = Some(swarm.status());
+            app.status_scroll = 0;
+            Ok("status: ↑↓ scroll, any other key closes".to_owned())
+        }
         (Command::Gc, _) => {
             swarm.gc_in_background();
             Ok("gc: measuring and reclaiming in the background…".to_owned())

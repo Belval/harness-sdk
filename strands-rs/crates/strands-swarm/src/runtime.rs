@@ -225,6 +225,9 @@ pub struct SwarmConfig {
     pub commit: Option<String>,
     /// The git checkout where the commits between two builds are looked up.
     pub source: PathBuf,
+    /// Branch [`Swarm::status`] compares agents' branches against; `None` uses the branch checked
+    /// out at the root agent's working directory.
+    pub status_base: Option<String>,
 }
 
 impl SwarmConfig {
@@ -247,6 +250,7 @@ impl SwarmConfig {
             reload_idle_timeout: RELOAD_IDLE_TIMEOUT,
             commit: crate::version::COMMIT.map(str::to_owned),
             source: PathBuf::from(crate::version::SOURCE),
+            status_base: None,
         }
     }
 }
@@ -577,6 +581,8 @@ struct Inner {
     /// Wall clock and tokio instant at construction: [`Swarm::now`] follows tokio's clock from
     /// here, so paused-time tests can fast-forward schedules.
     epoch: (DateTime<Utc>, tokio::time::Instant),
+    /// Branch commits for [`Swarm::status`], refreshed in the background.
+    branches: Mutex<crate::status::BranchCache>,
 }
 
 /// An agent's auxiliary model (what side calls such as the goal judge and context summarization
@@ -661,6 +667,7 @@ impl Swarm {
             schedules_changed: Notify::new(),
             scheduler: AtomicBool::new(false),
             epoch: (Utc::now(), tokio::time::Instant::now()),
+            branches: Mutex::default(),
             config,
         };
         let swarm = Self {
@@ -1163,6 +1170,96 @@ impl Swarm {
         let mut list = self.inner.schedules.lock().clone();
         list.sort_by_key(|s| s.next);
         list
+    }
+
+    /// A snapshot of every live agent without a model call: state, todos, branch commits not on
+    /// the base, running background jobs and schedules. The git part comes from a cache that is
+    /// refreshed in the background when older than [`crate::status::TTL`], so the first call
+    /// may report branches as unknown.
+    pub fn status(&self) -> crate::status::StatusReport {
+        self.refresh_branches();
+        let cache = self.inner.branches.lock().clone();
+        let schedules = self.schedules();
+        let now = self.now();
+        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        let agents = nodes
+            .iter()
+            .filter(|node| node.status.lock().is_live())
+            .map(|node| {
+                let info = node.info();
+                let agent = node.agent.get();
+                let todos = agent.and_then(|agent| {
+                    agent
+                        .state()
+                        .get_as::<Vec<strands_harness::plugins::TodoItem>>(crate::status::TODOS_KEY)
+                });
+                let jobs = agent.and_then(Agent::background_tasks);
+                let background = jobs.map_or_else(Vec::new, |jobs| {
+                    jobs.list()
+                        .into_iter()
+                        .filter(|job| !job.status.is_terminal())
+                        .map(|job| {
+                            let now = Utc::now().timestamp_millis().max(0) as u64;
+                            let age = Duration::from_millis(now.saturating_sub(job.created_at));
+                            format!("{} ({})", job.tool_name, crate::schedule::human(age))
+                        })
+                        .collect()
+                });
+                crate::status::AgentReport {
+                    label: node.label(),
+                    status: info.status,
+                    unread: info.unread,
+                    branch: info.branch,
+                    unmerged: cache.commits.get(&node.id).cloned(),
+                    todos: todos.unwrap_or_default(),
+                    background,
+                    schedules: schedules
+                        .iter()
+                        .filter(|s| s.to == node.id)
+                        .map(|s| s.describe(now))
+                        .collect(),
+                    id: info.id,
+                }
+            })
+            .collect();
+        crate::status::StatusReport {
+            base: cache.base,
+            agents,
+        }
+    }
+
+    /// Start a background refresh of the branch cache unless one runs or it is fresh.
+    fn refresh_branches(&self) {
+        {
+            let mut cache = self.inner.branches.lock();
+            let fresh = cache.at.is_some_and(|at| at.elapsed() < crate::status::TTL);
+            if cache.refreshing || fresh {
+                return;
+            }
+            cache.refreshing = true;
+        }
+        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        let root = nodes
+            .iter()
+            .find(|node| node.parent == USER)
+            .map(|node| node.cwd.clone());
+        let branches = nodes
+            .iter()
+            .filter(|node| node.status.lock().is_live())
+            .filter_map(|node| Some((node.id.clone(), node.cwd.clone(), node.branch.clone()?)))
+            .collect();
+        let base = self.inner.config.status_base.clone();
+        let swarm = self.clone();
+        tokio::spawn(async move {
+            let (base, commits) = crate::status::refresh(base, root, branches).await;
+            let mut cache = swarm.inner.branches.lock();
+            *cache = crate::status::BranchCache {
+                at: Some(tokio::time::Instant::now()),
+                refreshing: false,
+                base,
+                commits,
+            };
+        });
     }
 
     /// Drop schedules whose receiver or (agent) owner is gone or cancelled.

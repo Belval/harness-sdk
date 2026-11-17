@@ -43,6 +43,14 @@ struct Cli {
     /// Maximum number of model calls in flight across the swarm; more queue. 0 means no limit.
     #[arg(long, default_value_t = 8)]
     max_concurrent_calls: usize,
+    /// Ring the terminal bell when an agent messages you (TUI only; tmux and most terminals turn
+    /// it into a window flag or desktop notification).
+    #[arg(long)]
+    notify: bool,
+    /// Branch the TUI's `/status` compares agent branches against; default: the branch checked
+    /// out where the swarm started.
+    #[arg(long)]
+    status_base: Option<String>,
     /// Swarm-wide token budget (input + output, e.g. `5M`); once spent, model calls stop until it
     /// is raised (TUI `/budget N`). A resumed run keeps its last budget.
     #[arg(long, value_parser = strands_swarm::budget::parse_tokens)]
@@ -225,6 +233,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.models = Some(models);
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
+    config.status_base = cli.status_base;
     config.budget_tokens = cli.budget_tokens;
     config.compact_at = cli.compact_at;
     if !cli.no_memory {
@@ -260,7 +269,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     let root = if resumed { None } else { root };
 
     if !cli.headless {
-        return Ok(strands_swarm::tui::run(swarm, events, root).await?);
+        return Ok(strands_swarm::tui::run(swarm, events, root, cli.notify).await?);
     }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

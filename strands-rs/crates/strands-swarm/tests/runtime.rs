@@ -2793,3 +2793,82 @@ async fn agents_schedule_list_and_cancel_through_their_tools() {
     assert!(result(5).contains("Removed s1"), "{}", result(5));
     assert!(swarm.schedules().is_empty());
 }
+
+#[tokio::test]
+async fn status_reports_todos_and_branch_commits_without_a_model_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let commit = |dir: &Path, message: &str| {
+        std::fs::write(dir.join(format!("{message}.txt")), message).unwrap();
+        git(dir, &["add", "."]);
+        let who = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        git(dir, &[&who[..], &["commit", "-qm", message]].concat());
+    };
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(&repo, "init");
+
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    for id in ["a1", "a2"] {
+        map.lock()
+            .insert(id.to_owned(), MockMessageModel::shared(vec![say("ok")]));
+    }
+    let inner = mock_factory(&map);
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let build = inner(spec);
+        Box::pin(async move {
+            let agent = build.await?;
+            let todos = serde_json::json!([
+                {"content": "Write it", "activeForm": "Writing it", "status": "in_progress"},
+                {"content": "Test it", "activeForm": "Testing it", "status": "pending"},
+            ]);
+            agent.state().set("todos", todos);
+            Ok(agent)
+        })
+    });
+    let (swarm, _events) = Swarm::new(SwarmConfig::new(factory, &repo));
+    let root = spawn_root(&swarm, "lead").await;
+    let child = swarm
+        .spawn(
+            &root,
+            SpawnRequest {
+                task: "build".into(),
+                name: Some("builder".into()),
+                worktree: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    wait_for_status(&swarm, &child, AgentStatus::Idle).await;
+    commit(&swarm.agent(&child).unwrap().cwd, "feature");
+
+    let report = loop {
+        let report = swarm.status();
+        if report
+            .agents
+            .iter()
+            .all(|a| a.branch.is_none() || a.unmerged.is_some())
+        {
+            break report;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(report.base.as_deref(), Some("main"));
+    let builder = report.agents.iter().find(|a| a.id == child).unwrap();
+    assert_eq!(builder.label, format!("builder ({child})"));
+    assert_eq!(builder.todos.len(), 2);
+    let unmerged = builder.unmerged.as_ref().unwrap();
+    assert_eq!(unmerged.len(), 1, "{unmerged:?}");
+    assert!(unmerged[0].ends_with(" feature"), "{unmerged:?}");
+    let text = report.lines(&|_| None).join("\n");
+    assert!(text.contains("  [>] Writing it\n  [ ] Test it"), "{text}");
+    assert!(text.contains("1 not on main:"), "{text}");
+
+    swarm.cancel(&child).unwrap();
+    let report = swarm.status();
+    assert!(
+        report.agents.iter().all(|a| a.id != child),
+        "cancelled agents are left out"
+    );
+}

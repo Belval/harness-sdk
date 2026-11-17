@@ -32,7 +32,7 @@ strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--side-model ID]
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
               [--max-agents N] [--max-concurrent-calls N] [--compact-at TOKENS] [--memory FILE | --no-memory]
-              [--headless] [--journal | --gc] [TASK]
+              [--notify] [--status-base BRANCH] [--headless] [--journal | --gc] [TASK]
 ```
 
 Memory: one Markdown file shared by every agent and every run, for things you ask the swarm to
@@ -66,7 +66,14 @@ while the swarm was down fires once on resume, then keeps its interval. Schedule
 agent (as receiver or creator) are dropped.
 
 TUI: ↑/↓ select an agent, type to message it, `/to <agent> <message>` (by name or id, without selecting it), `/new <task>`, `/goal <goal>`, `/stop`, `/cancel`,
-`/gc`, `/schedules`, Ctrl-C quits.
+`/gc`, `/schedules`, `/status`, Ctrl-C quits.
+`/status` answers "what is everyone doing?" without a model call: a popup with each live agent's
+state and current activity, its todo list, its branch's commits not yet on the base
+(`git log <base>..<branch>`; base is the branch checked out where the swarm started, or
+`--status-base BRANCH`), running background jobs and schedules. It refreshes while open (git runs in
+the background, cached for 5 s); ↑/↓ scroll, any other key closes it. Programmatically:
+`Swarm::status`. `--notify` rings the terminal bell when an agent messages you (tmux and most
+terminals turn it into a window flag or a desktop notification).
 `/stop` (or Esc twice within a second on an empty input) interrupts the selected agent's turn without
 cancelling it, like Esc in Claude Code: an open tool call is closed as cancelled, the agent goes idle
 with its conversation intact, its parent gets an `interrupted` message, its children keep running,

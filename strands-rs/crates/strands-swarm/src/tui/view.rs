@@ -127,6 +127,9 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
     if app.show_keys {
         draw_keys(frame, areas.body);
     }
+    if let Some(report) = &app.status {
+        draw_status(frame, areas.body, app, report);
+    }
     let footer_text = app.notice.clone().unwrap_or_else(|| HINT.to_owned());
     frame.render_widget(Paragraph::new(footer_text).dim(), areas.footer);
 }
@@ -495,6 +498,36 @@ fn draw_keys(frame: &mut Frame, body: Rect) {
     frame.render_widget(popup, area);
 }
 
+fn draw_status(frame: &mut Frame, body: Rect, app: &App, report: &crate::status::StatusReport) {
+    let doing = |id: &str| {
+        let view = app.agents.get(id)?;
+        matches!(view.status, AgentStatus::Starting | AgentStatus::Running).then(|| view.doing.clone())
+    };
+    let lines: Vec<Line> = report
+        .lines(&doing)
+        .into_iter()
+        .map(|line| match line.strip_prefix("  ") {
+            Some(_) => Line::from(line).dim(),
+            None => Line::from(line).bold(),
+        })
+        .collect();
+    let width = body.width.saturating_sub(4).max(body.width.min(20));
+    let height = (lines.len() as u16 + 2).min(body.height);
+    let area = Rect::new(
+        body.x + (body.width - width) / 2,
+        body.y + (body.height - height) / 2,
+        width,
+        height,
+    );
+    let popup = Paragraph::new(lines).scroll((app.status_scroll, 0)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" status · ↑↓ scroll · any key close "),
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
+}
+
 /// An agent's log as plain text: the same lines the log pane shows, without styling, borders or
 /// wrapping, so the terminal can scroll, search and copy it natively.
 pub fn plain_log(view: &AgentView) -> String {
@@ -676,6 +709,36 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_status_popup_lists_agents_over_the_log() {
+        let mut app = app_with_an_image(None);
+        app.status = Some(crate::status::StatusReport {
+            base: Some("main".into()),
+            agents: vec![crate::status::AgentReport {
+                id: "a1".into(),
+                label: "shots (a1)".into(),
+                status: AgentStatus::Idle,
+                unread: 0,
+                branch: Some("swarm/r/a1".into()),
+                unmerged: Some(vec!["abc1234 feat: thumbnails".into()]),
+                todos: vec![],
+                background: vec![],
+                schedules: vec![],
+            }],
+        });
+        for width in [100, 30] {
+            let backend = ratatui::backend::TestBackend::new(width, 20);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+            let screen = screen_text(terminal.backend().buffer());
+            assert!(screen.contains("shots (a1) · idle"), "{screen}");
+            if width == 100 {
+                assert!(screen.contains("abc1234 feat: thumbnails"), "{screen}");
+                assert!(screen.contains("1 not on main"), "{screen}");
+            }
+        }
     }
 
     #[test]

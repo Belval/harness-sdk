@@ -28,6 +28,7 @@ pub mod schedule;
 pub mod selftest;
 pub mod skills;
 pub mod state;
+pub mod status;
 pub mod tools;
 pub mod tui;
 pub mod version;

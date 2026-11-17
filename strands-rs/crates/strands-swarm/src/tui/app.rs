@@ -241,6 +241,14 @@ pub struct App {
     pub images: super::images::Images,
     /// Set while the F1 key-binding popup is open.
     pub show_keys: bool,
+    /// The `/status` popup's report while it is open, refreshed by the event loop.
+    pub status: Option<crate::status::StatusReport>,
+    /// Lines the `/status` popup is scrolled down.
+    pub status_scroll: u16,
+    /// Ring the terminal bell when an agent messages the user (`--notify`).
+    pub notify: bool,
+    /// A bell is due; the event loop rings it.
+    pub bell: bool,
     /// The mouse selection being made or last made, highlighted until the next click.
     pub selection: Option<super::select::Selection>,
     /// When Esc was last pressed on an empty input; a second press soon after stops the turn.
@@ -319,6 +327,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/schedules",
         args: "",
         help: "list scheduled messages",
+    },
+    SlashCommand {
+        name: "/status",
+        args: "",
+        help: "every agent's state, todos, unmerged commits and jobs (no model call)",
     },
     SlashCommand {
         name: "/gc",
@@ -446,6 +459,9 @@ impl App {
     }
 
     fn apply_mail(&mut self, to: &str, mail: crate::runtime::Mail) {
+        if to == USER && mail.from != USER {
+            self.bell |= self.notify;
+        }
         // Replies to the user are already visible as the sender's streamed text.
         if to == USER && mail.kind == "reply" {
             return;
@@ -692,6 +708,8 @@ pub enum Command {
     Gc,
     /// List scheduled messages.
     Schedules,
+    /// Open the status popup.
+    Status,
     /// Quit.
     Quit,
 }
@@ -751,6 +769,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         "/remember" => return Some(Command::Remember(None)),
         "/gc" => return Some(Command::Gc),
         "/schedules" => return Some(Command::Schedules),
+        "/status" => return Some(Command::Status),
         "/quit" | "/q" => return Some(Command::Quit),
         _ => {}
     }
@@ -908,6 +927,40 @@ mod tests {
         });
         assert_eq!(app.agents["a1"].log.len(), 2);
         assert!(matches!(&app.agents["a1"].log[1], LogEntry::MailIn { from, .. } if from == "a1 → user"));
+    }
+
+    #[test]
+    fn notify_rings_the_bell_for_messages_to_the_user_only() {
+        let mail = |from: &str| Mail {
+            from: from.into(),
+            from_label: from.into(),
+            kind: "reply",
+            text: "done".into(),
+            images: Vec::new(),
+        };
+        let mut quiet = App::default();
+        quiet.apply(spawned("a1", USER));
+        quiet.apply(SwarmEvent::Mail {
+            to: USER.into(),
+            mail: mail("a1"),
+        });
+        assert!(!quiet.bell);
+
+        let mut app = App {
+            notify: true,
+            ..App::default()
+        };
+        app.apply(spawned("a1", USER));
+        app.apply(SwarmEvent::Mail {
+            to: "a1".into(),
+            mail: mail(USER),
+        });
+        assert!(!app.bell, "mail from the user does not ring");
+        app.apply(SwarmEvent::Mail {
+            to: USER.into(),
+            mail: mail("a1"),
+        });
+        assert!(app.bell);
     }
 
     #[test]
@@ -1177,6 +1230,7 @@ mod tests {
         );
         assert_eq!(parse_command("/gc", false), Some(Command::Gc));
         assert_eq!(parse_command("/schedules", false), Some(Command::Schedules));
+        assert_eq!(parse_command("/status", false), Some(Command::Status));
         assert_eq!(
             parse_command("/model  anthropic/claude-x ", true),
             Some(Command::SetModel(Some("anthropic/claude-x".into())))
