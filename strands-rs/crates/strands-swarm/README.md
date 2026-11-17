@@ -335,7 +335,10 @@ Typing text without a command messages the selected agent.
   - Once a cancelled worktree agent and its subtree have stopped (or on resume), its private target
     dir is deleted.
   - Its worktree is removed with `git worktree remove` unless it has uncommitted changes, and so
-    are `<repo>.swarm/<run>` and `<repo>.swarm` once that leaves them empty.
+    are `<repo>.swarm/<run>` and `<repo>.swarm` once that leaves them empty. A worktree with
+    another branch checked out goes only once the base has all of that branch (which stays);
+    otherwise it is kept, e.g. `on branch swarm/r/a3-fix: 1 commit not on main`. A detached one
+    is kept.
   - Its branch `swarm/<run>/<agent>` is deleted once no worktree has it checked out and the base
     `/status` uses has every commit on it: reachable (`merged`) or as a patch-equivalent copy
     (`all applied`, per `git cherry`; a merge commit never counts as applied). Otherwise it stays,

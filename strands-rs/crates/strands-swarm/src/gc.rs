@@ -175,16 +175,38 @@ pub async fn collect(
     let Some((root, repo)) = layout(run_id, id, cwd) else {
         return out;
     };
+    let base = match base {
+        Some(base) => Some(base.to_owned()),
+        None if repo.is_dir() => git(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .await
+            .ok(),
+        None => None,
+    };
     if root.exists() {
         if worktree_root(run_id, id, &root).await.as_ref() != Some(&root) {
             return out;
         }
-        remove_worktree(&root, branch, &mut out).await;
+        remove_worktree(&root, branch, base.as_deref(), &mut out).await;
     }
     if !root.exists() && branch == format!("swarm/{run_id}/{id}") {
-        delete_merged_branch(&repo, branch, base, &mut out).await;
+        delete_merged_branch(&repo, branch, base.as_deref(), &mut out).await;
     }
     out
+}
+
+/// How `base` already has every commit of `rev`: `merged`, or `all applied` (cherry-picked or
+/// rebased, same patch id); else why not.
+async fn integrated(dir: &Path, base: Option<&str>, rev: &str) -> Result<&'static str, String> {
+    let base = base.ok_or("no base branch to compare with")?;
+    match crate::status::applied(dir, base, rev).await? {
+        found if found.pending() == 0 && found.applied == 0 => Ok("merged"),
+        found if found.pending() == 0 => Ok("all applied"),
+        found => {
+            let count = found.pending();
+            let commits = if count == 1 { "commit" } else { "commits" };
+            Err(format!("{count} {commits} not on {base}"))
+        }
+    }
 }
 
 /// The agent's worktree root `/…/<repo>.swarm/<run_id>/<id>` among `cwd` and its ancestors, and
@@ -198,8 +220,8 @@ fn layout(run_id: &str, id: &str, cwd: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((root.to_path_buf(), owner.parent()?.join(name)))
 }
 
-/// Delete `branch` in `repo` if no worktree has it checked out and `base` contains every commit
-/// on it; otherwise record why it stays.
+/// Delete `branch` in `repo` if no worktree has it checked out and `base` (`None`: unknown)
+/// contains every commit on it; otherwise record why it stays.
 async fn delete_merged_branch(repo: &Path, branch: &str, base: Option<&str>, out: &mut Collected) {
     let reference = format!("refs/heads/{branch}");
     if !repo.is_dir() {
@@ -216,26 +238,12 @@ async fn delete_merged_branch(repo: &Path, branch: &str, base: Option<&str>, out
     if checked_out {
         return keep("checked out in a worktree".to_owned());
     }
-    let base = match base {
-        Some(base) => base.to_owned(),
-        None => match git(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await {
-            Ok(base) => base,
-            Err(_) => return keep("no base branch to compare with".to_owned()),
-        },
-    };
-    if base == branch {
+    if base == Some(branch) {
         return keep("it is the base".to_owned());
     }
-    // Merged, or every commit copied onto the base (cherry-pick, rebase) by patch id.
-    let how = match crate::status::applied(repo, &base, &commit).await {
-        Ok(found) if found.pending() == 0 && found.applied == 0 => "merged",
-        Ok(found) if found.pending() == 0 => "all applied",
-        Ok(found) => {
-            let count = found.pending();
-            let commits = if count == 1 { "commit" } else { "commits" };
-            return keep(format!("{count} {commits} not on {base}"));
-        }
-        Err(error) => return keep(error),
+    let how = match integrated(repo, base, &commit).await {
+        Ok(how) => how,
+        Err(why) => return keep(why),
     };
     // Deleted only if it still points at the commit checked above.
     match git(repo, &["update-ref", "-d", &reference, &commit]).await {
@@ -300,11 +308,18 @@ async fn worktree_root(run_id: &str, id: &str, cwd: &Path) -> Option<PathBuf> {
     owned_path(&root, run_id, id, ".swarm").then_some(root)
 }
 
-async fn remove_worktree(root: &Path, branch: &str, out: &mut Collected) {
+/// Remove the worktree at `root` if it is clean and on `branch`, or on another branch `base`
+/// already has all of (which nothing then tracks); otherwise record why it stays.
+async fn remove_worktree(root: &Path, branch: &str, base: Option<&str>, out: &mut Collected) {
     let keep = |out: &mut Collected, why: String| out.kept.push((root.to_path_buf(), why));
-    let head = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await;
-    if head.as_deref() != Ok(branch) {
-        return keep(out, format!("not on branch {branch}"));
+    match git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await {
+        Ok(head) if head == branch => {}
+        Ok(head) => {
+            if let Err(why) = integrated(root, base, &head).await {
+                return keep(out, format!("on branch {head}: {why}"));
+            }
+        }
+        Err(_) => return keep(out, format!("not on branch {branch}")),
     }
     match git(root, &["status", "--porcelain"]).await {
         Ok(status) if status.is_empty() => {}
@@ -586,6 +601,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_worktree_on_another_branch_goes_once_the_base_has_all_of_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, worktree) = repo_with_worktree(tmp.path());
+        let base = crate::worktree::test_git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        run(&worktree, &["checkout", "-q", "-b", "swarm/r1/a2-fix"]);
+        fs::write(worktree.join("fix.txt"), "fix").unwrap();
+        run(&worktree, &["add", "."]);
+        run(&worktree, &["commit", "-qm", "fix"]);
+        let none = BTreeMap::new();
+        let reclaim = || collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, None);
+
+        let unmerged = reclaim().await;
+        let why = format!("on branch swarm/r1/a2-fix: 1 commit not on {base}");
+        assert_eq!(unmerged.kept, [(worktree.clone(), why)]);
+        assert!(worktree.exists());
+        let busy = ("swarm/r1/a2".to_owned(), "checked out in a worktree".to_owned());
+        assert_ne!(unmerged.kept_branch, Some(busy), "its given branch is not out");
+
+        // Detached, its commits may be on no branch.
+        run(&worktree, &["checkout", "-q", "--detach"]);
+        let detached = reclaim().await;
+        let why = "not on branch swarm/r1/a2".to_owned();
+        assert_eq!(detached.kept, [(worktree.clone(), why)]);
+        run(&worktree, &["checkout", "-q", "swarm/r1/a2-fix"]);
+
+        // Cherry-picked onto the base: nothing is lost with the worktree.
+        run(&repo, &["cherry-pick", "swarm/r1/a2-fix"]);
+        let applied = reclaim().await;
+        assert!(applied.kept.is_empty(), "{applied:?}");
+        assert!(!worktree.exists());
+        let deleted = ("swarm/r1/a2".to_owned(), "merged".to_owned());
+        assert_eq!(applied.deleted_branch, Some(deleted), "the given branch goes too");
+        assert!(
+            branch_exists(&repo, "swarm/r1/a2-fix"),
+            "a branch it was not given stays"
+        );
+    }
+
+    #[tokio::test]
     async fn keeps_a_dirty_worktree_and_ignores_agents_without_a_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let (_repo, worktree) = repo_with_worktree(tmp.path());
@@ -640,11 +694,6 @@ mod tests {
         assert!(main.is_empty() && repo.exists(), "{main:?}");
         let other = collect("r1", "a3", Some("swarm/r1/a2"), &worktree, &BTreeMap::new(), None).await;
         assert!(other.is_empty() && worktree.exists(), "{other:?}");
-        // A worktree switched to another branch is reported, not removed.
-        run(&worktree, &["checkout", "-q", "-b", "elsewhere"]);
-        let switched = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &BTreeMap::new(), None).await;
-        assert_eq!(switched.kept.len(), 1, "{switched:?}");
-        assert!(worktree.exists());
     }
 
     fn saved_agent(
