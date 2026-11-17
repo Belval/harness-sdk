@@ -527,7 +527,8 @@ fn draw_keys(frame: &mut Frame, body: Rect) {
             ])
         })
         .collect();
-    let width = 60.min(body.width);
+    let longest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = to_u16(longest + 2).min(body.width);
     let height = (KEYS.len() as u16 + 2).min(body.height);
     let area = Rect::new(
         body.x + (body.width - width) / 2,
@@ -899,6 +900,20 @@ mod tests {
         let screen = screen_text(terminal.backend().buffer());
         assert_eq!(screen.matches("parser").count(), 1, "{screen}");
         assert!(screen.contains("running wait…"), "{screen}");
+    }
+
+    #[test]
+    fn the_keys_popup_fits_every_help_text() {
+        let app = App {
+            show_keys: true,
+            ..Default::default()
+        };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        for (_, help) in KEYS {
+            assert!(screen.contains(help), "{help}:\n{screen}");
+        }
     }
 
     #[test]
