@@ -9,8 +9,8 @@ mod tool;
 pub mod vended;
 
 pub use executor::{
-    ConcurrentToolExecutor, ExecuteToolsInput, SequentialToolExecutor, ToolExecutor, ToolExecutorEvent,
-    EXECUTION_CANCELLED_MESSAGE, HOOK_CANCELLED_MESSAGE,
+    ConcurrentToolExecutor, ExecuteToolsInput, OrderedToolExecutor, SequentialToolExecutor, ToolExecutor,
+    ToolExecutorEvent, EXECUTION_CANCELLED_MESSAGE, HOOK_CANCELLED_MESSAGE,
 };
 pub use function_tool::{
     function_tool, input_schema_for, wrap_in_tool_result, FunctionTool, FunctionToolBuilder,

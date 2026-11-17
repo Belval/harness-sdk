@@ -14,7 +14,7 @@ use strands_agents::plugins::vended::{GoalLoop, JudgeConfig, Skill};
 use strands_agents::sandbox::LocalSandbox;
 use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
 use strands_agents::storage::{namespace, LocalFileStorage};
-use strands_agents::tools::{Tool, ToolContext, ToolRef};
+use strands_agents::tools::{OrderedToolExecutor, Tool, ToolContext, ToolRef};
 use strands_agents::types::{ToolResultBlock, ToolSpec};
 use strands_agents::Plugin;
 use strands_agents::{Agent, FileStorage, Result, SessionManager};
@@ -36,6 +36,11 @@ use crate::skills::{skills_prompt, skills_tool};
 /// native search (every Bedrock model), so it is opt-in through MCP instead;
 /// `programmatic_tool_caller` has no runtime in Rust (the harness skips it with a warning).
 const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search", "programmatic_tool_caller"];
+
+/// Tools whose calls in one batch run one after another in the model's order
+/// ([`OrderedToolExecutor`]): a test run waits for the edits before it, a read or a job for the
+/// command that writes its file. Every other call (messages, MCP, fetches) still starts at once.
+const ORDERED_TOOLS: &[&str] = &["read", "write", "edit", "shell", "run_background", "land"];
 
 /// Preview kept in context when a large tool result is offloaded to the stash.
 /// How to use the file tools: agents otherwise script edits with `python3`/`sed` through `shell`,
@@ -319,6 +324,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
             options.cache_ttl.as_deref(),
         ),
         retry: Some(crate::retry::policy()),
+        tool_executor: Some(Arc::new(OrderedToolExecutor::new(ORDERED_TOOLS.iter().copied()))),
         id: Some(spec.id),
         name: Some(spec.name),
         ..Default::default()
@@ -569,6 +575,57 @@ mod tests {
             .iter()
             .map(|(_, options)| request_prefix(options))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_read_waits_for_the_command_before_it_in_the_same_batch() {
+        use strands_agents::testing::MockResponse;
+        use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("out.txt");
+        let batch = Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::ToolUse(ToolUseBlock::new(
+                    "shell",
+                    "t1",
+                    serde_json::json!({ "command": "sleep 0.3 && echo written > out.txt" }),
+                )),
+                ContentBlock::ToolUse(ToolUseBlock::new(
+                    "read",
+                    "t2",
+                    serde_json::json!({ "path": file }),
+                )),
+            ],
+        );
+        let mut spec = spec();
+        spec.cwd = dir.path().to_owned();
+        let options = HarnessFactoryOptions::default();
+        let mut harness = harness_options(&options, spec).unwrap();
+        let model = MockMessageModel::shared(vec![
+            MockResponse::message(batch),
+            MockResponse::message(Message::assistant("done")),
+        ]);
+        harness.model = Some(ModelOption::Instance(model.clone()));
+        build(&options, harness)
+            .await
+            .unwrap()
+            .invoke("go")
+            .await
+            .unwrap();
+
+        let calls = model.calls();
+        let results = calls[1].0.last().unwrap();
+        let read = results
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult(result) if result.tool_use_id == "t2" => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        let text = serde_json::to_string(&read.content).unwrap();
+        assert!(text.contains("written"), "{text}");
     }
 
     #[tokio::test]

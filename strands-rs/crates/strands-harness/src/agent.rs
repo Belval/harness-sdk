@@ -17,7 +17,7 @@ use strands_agents::sandbox::SandboxRef;
 use strands_agents::session::{FileStorage, SaveLatestStrategy, SessionManager, SessionManagerOptions};
 use strands_agents::storage::LocalFileStorage;
 use strands_agents::telemetry::AttrValue;
-use strands_agents::tools::ToolRef;
+use strands_agents::tools::{ToolExecutor, ToolRef};
 use strands_agents::ShellTool;
 use strands_agents::{Agent, Error, Result};
 
@@ -181,6 +181,9 @@ pub struct HarnessAgentOptions {
     /// TTL of the prompt-cache points (`"5m"`, `"1h"`) where caching is on for Bedrock or
     /// Anthropic; `None` leaves the provider default (5 minutes). Rust-only.
     pub cache_ttl: Option<String>,
+    /// How a batch of tool calls runs; `None` is the agent default (all at once, as in TS).
+    /// Rust-only.
+    pub tool_executor: Option<Arc<dyn ToolExecutor>>,
     /// Context management; [`ContextManagerOption::Auto`] by default.
     pub context_manager: ContextManagerOption,
     /// Model-call retry policy; `None` keeps the SDK default (throttling only, 6 attempts).
@@ -302,6 +305,9 @@ pub async fn create_harness(options: HarnessAgentOptions) -> Result<Agent> {
         .interventions(interventions);
     if let Some(retry) = options.retry.clone() {
         builder = builder.retry_strategy(DefaultModelRetryStrategy::new(retry)?);
+    }
+    if let Some(executor) = options.tool_executor.clone() {
+        builder = builder.tool_executor(executor);
     }
     if let Some(config) = crate::telemetry::setup_telemetry() {
         builder = builder.telemetry(config);

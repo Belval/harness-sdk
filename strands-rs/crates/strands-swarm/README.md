@@ -89,6 +89,9 @@ error.
   - The `context` tool lets the agent manage its own context. It lists the biggest items with tool
     results numbered. `offload: [n, …]` replaces results with a stub whose reference reads them
     back. `summarize: true` summarizes all but the latest four messages before the next call.
+- **Tool order.** A batch of tool calls runs at once, except that `read`, `write`, `edit`,
+  `shell`, `run_background` and `land` run one after another in the model's order: a test run
+  waits for the edits before it, a read for the command that writes the file.
 - **Worktrees.**
   - A worktree agent works in `<repo>.swarm/<run>/<agent>` on branch `swarm/<run>/<agent>`.
   - When `CARGO_TARGET_DIR` is set, it builds in its own `$CARGO_TARGET_DIR-worktrees/<run>/<agent>`.

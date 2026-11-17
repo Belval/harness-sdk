@@ -143,7 +143,8 @@ pub use tools::vended::HttpRequestTool;
 pub use tools::vended::McpRouterTool;
 pub use tools::vended::{FileEditorTool, HandoffToUserTool, ShellTool, SleepTool};
 pub use tools::{
-    ConcurrentToolExecutor, FunctionTool, SequentialToolExecutor, Tool, ToolContext, ToolExecutor,
+    ConcurrentToolExecutor, FunctionTool, OrderedToolExecutor, SequentialToolExecutor, Tool, ToolContext,
+    ToolExecutor,
 };
 pub use types::{
     ContentBlock, InterruptParams, InterruptResponse, InterruptResponseContent, Message, Role, StopReason,

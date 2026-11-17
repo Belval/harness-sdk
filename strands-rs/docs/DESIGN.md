@@ -99,6 +99,10 @@ installs the exporter).
   panicking constructor; a goal is either a description judged by an auto-built judge agent or a
   validator closure (`validator` async / `sync_validator`, a TS `throw` becoming `Err`), and the
   judge's structured-output schema is derived from `JudgeOutcome` with `schemars` rather than zod.
+- `tools::OrderedToolExecutor` is Rust-only: concurrent like `ConcurrentToolExecutor`, except
+  that calls to the listed tools run one after another in the model's order, so `edit` then
+  `shell` in one batch runs in that order while other calls still overlap. The TS executors are
+  unchanged; the harness takes it through `HarnessAgentOptions::tool_executor`.
 - `models::routing::ModelRouter` runs its per-invocation selection as **wrap-phase** middleware on
   `InvokeModelStage`, not TS's `InvokeModelStage.Input`: `add_input` is sync while
   `RoutingStrategy::select` is async, and wrap composes innermost so the stage still sees the

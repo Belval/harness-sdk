@@ -106,6 +106,24 @@ pub struct SequentialToolExecutor;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConcurrentToolExecutor;
 
+/// [`ConcurrentToolExecutor`], except that calls to the listed tools run one after another in the
+/// model's order, while every other call starts at once. With `write`, `edit` and `shell` listed,
+/// a test run waits for the edits before it and a file read back waits for the command that
+/// writes it. Rust-only.
+#[derive(Clone, Debug, Default)]
+pub struct OrderedToolExecutor {
+    ordered: std::collections::HashSet<String>,
+}
+
+impl OrderedToolExecutor {
+    /// An executor that keeps the model's order among calls to `tools`.
+    pub fn new(tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            ordered: tools.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[async_trait]
 impl ToolExecutor for SequentialToolExecutor {
     async fn execute(
@@ -147,45 +165,84 @@ impl ToolExecutor for ConcurrentToolExecutor {
         events: &mpsc::Sender<ToolExecutorEvent>,
         results: &mut Vec<ToolResultBlock>,
     ) -> Result<()> {
-        let mut pending: FuturesUnordered<_> = input
-            .tool_uses
-            .iter()
-            .enumerate()
-            .map(|(index, tool_use)| async move { (index, execute_tool(input, tool_use, events).await) })
-            .collect();
+        execute_concurrently(input, events, results, |_| false).await
+    }
+}
 
-        let mut collected: Vec<Option<ToolResultBlock>> = vec![None; input.tool_uses.len()];
-        // Interrupts are deferred: siblings run to completion so their results can be reused on
-        // resume. Last interrupt wins when several tools in a batch raise.
-        let mut interrupt: Option<Error> = None;
+#[async_trait]
+impl ToolExecutor for OrderedToolExecutor {
+    async fn execute(
+        &self,
+        input: &ExecuteToolsInput,
+        events: &mpsc::Sender<ToolExecutorEvent>,
+        results: &mut Vec<ToolResultBlock>,
+    ) -> Result<()> {
+        execute_concurrently(input, events, results, |name| self.ordered.contains(name)).await
+    }
+}
 
-        while let Some((index, outcome)) = pending.next().await {
-            let tool_use = &input.tool_uses[index];
-            let result = match outcome {
-                Ok(result) => result,
-                Err(Error::Cancelled) => {
-                    ToolResultBlock::error(&tool_use.tool_use_id, EXECUTION_CANCELLED_MESSAGE)
-                }
-                Err(error) if error.is_control_flow() => {
-                    interrupt = Some(error);
-                    continue;
-                }
-                Err(error) => ToolResultBlock::error(&tool_use.tool_use_id, error.to_string()),
-            };
-            collected[index] = Some(result.clone());
-            send(
-                events,
-                input,
-                ToolExecutorEvent::ToolResult(result_event(input, result)),
-            )
-            .await;
-        }
+/// Run a batch at once, except that each call `ordered` accepts waits for the previous such call.
+async fn execute_concurrently(
+    input: &ExecuteToolsInput,
+    events: &mpsc::Sender<ToolExecutorEvent>,
+    results: &mut Vec<ToolResultBlock>,
+    ordered: impl Fn(&str) -> bool,
+) -> Result<()> {
+    // A latch per call, fired once it has finished (whatever its outcome).
+    let done: Vec<CancellationToken> = input.tool_uses.iter().map(|_| CancellationToken::new()).collect();
+    let mut previous = None;
+    let after: Vec<Option<usize>> = (input.tool_uses.iter().enumerate())
+        .map(|(index, tool_use)| match ordered(&tool_use.name) {
+            true => previous.replace(index),
+            false => None,
+        })
+        .collect();
+    let (after, done) = (&after, &done);
+    let mut pending: FuturesUnordered<_> = input
+        .tool_uses
+        .iter()
+        .enumerate()
+        .map(|(index, tool_use)| async move {
+            if let Some(earlier) = after[index] {
+                done[earlier].cancelled().await;
+            }
+            let outcome = execute_tool(input, tool_use, events).await;
+            done[index].cancel();
+            (index, outcome)
+        })
+        .collect();
 
-        results.extend(collected.into_iter().flatten());
-        match interrupt {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+    let mut collected: Vec<Option<ToolResultBlock>> = vec![None; input.tool_uses.len()];
+    // Interrupts are deferred: siblings run to completion so their results can be reused on
+    // resume. Last interrupt wins when several tools in a batch raise.
+    let mut interrupt: Option<Error> = None;
+
+    while let Some((index, outcome)) = pending.next().await {
+        let tool_use = &input.tool_uses[index];
+        let result = match outcome {
+            Ok(result) => result,
+            Err(Error::Cancelled) => {
+                ToolResultBlock::error(&tool_use.tool_use_id, EXECUTION_CANCELLED_MESSAGE)
+            }
+            Err(error) if error.is_control_flow() => {
+                interrupt = Some(error);
+                continue;
+            }
+            Err(error) => ToolResultBlock::error(&tool_use.tool_use_id, error.to_string()),
+        };
+        collected[index] = Some(result.clone());
+        send(
+            events,
+            input,
+            ToolExecutorEvent::ToolResult(result_event(input, result)),
+        )
+        .await;
+    }
+
+    results.extend(collected.into_iter().flatten());
+    match interrupt {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -949,6 +1006,60 @@ mod tests {
                 .collect();
             assert_eq!(kinds, ["before", "after", "result"], "tool {id}");
         }
+    }
+
+    /// A tool that logs `start <id>` and `end <id>` around a 40ms sleep.
+    fn logged_tool(name: &'static str, log: &Arc<std::sync::Mutex<Vec<String>>>) -> ToolRef {
+        let log = log.clone();
+        Arc::new(FunctionTool::builder(name).description("logs").handler(
+            move |input: JsonValue, _ctx: ToolContext| {
+                let log = log.clone();
+                async move {
+                    let id = input["id"].as_str().unwrap_or_default().to_owned();
+                    log.lock().unwrap().push(format!("start {id}"));
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    log.lock().unwrap().push(format!("end {id}"));
+                    Ok(json!("ran"))
+                }
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn ordered_runs_the_listed_tools_in_model_order_and_the_rest_at_once() {
+        let agent = test_agent();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.with_tool_registry(|r| {
+            r.add_or_replace(["edit", "shell", "fetch"].map(|name| logged_tool(name, &log)))
+                .unwrap()
+        });
+        let call = |name: &str, id: &str| ToolUseBlock::new(name, id, json!({ "id": id }));
+        let batch = vec![
+            call("edit", "e1"),
+            call("fetch", "f2"),
+            call("shell", "s3"),
+            call("fetch", "f4"),
+            call("edit", "e5"),
+        ];
+        let executor = OrderedToolExecutor::new(["edit", "shell"]);
+        let (outcome, results, _) = run(&executor, &input(&agent, batch)).await;
+        assert!(outcome.is_ok());
+        let ids: Vec<&str> = results.iter().map(|r| r.tool_use_id.as_str()).collect();
+        assert_eq!(ids, ["e1", "f2", "s3", "f4", "e5"], "results stay in model order");
+
+        let log = log.lock().unwrap().clone();
+        let at = |entry: &str| {
+            log.iter()
+                .position(|e| e == entry)
+                .unwrap_or_else(|| panic!("{entry}: {log:?}"))
+        };
+        let before = |a: &str, b: &str| assert!(at(a) < at(b), "{a} before {b}: {log:?}");
+        // The command waits for the edit before it, the next edit for the command.
+        before("end e1", "start s3");
+        before("end s3", "start e5");
+        // The rest waits for nothing.
+        before("start f2", "end e1");
+        before("start f4", "end e1");
     }
 
     #[tokio::test]
