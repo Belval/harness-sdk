@@ -921,6 +921,16 @@ mod tests {
         assert!(screen.contains("Estimated cost: $6.00"), "{screen}");
         assert!(screen.contains("shots (a1)"), "{screen}");
         assert!(screen.contains("claude-sonnet-4-5"), "{screen}");
+
+        // An 80-column terminal clips the table, but not the estimate.
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        let row = screen
+            .lines()
+            .find(|row| row.contains("│shots (a1)"))
+            .expect(&screen);
+        assert!(row.contains("$6.00"), "{screen}");
     }
 
     #[test]

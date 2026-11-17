@@ -480,10 +480,12 @@ impl CostReport {
 
     /// The report as a text table.
     pub fn lines(&self) -> Vec<String> {
+        // The estimate (cell 6) is shown right after the model, so it stays in view when a narrow
+        // terminal clips the table.
         let row = |cells: [&str; 8]| {
             format!(
-                "{:<24} {:<22} {:>7} {:>7} {:>8} {:>8} {:>9} {:>14}",
-                cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7]
+                "{:<24} {:<22} {:>9} {:>7} {:>7} {:>8} {:>8} {:>14}",
+                cells[0], cells[1], cells[6], cells[2], cells[3], cells[4], cells[5], cells[7]
             )
             .trim_end()
             .to_owned()
@@ -811,7 +813,7 @@ mod tests {
             .expect("no side-call section");
         assert!(lines[at + 1].starts_with("  judge"), "{}", lines[at + 1]);
         assert!(lines[at + 1].contains("2 calls"), "{}", lines[at + 1]);
-        assert!(lines[at + 1].ends_with("$2.00"), "{}", lines[at + 1]);
+        assert!(lines[at + 1].contains("$2.00"), "{}", lines[at + 1]);
         assert!(lines[at + 2].starts_with("  summarizer"), "{}", lines[at + 2]);
         // The ledger persists with its side map and reads back.
         let json = serde_json::to_string(&ledger).unwrap();
