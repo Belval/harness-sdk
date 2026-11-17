@@ -238,7 +238,8 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
      compare-and-swap `update-ref`.
 - **Refusals.**
   - It refuses when that checkout has uncommitted changes to tracked files. It gives up if `into`
-    moved meanwhile.
+    moved meanwhile. Land jobs take turns from that check to the fast-forward (a lock in the
+    repository's git dir), so of two that finish together one lands and the other is told so.
   - A conflict (with the files), a failing check (with its last 30 lines) or a refusal changes
     nothing.
   - The scratch worktree is always removed, and the caller's branch is never modified. A land job

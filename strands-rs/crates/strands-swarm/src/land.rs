@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 
 use strands_agents::sandbox::detach_from_terminal;
@@ -22,6 +24,11 @@ pub const TAIL_LINES: usize = 30;
 /// commit pair per line: the rebase gives the landed commits new ids and, where the lines around
 /// them changed, new patch ids, so `git cherry` alone cannot tell the source's commits are in.
 pub const LANDED_FILE: &str = "swarm-landed";
+
+/// File in the repository's common git dir that land jobs hold an exclusive lock on from checking
+/// that the target has not moved to recording the landing, so two of them never fast-forward at
+/// once (two `git merge`s race for the checkout's `index.lock`).
+pub const LOCK_FILE: &str = "swarm-land.lock";
 
 /// Most landings [`LANDED_FILE`] keeps (the latest).
 const LANDED_KEPT: usize = 500;
@@ -140,6 +147,7 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
         passed.push(format!("  ok `{check}` ({}s)", started.elapsed().as_secs()));
     }
 
+    let _lock = land_lock(&plan.repo).await?;
     let into_ref = format!("refs/heads/{into}");
     let now = git(scratch, &["rev-parse", &into_ref]).await.unwrap_or_default();
     if now != old {
@@ -174,8 +182,38 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
 
 /// The landed-commit record of the repository at `dir`.
 async fn landed_file(dir: &Path) -> Option<PathBuf> {
+    common_file(dir, LANDED_FILE).await
+}
+
+/// File `name` in the common git dir of the repository at `dir`.
+async fn common_file(dir: &Path, name: &str) -> Option<PathBuf> {
     let common = git(dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await;
-    Some(PathBuf::from(common.ok()?).join(LANDED_FILE))
+    Some(PathBuf::from(common.ok()?).join(name))
+}
+
+/// Wait for the exclusive lock on [`LOCK_FILE`]; it is held until dropped (or the process dies).
+/// Polled, so a stopped landing gives up waiting at once.
+async fn land_lock(repo: &Path) -> Result<Flock<std::fs::File>, String> {
+    let path = common_file(repo, LOCK_FILE)
+        .await
+        .ok_or("Not landed: could not find the repository's git dir")?;
+    let failed = |e: &dyn std::fmt::Display| format!("Not landed: could not lock {}: {e}", path.display());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| failed(&e))?;
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(lock),
+            Err((unlocked, Errno::EWOULDBLOCK)) => {
+                file = unlocked;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err((_, e)) => return Err(failed(&e)),
+        }
+    }
 }
 
 /// Note in [`LANDED_FILE`] that `source`'s commits landed as `landed`. Best effort: a missing
@@ -643,6 +681,36 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("no branch nope"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_landing_waits_for_another_s_fast_forward_and_then_sees_the_target_moved() {
+        let fx = fixture().await;
+        let before = head(&fx.main, "main").await;
+        let held = std::fs::File::create(fx.main.join(".git").join(LOCK_FILE)).unwrap();
+        let held = Flock::lock(held, FlockArg::LockExclusive).unwrap();
+        let checked = fx.land.join("checked");
+        let plan = plan(&fx, &[&format!("touch '{}'", checked.display())]);
+        let landing = tokio::spawn(async move { run(&plan).await });
+        while !checked.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            head(&fx.main, "main").await,
+            before,
+            "fast-forwarded under another's lock"
+        );
+
+        // The other land job fast-forwards `main`, then lets go.
+        sh(&fx.main, "echo c > c.txt && git add . && git commit -qm 'add c'").await;
+        drop(held);
+        let error = landing.await.unwrap().unwrap_err();
+
+        assert!(
+            error.contains("moved from") && error.contains("meanwhile"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
