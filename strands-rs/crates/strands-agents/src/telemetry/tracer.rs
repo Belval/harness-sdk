@@ -153,7 +153,10 @@ impl Tracer {
         self.apply_custom(&mut attrs);
 
         {
+            // A new invocation starts a new local trace tree (TS resets `_traceState.traces`),
+            // so a long-lived agent does not keep, search and copy every earlier one.
             let mut state = self.state.lock();
+            state.traces.clear();
             state.current_cycle = None;
             state.current_cycle_span = backend::RawSpan::default();
         }
@@ -765,6 +768,23 @@ mod tests {
         tracer.end_node_span(&node, Some("COMPLETED"), Some(5), None, None);
         tracer.end_multi_agent_span(&span, Some(7), None, None);
         assert!(tracer.local_traces().is_empty());
+    }
+
+    #[test]
+    fn each_agent_span_starts_a_new_local_trace_tree() {
+        let tracer = Tracer::new(TelemetryConfig::new());
+        for turn in 0..3 {
+            let span = tracer.start_agent_span(AgentSpanOptions {
+                agent_name: "a",
+                ..Default::default()
+            });
+            let cycle = tracer.start_agent_loop_span(&span, &format!("c{turn}"));
+            tracer.end_agent_loop_span(&cycle, None);
+            tracer.end_agent_span(&span, None, None);
+        }
+        let traces = tracer.local_traces();
+        assert_eq!(traces.len(), 1, "only the last invocation's tree is kept");
+        assert_eq!(traces[0].children.len(), 1);
     }
 
     #[test]

@@ -76,6 +76,20 @@ async fn appends_input_messages_once_per_invocation() {
 }
 
 #[tokio::test]
+async fn each_result_carries_only_its_own_invocations_traces() {
+    let agent = Agent::builder()
+        .model(text_model(&["one", "two", "three"]))
+        .build()
+        .unwrap();
+
+    for _ in 0..3 {
+        let result = agent.invoke("go").await.unwrap();
+        // An earlier invocation's tree would be kept (and searched and copied) for ever.
+        assert_eq!(result.traces.len(), 1, "{:#?}", result.traces);
+    }
+}
+
+#[tokio::test]
 async fn runs_tools_and_feeds_results_back_to_the_model() {
     let model = MockMessageModel::shared(vec![
         MockResponse::with_stop_reason(
