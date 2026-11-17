@@ -4462,6 +4462,64 @@ async fn low_disk_space_warns_the_root_once_per_episode() {
     swarm.shutdown().await;
 }
 
+/// The guard's state outlives the process: a swarm restarted (reloaded, crashed) while space is
+/// still low does not warn its roots again, and one that finds it recovered warns anew.
+#[tokio::test]
+async fn a_restarted_swarm_does_not_repeat_a_disk_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let scripts = scripts_of(vec![("a1", (0..4).map(|_| say("noted")).collect())]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "root").await;
+    reply_to(&mut events, USER).await;
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(5 << 30));
+    let guard = |swarm: &Swarm| {
+        let probe = free.clone();
+        let check: strands_swarm::runtime::FreeSpace =
+            Arc::new(move |_: &Path| Some(probe.load(std::sync::atomic::Ordering::SeqCst)));
+        let guard = swarm
+            .clone()
+            .guard_disk(20 << 30, Duration::from_millis(10), check);
+        tokio::spawn(guard)
+    };
+    let mut warnings = async |wait: Duration| {
+        let mut seen = 0;
+        let _ = tokio::time::timeout(wait, async {
+            while let Some(event) = events.recv().await {
+                if matches!(&event, SwarmEvent::Mail { mail, .. } if mail.from == strands_swarm::runtime::DISK_SENDER) {
+                    seen += 1;
+                }
+            }
+        })
+        .await;
+        seen
+    };
+    let marker = state_dir.join(strands_swarm::runtime::DISK_WARNED_FILE);
+
+    let first = guard(&swarm);
+    assert_eq!(warnings(Duration::from_millis(300)).await, 1);
+    assert!(marker.exists());
+    first.abort();
+    // What the next process does on start.
+    let second = guard(&swarm);
+    assert_eq!(
+        warnings(Duration::from_millis(300)).await,
+        0,
+        "warned again after a restart"
+    );
+    free.store(30 << 30, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!marker.exists(), "recovered: the next low spell warns");
+    second.abort();
+    free.store(5 << 30, std::sync::atomic::Ordering::SeqCst);
+    let _third = guard(&swarm);
+    assert_eq!(warnings(Duration::from_millis(300)).await, 1);
+    swarm.shutdown().await;
+}
+
 /// A turn's last mail (reply or error) goes out before its agent's status leaves `Running`. In
 /// between, the agent looked done with nothing unread anywhere: `is_busy` said the swarm had
 /// nothing left to do, and a resumed headless run exited there, the root's error unprinted and

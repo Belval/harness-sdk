@@ -389,7 +389,8 @@ messages you.
     directories and the cargo target dirs. Below `--min-free-disk` (default `20G`, `0` turns it
     off) it mails the live root agents (or, with none, you) once, from `disk`, with the free space
     and the biggest per-agent target dirs; the TUI shows the first line in its footer. It warns
-    again only after the space has recovered to 10% above the threshold.
+    again only after the space has recovered to 10% above the threshold, restarts included (a
+    persistent run notes the warning in `<run dir>/disk-warned`).
 - **Memory.**
   - One Markdown file is shared by every agent and run: `$XDG_CONFIG_HOME/strands-swarm/memory.md`
     (default `~/.config`), or `--memory FILE`, or off with `--no-memory`.

@@ -6,6 +6,10 @@ use super::*;
 /// Sender of the disk guard's warnings.
 pub const DISK_SENDER: &str = "disk";
 
+/// In the run dir while the free space is low and the roots have been told
+/// ([`Swarm::guard_disk`]); holds the free bytes then.
+pub const DISK_WARNED_FILE: &str = "disk-warned";
+
 /// How often [`Swarm::guard_disk`] checks.
 pub const DISK_CHECK_EVERY: Duration = Duration::from_secs(60);
 
@@ -19,10 +23,17 @@ impl Swarm {
     /// Every `every`, check the free space (`free`) on the filesystems the swarm writes to: the
     /// run dir, the agents' working directories and the swarm's cargo target dirs. Once it drops
     /// below `min_free` bytes, tell the live root agents once, with the biggest per-agent target
-    /// dirs; a new warning needs the space to recover first (by a tenth of `min_free`). Runs
-    /// until the swarm shuts down.
+    /// dirs; a new warning needs the space to recover first (by a tenth of `min_free`). A
+    /// persistent run keeps that state on disk ([`DISK_WARNED_FILE`]), so a restart does not
+    /// warn again. Runs until the swarm shuts down.
     pub async fn guard_disk(self, min_free: u64, every: Duration, free: FreeSpace) {
-        let mut warned = false;
+        let marker = self
+            .inner
+            .config
+            .state_dir
+            .as_ref()
+            .map(|dir| dir.join(DISK_WARNED_FILE));
+        let mut warned = marker.as_ref().is_some_and(|marker| marker.exists());
         loop {
             tokio::select! {
                 () = self.inner.root_cancel.cancelled() => return,
@@ -38,9 +49,16 @@ impl Swarm {
             };
             let Some((path, bytes)) = lowest else { continue };
             if bytes >= min_free.saturating_add(min_free / 10) {
-                warned = false;
+                if std::mem::take(&mut warned) {
+                    if let Some(marker) = &marker {
+                        let _ = std::fs::remove_file(marker);
+                    }
+                }
             } else if bytes < min_free && !warned {
                 warned = true;
+                if let Some(marker) = &marker {
+                    let _ = std::fs::write(marker, format!("{bytes}\n"));
+                }
                 let targets = self.target_dirs();
                 let sizes = tokio::task::spawn_blocking(move || biggest(targets))
                     .await

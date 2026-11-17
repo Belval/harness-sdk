@@ -56,7 +56,7 @@ use actor::Start;
 pub use actor::SILENT_REPLY;
 use background::jobs_dir;
 use capacity::started;
-pub use disk::{free_space, FreeSpace, DISK_CHECK_EVERY, DISK_SENDER};
+pub use disk::{free_space, FreeSpace, DISK_CHECK_EVERY, DISK_SENDER, DISK_WARNED_FILE};
 use persist::history_event;
 pub use warm::{KEEP_WARM_EVERY, KEEP_WARM_MAX};
 
