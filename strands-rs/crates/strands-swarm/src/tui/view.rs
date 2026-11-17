@@ -370,14 +370,19 @@ struct LogWindow {
 /// The [`LogWindow`] of `view`'s log for the text area `inner`.
 fn log_window(view: &AgentView, app: &App, tick: usize, inner: Rect) -> LogWindow {
     let wanted = usize::from(inner.height) + usize::from(app.scroll);
-    // Newest first: each entry's lines, their wrapped rows and its thumbnail.
-    let mut groups: Vec<(Vec<Line<'static>>, Option<u64>)> = Vec::new();
-    let mut total = 0;
+    let rows_of = |lines: &[Line<'static>]| -> Vec<usize> {
+        lines.iter().map(|line| wrapped_rows(line, inner.width)).collect()
+    };
+    // Newest first: each entry's lines, their wrapped rows, and its thumbnail with the length of
+    // its placeholder (the lines before the reserved rows).
+    let mut groups = Vec::new();
     if let Some(activity) = view.activity() {
         let glyph = SPINNER[tick % SPINNER.len()];
         let line = Line::styled(format!("{glyph} {activity}"), Style::new().fg(Color::Cyan));
-        groups.push((vec![line], None));
+        let lines = vec![line];
+        groups.push((rows_of(&lines), lines, None));
     }
+    let mut total = 0;
     for entry in view.log.iter().rev() {
         if total >= wanted {
             break;
@@ -391,15 +396,13 @@ fn log_window(view: &AgentView, app: &App, tick: usize, inner: Rect) -> LogWindo
         {
             let rows = app.images.rows(decoded.id);
             if rows > 0 {
-                thumbnail = Some(decoded.id);
+                thumbnail = Some((lines.len(), decoded.id));
                 lines.extend(std::iter::repeat_n(Line::raw(""), usize::from(rows)));
             }
         }
-        total += lines
-            .iter()
-            .map(|line| wrapped_rows(line, inner.width))
-            .sum::<usize>();
-        groups.push((lines, thumbnail));
+        let rows = rows_of(&lines);
+        total += rows.iter().sum::<usize>();
+        groups.push((rows, lines, thumbnail));
     }
     let mut window = LogWindow {
         lines: Vec::new(),
@@ -407,17 +410,11 @@ fn log_window(view: &AgentView, app: &App, tick: usize, inner: Rect) -> LogWindo
         thumbnails: Vec::new(),
         offset: 0,
     };
-    for (lines, thumbnail) in groups.into_iter().rev() {
-        if let Some(id) = thumbnail {
-            // The placeholder is the entry's lines before the reserved rows.
-            let reserved = usize::from(app.images.rows(id));
-            window
-                .thumbnails
-                .push((window.lines.len() + lines.len() - reserved, id));
+    for (rows, lines, thumbnail) in groups.into_iter().rev() {
+        if let Some((placeholder, id)) = thumbnail {
+            window.thumbnails.push((window.lines.len() + placeholder, id));
         }
-        window
-            .rows
-            .extend(lines.iter().map(|line| wrapped_rows(line, inner.width)));
+        window.rows.extend(rows);
         window.lines.extend(lines);
     }
     let shown = window.rows.iter().sum();
