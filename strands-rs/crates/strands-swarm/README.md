@@ -141,7 +141,9 @@ TASK or `--goal`.
   - Once spent, model calls fail with a "budget exhausted" error that travels up to you.
   - `/budget N` raises it and tells every stopped agent to continue. `/budget off` lifts it and
     `/budget` shows usage.
-  - The budget is saved with the run.
+  - The budget is saved with the run. A resume keeps it unless given a `--budget-tokens` other
+    than the one the run was last started with (a supervisor that replays its arguments leaves
+    a `/budget` change in place).
 
 ## Cost
 

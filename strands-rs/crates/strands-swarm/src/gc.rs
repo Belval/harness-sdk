@@ -733,6 +733,7 @@ mod tests {
             next_id: agents.len() as u64 + 1,
             agents,
             budget_tokens: None,
+            budget_flag: None,
             max_agents: None,
             commit: None,
             schedules: Vec::new(),

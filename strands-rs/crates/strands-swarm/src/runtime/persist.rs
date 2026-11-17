@@ -9,12 +9,13 @@ impl Swarm {
         config: SwarmConfig,
         state: SwarmState,
     ) -> Result<(Self, mpsc::UnboundedReceiver<SwarmEvent>)> {
-        let (swarm, events) = Self::new(config);
+        let (swarm, events) = Self::build(config);
         swarm.inner.next_id.store(state.next_id, Ordering::SeqCst);
         *swarm.inner.max_agents.lock() = state.max_agents;
-        if let Some(tokens) = state.budget_tokens {
-            *swarm.inner.budget.lock() = Some(tokens);
-            swarm.emit(SwarmEvent::Budget { tokens: Some(tokens) });
+        let budget = resumed_budget(swarm.inner.config.budget_tokens, &state);
+        *swarm.inner.budget.lock() = budget;
+        if budget.is_some() {
+            swarm.emit(SwarmEvent::Budget { tokens: budget });
         }
         swarm.journal_event("resume", serde_json::json!({ "agents": state.agents.len() }));
         if let Some(dir) = swarm.inner.config.state_dir.clone() {
@@ -163,6 +164,7 @@ impl Swarm {
             next_id: self.inner.next_id.load(Ordering::SeqCst),
             agents,
             budget_tokens: *self.inner.budget.lock(),
+            budget_flag: self.inner.config.budget_tokens,
             max_agents: *self.inner.max_agents.lock(),
             commit: self.inner.config.commit.clone(),
             schedules: self.inner.schedules.lock().clone(),
@@ -339,6 +341,15 @@ pub(super) fn status_name(status: &AgentStatus) -> &'static str {
 /// The persistable view of one agent. Each lock is read on its own (see `Node::info`): guards
 /// taken inside the struct literal are all held until it is built, and holding `model` while
 /// waiting for `status` deadlocked against `Node::info`.
+/// The budget a resumed run starts with: the saved one, unless `--budget-tokens` was given with a
+/// value other than the run was last started with ([`SwarmState::budget_flag`]).
+fn resumed_budget(flag: Option<u64>, state: &SwarmState) -> Option<u64> {
+    match flag {
+        Some(tokens) if state.budget_flag != Some(tokens) => Some(tokens),
+        _ => state.budget_tokens,
+    }
+}
+
 pub(super) fn node_state(node: &Node) -> AgentState {
     let usage = *node.usage.lock();
     let model = node.model.lock().clone();

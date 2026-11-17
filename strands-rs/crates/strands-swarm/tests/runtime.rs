@@ -4366,3 +4366,43 @@ async fn a_turn_posts_its_reply_or_error_before_its_agent_stops_running() {
         assert!(mailed, "a1 was {status} before its {kind} was posted");
     }
 }
+
+/// A resume keeps the saved budget, which `/budget` may have changed, when `--budget-tokens` is
+/// absent or the same as the run was last started with (a supervisor replays its arguments); a
+/// different flag overrides it. Either way the budget is announced once, with the value in force.
+#[tokio::test]
+async fn a_resume_keeps_the_saved_budget_unless_given_a_new_budget_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved = |flag: Option<u64>| -> strands_swarm::state::SwarmState {
+        serde_json::from_value(json!({
+            "run_id": "old",
+            "cwd": dir.path(),
+            "next_id": 2,
+            "agents": [],
+            "budget_tokens": 10_000_000,
+            "budget_flag": flag,
+        }))
+        .unwrap()
+    };
+    let cases = [
+        (None, None, Some(10_000_000)),
+        (Some(6_000_000), Some(6_000_000), Some(10_000_000)),
+        (Some(6_000_000), Some(8_000_000), Some(8_000_000)),
+        (None, Some(8_000_000), Some(8_000_000)),
+    ];
+    for (last, flag, expected) in cases {
+        let mut config = SwarmConfig::new(mock_factory(&scripts_of(vec![])), dir.path());
+        config.budget_tokens = flag;
+        let (swarm, mut events) = Swarm::resume(config, saved(last)).await.unwrap();
+        assert_eq!(swarm.budget(), expected, "last {last:?}, flag {flag:?}");
+        let mut announced = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let SwarmEvent::Budget { tokens } = event {
+                announced.push(tokens);
+            }
+        }
+        assert_eq!(announced, vec![expected], "last {last:?}, flag {flag:?}");
+        assert_eq!(swarm.snapshot().budget_flag, flag);
+        swarm.shutdown().await;
+    }
+}

@@ -733,6 +733,15 @@ pub struct Swarm {
 impl Swarm {
     /// A new, empty swarm and the receiver of its event stream.
     pub fn new(config: SwarmConfig) -> (Self, mpsc::UnboundedReceiver<SwarmEvent>) {
+        let (swarm, rx) = Self::build(config);
+        if let Some(tokens) = swarm.budget() {
+            swarm.emit(SwarmEvent::Budget { tokens: Some(tokens) });
+        }
+        (swarm, rx)
+    }
+
+    /// [`Swarm::new`] without announcing the budget: a resume announces the one it settles on.
+    fn build(config: SwarmConfig) -> (Self, mpsc::UnboundedReceiver<SwarmEvent>) {
         let (events, rx) = mpsc::unbounded_channel();
         let inner = Inner {
             agents: Mutex::new(IndexMap::new()),
@@ -765,9 +774,6 @@ impl Swarm {
         let swarm = Self {
             inner: Arc::new(inner),
         };
-        if let Some(tokens) = swarm.budget() {
-            swarm.emit(SwarmEvent::Budget { tokens: Some(tokens) });
-        }
         (swarm, rx)
     }
 
