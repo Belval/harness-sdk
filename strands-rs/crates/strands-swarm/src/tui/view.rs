@@ -128,7 +128,7 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
     if app.show_keys {
         draw_keys(frame, areas.body);
     }
-    if let Some(popup) = popup(app) {
+    if let Some(popup) = popup(app, areas.body) {
         let (area, _) = popup_area(areas.body, &popup);
         frame.render_widget(Clear, area);
         frame.render_widget(popup.scroll((app.status_scroll, 0)), area);
@@ -540,7 +540,7 @@ fn draw_keys(frame: &mut Frame, body: Rect) {
 }
 
 /// The `/status` or `/cost` popup, when one is open, unscrolled.
-fn popup(app: &App) -> Option<Paragraph<'static>> {
+fn popup(app: &App, body: Rect) -> Option<Paragraph<'static>> {
     let (title, lines, wrap) = if let Some(report) = &app.status {
         let doing = |id: &str| {
             let view = app.agents.get(id)?;
@@ -557,7 +557,19 @@ fn popup(app: &App) -> Option<Paragraph<'static>> {
         // Prose wraps; the cost table does not, so its columns stay aligned.
         (" status · ↑↓ scroll · any key close ", lines, true)
     } else {
-        let lines = app.cost.as_ref()?.lines().into_iter().map(Line::from).collect();
+        // The first and last lines are prose (intro, footnote): those wrap by word.
+        let width = usize::from(popup_width(body).saturating_sub(2));
+        let lines = app.cost.as_ref()?.lines();
+        let last = lines.len().saturating_sub(1);
+        let lines = lines
+            .into_iter()
+            .enumerate()
+            .flat_map(|(at, line)| match at == 0 || at == last {
+                true => wrap_words(&line, width),
+                false => vec![line],
+            })
+            .map(Line::from)
+            .collect();
         (" estimated cost · ↑↓ scroll · any key close ", lines, false)
     };
     let popup = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
@@ -570,7 +582,7 @@ fn popup(app: &App) -> Option<Paragraph<'static>> {
 /// Where `popup` goes: centred over most of `body`, as tall as its lines need. Also returns
 /// its height in rows when not clipped (borders included).
 fn popup_area(body: Rect, popup: &Paragraph) -> (Rect, u16) {
-    let width = body.width.saturating_sub(4).max(body.width.min(20));
+    let width = popup_width(body);
     // `line_count` takes the inner width and counts both borders.
     let rows = to_u16(popup.line_count(width.saturating_sub(2)));
     let height = rows.min(body.height);
@@ -579,10 +591,32 @@ fn popup_area(body: Rect, popup: &Paragraph) -> (Rect, u16) {
     (Rect::new(x, y, width, height), rows)
 }
 
+fn popup_width(body: Rect) -> u16 {
+    body.width.saturating_sub(4).max(body.width.min(20))
+}
+
+/// `text` split at spaces into lines of at most `width` characters (a longer word gets its own).
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    for word in text.split(' ') {
+        let line = lines.last_mut().expect("never empty");
+        if line.is_empty() {
+            line.push_str(word);
+        } else if line.chars().count() + 1 + word.chars().count() <= width {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            lines.push(word.to_owned());
+        }
+    }
+    lines
+}
+
 /// How far the open popup can scroll on a `screen`-sized terminal: until its last line shows.
 pub fn popup_scroll_limit(app: &App, screen: Rect) -> u16 {
-    popup(app).map_or(0, |popup| {
-        let (area, rows) = popup_area(areas(app, screen).body, &popup);
+    let body = areas(app, screen).body;
+    popup(app, body).map_or(0, |popup| {
+        let (area, rows) = popup_area(body, &popup);
         rows - area.height
     })
 }
@@ -1080,6 +1114,18 @@ mod tests {
             .find(|row| row.contains("│shots (a1)"))
             .expect(&screen);
         assert!(row.contains("$6.00"), "{screen}");
+        // Its intro and footnote wrap instead of running off the edge.
+        let flat = screen
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace("│ │", "");
+        for prose in [
+            "write 1.25× input; not a bill)",
+            "--prices FILE adds or overrides prices.",
+        ] {
+            assert!(flat.contains(prose), "{prose}:\n{screen}");
+        }
     }
 
     #[test]
