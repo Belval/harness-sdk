@@ -4302,3 +4302,35 @@ async fn low_disk_space_warns_the_root_once_per_episode() {
     assert_eq!(warnings(Duration::from_millis(300)).await.len(), 1);
     swarm.shutdown().await;
 }
+
+/// A turn's last mail (reply or error) goes out before its agent's status leaves `Running`. In
+/// between, the agent looked done with nothing unread anywhere: `is_busy` said the swarm had
+/// nothing left to do, and a resumed headless run exited there, the root's error unprinted and
+/// its exit status 0.
+#[tokio::test]
+async fn a_turn_posts_its_reply_or_error_before_its_agent_stops_running() {
+    let rejected = || MockResponse::Error(strands_agents::Error::other("rejected"));
+    for (response, kind) in [(say("done"), "reply"), (rejected(), "error")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (swarm, mut events, _) = swarm_with(vec![("a1", vec![response])], dir.path());
+        spawn_root(&swarm, "go").await;
+        let mut mailed = false;
+        let ended = async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    SwarmEvent::Mail { to, mail } if to == USER && mail.kind == kind => mailed = true,
+                    SwarmEvent::Status { id, status } if id == "a1" => match status {
+                        AgentStatus::Starting | AgentStatus::Running => {}
+                        status => return status,
+                    },
+                    _ => {}
+                }
+            }
+            panic!("event stream closed");
+        };
+        let status = tokio::time::timeout(Duration::from_secs(10), ended)
+            .await
+            .unwrap();
+        assert!(mailed, "a1 was {status} before its {kind} was posted");
+    }
+}

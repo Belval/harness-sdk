@@ -151,8 +151,9 @@ impl Swarm {
 
     fn fail_construction(&self, node: &Node, error: Error) {
         let message = format!("Failed to start: {error}");
-        self.set_status(node, AgentStatus::Errored(message.clone()));
-        let _ = self.post(&node.id, &node.parent, "error", message);
+        // Mail before status, as at the end of a turn (see `run_turn`).
+        let _ = self.post(&node.id, &node.parent, "error", message.clone());
+        self.set_status(node, AgentStatus::Errored(message));
         self.set_status(node, AgentStatus::Cancelled);
     }
 
@@ -204,28 +205,31 @@ impl Swarm {
         if node.cancel.is_cancelled() || self.inner.shutting_down.load(Ordering::SeqCst) {
             return None;
         }
+        // Each ending posts its mail before the status leaves `Running`: in between, the agent
+        // would look done with nothing unread anywhere, which `Swarm::is_busy` reads as a swarm
+        // with nothing left to do (a headless run exited there, the root's error unprinted).
         if turn.is_cancelled() {
             // Interrupted: the SDK has already closed any open tool call, so the conversation
             // continues cleanly with the next message. No retry, even with a goal.
             node.paused.store(true, Ordering::SeqCst);
-            self.set_status(node, AgentStatus::Idle);
             let _ = self.post(&node.id, &node.parent, "interrupted", INTERRUPTED_TEXT.to_owned());
+            self.set_status(node, AgentStatus::Idle);
             return None;
         }
         if let Some(error) = failure {
             let message = error.to_string();
-            self.set_status(node, AgentStatus::Errored(message.clone()));
             if report {
                 let _ = self.post(&node.id, &node.parent, "error", message.clone());
             }
+            self.set_status(node, AgentStatus::Errored(message.clone()));
             return Some(message);
         }
-        self.set_status(node, AgentStatus::Idle);
         let reply = reply.unwrap_or_default();
         // The user sees replies as streamed text anyway, and headless runs wait for one.
         if node.parent == USER || !is_silent(&reply) {
             let _ = self.post(&node.id, &node.parent, "reply", reply);
         }
+        self.set_status(node, AgentStatus::Idle);
         None
     }
 
