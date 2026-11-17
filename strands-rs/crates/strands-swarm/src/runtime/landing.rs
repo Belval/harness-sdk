@@ -108,14 +108,16 @@ impl Swarm {
             .await
     }
 
-    /// [`crate::land::tidy`]: what land jobs killed outright left behind, once no land job runs
-    /// (`None` while one does).
-    pub(super) async fn tidy_landings(&self) -> Option<Collected> {
+    /// [`crate::land::tidy`] once no land job runs (`None` while one does); with `target`, the
+    /// checks' shared target dir goes too.
+    pub(super) async fn tidy_landings(&self, target: bool) -> Option<Collected> {
         let land = |job: &crate::jobs::JobMeta| job.command.contains(crate::land::LAND_FLAG);
         if self.inner.jobs.any_running(land).await {
             return None;
         }
-        Some(crate::land::tidy(&jobs_dir(&self.inner.config).join("land")).await)
+        let config = &self.inner.config;
+        let target = target.then(|| land_target_dir(config));
+        Some(crate::land::tidy(&jobs_dir(config).join("land"), target.as_deref()).await)
     }
 
     /// Branches `node` may land: its own (a root agent's is the one it has checked out), then
@@ -146,17 +148,10 @@ impl Swarm {
     }
 }
 
-/// The `CARGO_TARGET_DIR` every land job's checks share (it stays, so the next landing builds
-/// incrementally): `$CARGO_TARGET_DIR-land/<run>`, or under the jobs dir without a shared one.
+/// [`crate::land::target_dir`] of this swarm.
 pub(super) fn land_target_dir(config: &SwarmConfig) -> PathBuf {
-    match &config.cargo_target_dir {
-        Some(shared) => {
-            let mut name = shared.as_os_str().to_owned();
-            name.push("-land");
-            PathBuf::from(name).join(&config.run_id)
-        }
-        None => jobs_dir(config).join("land").join("target"),
-    }
+    let land = jobs_dir(config).join("land");
+    crate::land::target_dir(config.cargo_target_dir.as_deref(), &config.run_id, &land)
 }
 
 fn listing(branches: &[String]) -> String {

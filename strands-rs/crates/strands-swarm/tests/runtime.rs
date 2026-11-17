@@ -2574,6 +2574,8 @@ async fn gc_and_resume_remove_a_killed_land_job_s_scratch_once_no_land_job_runs(
     let land = state_dir.join("jobs/land");
     std::fs::create_dir_all(&land).unwrap();
     let scratch = land.join("a2-20260101-000000000");
+    let target = land.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
     let plan = strands_swarm::land::LandPlan {
         repo: repo.clone(),
         source: "main".into(),
@@ -2588,6 +2590,14 @@ async fn gc_and_resume_remove_a_killed_land_job_s_scratch_once_no_land_job_runs(
         &repo,
         &["worktree", "add", "-q", "--detach", scratch.to_str().unwrap()],
     );
+    // Left a while ago: a landing's that started just now are not touched.
+    let aged = std::process::Command::new("touch")
+        .args(["-d", "2 minutes ago"])
+        .arg(&scratch)
+        .arg(scratch.with_extension("json"))
+        .status()
+        .unwrap();
+    assert!(aged.success());
     let scripts = scripts_of(vec![("a1", vec![say("ok")])]);
     let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
     config.state_dir = Some(state_dir.clone());
@@ -2608,10 +2618,44 @@ async fn gc_and_resume_remove_a_killed_land_job_s_scratch_once_no_land_job_runs(
 
     let saved = strands_swarm::state::load(&state_dir).await.unwrap().unwrap();
     let (resumed, _events) = Swarm::resume(config, saved).await.unwrap();
-    eventually("resume removes the scratch worktree", || !scratch.exists()).await;
+    let plan = scratch.with_extension("json");
+    eventually("resume removes the scratch worktree and its plan", || {
+        !scratch.exists() && !plan.exists()
+    })
+    .await;
     let listed = git(&repo, &["worktree", "list", "--porcelain"]);
     assert_eq!(listed.matches("worktree ").count(), 1, "{listed}");
+    assert!(
+        target.exists(),
+        "resume keeps the checks' target dir for the next landing"
+    );
+    let collected = resumed.gc().await;
+    let land = collected
+        .iter()
+        .find(|c| c.id == "land")
+        .expect("gc reports the land dir");
+    assert_eq!(land.removed.len(), 1, "{land:?}");
+    assert!(!target.exists(), "an explicit gc reclaims it");
     resumed.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_run_that_cannot_resume_deletes_its_land_checks_target_dir_on_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[("a.txt", "a")]);
+    let scripts = scripts_of(vec![("a1", vec![say("ok")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
+    config.cargo_target_dir = Some(dir.path().join("target"));
+    config.run_id = "r1".into();
+    let target = dir.path().join("target-land/r1");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "root").await;
+    reply_to(&mut events, USER).await;
+
+    swarm.shutdown().await;
+
+    assert!(!target.exists());
 }
 
 #[tokio::test]

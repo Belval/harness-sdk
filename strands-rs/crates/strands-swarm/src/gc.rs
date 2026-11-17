@@ -284,7 +284,7 @@ fn owned_path(path: &Path, run_id: &str, id: &str, suffix: &str) -> bool {
         && names[2].strip_suffix(suffix).is_some_and(|name| !name.is_empty())
 }
 
-async fn remove_dir(dir: &Path, out: &mut Collected) {
+pub(crate) async fn remove_dir(dir: &Path, out: &mut Collected) {
     // A symlink is never followed: only a real directory at the expected path is deleted.
     match tokio::fs::symlink_metadata(dir).await {
         Ok(meta) if meta.is_dir() => {}

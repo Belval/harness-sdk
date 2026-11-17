@@ -246,7 +246,11 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
     that is stopped (killed with `jobs`, or its agent cancelled) kills the check in flight with its
     children and removes the scratch worktree too. One killed outright (`kill -9`, a reboot)
     leaves it behind; the next resume, `/gc` or `--gc` that finds no land job running removes it
-    (a `gc` event for `land`).
+    (a `gc` event for `land`), with any plan left in `jobs/land` (each job deletes its own) once
+    a minute old.
+  - The checks' shared target dir (`$CARGO_TARGET_DIR-land/<run>`, else `jobs/land/target`) stays
+    for the next landing's incremental build. `/gc` and `--gc` delete it when no land job runs,
+    and a run without `--run` on exit.
 - Programmatically: `Swarm::land`.
 
 ## TUI
@@ -393,7 +397,7 @@ messages you.
     directories and the cargo target dirs. Below `--min-free-disk` (default `20G`, `0` turns it
     off) it mails the live root agents (or, with none, you) once, from `disk`, with the free space
     and the biggest per-agent target dirs (and the land checks' shared `$CARGO_TARGET_DIR-land/<run>`,
-    which nothing reclaims); the TUI shows the first line in its footer. It warns
+    which only `/gc` and `--gc` reclaim); the TUI shows the first line in its footer. It warns
     again only after the space has recovered to 10% above the threshold, restarts included (a
     persistent run notes the warning in `<run dir>/disk-warned`).
 - **Memory.**

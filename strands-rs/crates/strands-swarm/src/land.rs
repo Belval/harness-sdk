@@ -183,23 +183,52 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
     ))
 }
 
-/// What a land job killed outright (`kill -9`, a reboot) left in `land_dir` (the swarm's
-/// `jobs/land`): scratch worktrees, unregistered from their repository and deleted, as
-/// [`crate::gc::Collected`] under the id `land`. Call it only while no land job runs; the
-/// shared target dir (`target`, without `CARGO_TARGET_DIR`) is left alone.
-pub async fn tidy(land_dir: &Path) -> crate::gc::Collected {
+/// How old a leftover in the land dir must be for [`tidy`] to touch it: a landing that started
+/// after the caller saw none running is younger.
+const LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The `CARGO_TARGET_DIR` every land job's checks share (it stays, so the next landing builds
+/// incrementally): `<shared>-land/<run>` beside the swarm's shared one, else `<land_dir>/target`.
+pub fn target_dir(shared: Option<&Path>, run_id: &str, land_dir: &Path) -> PathBuf {
+    match shared {
+        Some(shared) => {
+            let mut name = shared.as_os_str().to_owned();
+            name.push("-land");
+            PathBuf::from(name).join(run_id)
+        }
+        None => land_dir.join("target"),
+    }
+}
+
+/// Clean up `land_dir` (the swarm's `jobs/land`) after land jobs, as [`crate::gc::Collected`]
+/// under the id `land`. Call it only while no land job runs.
+/// - The scratch worktree a job killed outright (`kill -9`, a reboot) left is unregistered from
+///   its repository and deleted.
+/// - Plans of ended jobs are deleted (a job deletes its own when it ends).
+/// - With `target`, the checks' shared target dir is deleted too (explicit gc, a run's end);
+///   otherwise it stays for the next landing.
+pub async fn tidy(land_dir: &Path, target: Option<&Path>) -> crate::gc::Collected {
     let mut out = crate::gc::Collected {
         id: "land".into(),
         ..Default::default()
     };
-    let Ok(mut entries) = tokio::fs::read_dir(land_dir).await else {
-        return out;
-    };
     let mut scratches = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let is_dir = entry.file_type().await.is_ok_and(|kind| kind.is_dir());
-        if is_dir && entry.file_name() != "target" {
-            scratches.push(entry.path());
+    let mut plans = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(land_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+            let age = meta.modified().ok().and_then(|at| at.elapsed().ok());
+            if age.is_none_or(|age| age < LEFTOVER_AGE) {
+                continue;
+            }
+            let path = entry.path();
+            if meta.is_dir() && entry.file_name() != "target" {
+                scratches.push(path);
+            } else if meta.is_file() && path.extension().is_some_and(|ext| ext == "json") {
+                plans.push(path);
+            }
         }
     }
     scratches.sort();
@@ -221,6 +250,12 @@ pub async fn tidy(land_dir: &Path) -> crate::gc::Collected {
             let _ = git(&plan.repo, &["worktree", "prune"]).await;
         }
         out.removed.push((scratch, bytes));
+    }
+    for plan in plans.iter().filter(|plan| !plan.with_extension("").exists()) {
+        let _ = tokio::fs::remove_file(plan).await;
+    }
+    if let Some(target) = target {
+        crate::gc::remove_dir(target, &mut out).await;
     }
     out
 }
@@ -758,12 +793,22 @@ mod tests {
         );
     }
 
+    /// Backdate `path` past [`LEFTOVER_AGE`].
+    async fn age(path: &Path) {
+        sh(
+            path.parent().unwrap(),
+            &format!("touch -d '2 minutes ago' '{}'", path.display()),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn tidying_removes_the_scratch_worktree_of_a_killed_land_job_and_keeps_the_target() {
         let fx = fixture().await;
         let plan = plan(&fx, &[]);
         std::fs::create_dir_all(&fx.land).unwrap();
-        std::fs::write(fx.land.join("scratch.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+        let plan_path = fx.land.join("scratch.json");
+        std::fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
         // What `kill -9` leaves: the job's scratch worktree, mid-rebase or mid-check.
         let path = plan.scratch.to_string_lossy().into_owned();
         git(&fx.main, &["worktree", "add", "-q", "--detach", &path, "feature"])
@@ -771,20 +816,48 @@ mod tests {
             .unwrap();
         std::fs::write(plan.scratch.join("built.o"), "x").unwrap();
         std::fs::create_dir_all(fx.land.join("target/debug")).unwrap();
+        // A landing that started just now: its scratch is in use.
+        let fresh = fx.land.join("a9-now");
+        std::fs::create_dir_all(&fresh).unwrap();
+        assert!(tidy(&fx.land, None).await.is_empty(), "nothing is old enough yet");
+        age(&plan.scratch).await;
+        age(&plan_path).await;
 
-        let tidied = tidy(&fx.land).await;
+        let tidied = tidy(&fx.land, None).await;
 
         assert_eq!(tidied.id, "land");
         assert_eq!(tidied.removed.len(), 1, "{tidied:?}");
         assert_eq!(tidied.removed[0].0, plan.scratch);
         assert!(tidied.kept.is_empty(), "{tidied:?}");
-        assert!(!plan.scratch.exists());
+        assert!(!plan.scratch.exists() && !plan_path.exists());
         assert_eq!(worktrees(&fx.main).await, 2, "main and feature only");
+        assert!(
+            fresh.exists(),
+            "a young scratch may belong to a landing that just started"
+        );
         assert!(
             fx.land.join("target/debug").exists(),
             "the shared target dir stays"
         );
-        assert!(tidy(&fx.land).await.is_empty());
+        assert!(tidy(&fx.land, None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tidying_deletes_ended_jobs_plans_and_on_request_the_checks_target_dir() {
+        let fx = fixture().await;
+        std::fs::create_dir_all(fx.land.join("target/debug")).unwrap();
+        std::fs::write(fx.land.join("target/debug/lib.rlib"), vec![0; 100]).unwrap();
+        let (old, new) = (fx.land.join("a2-old.json"), fx.land.join("a3-new.json"));
+        std::fs::write(&old, "{}").unwrap();
+        std::fs::write(&new, "{}").unwrap();
+        age(&old).await;
+
+        let tidied = tidy(&fx.land, Some(&fx.land.join("target"))).await;
+
+        assert!(!old.exists(), "an ended job's plan is deleted");
+        assert!(new.exists(), "a plan just written is kept for its job");
+        assert_eq!(tidied.removed, [(fx.land.join("target"), 100)]);
+        assert!(!fx.land.join("target").exists());
     }
 
     #[tokio::test]

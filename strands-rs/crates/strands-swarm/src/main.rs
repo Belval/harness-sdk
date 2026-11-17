@@ -184,10 +184,13 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
-    if let Some(plan) = &cli.land {
-        let plan: strands_swarm::land::LandPlan = serde_json::from_slice(&std::fs::read(plan)?)?;
+    if let Some(path) = &cli.land {
+        let plan: strands_swarm::land::LandPlan = serde_json::from_slice(&std::fs::read(path)?)?;
         let stop = strands_swarm::land::stop_signal();
-        return match strands_swarm::land::run_until(&plan, stop).await {
+        let outcome = strands_swarm::land::run_until(&plan, stop).await;
+        // Done with: only a job killed before this leaves its plan (see `land::tidy`).
+        let _ = std::fs::remove_file(path);
+        return match outcome {
             Ok(report) => {
                 println!("{report}");
                 Ok(Exit::Quit)
@@ -208,7 +211,10 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         let jobs = strands_swarm::jobs::Jobs::new(dir.join("jobs"));
         let land = |job: &strands_swarm::jobs::JobMeta| job.command.contains(strands_swarm::land::LAND_FLAG);
         if !jobs.any_running(land).await {
-            collected.push(strands_swarm::land::tidy(&dir.join("jobs/land")).await);
+            let land = dir.join("jobs/land");
+            let shared = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+            let target = strands_swarm::land::target_dir(shared.as_deref(), &saved.run_id, &land);
+            collected.push(strands_swarm::land::tidy(&land, Some(&target)).await);
         }
         let journal = strands_swarm::journal::Journal::open(&dir);
         for agent in collected.iter().filter(|c| !c.is_empty()) {
