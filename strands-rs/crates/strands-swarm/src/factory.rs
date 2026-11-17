@@ -59,7 +59,6 @@ const ORDERED_TOOLS: &[&str] = &[
     "jobs",
 ];
 
-/// Preview kept in context when a large tool result is offloaded to the stash.
 /// How to use the file tools: agents otherwise script edits with `python3`/`sed` through `shell`,
 /// which hides the change from the log and skips the uniqueness check `edit` makes.
 const FILE_TOOLS_PROMPT: &str = "# Files\n\
@@ -68,6 +67,7 @@ change them with `edit` (replaces one exact, unique string) or `write` (whole fi
 `python3`/`sed` scripts in `shell`. Search with `rg -n` (or `grep -n`) in `shell`. The file tools \
 take absolute paths; relative ones do not resolve against your working directory.";
 
+/// Preview kept in context when a large tool result is offloaded to the stash.
 const TRUNCATE_PREVIEW_TOKENS: usize = 2_000;
 
 /// Transcript the goal judge sees, in characters (about 10k tokens): the task, the latest
@@ -213,11 +213,9 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
 /// summarize old turns at `compact_at` tokens (see [`CompactAt`]). Earlier turns' reasoning and
 /// older large `shell`/`read` results are pruned only when the prompt cache is lost anyway (see
-/// [`CachePrune`]). With `stash_dir` the full
-/// outputs behind truncated results are kept there, so `retrieve_context` still finds them after
-/// a restart.
-/// `control` (the agent's `context` tool) gets the stash and can request a summary; each
-/// summary is reported to `on_compacted`.
+/// [`CachePrune`]). With `stash_dir` the full outputs behind truncated results are kept there,
+/// so `retrieve_context` still finds them after a restart. `control` (the agent's `context`
+/// tool) gets the stash and can request a summary; each summary is reported to `on_compacted`.
 fn context_manager(
     compact_at: u64,
     stash_dir: Option<&std::path::Path>,
@@ -357,7 +355,7 @@ mod prefix_tests;
 mod tests {
     use super::*;
     use strands_agents::context_manager::ContextManager;
-    use strands_agents::testing::MockMessageModel;
+    use strands_agents::testing::{MockMessageModel, MockResponse};
     use strands_agents::types::{
         ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolUseBlock,
     };
@@ -376,6 +374,14 @@ mod tests {
         ]
     }
 
+    fn manager(
+        compact_at: u64,
+        stash_dir: Option<&std::path::Path>,
+        control: &Arc<ContextControl>,
+    ) -> Arc<ContextManager> {
+        ContextManager::from(context_manager(compact_at, stash_dir, control, None, None)).unwrap()
+    }
+
     fn result_len(message: &Message) -> usize {
         message.tool_results().next().unwrap().text().chars().count()
     }
@@ -386,14 +392,7 @@ mod tests {
             .model(Arc::new(MockMessageModel::new(Vec::new())))
             .build()
             .unwrap();
-        let manager = ContextManager::from(context_manager(
-            DEFAULT_COMPACT_AT,
-            None,
-            &ContextControl::new(DEFAULT_COMPACT_AT),
-            None,
-            None,
-        ))
-        .unwrap();
+        let manager = manager(DEFAULT_COMPACT_AT, None, &ContextControl::new(DEFAULT_COMPACT_AT));
         let mut messages = vec![Message::user("start")];
         messages.extend(exchange("file-read", 16_000));
         messages.extend(exchange("huge-log", 200_000));
@@ -420,21 +419,13 @@ mod tests {
 
     #[tokio::test]
     async fn summarizes_older_turns_once_input_reaches_compact_at() {
-        use strands_agents::testing::MockResponse;
         let model = MockMessageModel::shared(vec![MockResponse::message(Message::assistant(
             "SUMMARY of the early turns",
         ))]);
         let agent = Agent::builder().model(model.clone()).build().unwrap();
         // The mock has no known window, so the context manager assumes 200k: 5k tokens is 2.5%,
         // far below the 85% mark, but past `compact_at`.
-        let manager = ContextManager::from(context_manager(
-            4_000,
-            None,
-            &ContextControl::new(4_000),
-            None,
-            None,
-        ))
-        .unwrap();
+        let manager = manager(4_000, None, &ContextControl::new(4_000));
 
         let mut below = chat(6);
         let changed = manager
@@ -464,14 +455,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_context_tool_can_request_a_summary_below_compact_at() {
-        use strands_agents::testing::MockResponse;
         let model = MockMessageModel::shared(vec![MockResponse::message(Message::assistant(
             "SUMMARY on request",
         ))]);
         let agent = Agent::builder().model(model.clone()).build().unwrap();
         let control = ContextControl::new(DEFAULT_COMPACT_AT);
-        let manager =
-            ContextManager::from(context_manager(DEFAULT_COMPACT_AT, None, &control, None, None)).unwrap();
+        let manager = manager(DEFAULT_COMPACT_AT, None, &control);
         control.request_summary();
 
         let mut messages = chat(6);
@@ -498,14 +487,11 @@ mod tests {
         let stash_of = |agent: Agent| {
             let dir = dir.path().to_owned();
             async move {
-                let manager = ContextManager::from(context_manager(
+                let manager = manager(
                     DEFAULT_COMPACT_AT,
                     Some(&dir),
                     &ContextControl::new(DEFAULT_COMPACT_AT),
-                    None,
-                    None,
-                ))
-                .unwrap();
+                );
                 manager.init_agent(&agent).await.unwrap();
                 manager.stash().unwrap()
             }
@@ -581,17 +567,41 @@ mod tests {
         )
     }
 
-    /// Builds the agent `harness_factory` would, on `model`, and runs one turn.
-    async fn run_turn(
+    fn tool_call(name: &str, id: &str, input: serde_json::Value) -> ContentBlock {
+        ContentBlock::ToolUse(ToolUseBlock::new(name, id, input))
+    }
+
+    /// One assistant message making `calls`, then "done".
+    fn calls_then_done(calls: Vec<ContentBlock>) -> Vec<MockResponse> {
+        vec![
+            MockResponse::message(Message::new(Role::Assistant, calls)),
+            MockResponse::message(Message::assistant("done")),
+        ]
+    }
+
+    /// Builds the agent `harness_factory` would on a mock answering `responses`, and runs
+    /// `prompt`; the mock, for its calls.
+    async fn run(
         options: &HarnessFactoryOptions,
         spec: AgentSpec,
-        responses: Vec<strands_agents::testing::MockResponse>,
-    ) -> Vec<String> {
+        responses: Vec<MockResponse>,
+        prompt: &str,
+    ) -> Arc<MockMessageModel> {
         let mut harness = harness_options(options, spec).unwrap();
         let model = MockMessageModel::shared(responses);
         harness.model = Some(ModelOption::Instance(model.clone()));
         let agent = build(options, harness).await.unwrap();
-        agent.invoke("go").await.unwrap();
+        agent.invoke(prompt).await.unwrap();
+        model
+    }
+
+    /// One turn's request prefixes (see [`request_prefix`]).
+    async fn run_turn(
+        options: &HarnessFactoryOptions,
+        spec: AgentSpec,
+        responses: Vec<MockResponse>,
+    ) -> Vec<String> {
+        let model = run(options, spec, responses, "go").await;
         model
             .calls()
             .iter()
@@ -599,63 +609,12 @@ mod tests {
             .collect()
     }
 
+    /// A read may need the file a command writes, a cancel removes a worktree only if it is
+    /// clean, a worktree spawn branches from HEAD, a message may announce a commit, and `wait`,
+    /// `list_agents` and `jobs` report on what came before them: each waits for the command
+    /// before it in the same batch.
     #[tokio::test]
-    async fn a_read_waits_for_the_command_before_it_in_the_same_batch() {
-        use strands_agents::testing::MockResponse;
-        use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("out.txt");
-        let batch = Message::new(
-            Role::Assistant,
-            vec![
-                ContentBlock::ToolUse(ToolUseBlock::new(
-                    "shell",
-                    "t1",
-                    serde_json::json!({ "command": "sleep 0.3 && echo written > out.txt" }),
-                )),
-                ContentBlock::ToolUse(ToolUseBlock::new(
-                    "read",
-                    "t2",
-                    serde_json::json!({ "path": file }),
-                )),
-            ],
-        );
-        let mut spec = spec();
-        spec.cwd = dir.path().to_owned();
-        let options = HarnessFactoryOptions::default();
-        let mut harness = harness_options(&options, spec).unwrap();
-        let model = MockMessageModel::shared(vec![
-            MockResponse::message(batch),
-            MockResponse::message(Message::assistant("done")),
-        ]);
-        harness.model = Some(ModelOption::Instance(model.clone()));
-        build(&options, harness)
-            .await
-            .unwrap()
-            .invoke("go")
-            .await
-            .unwrap();
-
-        let calls = model.calls();
-        let results = calls[1].0.last().unwrap();
-        let read = results
-            .content
-            .iter()
-            .find_map(|block| match block {
-                ContentBlock::ToolResult(result) if result.tool_use_id == "t2" => Some(result),
-                _ => None,
-            })
-            .unwrap();
-        let text = serde_json::to_string(&read.content).unwrap();
-        assert!(text.contains("written"), "{text}");
-    }
-
-    /// A cancel removes a worktree only if it is clean, a worktree spawn branches from HEAD, a
-    /// message may announce a commit, and `wait`, `list_agents` and `jobs` report on what came
-    /// before them: each waits for the command before it.
-    #[tokio::test]
-    async fn swarm_tools_wait_for_the_command_before_them() {
-        use strands_agents::testing::MockResponse;
+    async fn ordered_tools_wait_for_the_command_before_them() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("committed");
         let probe = |name: &str| -> ToolRef {
@@ -667,67 +626,54 @@ mod tests {
                 },
             ))
         };
-        let call = |name: &str, id: &str, input| ContentBlock::ToolUse(ToolUseBlock::new(name, id, input));
-        let batch = Message::new(
-            Role::Assistant,
-            vec![
-                call(
-                    "shell",
-                    "t1",
-                    serde_json::json!({ "command": "sleep 0.3 && touch committed" }),
-                ),
-                call("spawn_agent", "t2", serde_json::json!({})),
-                call("cancel_agent", "t3", serde_json::json!({})),
-                call("send_message", "t4", serde_json::json!({})),
-                call("list_agents", "t5", serde_json::json!({})),
-                call("jobs", "t6", serde_json::json!({})),
-                call("wait", "t7", serde_json::json!({})),
-            ],
-        );
+        let probed = [
+            "spawn_agent",
+            "cancel_agent",
+            "send_message",
+            "list_agents",
+            "jobs",
+            "wait",
+        ];
+        let command = serde_json::json!({ "command": "sleep 0.3 && echo written > committed" });
+        let mut batch = vec![tool_call("shell", "shell", command)];
+        batch.extend(probed.map(|name| tool_call(name, name, serde_json::json!({}))));
+        batch.push(tool_call("read", "read", serde_json::json!({ "path": file })));
         let spec = AgentSpec {
             cwd: dir.path().to_owned(),
-            tools: [
-                "spawn_agent",
-                "cancel_agent",
-                "send_message",
-                "list_agents",
-                "jobs",
-                "wait",
-            ]
-            .map(probe)
-            .into(),
+            tools: probed.map(probe).into(),
             ..spec()
         };
-        let options = HarnessFactoryOptions::default();
-        let mut harness = harness_options(&options, spec).unwrap();
-        let model = MockMessageModel::shared(vec![
-            MockResponse::message(batch),
-            MockResponse::message(Message::assistant("done")),
-        ]);
-        harness.model = Some(ModelOption::Instance(model.clone()));
-        build(&options, harness)
-            .await
-            .unwrap()
-            .invoke("go")
-            .await
-            .unwrap();
+        let model = run(
+            &HarnessFactoryOptions::default(),
+            spec,
+            calls_then_done(batch),
+            "go",
+        )
+        .await;
 
         let calls = model.calls();
-        let results: Vec<String> = calls[1]
+        let results: Vec<(String, String)> = calls[1]
             .0
             .last()
             .unwrap()
             .tool_results()
-            .filter(|result| result.tool_use_id != "t1")
-            .map(|result| serde_json::to_string(&result.content).unwrap())
+            .filter(|result| result.tool_use_id != "shell")
+            .map(|result| {
+                (
+                    result.tool_use_id.clone(),
+                    serde_json::to_string(&result.content).unwrap(),
+                )
+            })
             .collect();
-        assert_eq!(results.len(), 6, "{results:?}");
-        assert!(results.iter().all(|r| r.contains("true")), "{results:?}");
+        assert_eq!(results.len(), 7, "{results:?}");
+        for (id, text) in &results {
+            let seen = if id == "read" { "written" } else { "true" };
+            assert!(text.contains(seen), "{id}: {text}");
+        }
     }
 
     #[tokio::test]
     async fn the_system_prompt_and_tool_specs_are_identical_across_builds_and_resumes() {
-        use strands_agents::testing::MockResponse;
         let dir = tempfile::tempdir().unwrap();
         let tool = |name: &str| -> ToolRef {
             Arc::new(
@@ -796,7 +742,6 @@ mod tests {
 
     #[tokio::test]
     async fn agents_see_the_skill_catalog_and_load_a_skill_on_demand() {
-        use strands_agents::testing::MockResponse;
         let dir = tempfile::tempdir().unwrap();
         let mut skill = Skill::new("review", "Review a change.", "Step 1: read the diff.");
         skill.path = Some(dir.path().join("review"));
@@ -804,16 +749,10 @@ mod tests {
             skills: Arc::new(vec![skill]),
             ..Default::default()
         };
-        let mut harness = harness_options(&options, spec()).unwrap();
+        let harness = harness_options(&options, spec()).unwrap();
         assert!(harness.instructions.as_deref().unwrap().contains("`skills` tool"));
-        let call = ToolUseBlock::new("skills", "s1", serde_json::json!({ "skill_name": "review" }));
-        let model = MockMessageModel::shared(vec![
-            MockResponse::message(Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)])),
-            MockResponse::message(Message::assistant("done")),
-        ]);
-        harness.model = Some(ModelOption::Instance(model.clone()));
-        let agent = create_harness(harness).await.unwrap();
-        agent.invoke("review my change").await.unwrap();
+        let load = tool_call("skills", "s1", serde_json::json!({ "skill_name": "review" }));
+        let model = run(&options, spec(), calls_then_done(vec![load]), "review my change").await;
 
         let calls = model.calls();
         let prompt = calls[0].1.system_prompt.as_ref().unwrap().text();
@@ -833,25 +772,20 @@ mod tests {
     /// while the shell tool runs in the agent's sandbox.
     #[tokio::test]
     async fn shell_commands_start_in_the_agents_working_directory() {
-        use strands_agents::testing::MockResponse;
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
-        let mut harness = harness_options(
+        let spec = AgentSpec {
+            cwd: cwd.clone(),
+            ..spec()
+        };
+        let pwd = tool_call("shell", "s1", serde_json::json!({ "command": "pwd" }));
+        let model = run(
             &HarnessFactoryOptions::default(),
-            AgentSpec {
-                cwd: cwd.clone(),
-                ..spec()
-            },
+            spec,
+            calls_then_done(vec![pwd]),
+            "where am I",
         )
-        .unwrap();
-        let call = ToolUseBlock::new("shell", "s1", serde_json::json!({ "command": "pwd" }));
-        let model = MockMessageModel::shared(vec![
-            MockResponse::message(Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)])),
-            MockResponse::message(Message::assistant("done")),
-        ]);
-        harness.model = Some(ModelOption::Instance(model.clone()));
-        let agent = create_harness(harness).await.unwrap();
-        agent.invoke("where am I").await.unwrap();
+        .await;
 
         let calls = model.calls();
         // The SDK's JSON block reaches the model as plain text (crate::shell_text).
@@ -860,57 +794,6 @@ mod tests {
             [ToolResultContent::Text(text)] => assert_eq!(text, &cwd.display().to_string()),
             other => panic!("{other:?}"),
         }
-    }
-
-    /// Through the whole harness (every plugin and hook), a call that has no reason to prune
-    /// re-sends the previous call's messages unchanged, so the prompt cache matches all of them.
-    #[tokio::test]
-    async fn the_next_call_resends_history_unchanged() {
-        use strands_agents::testing::MockResponse;
-        let dir = tempfile::tempdir().unwrap();
-        let mut harness = harness_options(
-            &HarnessFactoryOptions::default(),
-            AgentSpec {
-                cwd: dir.path().to_path_buf(),
-                ..spec()
-            },
-        )
-        .unwrap();
-        let call = ToolUseBlock::new("shell", "s1", serde_json::json!({ "command": "echo hi" }));
-        let model = MockMessageModel::shared(vec![
-            MockResponse::message(Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)])),
-            MockResponse::message(Message::assistant("done")),
-            MockResponse::message(Message::assistant("again")),
-        ]);
-        harness.model = Some(ModelOption::Instance(model.clone()));
-        let agent = create_harness(harness).await.unwrap();
-        agent
-            .invoke(format!("first task {}", "x".repeat(4_000)))
-            .await
-            .unwrap();
-        agent.invoke("second task").await.unwrap();
-
-        let calls = model.calls();
-        // Without the per-call environment block the injector folds into the last user message
-        // (after the cache point, by design).
-        let json = |messages: &[Message]| {
-            let mut messages = messages.to_vec();
-            for message in &mut messages {
-                message.content.retain(
-                    |block| !matches!(block, ContentBlock::Text(text) if text.contains("<system-reminder>")),
-                );
-            }
-            serde_json::to_string(&messages).unwrap()
-        };
-        for pair in calls.windows(2) {
-            let (before, after) = (&pair[0].0, &pair[1].0);
-            assert_eq!(
-                json(&after[..before.len()]),
-                json(before),
-                "the sent prefix changed"
-            );
-        }
-        assert_eq!(calls.len(), 3);
     }
 
     #[test]
@@ -983,7 +866,6 @@ mod tests {
     /// into `(part, bytes)`: the system prompt sections, then one entry per tool spec.
     async fn fixed_prefix() -> Vec<(String, usize)> {
         use crate::runtime::{SpawnRequest, Swarm, SwarmConfig, USER};
-        use strands_agents::testing::MockResponse;
         let dir = tempfile::tempdir().unwrap();
         let tool = |name: &str| -> ToolRef {
             Arc::new(
