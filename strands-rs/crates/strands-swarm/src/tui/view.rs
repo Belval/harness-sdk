@@ -917,6 +917,23 @@ mod tests {
     }
 
     #[test]
+    fn every_overlay_renders_on_a_tiny_terminal() {
+        let mut app = app_with_an_image(None);
+        app.input = "/".into();
+        app.show_keys = true;
+        app.status = Some(crate::status::StatusReport::default());
+        app.cost = Some(crate::cost::CostReport {
+            agents: vec![],
+            prices: crate::cost::Prices::default(),
+        });
+        for (width, height) in [(1, 1), (5, 3), (20, 5), (40, 10)] {
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        }
+    }
+
+    #[test]
     fn the_status_popup_wraps_long_lines() {
         let mut app = app_with_an_image(None);
         let subject = "abc1234 feat: thumbnails for every image in the log pane, scaled to fit the cell grid";
