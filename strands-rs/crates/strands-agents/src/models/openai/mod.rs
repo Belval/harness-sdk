@@ -69,7 +69,7 @@ const RESPONSES_MANAGED: &[&str] = &["model", "input", "stream", "store"];
 const CHAT_MANAGED: &[&str] = &["model", "messages", "stream", "stream_options"];
 
 /// An HTTP request the provider wants executed.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct OpenAIRequest {
     /// Fully-qualified URL.
     pub url: String,
@@ -77,6 +77,17 @@ pub struct OpenAIRequest {
     pub body: JsonValue,
     /// Authorization bearer token, if any.
     pub bearer_token: Option<String>,
+}
+
+/// Redacts the bearer token: a minted Mantle token carries the signer's session credentials.
+impl std::fmt::Debug for OpenAIRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAIRequest")
+            .field("url", &self.url)
+            .field("body", &self.body)
+            .field("bearer_token", &self.bearer_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Transport that executes an OpenAI request and yields raw SSE body chunks.

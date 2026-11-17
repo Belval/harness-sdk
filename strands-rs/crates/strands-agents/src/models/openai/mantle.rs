@@ -43,11 +43,21 @@ const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// What mints a Mantle bearer token for each request: the AWS credentials of the chain (or
 /// profile) the model was connected with, which refresh themselves.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct MantleAuth {
     credentials: SharedCredentialsProvider,
     region: String,
     lifetime: Duration,
+}
+
+/// Leaves the credentials provider out, so no cached credentials reach a log.
+impl std::fmt::Debug for MantleAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MantleAuth")
+            .field("region", &self.region)
+            .field("lifetime", &self.lifetime)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MantleAuth {

@@ -593,6 +593,12 @@ async fn connect_takes_region_and_credentials_from_the_profile_not_the_environme
     let options = stream_options();
     let _ = model.stream(&messages, &options).collect::<Vec<_>>().await;
     let request = transport.requests.lock().pop().expect("a request was sent");
+    // Neither the model nor the request prints the credentials or the token minted from them.
+    for debug in [format!("{model:?}"), format!("{request:?}")] {
+        for secret in ["secret", "session", "bedrock-api-key-"] {
+            assert!(!debug.contains(secret), "{secret} in {debug}");
+        }
+    }
     assert_eq!(
         request.url,
         "https://bedrock-mantle.eu-north-1.api.aws/openai/v1/responses"
