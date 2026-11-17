@@ -2,7 +2,8 @@
 //!
 //! The TS tools route file access through `context.agent.sandbox`; the Rust SDK has no sandbox
 //! seam yet, so these use `tokio::fs` on the host filesystem. Names, descriptions, schemas,
-//! output formats and error strings are verbatim.
+//! output formats and error strings are verbatim. `write` and `edit` hold a per-path lock, so
+//! parallel tool calls on one file apply in turn instead of one overwriting the other's edit.
 
 use serde::Deserialize;
 use strands_agents::tools::FunctionTool;
@@ -13,6 +14,17 @@ use strands_agents::types::{
 use strands_agents::{Error, Result};
 
 const READ_DEFAULT_LIMIT: usize = 2000;
+
+/// One lock per file `write` and `edit` have touched in this process.
+static FILE_LOCKS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Hold `path`'s lock: an `edit` reads, changes and writes the file in one step.
+async fn lock_file(path: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = FILE_LOCKS.lock().entry(path.to_owned()).or_default().clone();
+    lock.lock_owned().await
+}
 
 const READ_DESCRIPTION: &str = concat!(
     "Read a file. Text returns `cat -n` style numbered lines so you can cite `path:line`; images ",
@@ -284,6 +296,7 @@ pub fn write() -> FunctionTool {
         }))
         .typed_handler(|input: WriteInput, _ctx| async move {
             validate_path(&input.path)?;
+            let _lock = lock_file(&input.path).await;
             tokio::fs::write(&input.path, &input.content)
                 .await
                 .map_err(|e| err(e.to_string()))?;
@@ -312,6 +325,7 @@ pub fn edit() -> FunctionTool {
         }))
         .typed_handler(|input: EditInput, _ctx| async move {
             validate_path(&input.path)?;
+            let _lock = lock_file(&input.path).await;
             let content = read_text(&input.path).await?;
 
             let occurrences = content.split(&input.old_str).count() - 1;
@@ -489,6 +503,26 @@ mod tests {
         .await;
         assert_eq!(text_of(&result), format!("Edited {}.", path.display()));
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "hello rust");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_edits_to_one_file_all_apply() {
+        let dir = tmp();
+        let path = dir.path().join("a.txt");
+        let original: Vec<String> = (0..20).map(|i| format!("[{i}]")).collect();
+        tokio::fs::write(&path, original.join("\n")).await.unwrap();
+        let edits = (0..20).map(|i| {
+            let input = serde_json::json!({ "path": path, "old_str": format!("[{i}]"), "new_str": format!("[edited {i}]") });
+            tokio::spawn(async move { invoke(&edit(), input).await })
+        });
+        for edit in futures::future::join_all(edits).await {
+            assert_eq!(edit.unwrap().status, ToolResultStatus::Success);
+        }
+        let expected: Vec<String> = (0..20).map(|i| format!("[edited {i}]")).collect();
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            expected.join("\n")
+        );
     }
 
     #[tokio::test]
