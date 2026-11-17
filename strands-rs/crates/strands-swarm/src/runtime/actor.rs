@@ -9,6 +9,7 @@ impl Swarm {
         self.track(tokio::spawn(async move {
             swarm.clone().run_actor(node.clone(), start).await;
             node.finished.store(true, Ordering::SeqCst);
+            node.release_agent();
             swarm.collect_in_background();
         }));
     }
@@ -101,7 +102,7 @@ impl Swarm {
             node: Arc::downgrade(&node),
             model: self.inner.config.side_model.clone(),
         })));
-        let _ = node.agent.set(agent.clone());
+        *node.agent.lock() = Some(agent.clone());
         self.emit_model(&node);
 
         let mut input = match start {
@@ -230,7 +231,7 @@ impl Swarm {
                 ModelStreamEvent::Metadata {
                     usage: Some(usage), ..
                 } => {
-                    let model = node.agent.get().and_then(|agent| agent.model().model_id());
+                    let model = node.agent().and_then(|agent| agent.model().model_id());
                     self.add_usage(node, usage, model, true)
                 }
                 _ => {}
@@ -331,7 +332,7 @@ impl Swarm {
         // Relative to the compaction point, so 100% means older turns are summarized before the
         // next call; the window is the one the context manager assumes. A side call's input is
         // not the agent's context.
-        if let Some(agent) = node.agent.get().filter(|_| own_call) {
+        if let Some(agent) = node.agent().filter(|_| own_call) {
             let window = crate::compaction::window_of(agent.model().as_ref());
             let point = crate::compaction::compaction_point(window, self.inner.config.compact_at);
             *node.context.lock() = Some(input as f64 / point as f64);
@@ -415,7 +416,7 @@ pub(super) struct SideModel {
 
 impl SideModel {
     fn current(&self) -> Option<Arc<dyn Model>> {
-        let host = || self.node.upgrade()?.agent.get().map(Agent::model);
+        let host = || self.node.upgrade()?.agent().map(|agent| agent.model());
         self.model.clone().or_else(host)
     }
 }

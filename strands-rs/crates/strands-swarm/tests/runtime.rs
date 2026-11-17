@@ -252,6 +252,45 @@ async fn cancelling_an_agent_cancels_its_descendants() {
 }
 
 #[tokio::test]
+async fn a_cancelled_agent_that_stopped_is_released_from_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![("a1", vec![say("first")]), ("a2", vec![say("kept")])],
+        dir.path(),
+    );
+    let spawn = |task: &str| SpawnRequest {
+        task: task.into(),
+        ..Default::default()
+    };
+    let gone = swarm.spawn(USER, spawn("go")).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "first");
+    swarm.spawn(USER, spawn("stay")).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "kept");
+    // Counted: the scripts map's and the one `model` hands out, plus the agent's while held.
+    let model = |id: &str| scripts.lock()[id].clone();
+    assert!(
+        Arc::strong_count(&model("a1")) > 2,
+        "the live agent holds its model"
+    );
+
+    swarm.cancel(&gone).unwrap();
+    let released = async {
+        while Arc::strong_count(&model("a1")) > 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), released)
+        .await
+        .expect("the cancelled agent is still held, and its conversation with it");
+    assert!(Arc::strong_count(&model("a2")) > 2, "a live agent keeps its own");
+    let listed = swarm.agents();
+    let info = listed.iter().find(|a| a.id == gone).unwrap();
+    assert_eq!(info.status, AgentStatus::Cancelled);
+    assert_eq!(info.model.as_deref(), Some("test-model"), "its model id is kept");
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
 async fn agents_get_unique_names_and_can_be_addressed_by_them() {
     let dir = tempfile::tempdir().unwrap();
     let (swarm, mut events, scripts) = swarm_with(

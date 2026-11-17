@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -546,7 +546,11 @@ struct Node {
     mailbox: Mutex<VecDeque<Mail>>,
     notify: Notify,
     cancel: CancellationToken,
-    agent: OnceLock<Agent>,
+    /// The built agent while its actor runs; released once it is cancelled and stopped, so a long
+    /// run does not keep every finished agent's conversation in memory.
+    agent: Mutex<Option<Agent>>,
+    /// The model id the agent last used, kept once the agent is released.
+    last_model: Mutex<Option<String>>,
     task: String,
     /// Model override; `None` follows the swarm default.
     model: Mutex<Option<String>>,
@@ -604,12 +608,27 @@ impl Node {
         }
     }
 
-    /// The live agent's model id, else the override.
+    /// The live agent's model id, else the one it last used, else the override.
     fn model_id(&self) -> Option<String> {
-        self.agent
-            .get()
+        self.agent()
             .and_then(|agent| agent.model().model_id())
+            .or_else(|| self.last_model.lock().clone())
             .or_else(|| self.model.lock().clone())
+    }
+
+    /// The built agent, while it is held.
+    fn agent(&self) -> Option<Agent> {
+        self.agent.lock().clone()
+    }
+
+    /// Drop the agent of a cancelled node whose actor has stopped, keeping its model id.
+    fn release_agent(&self) {
+        if *self.status.lock() != AgentStatus::Cancelled {
+            return;
+        }
+        if let Some(agent) = self.agent.lock().take() {
+            *self.last_model.lock() = agent.model().model_id();
+        }
     }
 }
 
@@ -771,7 +790,8 @@ impl Swarm {
                 mailbox: Mutex::new(VecDeque::new()),
                 notify: Notify::new(),
                 cancel,
-                agent: OnceLock::new(),
+                agent: Mutex::new(None),
+                last_model: Mutex::new(None),
                 task: request.task.clone(),
                 model: Mutex::new(request.model.clone()),
                 goal: request.goal.clone(),
@@ -843,7 +863,7 @@ impl Swarm {
         // Recorded right away for the whole subtree, so capacity, mail and `list_agents` reflect
         // it even while an actor is still starting or finishing a tool call.
         for node in self.subtree(&node.id) {
-            if let Some(agent) = node.agent.get() {
+            if let Some(agent) = node.agent() {
                 agent.cancel();
             }
             self.set_status(&node, AgentStatus::Cancelled);
@@ -879,10 +899,9 @@ impl Swarm {
         if !node.status.lock().is_live() {
             return Err(Error::other(format!("Agent {id} is cancelled.")));
         }
-        let agent =
-            node.agent.get().cloned().ok_or_else(|| {
-                Error::other(format!("Agent {id} is still starting; try again in a moment."))
-            })?;
+        let agent = node
+            .agent()
+            .ok_or_else(|| Error::other(format!("Agent {id} is still starting; try again in a moment.")))?;
         let wanted = model.as_deref().unwrap_or("the default model");
         let resolved = resolver(model.clone())
             .await

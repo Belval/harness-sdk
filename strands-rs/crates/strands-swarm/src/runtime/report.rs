@@ -18,7 +18,8 @@ impl Swarm {
             .filter(|node| node.status.lock().is_live())
             .map(|node| {
                 let info = node.info();
-                let agent = node.agent.get();
+                let agent = node.agent();
+                let agent = agent.as_ref();
                 let todos = agent.and_then(|agent| {
                     agent
                         .state()
