@@ -111,6 +111,13 @@ struct SpawnInput {
 struct SendInput {
     to: String,
     message: String,
+    /// false: no idle recipient wakes for it (FYIs).
+    #[serde(default = "yes")]
+    wake: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -508,7 +515,12 @@ async fn send_tool(swarm: Swarm, me: String, input: SendInput, _ctx: ToolContext
     }
     let (mut sent, mut failed) = (Vec::new(), Vec::new());
     for id in &to {
-        match swarm.send(&me, id, input.message.clone()) {
+        let message = input.message.clone();
+        let posted = match input.wake {
+            true => swarm.send(&me, id, message),
+            false => swarm.send_fyi(&me, id, message),
+        };
+        match posted {
             Ok(()) => sent.push(id),
             Err(error) if to.len() == 1 => return Err(error),
             Err(error) => failed.push(format!("{}: {error}", swarm.label(id))),

@@ -444,6 +444,7 @@ pub(super) fn mail_from_state(mail: MailState) -> Mail {
         "error" => "error",
         "interrupted" => "interrupted",
         "schedule" => "schedule",
+        "fyi" => super::FYI,
         _ => "message",
     };
     Mail {

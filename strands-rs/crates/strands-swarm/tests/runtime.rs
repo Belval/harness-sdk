@@ -497,6 +497,79 @@ async fn mail_that_arrives_mid_turn_is_appended_to_the_next_tool_result() {
 }
 
 #[tokio::test]
+async fn fyi_mail_wakes_no_idle_agent_even_on_resume_and_comes_with_the_next_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({
+        "run_id": "old",
+        "cwd": dir.path(),
+        "next_id": 2,
+        "agents": [
+            {"id": "a1", "name": "lead", "parent": "user", "cwd": dir.path(), "branch": null, "task": "lead",
+             "model": null, "goal": null, "status": "idle",
+             "mailbox": [{"from": "user", "from_label": "user", "kind": "fyi", "text": "saved note"}]},
+        ],
+    }))
+    .unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("both read")])]);
+    let config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    let (swarm, mut events) = Swarm::resume(config, saved).await.unwrap();
+    swarm.send_fyi(USER, "a1", "fresh note").unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let root = scripts.lock()["a1"].clone();
+    assert_eq!(root.calls().len(), 0, "an FYI starts no turn");
+    assert_eq!(swarm.agent("a1").unwrap().status, AgentStatus::Idle);
+    assert!(!swarm.is_busy(), "FYI mail alone leaves nothing to do");
+
+    swarm.send(USER, "a1", "now act").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "both read");
+    let sent = sent_text(&root, 0);
+    for text in ["saved note", "fresh note", "now act", "kind=\\\"fyi\\\""] {
+        assert!(sent.contains(text), "{text}: {sent}");
+    }
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_wait_does_not_end_on_fyi_mail_but_returns_it_with_the_next_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
+                    tool_call("wait", "w1", json!({"from": ["sub"]})),
+                    say("done"),
+                ],
+            ),
+            (
+                "a2",
+                vec![
+                    tool_call(
+                        "send_message",
+                        "s1",
+                        json!({"to": "parent", "message": "started, no answer needed", "wake": false}),
+                    ),
+                    tool_call("wait", "w2", json!({"timeout_seconds": 1})),
+                    say("finished"),
+                ],
+            ),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let root = scripts.lock()["a1"].clone();
+    assert_eq!(root.calls().len(), 3, "the wait ended once, on the reply");
+    let after_wait = sent_text(&root, 2);
+    let (fyi, reply) = (
+        after_wait.find("started, no answer needed").expect("the FYI"),
+        after_wait.find("finished").expect("the reply"),
+    );
+    assert!(fyi < reply, "{after_wait}");
+}
+
+#[tokio::test]
 async fn cancelling_an_agent_cancels_its_descendants() {
     let dir = tempfile::tempdir().unwrap();
     let (swarm, mut events, _scripts) = swarm_with(

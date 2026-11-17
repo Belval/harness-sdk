@@ -6,7 +6,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | Tool | What it does |
 | --- | --- |
 | `spawn_agent` | Start an agent on a task (optionally in another directory, in its own git worktree, with a model, a goal or its own compaction point). Non-blocking. |
-| `send_message` | Message any agent (by id or name), or `parent`; a comma-separated `to` sends one message to each (every name must resolve first, so a typo sends nothing). Busy agents see it after their current tool call; idle ones wake up. |
+| `send_message` | Message any agent (by id or name), or `parent`; a comma-separated `to` sends one message to each (every name must resolve first, so a typo sends nothing). Busy agents see it after their current tool call; idle ones wake up, unless it is sent with `wake: false`. |
 | `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports, which returns at once when none is pending); a user message always ends it. With `all`, until every agent in `from` has sent something; a timeout (default 10 min, at most an hour) returns what came and who is still missing. Mail stays unread (and saved) until it returns, so a restart meanwhile loses none. |
 | `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files, other agents' branches changing the same files), running jobs, schedules, model (and an agent's own compaction point), estimated spend, and which idle worktree agents have nothing left to merge (cancel to reclaim their disk). |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
@@ -27,7 +27,7 @@ would show (stdout, then `[stderr]` and `[exit code N]` when there are any), not
 block, whose escaped quotes models copied into `edit`'s `old_str`. It and a job report's last lines
 drop ANSI escape sequences, and of a line `\r` overwrote (progress bars) only the final text. Tool
 specs and the swarm's prompt sections are sent on every model call, so
-`the_fixed_prefix_stays_within_its_budget` pins their size: 16.3 kB (about 4.8k tokens) with 20
+`the_fixed_prefix_stays_within_its_budget` pins their size: 16.4 kB (about 4.8k tokens) with 20
 skills, the skills list at 2.5 kB of it.
 
 ## Run
@@ -82,6 +82,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   that found nothing) reaches no agent parent; the user's root always replies. A `send_message` to
   an agent's parent says so in its result, as agents that report mid-turn tend to repeat the report
   as their final reply, which costs the parent a turn.
+- **FYI mail.** Every wake costs the receiver a whole turn, its context re-sent. `send_message`
+  with `wake: false` posts kind `fyi` (an acknowledgement, a progress note, news a worker can use
+  later): an idle receiver is not woken but gets it with its next waking mail, a busy one after
+  its current tool call as usual. It ends no `wait` (`all` included), counts as no unread mail
+  in `list_agents` and `/status`, keeps no headless run alive, and is saved like other mail.
 - **Working directory.** An agent works where its spawner does unless `spawn_agent` gets a `cwd`
   (absolute or relative), e.g. another repository; with `worktree` the worktree is cut from the
   repository there. An agent moves itself with a `shell` call that is only `cd DIR` (one word or

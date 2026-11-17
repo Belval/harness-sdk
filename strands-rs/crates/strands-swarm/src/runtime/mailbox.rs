@@ -17,6 +17,17 @@ impl Swarm {
         self.post(from, to, "message", text.into())
     }
 
+    /// [`Swarm::send`] without waking `to` ([`FYI`]): for acknowledgements and progress notes,
+    /// which would otherwise cost an idle receiver a whole turn each.
+    pub fn send_fyi(&self, from: &str, to: &str, text: impl Into<String>) -> Result<()> {
+        if from == to {
+            return Err(Error::other(
+                "You cannot message yourself; keep notes in your reply or in a file instead.",
+            ));
+        }
+        self.post(from, to, FYI, text.into())
+    }
+
     /// [`Swarm::send`] with images attached. Only their paths are queued (and saved); each must
     /// pass [`images::check`] now, and is read when `to` takes the mail.
     pub fn send_with_images(
@@ -98,10 +109,17 @@ impl Swarm {
         self.node(id).is_some_and(|node| has_matching_mail(&node, from))
     }
 
-    /// The senders of `id`'s unread mail.
+    /// The senders of `id`'s unread mail that wakes it.
     pub fn unread_senders(&self, id: &str) -> Vec<String> {
         self.node(id)
-            .map(|node| node.mailbox.lock().iter().map(|mail| mail.from.clone()).collect())
+            .map(|node| {
+                let mailbox = node.mailbox.lock();
+                mailbox
+                    .iter()
+                    .filter(|mail| mail.wakes())
+                    .map(|mail| mail.from.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -189,7 +207,9 @@ impl Swarm {
             let status = other.status.lock().clone();
             match status {
                 AgentStatus::Running | AgentStatus::Starting => return None,
-                AgentStatus::Idle | AgentStatus::Errored(_) if !other.mailbox.lock().is_empty() => {
+                AgentStatus::Idle | AgentStatus::Errored(_)
+                    if other.mailbox.lock().iter().any(Mail::wakes) =>
+                {
                     return None
                 }
                 AgentStatus::Idle | AgentStatus::Errored(_) if !scheduled.contains(&other.id) => {
@@ -299,11 +319,10 @@ impl Swarm {
 
 pub(super) fn has_matching_mail(node: &Node, filter: &[String]) -> bool {
     let mailbox = node.mailbox.lock();
+    let mut waking = mailbox.iter().filter(|mail| mail.wakes());
     match filter.is_empty() {
-        true => !mailbox.is_empty(),
+        true => waking.next().is_some(),
         // The user is never filtered out: their message ends any wait.
-        false => mailbox
-            .iter()
-            .any(|mail| mail.from == USER || filter.contains(&mail.from)),
+        false => waking.any(|mail| mail.from == USER || filter.contains(&mail.from)),
     }
 }

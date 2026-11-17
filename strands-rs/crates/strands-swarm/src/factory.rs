@@ -1170,7 +1170,7 @@ mod tests {
     async fn the_fixed_prefix_stays_within_its_budget() {
         // About 4.8k tokens by Bedrock's count for Claude with these 20 skills (each skill line
         // ~25 tokens; a real run's 58 skills ~1.5k tokens).
-        const BUDGET_BYTES: usize = 16_300;
+        const BUDGET_BYTES: usize = 16_400;
         const TOOL_BUDGET_BYTES: usize = 1_100;
         // 20 skill lines of at most ~110 bytes plus the heading.
         const SKILLS_BUDGET_BYTES: usize = 2_500;

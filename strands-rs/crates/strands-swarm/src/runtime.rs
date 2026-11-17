@@ -139,7 +139,7 @@ pub struct Mail {
     /// Sender label as rendered to the receiver, e.g. `parser (a2)`.
     pub from_label: String,
     /// What kind of message this is: `message`, `reply` (a turn's final text), `error`,
-    /// `interrupted` or `schedule` (posted by a [`Schedule`]).
+    /// `interrupted`, `schedule` (posted by a [`Schedule`]) or [`FYI`].
     pub kind: &'static str,
     /// Body.
     pub text: String,
@@ -147,7 +147,16 @@ pub struct Mail {
     pub images: Vec<PathBuf>,
 }
 
+/// The kind of mail that wakes nobody ([`Swarm::send_fyi`]): an idle receiver takes it with its
+/// next waking mail, a busy one after its current tool call, and it ends no `wait`.
+pub const FYI: &str = "fyi";
+
 impl Mail {
+    /// Whether this mail starts a turn of an idle receiver and ends its `wait`.
+    pub fn wakes(&self) -> bool {
+        self.kind != FYI
+    }
+
     /// The `<message>` block the receiving model sees (attached images follow as image blocks).
     pub fn render(&self) -> String {
         let attached: String = self
@@ -398,7 +407,7 @@ pub struct AgentInfo {
     pub branch: Option<String>,
     /// Status.
     pub status: AgentStatus,
-    /// Unread messages.
+    /// Unread messages that wake it ([`FYI`] mail left out).
     pub unread: usize,
     /// Model in use: the live agent's model id, else its override (`None`: the default).
     pub model: Option<String>,
@@ -687,7 +696,7 @@ impl Node {
     /// ([`persist::node_state`]) that takes them in another order.
     fn info(&self) -> AgentInfo {
         let status = self.status.lock().clone();
-        let unread = self.mailbox.lock().len();
+        let unread = self.mailbox.lock().iter().filter(|mail| mail.wakes()).count();
         let model = self.model_id();
         AgentInfo {
             id: self.id.clone(),
