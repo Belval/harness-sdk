@@ -62,10 +62,10 @@ const ORDERED_TOOLS: &[&str] = &[
 /// How to use the file tools: agents otherwise script edits with `python3`/`sed` through `shell`,
 /// which hides the change from the log and skips the uniqueness check `edit` makes.
 const FILE_TOOLS_PROMPT: &str = "# Files\n\
-Read files with `read` (use `offset`/`limit` to page through large ones) instead of `cat`/`sed -n`; \
-change them with `edit` (replaces one exact, unique string) or `write` (whole file) instead of \
-`python3`/`sed` scripts in `shell`. Search with `rg -n` (or `grep -n`) in `shell`. The file tools \
-take absolute paths; relative ones do not resolve against your working directory.";
+Read files with `read` instead of `cat`/`sed -n`, and change them with `edit` or `write` instead of \
+`python3`/`sed` scripts in `shell`: `edit` refuses an ambiguous `old_str` and shows the closest text \
+when it misses, and several `edit`s in one turn apply in order. Search with `rg -n` in `shell`. The \
+file tools take absolute paths; relative ones do not resolve against your working directory.";
 
 /// Preview kept in context when a large tool result is offloaded to the stash.
 const TRUNCATE_PREVIEW_TOKENS: usize = 2_000;
@@ -129,14 +129,40 @@ async fn build(options: &HarnessFactoryOptions, harness: HarnessAgentOptions) ->
 /// Builtin tools whose descriptions the swarm replaces, and with what.
 const REWORDED: &[(&str, &str)] = &[
     ("shell", SHELL_DESCRIPTION),
+    ("read", READ_DESCRIPTION),
+    ("write", WRITE_DESCRIPTION),
+    ("web_fetch", WEB_FETCH_DESCRIPTION),
+    ("todo_write", TODO_DESCRIPTION),
     (RETRIEVAL_TOOL_NAME, RETRIEVAL_DESCRIPTION),
 ];
+
+/// `read`'s description without the paging its `offset`/`limit` docs (and a cut-off result) give.
+const READ_DESCRIPTION: &str = concat!(
+    "Read a file. Text returns `cat -n` style numbered lines so you can cite `path:line`; images ",
+    "(png/jpg/jpeg/gif/webp) and binary documents (pdf/doc/docx/xls/xlsx) return media you can view ",
+    "directly."
+);
+
+/// `write`'s description without the advice the Files prompt section gives.
+const WRITE_DESCRIPTION: &str = "Write a file, creating it or overwriting it.";
 
 /// `shell`'s description for the text [`crate::shell_text::ShellText`] makes of its result (the
 /// SDK's describes its JSON fields).
 const SHELL_DESCRIPTION: &str = concat!(
     "Run a command with `sh -c` in a fresh process, so variables and `cd` do not carry over to the ",
     "next call. Returns stdout, then `[stderr]` and stderr, then `[exit code N]` unless it is 0."
+);
+
+/// `web_fetch`'s description without the harness's walk through how it works.
+const WEB_FETCH_DESCRIPTION: &str = concat!(
+    "Fetch a URL (HTTP GET) and have a small model answer `prompt` from the page's text, so a large ",
+    "page does not fill your context. Pages stay cached for 15 minutes, so another prompt is quick."
+);
+
+/// `todo_write`'s description as facts: the harness's prescribes when and how to use it.
+const TODO_DESCRIPTION: &str = concat!(
+    "Replace your task list with `todos` (empty clears it). It is shown to you before each model ",
+    "call, so you need not restate it, and to the user in `/status`."
 );
 
 /// `retrieve_context`'s description without the SDK's options list and examples, which repeat
@@ -858,7 +884,7 @@ mod tests {
         }
         let instructions = harness.instructions.unwrap();
         assert!(instructions.contains("`edit`"), "{instructions}");
-        assert!(instructions.contains("`offset`/`limit`"), "{instructions}");
+        assert!(instructions.contains("several `edit`s"), "{instructions}");
     }
 
     #[test]
@@ -1009,9 +1035,9 @@ mod tests {
     /// `STRANDS_SWARM_DUMP_PREFIX=<file>` also writes the prompt and tool specs out.
     #[tokio::test]
     async fn the_fixed_prefix_stays_within_its_budget() {
-        // About 5.0k tokens by Bedrock's count for Claude with these 20 skills (each skill line
+        // About 4.8k tokens by Bedrock's count for Claude with these 20 skills (each skill line
         // ~25 tokens; a real run's 58 skills ~1.5k tokens).
-        const BUDGET_BYTES: usize = 17_000;
+        const BUDGET_BYTES: usize = 16_300;
         const TOOL_BUDGET_BYTES: usize = 1_100;
         // 20 skill lines of at most ~110 bytes plus the heading.
         const SKILLS_BUDGET_BYTES: usize = 2_500;

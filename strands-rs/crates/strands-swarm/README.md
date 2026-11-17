@@ -28,7 +28,7 @@ block, whose escaped quotes models copied into `edit`'s `old_str`. That result a
 last lines carry no ANSI escape sequences (colours, cursor moves, OSC links), and a line a `\r`
 overwrote (progress bars) shows only its final text. Tool specs and the swarm's
 prompt sections are sent on every model call, so `the_fixed_prefix_stays_within_its_budget` pins
-their size: 17 kB (about 5k tokens) with 20 skills, the skills list at 2.5 kB of it.
+their size: 16.3 kB (about 4.8k tokens) with 20 skills, the skills list at 2.5 kB of it.
 
 ## Run
 

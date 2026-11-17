@@ -170,9 +170,9 @@ async fn reload_tool(swarm: Swarm, _me: String, input: ReloadInput, _ctx: ToolCo
 }
 
 const RUN_BACKGROUND_DESCRIPTION: &str = concat!(
-    "Run a shell command in your cwd, detached (survives swarm restarts); returns its job id. When it ends you ",
-    "get a message from `jobs` with the exit code and output tail, waking you if idle. For builds, tests, ",
-    "anything slow: start it here, then `wait` or end your turn; do not sleep-poll its log."
+    "Run a shell command in your cwd, detached and with no timeout (survives swarm restarts); returns ",
+    "its job id at once. When it ends you get a message from `jobs` with the exit code and last 40 ",
+    "output lines, waking you if idle."
 );
 
 const JOBS_DESCRIPTION: &str =
@@ -324,9 +324,9 @@ struct ScheduleInput {
 }
 
 const SCHEDULE_DESCRIPTION: &str = concat!(
-    "Post `message` to a mailbox later and/or repeatedly. For periodic work, schedule yourself and end ",
-    "your turn rather than a long `wait`: each fire starts a turn, and an agent idle on a schedule holds ",
-    "no agent slot. Survives restarts (a missed fire is delivered once)."
+    "Post `message` to a mailbox later and/or repeatedly; a fire wakes an idle recipient. An agent ",
+    "idle on a schedule holds no agent slot, unlike one in `wait`. Survives restarts (a missed fire is ",
+    "delivered once)."
 );
 
 async fn schedule_tool(swarm: Swarm, me: String, input: ScheduleInput, _ctx: ToolContext) -> Result<String> {
