@@ -179,10 +179,11 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
 }
 
 fn draw_agents(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
+    let width = usize::from(area.width.saturating_sub(1));
     let items: Vec<ListItem> = app
         .tree()
         .into_iter()
-        .map(|(depth, view)| ListItem::new(agent_item(depth, view, tick)))
+        .map(|(depth, view)| ListItem::new(fit_row(agent_item(depth, view, tick), width, view.unseen)))
         .collect();
     let list = List::new(items)
         .block(
@@ -243,6 +244,30 @@ fn agent_item(depth: usize, view: &AgentView, tick: usize) -> Text<'static> {
     if view.unseen {
         spans.push(Span::styled(" •", Style::new().fg(Color::Yellow)));
     }
+    Text::from(Line::from(spans))
+}
+
+/// Clip an agent row to `width` columns, keeping its trailing unseen marker (the last span) in
+/// view: it is what tells the user to look, so it must not fall off a narrow tree.
+fn fit_row(row: Text<'static>, width: usize, unseen: bool) -> Text<'static> {
+    let mut line = row.lines.into_iter().next().unwrap_or_default();
+    if !unseen || line.width() <= width {
+        return Text::from(line);
+    }
+    let marker = line.spans.pop().unwrap_or_default();
+    let mut room = width.saturating_sub(marker.width());
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let chars = span.content.chars().count();
+        if chars > room {
+            let head: String = span.content.chars().take(room).collect();
+            spans.push(Span::styled(head, span.style));
+            break;
+        }
+        room -= chars;
+        spans.push(span);
+    }
+    spans.push(marker);
     Text::from(Line::from(spans))
 }
 
@@ -720,6 +745,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_clipped_tree_row_keeps_its_unseen_marker() {
+        let mut app = App::default();
+        for (id, name) in [("a1", "root"), ("a2", "lazy-mcp-discovery-and-enable-tools")] {
+            app.apply(crate::runtime::SwarmEvent::Spawned {
+                id: id.into(),
+                parent: if id == "a1" { USER.into() } else { "a1".into() },
+                name: name.into(),
+                task: "t".into(),
+                cwd: "/w".into(),
+                branch: Some(format!("swarm/{id}")),
+            });
+        }
+        app.agents.get_mut("a1").unwrap().unseen = false;
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        let rows: Vec<&str> = screen.lines().collect();
+        let tree = usize::from(tree_width(&app, 80)) - 1;
+        let row = |y: usize| rows[y].chars().take(tree).collect::<String>();
+        assert_eq!(row(3), "  … lazy-mcp-discover •", "{screen}");
+        assert!(!row(2).contains('•'), "{screen}");
     }
 
     #[test]
