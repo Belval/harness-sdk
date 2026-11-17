@@ -4864,6 +4864,63 @@ async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_cal
     swarm.shutdown().await;
 }
 
+/// A free-space reading for the disk guard that counts its reads, so a test waits for the guard
+/// to have checked again rather than for time to pass.
+struct DiskProbe {
+    free: std::sync::atomic::AtomicU64,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl DiskProbe {
+    fn new(free: u64) -> Arc<Self> {
+        Arc::new(Self {
+            free: free.into(),
+            reads: 0.into(),
+        })
+    }
+
+    fn set(&self, free: u64) {
+        self.free.store(free, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn check(self: &Arc<Self>) -> strands_swarm::runtime::FreeSpace {
+        let probe = self.clone();
+        Arc::new(move |_: &Path| {
+            probe.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(probe.free.load(std::sync::atomic::Ordering::SeqCst))
+        })
+    }
+
+    /// Until the guard has made a whole check since the last [`DiskProbe::set`] and acted on it.
+    /// A check reads every path (a few here) before it warns, and the next starts after that, so
+    /// 20 more reads span at least one whole check and the start of the next.
+    async fn settle(&self) {
+        let reads = || self.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let target = reads() + 20;
+        let settled = async {
+            while reads() < target {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), settled)
+            .await
+            .expect("the disk guard stopped checking");
+    }
+}
+
+/// The disk warnings among the events so far.
+fn disk_warnings(events: &mut UnboundedReceiver<SwarmEvent>) -> Vec<(String, String)> {
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let SwarmEvent::Mail { to, mail } = event {
+            if mail.from == strands_swarm::runtime::DISK_SENDER {
+                seen.push((to, mail.text));
+            }
+        }
+    }
+    seen
+}
+
 #[tokio::test]
 async fn low_disk_space_warns_the_root_once_per_episode() {
     let dir = tempfile::tempdir().unwrap();
@@ -4871,30 +4928,14 @@ async fn low_disk_space_warns_the_root_once_per_episode() {
     let (swarm, mut events, _) = swarm_with(vec![("a1", replies)], dir.path());
     spawn_root(&swarm, "root").await;
     reply_to(&mut events, USER).await;
-    let free = Arc::new(std::sync::atomic::AtomicU64::new(5 << 30));
-    let probe = free.clone();
-    let check: strands_swarm::runtime::FreeSpace =
-        Arc::new(move |_: &Path| Some(probe.load(std::sync::atomic::Ordering::SeqCst)));
+    let probe = DiskProbe::new(5 << 30);
     tokio::spawn(
         swarm
             .clone()
-            .guard_disk(20 << 30, Duration::from_millis(10), check),
+            .guard_disk(20 << 30, Duration::from_millis(1), probe.check()),
     );
-    let mut warnings = async |wait: Duration| {
-        let mut seen = Vec::new();
-        let _ = tokio::time::timeout(wait, async {
-            while let Some(event) = events.recv().await {
-                if let SwarmEvent::Mail { to, mail } = event {
-                    if mail.from == strands_swarm::runtime::DISK_SENDER {
-                        seen.push((to, mail.text));
-                    }
-                }
-            }
-        })
-        .await;
-        seen
-    };
-    let first = warnings(Duration::from_millis(300)).await;
+    probe.settle().await;
+    let first = disk_warnings(&mut events);
     assert_eq!(first.len(), 1, "one warning while space stays low: {first:?}");
     assert_eq!(first[0].0, "a1");
     assert!(
@@ -4903,14 +4944,16 @@ async fn low_disk_space_warns_the_root_once_per_episode() {
         first[0].1
     );
     // Just above the threshold is not recovered yet; well above re-arms the warning.
-    free.store(21 << 30, std::sync::atomic::Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    free.store(5 << 30, std::sync::atomic::Ordering::SeqCst);
-    assert!(warnings(Duration::from_millis(100)).await.is_empty());
-    free.store(30 << 30, std::sync::atomic::Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    free.store(5 << 30, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(warnings(Duration::from_millis(300)).await.len(), 1);
+    probe.set(21 << 30);
+    probe.settle().await;
+    probe.set(5 << 30);
+    probe.settle().await;
+    assert_eq!(disk_warnings(&mut events), []);
+    probe.set(30 << 30);
+    probe.settle().await;
+    probe.set(5 << 30);
+    probe.settle().await;
+    assert_eq!(disk_warnings(&mut events).len(), 1);
     swarm.shutdown().await;
 }
 
@@ -4959,48 +5002,32 @@ async fn a_restarted_swarm_does_not_repeat_a_disk_warning() {
     let (swarm, mut events) = Swarm::new(config);
     spawn_root(&swarm, "root").await;
     reply_to(&mut events, USER).await;
-    let free = Arc::new(std::sync::atomic::AtomicU64::new(5 << 30));
+    let probe = DiskProbe::new(5 << 30);
     let guard = |swarm: &Swarm| {
-        let probe = free.clone();
-        let check: strands_swarm::runtime::FreeSpace =
-            Arc::new(move |_: &Path| Some(probe.load(std::sync::atomic::Ordering::SeqCst)));
         let guard = swarm
             .clone()
-            .guard_disk(20 << 30, Duration::from_millis(10), check);
+            .guard_disk(20 << 30, Duration::from_millis(1), probe.check());
         tokio::spawn(guard)
-    };
-    let mut warnings = async |wait: Duration| {
-        let mut seen = 0;
-        let _ = tokio::time::timeout(wait, async {
-            while let Some(event) = events.recv().await {
-                if matches!(&event, SwarmEvent::Mail { mail, .. } if mail.from == strands_swarm::runtime::DISK_SENDER) {
-                    seen += 1;
-                }
-            }
-        })
-        .await;
-        seen
     };
     let marker = state_dir.join(strands_swarm::runtime::DISK_WARNED_FILE);
 
     let first = guard(&swarm);
-    assert_eq!(warnings(Duration::from_millis(300)).await, 1);
+    probe.settle().await;
+    assert_eq!(disk_warnings(&mut events).len(), 1);
     assert!(marker.exists());
     first.abort();
     // What the next process does on start.
     let second = guard(&swarm);
-    assert_eq!(
-        warnings(Duration::from_millis(300)).await,
-        0,
-        "warned again after a restart"
-    );
-    free.store(30 << 30, std::sync::atomic::Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    probe.settle().await;
+    assert_eq!(disk_warnings(&mut events), [], "warned again after a restart");
+    probe.set(30 << 30);
+    probe.settle().await;
     assert!(!marker.exists(), "recovered: the next low spell warns");
     second.abort();
-    free.store(5 << 30, std::sync::atomic::Ordering::SeqCst);
+    probe.set(5 << 30);
     let _third = guard(&swarm);
-    assert_eq!(warnings(Duration::from_millis(300)).await, 1);
+    probe.settle().await;
+    assert_eq!(disk_warnings(&mut events).len(), 1);
     swarm.shutdown().await;
 }
 
