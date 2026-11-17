@@ -228,7 +228,7 @@ fn spawn_three_then(wait: serde_json::Value) -> Vec<MockResponse> {
     ]
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_all_returns_once_every_named_agent_has_replied() {
     let dir = tempfile::tempdir().unwrap();
     let from = json!({"from": ["c1", "c2", "c3"], "all": true, "timeout_seconds": 30});
@@ -251,7 +251,7 @@ async fn wait_all_returns_once_every_named_agent_has_replied() {
     assert!(!result.contains("still waiting"), "{result}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_wait_timeout_counts_cancelled_agents_instead_of_listing_them() {
     let dir = tempfile::tempdir().unwrap();
     let root = vec![
@@ -277,7 +277,7 @@ async fn a_wait_timeout_counts_cancelled_agents_instead_of_listing_them() {
     assert!(result.contains("(1 cancelled agents not shown)"), "{result}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_all_on_timeout_returns_what_came_and_who_is_missing() {
     let dir = tempfile::tempdir().unwrap();
     let from = json!({"from": ["c1", "c2", "c3"], "all": true, "timeout_seconds": 1});
@@ -305,7 +305,7 @@ async fn wait_all_on_timeout_returns_what_came_and_who_is_missing() {
 
 /// A `wait` with `all` leaves the replies that came in the saved mailbox until it returns: a
 /// kill -9 while it still waits on others would otherwise lose them.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_all_keeps_the_replies_in_the_saved_mailbox_until_it_returns() {
     let dir = tempfile::tempdir().unwrap();
     let from = json!({"from": ["c1", "c2"], "all": true, "timeout_seconds": 30});
