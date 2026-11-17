@@ -3820,7 +3820,8 @@ async fn a_newer_reload_supersedes_a_pending_one() {
         "a1",
         vec![tool_call("slow", "t1", json!({})), say("done")],
     )]);
-    let (swarm, mut events) = reloadable_swarm(&scripts, dir.path(), Duration::from_secs(1));
+    let timeout = Duration::from_secs(1);
+    let (swarm, mut events) = reloadable_swarm(&scripts, dir.path(), timeout);
     spawn_root(&swarm, "work").await;
     tool_started(&mut events, "slow").await;
 
@@ -3828,13 +3829,21 @@ async fn a_newer_reload_supersedes_a_pending_one() {
         .reload(Path::new("/bin/true"), ReloadWhen::Idle)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // The first request's deadline is at most `timeout` from here; the second's at least
+    // `timeout` from its start, 300ms later.
+    let first_by = tokio::time::Instant::now() + timeout;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     swarm
         .reload(Path::new("/bin/true"), ReloadWhen::Idle)
         .await
         .unwrap();
-    // The first request's deadline passes; only the second one's counts.
-    assert!(!reloads_within(&swarm, Duration::from_millis(600)).await);
+    // The second supersedes the first once its self-test of the binary has passed. When that
+    // took past the first deadline (a loaded machine), the first rightly fired; otherwise the
+    // first deadline passes (its watcher polls every 200ms) and only the second one's counts.
+    if tokio::time::Instant::now() < first_by {
+        let left = (first_by + Duration::from_millis(250)) - tokio::time::Instant::now();
+        assert!(!reloads_within(&swarm, left).await);
+    }
     assert!(reloads_within(&swarm, Duration::from_secs(5)).await);
 
     swarm.shutdown().await;
