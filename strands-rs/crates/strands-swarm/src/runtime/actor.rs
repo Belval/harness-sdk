@@ -29,6 +29,7 @@ impl Swarm {
             tracing::warn!(agent = %node.id, %error, "session restore failed");
         }
         self.restore_open_batch(node, agent).await;
+        self.pair_tool_calls(node, agent);
         if interrupted {
             agent.with_messages(|messages| resume::reword_cancel(messages));
         }
@@ -198,6 +199,15 @@ impl Swarm {
         })
     }
 
+    /// Repair calls left without results (or results without calls) by a save that failed
+    /// mid-turn ([`resume::pair_tool_calls`]), which would otherwise fail every later turn.
+    fn pair_tool_calls(&self, node: &Node, agent: &Agent) {
+        let changed = agent.with_messages(resume::pair_tool_calls);
+        if changed > 0 {
+            tracing::warn!(agent = %node.id, changed, "repaired tool calls without results");
+        }
+    }
+
     /// Run one turn; returns the error message when it failed (not when it was cancelled). A
     /// failure is posted to the parent when `report` is set.
     async fn run_turn(
@@ -214,6 +224,7 @@ impl Swarm {
         self.refresh_memory(agent).await;
         let options = InvokeOptions::default().with_cancel(turn.clone());
         let given = matches!(input, InvokeInput::Text(_) | InvokeInput::Blocks(_));
+        self.pair_tool_calls(node, agent);
         let input = agent.with_messages(|messages| resume::fold_into_open_turn(messages, input));
         if given && matches!(input, InvokeInput::None) {
             // The SDK adds no message for it, so nothing would save the mail it holds, which has

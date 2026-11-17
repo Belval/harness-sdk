@@ -172,6 +172,71 @@ pub fn append_notice(messages: &mut Vec<Message>, notice: &str) -> bool {
     true
 }
 
+/// The result given to a call whose result was never saved ([`pair_tool_calls`]).
+pub const UNRECORDED: &str = "Interrupted: no result was recorded for this call.";
+
+/// Answer every tool call and drop every result without its call, anywhere but at the very end of
+/// the conversation. A save that failed mid-turn (a full disk) can leave a call whose result never
+/// made it into the conversation, followed by later turns; the provider then refuses every call
+/// the agent makes. An unanswered call gets an error result ([`UNRECORDED`]) at the front of the
+/// next user message, or in a new one where two assistant messages meet. A call in the last
+/// message is left to [`append_notice`] (a cut batch). Returns how many blocks were changed.
+pub fn pair_tool_calls(messages: &mut Vec<Message>) -> usize {
+    use std::collections::HashSet;
+    let mut changed = 0;
+    let mut at = 0;
+    while at < messages.len() {
+        if messages[at].role == Role::User {
+            let calls: HashSet<String> = match at.checked_sub(1).map(|before| &messages[before]) {
+                Some(before) if before.role == Role::Assistant => {
+                    before.tool_uses().map(|call| call.tool_use_id.clone()).collect()
+                }
+                _ => HashSet::new(),
+            };
+            let content = &mut messages[at].content;
+            let before = content.len();
+            content.retain(|block| {
+                !matches!(block, ContentBlock::ToolResult(result) if !calls.contains(&result.tool_use_id))
+            });
+            if content.len() < before {
+                changed += before - content.len();
+                if content.is_empty() {
+                    content.push(ContentBlock::text(
+                        "(results of calls no longer in the conversation were removed)",
+                    ));
+                }
+            }
+        } else if at + 1 < messages.len() {
+            let next = &messages[at + 1];
+            let answered: HashSet<&str> = match next.role {
+                Role::User => next
+                    .tool_results()
+                    .map(|result| result.tool_use_id.as_str())
+                    .collect(),
+                _ => HashSet::new(),
+            };
+            let missing: Vec<ContentBlock> = messages[at]
+                .tool_uses()
+                .filter(|call| !answered.contains(call.tool_use_id.as_str()))
+                .map(|call| {
+                    ContentBlock::ToolResult(ToolResultBlock::error(call.tool_use_id.clone(), UNRECORDED))
+                })
+                .collect();
+            if !missing.is_empty() {
+                changed += missing.len();
+                if messages[at + 1].role == Role::User {
+                    let rest = std::mem::take(&mut messages[at + 1].content);
+                    messages[at + 1].content = missing.into_iter().chain(rest).collect();
+                } else {
+                    messages.insert(at + 1, Message::new(Role::User, missing));
+                }
+            }
+        }
+        at += 1;
+    }
+    changed
+}
+
 /// File in an agent's session directory that holds its [`OpenBatch`].
 pub const OPEN_BATCH_FILE: &str = "open-batch.json";
 
@@ -303,6 +368,50 @@ mod tests {
 
     fn ids(calls: Vec<ToolUseBlock>) -> Vec<String> {
         calls.into_iter().map(|c| c.tool_use_id).collect()
+    }
+
+    #[test]
+    fn calls_whose_results_were_never_saved_are_answered_and_stray_results_dropped() {
+        // t1's result was lost by a failed save; later turns went on. t2 is answered. A stray
+        // result (t9) answers nothing. Two assistant messages meet after t3. t4 is the cut batch.
+        let mut messages = vec![
+            Message::user("go"),
+            calls(&["t1", "t2"]),
+            Message::new(
+                Role::User,
+                vec![ContentBlock::ToolResult(ok("t2")), ContentBlock::text("mail")],
+            ),
+            calls(&["t3"]),
+            calls(&["t5"]),
+            results(vec![ok("t5"), ok("t9")]),
+            Message::assistant("ok"),
+            results(vec![ok("t8")]),
+            calls(&["t4"]),
+        ];
+        assert_eq!(pair_tool_calls(&mut messages), 4);
+        let texts = |m: &Message| {
+            m.tool_results()
+                .map(|r| (r.tool_use_id.clone(), r.text()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&messages[2])[0], ("t1".to_owned(), UNRECORDED.to_owned()));
+        assert_eq!(texts(&messages[2])[1].0, "t2");
+        assert_eq!(messages[2].content.last(), Some(&ContentBlock::text("mail")));
+        assert_eq!(
+            messages[4].role,
+            Role::User,
+            "a user message between the two assistant ones"
+        );
+        assert_eq!(texts(&messages[4]), [("t3".to_owned(), UNRECORDED.to_owned())]);
+        assert_eq!(texts(&messages[6]).len(), 1, "t9 dropped");
+        assert_eq!(messages[8].tool_results().count(), 0, "t8 answers nothing");
+        assert!(!messages[8].content.is_empty());
+        assert_eq!(messages.len(), 10, "the cut batch at the end is left alone");
+        assert_eq!(
+            pair_tool_calls(&mut messages),
+            0,
+            "a repaired conversation stays as it is"
+        );
     }
 
     #[test]
