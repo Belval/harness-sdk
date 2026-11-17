@@ -162,18 +162,26 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
         .budget
         .map(|budget| format!(" · budget {}", compact(budget)))
         .unwrap_or_default();
-    let mut line = Line::from(vec![
-        Span::styled(" strands-swarm ", Style::new().bold().reversed()),
-        Span::raw(format!(
-            "  run {run_id} · {} agents · {running} running · in {}{cached} · out {}{spend}{budget}{hidden}",
-            app.agents.len(),
-            compact(input),
-            compact(output)
-        )),
-    ]);
-    if let Some(calls) = app.reload_pending {
-        let text = format!(" · reload pending (waiting for {calls} tool calls)");
-        line.push_span(Span::styled(text, Style::new().yellow()));
+    let tokens = format!(" · in {}{cached} · out {}", compact(input), compact(output));
+    let header = |tokens: &str| {
+        let mut line = Line::from(vec![
+            Span::styled(" strands-swarm ", Style::new().bold().reversed()),
+            Span::raw(format!(
+                "  run {run_id} · {} agents · {running} running{tokens}{spend}{budget}{hidden}",
+                app.agents.len(),
+            )),
+        ]);
+        if let Some(calls) = app.reload_pending {
+            let text = format!(" · reload pending (waiting for {calls} tool calls)");
+            line.push_span(Span::styled(text, Style::new().yellow()));
+        }
+        line
+    };
+    // A narrow terminal drops the token totals first: spend, budget, hidden agents and a
+    // pending reload matter more.
+    let mut line = header(&tokens);
+    if line.width() > usize::from(area.width) {
+        line = header("");
     }
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -824,6 +832,46 @@ mod tests {
             .max_by_key(|h| h.len())
             .unwrap();
         assert!(screen.contains(&format!("{longest}│")), "{screen}");
+    }
+
+    #[test]
+    fn a_narrow_header_drops_token_totals_before_spend_and_hidden_agents() {
+        let mut app = App::default();
+        for (id, status) in [("a1", AgentStatus::Running), ("a2", AgentStatus::Cancelled)] {
+            app.apply(crate::runtime::SwarmEvent::Spawned {
+                id: id.into(),
+                parent: USER.into(),
+                name: format!("agent-{id}"),
+                task: "t".into(),
+                cwd: "/w".into(),
+                branch: None,
+            });
+            app.apply(crate::runtime::SwarmEvent::Status {
+                id: id.into(),
+                status,
+            });
+        }
+        app.agents.get_mut("a1").unwrap().input_tokens = 14_100_000;
+        app.budget = Some(50_000_000);
+        let header = |width: u16| {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 10)).unwrap();
+            terminal.draw(|frame| draw(frame, &app, "r", 0)).unwrap();
+            screen_text(terminal.backend().buffer())
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end()
+                .to_owned()
+        };
+        assert_eq!(
+            header(90),
+            " strands-swarm   run r · 2 agents · 1 running · budget 50.0M · 1 cancelled hidden (f3)"
+        );
+        let wide = header(160);
+        assert!(
+            wide.contains("· in 14.1M (0% cached) · out 0 · budget 50.0M · 1 cancelled hidden (f3)"),
+            "{wide}"
+        );
     }
 
     #[test]
