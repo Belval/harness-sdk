@@ -350,6 +350,9 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
 }
 
 #[cfg(test)]
+mod prefix_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use strands_agents::context_manager::ContextManager;
