@@ -2262,6 +2262,34 @@ async fn interrupting_mid_tool_idles_the_agent_and_the_next_message_continues_th
 }
 
 #[tokio::test]
+async fn a_restored_agent_that_had_finished_rests_until_its_next_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("done")])]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(mock_factory(&scripts), dir.path()));
+    spawn_root(&swarm, "work").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let mut saved = swarm.snapshot();
+    swarm.shutdown().await;
+    // Even with a goal: its turn ended, so the goal was met or given up on.
+    saved.agents[0].goal = Some("shipped".into());
+
+    let resumed_scripts = scripts_of(vec![("a1", vec![say("again")])]);
+    let config = SwarmConfig::new(mock_factory(&resumed_scripts), dir.path());
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    assert_eq!(
+        resumed.agent("a1").unwrap().status,
+        AgentStatus::Idle,
+        "not starting"
+    );
+    assert!(!resumed.is_busy());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(resumed_scripts.lock()["a1"].call_count(), 0, "no turn of its own");
+    resumed.send(USER, "a1", "more").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "again");
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_interrupted_goal_agent_stays_idle_until_its_next_message_even_across_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = scripts_of(vec![(

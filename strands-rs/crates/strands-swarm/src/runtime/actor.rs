@@ -28,8 +28,11 @@ impl Swarm {
         if let Some(history) = agent.with_messages(|messages| history_event(&node.id, messages)) {
             self.emit(history);
         }
-        let paused = node.paused.load(Ordering::SeqCst);
-        if !interrupted && (node.goal.is_none() || paused) {
+        // A goal agent whose turn failed retries, as it would have without the restart; one that
+        // finished its turn (goal met or given up on) waits for mail like any other.
+        let errored = matches!(*node.status.lock(), AgentStatus::Errored(_));
+        let retry = errored && node.goal.is_some() && !node.paused.load(Ordering::SeqCst);
+        if !interrupted && !retry {
             return None;
         }
         let in_flight = agent.with_messages(|messages| resume::in_flight(messages));

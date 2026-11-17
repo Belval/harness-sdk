@@ -87,9 +87,13 @@ impl Swarm {
             .as_ref()
             .map_or(&self.inner.root_cancel, |node| &node.cancel)
             .child_token();
+        // An agent that was resting stays so until its next message; only one that was mid-turn
+        // starts again on its own.
         let status = match saved.status.as_str() {
             "cancelled" => AgentStatus::Cancelled,
             "queued" => AgentStatus::Queued,
+            "idle" => AgentStatus::Idle,
+            "errored" => AgentStatus::Errored(RESTORED_ERROR.to_owned()),
             _ => AgentStatus::Starting,
         };
         let interrupted = matches!(saved.status.as_str(), "running" | "starting");
@@ -185,6 +189,9 @@ impl Swarm {
         });
     }
 }
+
+/// What a restored errored agent shows: the error itself is not persisted.
+const RESTORED_ERROR: &str = "its last turn failed before the restart";
 
 pub(super) fn status_name(status: &AgentStatus) -> &'static str {
     match status {
