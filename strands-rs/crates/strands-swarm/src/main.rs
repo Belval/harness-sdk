@@ -348,6 +348,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.gates = cli.gates;
     config.land_into = cli.land_into;
     config.budget_tokens = cli.budget_tokens;
+    config.task_flag = task.clone().filter(|task| !task.is_empty());
     config.compact_at = cli.compact_at;
     config.prices = Arc::new(prices);
     config.default_model = Some(default_model);
@@ -368,6 +369,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         _ => None,
     };
     let resumed = saved.is_some();
+    let last_task = saved.as_ref().and_then(|saved| saved.task_flag.clone());
     let (swarm, events) = match saved {
         Some(saved) => {
             config.cwd = saved.cwd.clone();
@@ -392,7 +394,8 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         .agents()
         .into_iter()
         .find(|agent| agent.parent == USER && agent.status.is_live());
-    let (root, expect_reply) = match (start_plan(task, goal, live_root.is_some()), live_root) {
+    let plan = start_plan(task, goal, live_root.is_some(), last_task.as_deref());
+    let (root, expect_reply) = match (plan, live_root) {
         (StartPlan::Message(task), Some(agent)) => {
             swarm.send(USER, &agent.id, task)?;
             (None, true)
@@ -458,12 +461,18 @@ enum StartPlan {
     Nothing,
 }
 
-/// A resumed run that still has a live root gets only a TASK, as a message: `--goal` seeds a new
-/// root alone, as a supervisor replays it on every restart. Otherwise the TASK (or the goal)
-/// starts a root.
-fn start_plan(task: Option<String>, goal: Option<String>, live_root: bool) -> StartPlan {
+/// A resumed run that still has a live root gets only a TASK, as a message, and only one other
+/// than `last_task` (the one the run was last started with): a supervisor replays its arguments
+/// on every restart. `--goal` seeds a new root alone, for the same reason. Otherwise the TASK
+/// (or the goal) starts a root.
+fn start_plan(
+    task: Option<String>,
+    goal: Option<String>,
+    live_root: bool,
+    last_task: Option<&str>,
+) -> StartPlan {
     if live_root {
-        return match task.filter(|task| !task.is_empty()) {
+        return match task.filter(|task| !task.is_empty() && Some(task.as_str()) != last_task) {
             Some(task) => StartPlan::Message(task),
             None => StartPlan::Nothing,
         };
@@ -583,27 +592,40 @@ mod tests {
     #[test]
     fn a_resume_sends_its_live_root_the_task_but_never_the_goal() {
         let goal = || Some("all tests pass".to_owned());
-        assert!(matches!(start_plan(None, goal(), true), StartPlan::Nothing));
+        assert!(matches!(start_plan(None, goal(), true, None), StartPlan::Nothing));
         assert!(matches!(
-            start_plan(Some("also fix X".into()), goal(), true),
+            start_plan(Some("also fix X".into()), goal(), true, None),
             StartPlan::Message(task) if task == "also fix X"
         ));
         assert!(matches!(
-            start_plan(Some(String::new()), None, true),
+            start_plan(Some(String::new()), None, true, None),
             StartPlan::Nothing
         ));
     }
 
     #[test]
+    fn a_replayed_task_is_not_sent_again_but_a_new_one_is() {
+        let last = Some("build it");
+        assert!(matches!(
+            start_plan(Some("build it".into()), None, true, last),
+            StartPlan::Nothing
+        ));
+        assert!(matches!(
+            start_plan(Some("also fix X".into()), None, true, last),
+            StartPlan::Message(task) if task == "also fix X"
+        ));
+    }
+
+    #[test]
     fn without_a_live_root_the_task_or_goal_starts_one() {
-        let StartPlan::Spawn(request) = start_plan(None, Some("g".into()), false) else {
+        let StartPlan::Spawn(request) = start_plan(None, Some("g".into()), false, None) else {
             panic!("a goal starts a root");
         };
         assert_eq!((request.task.as_str(), request.goal.as_deref()), ("g", Some("g")));
-        let StartPlan::Spawn(request) = start_plan(Some("t".into()), None, false) else {
+        let StartPlan::Spawn(request) = start_plan(Some("t".into()), None, false, Some("t")) else {
             panic!("a task starts a root");
         };
         assert_eq!((request.task.as_str(), request.goal), ("t", None));
-        assert!(matches!(start_plan(None, None, false), StartPlan::Nothing));
+        assert!(matches!(start_plan(None, None, false, None), StartPlan::Nothing));
     }
 }

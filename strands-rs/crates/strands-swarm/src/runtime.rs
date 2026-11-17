@@ -236,6 +236,9 @@ pub struct SwarmConfig {
     /// Swarm-wide token budget (input + output over all agents); once spent, model calls fail
     /// until [`Swarm::set_budget`] raises it. A resumed run keeps the budget it was saved with.
     pub budget_tokens: Option<u64>,
+    /// The TASK this process was started with, saved with the run ([`SwarmState::task_flag`]) so
+    /// that a supervisor replaying the same arguments does not send it again on every restart.
+    pub task_flag: Option<String>,
     /// Run id, used in worktree paths and branch names.
     pub run_id: String,
     /// Run directory for state and sessions; `None` keeps everything in memory.
@@ -298,6 +301,7 @@ impl SwarmConfig {
             max_agents: 16,
             max_concurrent_calls: 8,
             budget_tokens: None,
+            task_flag: None,
             run_id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
             state_dir: None,
             cargo_target_dir: None,

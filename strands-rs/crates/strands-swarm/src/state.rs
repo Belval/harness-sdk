@@ -36,6 +36,10 @@ pub struct SwarmState {
     /// changed since; a different one overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_flag: Option<u64>,
+    /// The TASK the run was last started with. A resume given the same one again (a supervisor
+    /// replays its arguments) does not send it to the live root a second time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_flag: Option<String>,
     /// Live-agent limit set at runtime, overriding `--max-agents`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_agents: Option<usize>,

@@ -4517,3 +4517,19 @@ async fn a_resume_keeps_the_saved_budget_unless_given_a_new_budget_flag() {
         swarm.shutdown().await;
     }
 }
+
+/// The TASK a run was started with is saved, so the next start (a supervisor replaying the same
+/// arguments) can tell it from a new one.
+#[tokio::test]
+async fn the_task_a_run_was_started_with_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = SwarmConfig::new(mock_factory(&scripts_of(vec![])), dir.path());
+    config.task_flag = Some("build it".to_owned());
+    let (swarm, _events) = Swarm::new(config);
+    let state = swarm.snapshot();
+    assert_eq!(state.task_flag.as_deref(), Some("build it"));
+    let saved: strands_swarm::state::SwarmState =
+        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    assert_eq!(saved.task_flag.as_deref(), Some("build it"));
+    swarm.shutdown().await;
+}

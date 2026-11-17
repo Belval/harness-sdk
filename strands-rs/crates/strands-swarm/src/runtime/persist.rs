@@ -165,6 +165,7 @@ impl Swarm {
             agents,
             budget_tokens: *self.inner.budget.lock(),
             budget_flag: self.inner.config.budget_tokens,
+            task_flag: self.inner.config.task_flag.clone(),
             max_agents: *self.inner.max_agents.lock(),
             commit: self.inner.config.commit.clone(),
             schedules: self.inner.schedules.lock().clone(),
