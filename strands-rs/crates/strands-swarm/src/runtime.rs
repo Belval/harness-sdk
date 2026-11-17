@@ -52,6 +52,7 @@ mod warm;
 
 pub(crate) use actor::summarize_input;
 use actor::Start;
+pub use actor::SILENT_REPLY;
 use background::jobs_dir;
 use capacity::started;
 use persist::history_event;

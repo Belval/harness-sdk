@@ -211,7 +211,11 @@ impl Swarm {
             return Some(message);
         }
         self.set_status(node, AgentStatus::Idle);
-        let _ = self.post(&node.id, &node.parent, "reply", reply.unwrap_or_default());
+        let reply = reply.unwrap_or_default();
+        // The user sees replies as streamed text anyway, and headless runs wait for one.
+        if node.parent == USER || !is_silent(&reply) {
+            let _ = self.post(&node.id, &node.parent, "reply", reply);
+        }
         None
     }
 
@@ -365,6 +369,12 @@ impl Swarm {
             .get("CARGO_TARGET_DIR")
             .map(|dir| format!(" Your commands run with `CARGO_TARGET_DIR={dir}`, private to this worktree (the first build starts from scratch)."))
             .unwrap_or_default();
+        let silent = match node.parent == USER {
+            true => String::new(),
+            false => format!(
+                " When there is nothing worth telling them (e.g. a poll found no change), end with just `{SILENT_REPLY}` and nothing is sent."
+            ),
+        };
         let swarm = format!(
             "# Swarm\n\
              You are {who}, one of a group of cooperating agents. Your working directory is `{}`; every `shell` call starts there, so there is no need to `cd` into it.{branch}{env}\n\
@@ -372,7 +382,7 @@ impl Swarm {
              (`send_message`), wait for messages (`wait`), see who exists (`list_agents`) and stop agents \
              (`cancel_agent`). Whether and how to split the work is your call.\n\
              Messages from other agents reach you as `<message from=\"...\">` blocks, either appended to a \
-             tool result or as a new turn. Your final reply at the end of each turn is delivered to {reports_to}.",
+             tool result or as a new turn. Your final reply at the end of each turn is delivered to {reports_to}.{silent}",
             node.cwd.display()
         );
         match goal {
@@ -386,6 +396,15 @@ impl Swarm {
             None => swarm,
         }
     }
+}
+
+/// A final reply that is only this (or only whitespace) is not delivered to an agent parent.
+pub const SILENT_REPLY: &str = "[silent]";
+
+/// Whether `reply` ends the turn without a message to the parent ([`SILENT_REPLY`]).
+pub(super) fn is_silent(reply: &str) -> bool {
+    let reply = reply.trim();
+    reply.is_empty() || reply.eq_ignore_ascii_case(SILENT_REPLY)
 }
 
 pub(super) const RETRY_INITIAL: Duration = Duration::from_secs(15);

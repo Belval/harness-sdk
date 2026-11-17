@@ -135,6 +135,55 @@ async fn a_spawned_agents_reply_reaches_the_parent_through_wait() {
 }
 
 #[tokio::test]
+async fn a_silent_or_empty_final_reply_reaches_no_agent_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let spawn = json!({"task": "poll", "name": "poller"});
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", spawn),
+                    say("spawned"),
+                    say("noted"),
+                ],
+            ),
+            ("a2", vec![say("[silent]"), say(" \n"), say("CI is green")]),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "spawned");
+    let child = scripts.lock()["a2"].clone();
+    for (turn, poll) in ["poll 2", "poll 3"].into_iter().enumerate() {
+        while child.call_count() <= turn {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        wait_for_status(&swarm, "a2", AgentStatus::Idle).await;
+        swarm.send(USER, "a2", poll).unwrap();
+    }
+    let mut to_parent = Vec::new();
+    while let Some(event) = events.recv().await {
+        match event {
+            SwarmEvent::Mail { to, mail } if to == "a1" && mail.from == "a2" => to_parent.push(mail.text),
+            SwarmEvent::Mail { to, mail } if to == USER && mail.text == "noted" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(to_parent, ["CI is green"]);
+    let prompt = system_prompt(&child, 0);
+    assert!(
+        prompt.contains("end with just `[silent]` and nothing is sent"),
+        "{prompt}"
+    );
+    let root = scripts.lock()["a1"].clone();
+    assert!(
+        !system_prompt(&root, 0).contains("[silent]"),
+        "the user's root has no parent agent"
+    );
+}
+
+#[tokio::test]
 async fn an_idle_agent_wakes_up_for_a_new_message() {
     let dir = tempfile::tempdir().unwrap();
     let (swarm, mut events, scripts) =

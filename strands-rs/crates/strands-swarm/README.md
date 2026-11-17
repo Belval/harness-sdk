@@ -55,7 +55,8 @@ error.
 - **Names.** Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else
   one derived from its task. Ids and names work interchangeably.
 - **Replies.** Each agent's final reply per turn goes to its parent. Mail that arrives mid-turn is
-  appended to the next tool result.
+  appended to the next tool result. A reply that is empty or just `[silent]` (e.g. a scheduled poll
+  that found nothing) reaches no agent parent; the user's root always replies.
 - **Goals.** A `goal` (`spawn_agent`, `/goal`, `--goal`) puts a judge in the loop that sends the
   agent back to work until the goal is met. It runs after every turn and sees the goal, the task
   and the latest ~40k characters of the conversation.
