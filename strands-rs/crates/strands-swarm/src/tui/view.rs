@@ -134,7 +134,7 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
     if let Some(report) = &app.cost {
         let lines = report.lines().into_iter().map(Line::from).collect();
         let title = " estimated cost · ↑↓ scroll · any key close ";
-        draw_popup(frame, areas.body, title, lines, app.status_scroll);
+        draw_popup(frame, areas.body, title, lines, app.status_scroll, false);
     }
     let footer_text = app.notice.clone().unwrap_or_else(|| HINT.to_owned());
     frame.render_widget(Paragraph::new(footer_text).dim(), areas.footer);
@@ -552,22 +552,28 @@ fn draw_status(frame: &mut Frame, body: Rect, app: &App, report: &crate::status:
         " status · ↑↓ scroll · any key close ",
         lines,
         app.status_scroll,
+        true,
     );
 }
 
-/// A scrollable popup over most of `body`, as tall as `lines` need.
-fn draw_popup(frame: &mut Frame, body: Rect, title: &str, lines: Vec<Line>, scroll: u16) {
+/// A scrollable popup over most of `body`, as tall as `lines` need. `wrap` folds long lines
+/// (prose); tables are left unwrapped so their columns stay aligned.
+fn draw_popup(frame: &mut Frame, body: Rect, title: &str, lines: Vec<Line>, scroll: u16, wrap: bool) {
     let width = body.width.saturating_sub(4).max(body.width.min(20));
-    let height = (lines.len() as u16 + 2).min(body.height);
+    let mut popup = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    if wrap {
+        popup = popup.wrap(Wrap { trim: false });
+    }
+    // `line_count` takes the inner width and counts both borders.
+    let rows = to_u16(popup.line_count(width.saturating_sub(2)));
+    let height = rows.min(body.height);
     let area = Rect::new(
         body.x + (body.width - width) / 2,
         body.y + (body.height - height) / 2,
         width,
         height,
     );
-    let popup = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let popup = popup.scroll((scroll, 0));
     frame.render_widget(Clear, area);
     frame.render_widget(popup, area);
 }
@@ -818,6 +824,34 @@ mod tests {
             .max_by_key(|h| h.len())
             .unwrap();
         assert!(screen.contains(&format!("{longest}│")), "{screen}");
+    }
+
+    #[test]
+    fn the_status_popup_wraps_long_lines() {
+        let mut app = app_with_an_image(None);
+        let subject = "abc1234 feat: thumbnails for every image in the log pane, scaled to fit the cell grid";
+        app.status = Some(crate::status::StatusReport {
+            base: Some("main".into()),
+            agents: vec![crate::status::AgentReport {
+                id: "a1".into(),
+                label: "shots (a1)".into(),
+                status: AgentStatus::Idle,
+                unread: 0,
+                branch: Some("swarm/r/a1".into()),
+                git: Some(crate::status::BranchState {
+                    ahead: vec![subject.into()],
+                    ..Default::default()
+                }),
+                todos: vec![],
+                background: vec![],
+                schedules: vec![],
+            }],
+        });
+        let backend = ratatui::backend::TestBackend::new(60, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        assert!(screen.contains("scaled to fit the cell grid"), "{screen}");
     }
 
     #[test]
