@@ -898,6 +898,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_cancelled_shell_call_keeps_its_partial_output_as_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = AgentSpec {
+            cwd: dir.path().to_path_buf(),
+            ..spec()
+        };
+        let options = HarnessFactoryOptions::default();
+        let mut harness = harness_options(&options, spec).unwrap();
+        let command = "echo 'say \"hi\"'; touch started; sleep 10";
+        let slow = tool_call("shell", "s1", serde_json::json!({ "command": command }));
+        harness.model = Some(ModelOption::Instance(MockMessageModel::shared(calls_then_done(
+            vec![slow],
+        ))));
+        let agent = build(&options, harness).await.unwrap();
+        let stopper = agent.clone();
+        let marker = dir.path().join("started");
+        let cancelled_at = Arc::new(parking_lot::Mutex::new(None));
+        let at = cancelled_at.clone();
+        tokio::spawn(async move {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            *at.lock() = Some(std::time::Instant::now());
+            stopper.cancel();
+        });
+        let _ = agent.invoke("try it").await;
+        let cancelled = cancelled_at.lock().expect("the command started");
+        assert!(
+            cancelled.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            cancelled.elapsed()
+        );
+
+        let results: Vec<ToolResultBlock> =
+            agent.with_messages(|messages| messages.iter().flat_map(|m| m.tool_results()).cloned().collect());
+        match &results[0].content[..] {
+            [ToolResultContent::Text(text)] => {
+                let (output, end) = text.rsplit_once('\n').unwrap();
+                assert_eq!(output, "say \"hi\"");
+                assert!(
+                    end.starts_with("[cancelled after ") && end.ends_with("s]"),
+                    "{text}"
+                );
+                assert!(crate::shell_text::is_cancelled(text));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn agents_are_told_to_prefer_the_file_tools_over_shell_edits() {
         let harness = harness_options(&HarnessFactoryOptions::default(), spec()).unwrap();

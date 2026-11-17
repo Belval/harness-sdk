@@ -46,7 +46,9 @@ pub fn in_flight(messages: &[Message]) -> Vec<ToolUseBlock> {
             |call| match results.iter().find(|r| r.tool_use_id == call.tool_use_id) {
                 None => true,
                 Some(result) => {
-                    result.status == ToolResultStatus::Error && result.text() == EXECUTION_CANCELLED_MESSAGE
+                    result.status == ToolResultStatus::Error
+                        && (result.text() == EXECUTION_CANCELLED_MESSAGE
+                            || crate::shell_text::is_cancelled(&result.text()))
                 }
             },
         )
@@ -316,6 +318,12 @@ mod tests {
             results(vec![ToolResultBlock::error("t1", "exit 1")]),
         ];
         assert!(in_flight(&failed).is_empty(), "a real failure completed");
+        let killed = vec![
+            Message::user("go"),
+            calls(&["t1"]),
+            results(vec![ToolResultBlock::error("t1", "half\n[cancelled after 2.0s]")]),
+        ];
+        assert_eq!(ids(in_flight(&killed)), ["t1"], "a cut shell call with output");
         assert!(in_flight(&[Message::user("go"), Message::assistant("done")]).is_empty());
     }
 
