@@ -100,9 +100,29 @@ async fn write_json_atomically<T: serde::Serialize>(
     let mut tmp_path = path.as_os_str().to_owned();
     tmp_path.push(".tmp");
     let tmp_path = PathBuf::from(tmp_path);
-    tokio::fs::write(&tmp_path, serde_json::to_vec_pretty(data)?).await?;
+    write_synced(&tmp_path, &serde_json::to_vec_pretty(data)?).await?;
     tokio::fs::rename(&tmp_path, path).await?;
+    sync_parent(path).await;
     Ok(())
+}
+
+/// Write `bytes` to `path` and wait until they are on disk, so that after a power loss a rename
+/// of `path` never leaves an empty or partial file.
+async fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await
+}
+
+/// Make a rename into `path`'s directory durable; best effort (not every platform syncs a
+/// directory).
+async fn sync_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
 }
 
 fn session_error(message: String, source: impl Into<BoxError>) -> Error {

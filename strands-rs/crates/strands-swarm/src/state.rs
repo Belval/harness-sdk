@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use strands_agents::{Error, Result};
+use tokio::io::AsyncWriteExt;
 
 /// File name of the swarm state inside a run directory.
 pub const STATE_FILE: &str = "swarm.json";
@@ -170,10 +171,17 @@ impl Persister {
         let io = |e: std::io::Error| Error::other(format!("Failed to save swarm state: {e}"));
         tokio::fs::create_dir_all(&self.dir).await.map_err(io)?;
         let tmp = self.dir.join(format!("{STATE_FILE}.tmp"));
-        tokio::fs::write(&tmp, json).await.map_err(io)?;
+        // Synced before the rename, and the directory after it: after a power loss, the old
+        // state or the new one, never an empty file.
+        let mut file = tokio::fs::File::create(&tmp).await.map_err(io)?;
+        file.write_all(&json).await.map_err(io)?;
+        file.sync_all().await.map_err(io)?;
         tokio::fs::rename(&tmp, self.dir.join(STATE_FILE))
             .await
             .map_err(io)?;
+        if let Ok(dir) = tokio::fs::File::open(&self.dir).await {
+            let _ = dir.sync_all().await;
+        }
         *written = generation;
         Ok(())
     }

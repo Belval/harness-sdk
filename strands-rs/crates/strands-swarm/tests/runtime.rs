@@ -1318,6 +1318,12 @@ async fn a_hard_crash_mid_batch_keeps_its_calls_and_the_results_that_came_in() {
         std::fs::read_to_string(&batch_file).is_ok_and(|text| text.contains("(a1)"))
     })
     .await;
+    // The state is saved in the background, and synced to disk.
+    let state_file = state_dir.join("swarm.json");
+    eventually("the running status is saved", || {
+        std::fs::read_to_string(&state_file).is_ok_and(|text| text.contains("\"running\""))
+    })
+    .await;
     let crashed = dir.path().join("crashed");
     crash_copy(&state_dir, &crashed);
     swarm.shutdown().await;
