@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::dashboard::ContextControl;
 use async_trait::async_trait;
 use strands_agents::context_manager::stash::Stash;
 use strands_agents::context_manager::{ContextState, ContextStrategy, AUTO_SUMMARIZE_UTILIZATION};
@@ -35,16 +36,28 @@ pub fn window_of(model: &dyn Model) -> u64 {
 }
 
 /// Runs `inner` (an ungated summarize strategy) once utilization reaches the compaction point of
-/// the agent's current model, so a `/model` switch moves the point with the window.
+/// the agent's current model, so a `/model` switch moves the point with the window, or when the
+/// agent asked for it through its `context` tool.
 pub struct CompactAt {
     inner: Arc<dyn ContextStrategy>,
     compact_at: u64,
+    control: Option<Arc<ContextControl>>,
 }
 
 impl CompactAt {
     /// Gate `inner` at `compact_at` tokens.
     pub fn new(inner: Arc<dyn ContextStrategy>, compact_at: u64) -> Self {
-        Self { inner, compact_at }
+        Self {
+            inner,
+            compact_at,
+            control: None,
+        }
+    }
+
+    /// Also run `inner` once after each summarize request made through `control`.
+    pub fn on_request(mut self, control: Arc<ContextControl>) -> Self {
+        self.control = Some(control);
+        self
     }
 }
 
@@ -59,8 +72,9 @@ impl ContextStrategy for CompactAt {
     }
 
     async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
+        let requested = self.control.as_ref().is_some_and(|c| c.take_summarize_request());
         let window = window_of(ctx.agent.model().as_ref());
-        if !ctx.overflow && ctx.utilization < compaction_utilization(window, self.compact_at) {
+        if !requested && !ctx.overflow && ctx.utilization < compaction_utilization(window, self.compact_at) {
             return Ok(false);
         }
         self.inner.apply(ctx).await

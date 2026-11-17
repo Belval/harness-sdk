@@ -25,6 +25,7 @@ use strands_harness::{
 
 use crate::catalog::ToolCatalog;
 use crate::compaction::{CompactAt, DEFAULT_COMPACT_AT};
+use crate::dashboard::{ContextControl, SUMMARY_KEEPS};
 use crate::pruning::{DropOldReasoning, TrimOldResults};
 use crate::runtime::{AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
 use crate::skills::{skills_prompt, skills_tool};
@@ -137,7 +138,12 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// dropped first (see [`DropOldReasoning`]) and older large `shell`/`read` results are cut to a
 /// preview (see [`TrimOldResults`]). With `stash_dir` the full outputs behind those previews are
 /// kept there, so `retrieve_context` still finds them after a restart.
-fn context_manager(compact_at: u64, stash_dir: Option<&std::path::Path>) -> ContextManagerOption {
+/// `control` (the agent's `context` tool) gets the stash and can request a summary.
+fn context_manager(
+    compact_at: u64,
+    stash_dir: Option<&std::path::Path>,
+    control: &Arc<ContextControl>,
+) -> ContextManagerOption {
     let truncate = Offload::truncate(
         OffloadTarget::ToolResults,
         TruncateConfig {
@@ -152,16 +158,17 @@ fn context_manager(compact_at: u64, stash_dir: Option<&std::path::Path>) -> Cont
     // Ungated (utilization 0) and message-level; `CompactAt` decides when it runs.
     let summarize = Offload::summarize(OffloadTarget::All).when(OffloadConditions {
         utilization: Some(0.0),
-        preserve_recent: Some(4.0),
+        preserve_recent: Some(SUMMARY_KEEPS as f64),
         ..Default::default()
     });
-    let summarize = CompactAt::new(Arc::new(summarize), compact_at);
+    let summarize = CompactAt::new(Arc::new(summarize), compact_at).on_request(Arc::clone(control));
     ContextManagerOption::Config(ContextManagerConfig {
         strategies: Some(vec![
             Arc::new(DropOldReasoning),
             Arc::new(truncate),
             Arc::new(TrimOldResults::default()),
             Arc::new(summarize),
+            control.strategy(),
         ]),
         stash: match stash_dir {
             // A namespaced view is used as the stash root as is; plain storage would be keyed by
@@ -208,8 +215,11 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
     if !spec.env.is_empty() {
         sandbox = sandbox.with_env(spec.env.into_iter().collect());
     }
+    let compact_at = options.compact_at.unwrap_or(DEFAULT_COMPACT_AT);
+    let control = ContextControl::new(compact_at);
     let mut tools = spec.tools;
     tools.extend(options.tools.iter().cloned());
+    tools.push(control.tool());
     if let Some(catalog) = options.catalog.as_ref().filter(|catalog| !catalog.is_empty()) {
         tools.push(catalog.find_tool());
     }
@@ -235,10 +245,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         // Discovery happens once at startup (crate::skills); the harness's own `./.agent/skills`
         // lookup, relative to the process rather than the agent, stays off.
         skills: SkillsOption::Off,
-        context_manager: context_manager(
-            options.compact_at.unwrap_or(DEFAULT_COMPACT_AT),
-            stash_dir.as_deref(),
-        ),
+        context_manager: context_manager(compact_at, stash_dir.as_deref(), &control),
         id: Some(spec.id),
         name: Some(spec.name),
         ..Default::default()
@@ -279,7 +286,12 @@ mod tests {
             .model(Arc::new(MockMessageModel::new(Vec::new())))
             .build()
             .unwrap();
-        let manager = ContextManager::from(context_manager(DEFAULT_COMPACT_AT, None)).unwrap();
+        let manager = ContextManager::from(context_manager(
+            DEFAULT_COMPACT_AT,
+            None,
+            &ContextControl::new(DEFAULT_COMPACT_AT),
+        ))
+        .unwrap();
         let mut messages = vec![Message::user("start")];
         messages.extend(exchange("file-read", 16_000));
         messages.extend(exchange("huge-log", 200_000));
@@ -313,7 +325,8 @@ mod tests {
         let agent = Agent::builder().model(model.clone()).build().unwrap();
         // The mock has no known window, so the context manager assumes 200k: 5k tokens is 2.5%,
         // far below the 85% mark, but past `compact_at`.
-        let manager = ContextManager::from(context_manager(4_000, None)).unwrap();
+        let manager =
+            ContextManager::from(context_manager(4_000, None, &ContextControl::new(4_000))).unwrap();
 
         let mut below = chat(6);
         let changed = manager
@@ -342,13 +355,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_context_tool_can_request_a_summary_below_compact_at() {
+        use strands_agents::testing::MockResponse;
+        let model = MockMessageModel::shared(vec![MockResponse::message(Message::assistant(
+            "SUMMARY on request",
+        ))]);
+        let agent = Agent::builder().model(model.clone()).build().unwrap();
+        let control = ContextControl::new(DEFAULT_COMPACT_AT);
+        let manager = ContextManager::from(context_manager(DEFAULT_COMPACT_AT, None, &control)).unwrap();
+        control.request_summary();
+
+        let mut messages = chat(6);
+        let changed = manager
+            .run_strategies_on(&agent, &mut messages, Some(3_000), false)
+            .await
+            .unwrap();
+        assert!(changed, "summarized although far below the point");
+        assert!(messages.iter().any(|m| m.text().contains("SUMMARY on request")));
+
+        let mut again = chat(6);
+        let changed = manager
+            .run_strategies_on(&agent, &mut again, Some(3_000), false)
+            .await
+            .unwrap();
+        assert!(!changed, "a request is used once");
+        assert_eq!(model.call_count(), 1);
+    }
+
+    #[tokio::test]
     async fn stashed_tool_output_outlives_the_process_with_a_stash_dir() {
         use strands_agents::Plugin;
         let dir = tempfile::tempdir().unwrap();
         let stash_of = |agent: Agent| {
             let dir = dir.path().to_owned();
             async move {
-                let manager = ContextManager::from(context_manager(DEFAULT_COMPACT_AT, Some(&dir))).unwrap();
+                let manager = ContextManager::from(context_manager(
+                    DEFAULT_COMPACT_AT,
+                    Some(&dir),
+                    &ContextControl::new(DEFAULT_COMPACT_AT),
+                ))
+                .unwrap();
                 manager.init_agent(&agent).await.unwrap();
                 manager.stash().unwrap()
             }
@@ -407,10 +453,10 @@ mod tests {
                 .handler(|input: serde_json::Value, _ctx| async move { Result::Ok(input) }),
         );
         let full = ToolCatalog::new(vec![tool], vec![("srv".into(), 1)]);
-        assert_eq!(tool_names(Some(Arc::new(full))), ["find_tools"]);
+        assert_eq!(tool_names(Some(Arc::new(full))), ["context", "find_tools"]);
         let empty = ToolCatalog::new(Vec::new(), vec![("srv".into(), 0)]);
-        assert!(tool_names(Some(Arc::new(empty))).is_empty());
-        assert!(tool_names(None).is_empty());
+        assert_eq!(tool_names(Some(Arc::new(empty))), ["context"]);
+        assert_eq!(tool_names(None), ["context"]);
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ agent with nine extra tools, and decides for itself whether and how to split the
 | `schedule` | Post a message to an agent's mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
 | `run_background` | Start a shell command as a background job and return its id at once; the agent gets a message with the exit code and the output's last 40 lines when it ends. |
 | `jobs` | List background jobs (status, log path), or kill one with everything it started. |
+| `context` | The agent's own context dashboard: size against the compaction point, the 10 biggest items with their age, what is stashed; offload chosen tool results to the stash or summarize older turns now. |
 | `land` | Only with `--allow-land`: rebase the caller's (or a descendant's) branch onto the root's checked-out branch, run the checks, and fast-forward it (see below). |
 | `find_tools` | Only with MCP servers: search the shared MCP tools by keyword and enable some for the calling agent. |
 | `skills` | Only with skills: load a skill's full `SKILL.md` instructions, its location and its bundled files. |
@@ -120,6 +121,10 @@ keeps it, as Anthropic requires within a tool-use loop.
 `shell` and `read` results over 2,000 characters are cut to their head and tail (~800 characters)
 once six newer ones exist, in batches to spare the prompt cache; `retrieve_context` with the
 reference at the end returns the full output.
+Beyond these fixed thresholds an agent manages its own context with the `context` tool: it lists
+the biggest items (tool results numbered), `offload: [n, …]` replaces those results with a
+one-line stub whose reference still reads the full output back, and `summarize: true` has the
+pipeline summarize all but the latest four messages before the next model call.
 The header totals the swarm's tokens as `in 84.8M (97% cached) · out 291k`: input counts cache reads
 and writes (the budget does too), and the share read from the prompt cache is shown beside it, as
 in each agent's log title.
