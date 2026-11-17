@@ -686,6 +686,9 @@ struct Inner {
     reload: CancellationToken,
     /// Bumped by every installed reload; a pending idle-mode reload yields to a newer one.
     reload_generation: AtomicU64,
+    /// An idle-mode reload is pending: agents' model calls wait for the restart
+    /// ([`Swarm::hold_for_reload`]).
+    reload_held: AtomicBool,
     model_calls: Option<Arc<Semaphore>>,
     budget: Mutex<Option<u64>>,
     /// Live-agent limit set at runtime with [`Swarm::set_max_agents`]; overrides the config.
@@ -731,6 +734,7 @@ impl Swarm {
             actors: Mutex::new(Vec::new()),
             reload: CancellationToken::new(),
             reload_generation: AtomicU64::new(0),
+            reload_held: AtomicBool::new(false),
             model_calls: (config.max_concurrent_calls > 0)
                 .then(|| Arc::new(Semaphore::new(config.max_concurrent_calls))),
             budget: Mutex::new(config.budget_tokens),

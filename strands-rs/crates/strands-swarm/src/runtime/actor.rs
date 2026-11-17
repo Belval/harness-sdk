@@ -461,6 +461,7 @@ impl Model for SideModel {
             let cancel = node.turn_token();
             let prompt = options.system_prompt.as_ref().map(|prompt| prompt.text());
             let purpose = crate::cost::SidePurpose::of(prompt.as_deref());
+            self.swarm.hold_for_reload(&node.id, &cancel).await?;
             let _permit = self.swarm.admit_model_call(&node.id, &cancel).await?;
             // A summary or a verdict is asked for once, of a prompt never sent again: a cache
             // write there costs 25% more than plain input and is never read.

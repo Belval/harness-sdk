@@ -3039,6 +3039,84 @@ async fn a_call_cut_by_a_restart_is_listed_with_how_long_it_ran() {
 }
 
 #[tokio::test]
+async fn a_pending_reload_holds_the_next_model_call_and_the_resumed_agent_makes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("gated", "g1", json!({})),
+            // Never reached: the call after `gated` is held until the restart.
+            tool_call("slow", "t2", json!({})),
+            say("done"),
+        ],
+    )]);
+    let run = dir.path().join("run");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let factory = {
+        let gate = gate.clone();
+        let inner = with_slow_tool(session_factory(&scripts, run.join("sessions")));
+        move || -> AgentFactory {
+            let (gate, inner) = (gate.clone(), inner.clone());
+            Arc::new(move |mut spec: AgentSpec| {
+                let gate = gate.clone();
+                let gated = strands_agents::tools::FunctionTool::builder("gated")
+                    .description("Runs until the test lets it finish.")
+                    .handler(move |_input: serde_json::Value, _ctx| {
+                        let gate = gate.clone();
+                        async move {
+                            gate.notified().await;
+                            strands_agents::Result::<String>::Ok("built".into())
+                        }
+                    });
+                spec.tools.push(Arc::new(gated));
+                inner(spec)
+            })
+        }
+    };
+    let mut config = SwarmConfig::new(factory(), dir.path());
+    config.state_dir = Some(run.clone());
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "work").await;
+    tool_started(&mut events, "gated").await;
+    swarm
+        .reload(Path::new("/bin/true"), ReloadWhen::Idle)
+        .await
+        .unwrap();
+    assert_eq!(reload_pending(&mut events).await, 1);
+
+    gate.notify_one();
+    assert!(
+        reloads_within(&swarm, Duration::from_secs(5)).await,
+        "idle once the call finished"
+    );
+    assert_eq!(
+        scripts.lock()["a1"].call_count(),
+        1,
+        "the next model call is held"
+    );
+    assert_eq!(swarm.tool_calls_in_flight(), 0, "and starts no tool");
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&run)
+        .await
+        .unwrap()
+        .expect("state saved");
+    assert!(saved.agents[0].running_calls.is_empty(), "nothing was cut");
+    scripts
+        .lock()
+        .insert("a1".into(), MockMessageModel::shared(vec![say("resumed")]));
+    let mut config = SwarmConfig::new(factory(), dir.path());
+    config.state_dir = Some(run.clone());
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "resumed");
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 0);
+    assert!(sent.contains("built"), "the tool's result was kept: {sent}");
+    assert!(sent.contains("No tool call was in flight"), "{sent}");
+    assert!(!sent.contains("Cancelled by user"), "{sent}");
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_newer_reload_supersedes_a_pending_one() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = scripts_of(vec![(

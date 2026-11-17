@@ -430,6 +430,10 @@ swarmctl status
 - The default, `"idle"`, waits until no agent has a tool call in flight (`wait` excluded), at most
   10 minutes (`SwarmConfig::reload_idle_timeout`). The header shows
   `reload pending (waiting for N tool calls)`.
+- While it waits, agents start no new tool calls: each agent's next model call (and side call)
+  waits for the restart, so a busy swarm still gets idle. Its tool results are saved, and the
+  resumed agent makes that call; nothing is cut. Keep-warm refreshes go on, so that call finds
+  the cache warm.
 - A newer reload replaces a pending one.
 
 **Version tracking.** Each binary embeds its git commit (`build.rs`), saved with the run. When a run

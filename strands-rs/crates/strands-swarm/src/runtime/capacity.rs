@@ -128,6 +128,7 @@ impl Swarm {
                 // The invocation's token: cancelled by an interrupt as well as by a cancel.
                 let cancel = context.agent.cancel_token();
                 async move {
+                    swarm.hold_for_reload(&id, &cancel).await?;
                     let _permit = swarm.admit_model_call(&id, &cancel).await?;
                     next.run(context, &events).await
                 }

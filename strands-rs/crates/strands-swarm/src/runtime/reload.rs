@@ -11,6 +11,8 @@ impl Swarm {
     /// Install `binary` as the run's next binary and ask the host process to restart into it:
     /// right away, or with [`ReloadWhen::Idle`] once no agent has a tool call in flight (at most
     /// [`SwarmConfig::reload_idle_timeout`] later). A newer reload supersedes a pending one.
+    /// Meanwhile agents start no new tool calls: their next model call waits for the restart
+    /// ([`Swarm::hold_for_reload`]).
     ///
     /// The binary must answer `--version` within 30 s and pass its own `--self-test` on a
     /// temporary copy of the run within [`SELF_TEST_TIMEOUT`] (see [`crate::selftest`]); otherwise
@@ -39,6 +41,7 @@ impl Swarm {
 
     /// Signal the reload once nothing is in flight, unless a newer reload took over first.
     pub(super) fn reload_when_idle(&self, generation: u64) {
+        self.inner.reload_held.store(true, Ordering::SeqCst);
         let swarm = self.clone();
         let deadline = Instant::now() + self.inner.config.reload_idle_timeout;
         tokio::spawn(async move {
@@ -60,6 +63,26 @@ impl Swarm {
             }
             swarm.inner.reload.cancel();
         });
+    }
+
+    /// While an idle-mode reload waits, hold an agent's model call until the swarm shuts down for
+    /// it (or `cancel` fires), then fail it as cancelled. Otherwise each finished tool call is
+    /// followed by a model call that starts the next, and a busy swarm never gets idle. The tool
+    /// results are saved, so the resumed agent makes the held call; nothing is cut. Keep-warm
+    /// refreshes are not held: they keep the cache that call reads warm through the restart.
+    pub(super) async fn hold_for_reload(&self, id: &str, cancel: &CancellationToken) -> Result<()> {
+        if !self.inner.reload_held.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.emit(SwarmEvent::ModelQueued {
+            id: id.to_owned(),
+            queued: true,
+        });
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = self.inner.root_cancel.cancelled() => {}
+        }
+        Err(Error::Cancelled)
     }
 
     /// Tool calls in flight across running agents, not counting tools that only wait (`wait`).
