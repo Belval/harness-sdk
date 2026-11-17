@@ -49,6 +49,11 @@ pub struct BranchState {
     pub pending: usize,
     /// Whether merging the branch into the base would conflict.
     pub merge: Merge,
+    /// The branch checked out in the agent's cwd, which the rest describes, when it is not the one
+    /// the agent was given.
+    pub head: Option<String>,
+    /// The agent's other branches (its own and `<its own>-*`) with commits the base lacks.
+    pub others: Vec<String>,
 }
 
 /// The outcome of a trial merge (`git merge-tree`) of a branch into the base.
@@ -66,8 +71,18 @@ pub enum Merge {
 }
 
 impl BranchState {
-    /// `3 not on main, 5 behind, conflicts in README.md`: the summary after the branch name.
+    /// `3 not on main, 5 behind, conflicts in README.md; also unmerged: swarm/r/a2-old`: the
+    /// summary after the branch name.
     pub fn describe(&self, base: &str) -> String {
+        let mut text = self.compared(base);
+        if !self.others.is_empty() {
+            text.push_str(&format!("; also unmerged: {}", self.others.join(", ")));
+        }
+        text
+    }
+
+    /// [`Self::describe`] of the compared branch alone.
+    fn compared(&self, base: &str) -> String {
         let more = if self.ahead.len() >= MAX_COMMITS { "+" } else { "" };
         let mut text = match self.ahead.len() {
             0 => format!("nothing beyond {base}"),
@@ -148,7 +163,8 @@ impl StatusReport {
             lines.push(String::new());
             lines.push(head);
             lines.extend(agent.todos.iter().map(todo_line));
-            if let Some(branch) = &agent.branch {
+            let head = agent.git.as_ref().and_then(|state| state.head.as_ref());
+            if let Some(branch) = head.or(agent.branch.as_ref()) {
                 lines.push(match &agent.git {
                     None => format!("  branch {branch} · checking…"),
                     Some(state) if state.ahead.is_empty() => {
@@ -175,7 +191,8 @@ fn todo_line(item: &TodoItem) -> String {
 }
 
 /// Look up the base (`base`, else the branch checked out at `root`) and, for each
-/// `(agent id, cwd, branch)`, how the branch stands against it.
+/// `(agent id, cwd, branch)`, how what is checked out in `cwd` stands against it (`branch` when
+/// detached), and which of the agent's other branches the base still lacks.
 pub async fn refresh(
     base: Option<String>,
     root: Option<PathBuf>,
@@ -189,7 +206,10 @@ pub async fn refresh(
     let mut states = HashMap::new();
     if let Some(base) = &base {
         for (id, cwd, branch) in branches {
-            if let Some(state) = branch_state(&cwd, base, &branch).await {
+            let head = current_branch(&cwd).await.unwrap_or_else(|| branch.clone());
+            if let Some(mut state) = branch_state(&cwd, base, &head).await {
+                state.others = other_unmerged(&cwd, base, &branch, &head).await;
+                state.head = (head != branch).then_some(head);
                 states.insert(id, state);
             }
         }
@@ -218,6 +238,30 @@ pub async fn branch_state(dir: &Path, base: &str, branch: &str) -> Option<Branch
         state.merge = trial_merge(dir, base, branch).await;
     }
     Some(state)
+}
+
+/// `branch` and the `<branch>-*` branches, `head` aside, with commits whose changes `base` lacks
+/// (neither merged nor cherry-picked there).
+async fn other_unmerged(dir: &Path, base: &str, branch: &str, head: &str) -> Vec<String> {
+    let no_merged = format!("--no-merged={base}");
+    let (own, derived) = (format!("refs/heads/{branch}"), format!("refs/heads/{branch}-*"));
+    let args = [
+        "for-each-ref",
+        "--format=%(refname:lstrip=2)",
+        &no_merged,
+        &own,
+        &derived,
+    ];
+    let Some(out) = git(dir, &args).await else {
+        return Vec::new();
+    };
+    let mut others = Vec::new();
+    for name in out.lines().filter(|name| !name.is_empty() && *name != head) {
+        if !matches!(applied(dir, base, name).await, Ok(found) if found.pending() == 0) {
+            others.push(name.to_owned());
+        }
+    }
+    others
 }
 
 /// Which of the commits on `rev` not on `base` the base already has a copy of, by patch id
@@ -499,5 +543,75 @@ mod tests {
         let state = branch_state(repo, "main", "picked").await.unwrap();
         assert_eq!((state.ahead.len(), state.applied, state.pending), (1, 1, 0));
         assert_eq!(state.describe("main"), "1 not on main (all applied), 3 behind");
+    }
+
+    #[tokio::test]
+    async fn the_branch_state_is_of_what_the_agent_has_checked_out() {
+        use crate::worktree::test_git as git;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let commit = |file: &str| {
+            std::fs::write(repo.join(file), file).unwrap();
+            git(repo, &["add", "-A"]);
+            git(repo, &["commit", "-q", "-m", file]);
+        };
+        git(repo, &["init", "-q", "-b", "main"]);
+        commit("init");
+        // Given `swarm/r/a7`, the agent commits there, then works on branches of its own.
+        git(repo, &["checkout", "-q", "-b", "swarm/r/a7"]);
+        commit("given");
+        git(repo, &["checkout", "-q", "-b", "swarm/r/a7-merged", "main"]);
+        commit("merged");
+        git(repo, &["checkout", "-q", "-b", "swarm/r/a7-picked", "main"]);
+        commit("picked");
+        git(repo, &["checkout", "-q", "-b", "swarm/r/a70", "main"]);
+        commit("someone else's");
+        git(repo, &["checkout", "-q", "main"]);
+        git(
+            repo,
+            &["merge", "-q", "--no-ff", "-m", "merge", "swarm/r/a7-merged"],
+        );
+        git(repo, &["cherry-pick", "swarm/r/a7-picked"]);
+        git(repo, &["checkout", "-q", "-b", "swarm/r/a7-fix"]);
+        commit("fix");
+
+        let agents = vec![("a7".to_owned(), repo.to_path_buf(), "swarm/r/a7".to_owned())];
+        let (base, states) = refresh(Some("main".into()), None, agents.clone()).await;
+        assert_eq!(base.as_deref(), Some("main"));
+        let state = &states["a7"];
+        assert_eq!(state.head.as_deref(), Some("swarm/r/a7-fix"));
+        assert_eq!((state.ahead.len(), state.behind), (1, 0), "{state:?}");
+        assert!(state.ahead[0].ends_with(" fix"), "{state:?}");
+        assert_eq!(state.others, ["swarm/r/a7"]);
+        assert_eq!(
+            state.describe("main"),
+            "1 not on main, fast-forward; also unmerged: swarm/r/a7"
+        );
+        let report = StatusReport {
+            base,
+            agents: vec![AgentReport {
+                id: "a7".into(),
+                label: "a7".into(),
+                status: crate::AgentStatus::Running,
+                unread: 0,
+                branch: Some("swarm/r/a7".into()),
+                git: Some(state.clone()),
+                todos: vec![],
+                background: vec![],
+                schedules: vec![],
+            }],
+        };
+        assert_eq!(
+            report.lines(&|_| None)[3],
+            "  branch swarm/r/a7-fix · 1 not on main, fast-forward; also unmerged: swarm/r/a7:"
+        );
+
+        // Back on its own branch, that is what is compared.
+        git(repo, &["checkout", "-q", "swarm/r/a7"]);
+        let (_, states) = refresh(Some("main".into()), None, agents).await;
+        let state = &states["a7"];
+        assert_eq!(state.head, None);
+        assert!(state.ahead[0].ends_with(" given"), "{state:?}");
+        assert_eq!(state.others, ["swarm/r/a7-fix"]);
     }
 }

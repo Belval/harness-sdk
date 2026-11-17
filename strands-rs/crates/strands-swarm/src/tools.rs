@@ -646,7 +646,10 @@ fn list_agents(
     let merge = |id: &str| -> String {
         let base = base.as_deref().unwrap_or("the base");
         match (branches.get(id), cancelled.get(id)) {
-            (Some(state), _) => format!(" ({})", state.describe(base)),
+            (Some(state), _) => match &state.head {
+                Some(head) => format!(", checked out {head} ({})", state.describe(base)),
+                None => format!(" ({})", state.describe(base)),
+            },
             (None, Some(Some(state))) => format!(" (kept: {})", state.describe(base)),
             (None, Some(None)) => " (deleted)".to_owned(),
             (None, None) => String::new(),

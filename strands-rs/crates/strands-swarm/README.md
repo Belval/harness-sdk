@@ -267,6 +267,10 @@ Typing text without a command messages the selected agent.
     copy of (cherry-picked or rebased, same patch id per `git cherry`) are counted:
     `3 not on main (all applied), 4 behind` means nothing is left to integrate. `list_agents`
     shows the same, fresh on every call.
+  - The branch compared is the one checked out in the agent's cwd (its given `swarm/<run>/<id>`
+    when detached); `list_agents` names it when it is another (`checked out swarm/r/a7-fix`).
+    The agent's other branches (`swarm/<run>/<id>` and `swarm/<run>/<id>-*`) whose commits the
+    base lacks are listed after it: `…; also unmerged: swarm/r/a7`.
   - It refreshes while open; git runs in the background and is cached for 5 s.
   - Programmatically: `Swarm::status`.
 
