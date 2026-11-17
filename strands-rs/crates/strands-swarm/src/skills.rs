@@ -70,7 +70,7 @@ impl Skills {
 /// The system-prompt section listing `skills` as `- name: first sentence of the description`.
 pub fn skills_prompt(skills: &[Skill]) -> String {
     let mut lines = vec![
-        "## Skills".to_owned(),
+        "# Skills".to_owned(),
         "Task-specific instructions. When a task matches a skill, load it with the `skills` tool before \
          you start and follow it."
             .to_owned(),

@@ -113,10 +113,11 @@ pub fn harness_factory(options: HarnessFactoryOptions) -> AgentFactory {
 async fn build(options: &HarnessFactoryOptions, harness: HarnessAgentOptions) -> Result<Agent> {
     let agent = create_harness(harness).await?;
     agent.with_tool_registry(|registry| {
-        let Some(tool) = registry.get(RETRIEVAL_TOOL_NAME) else {
-            return Ok(());
-        };
-        registry.add_or_replace([Reworded::tool(tool, RETRIEVAL_DESCRIPTION)])
+        let reworded: Vec<ToolRef> = REWORDED
+            .iter()
+            .filter_map(|(name, description)| Some(Reworded::tool(registry.get(name)?, description)))
+            .collect();
+        registry.add_or_replace(reworded)
     })?;
     // The harness has restored the session by now; give back the tools enabled before.
     if let Some(catalog) = &options.catalog {
@@ -124,6 +125,19 @@ async fn build(options: &HarnessFactoryOptions, harness: HarnessAgentOptions) ->
     }
     Ok(agent)
 }
+
+/// Builtin tools whose descriptions the swarm replaces, and with what.
+const REWORDED: &[(&str, &str)] = &[
+    ("shell", SHELL_DESCRIPTION),
+    (RETRIEVAL_TOOL_NAME, RETRIEVAL_DESCRIPTION),
+];
+
+/// `shell`'s description for the text [`crate::shell_text::ShellText`] makes of its result (the
+/// SDK's describes its JSON fields).
+const SHELL_DESCRIPTION: &str = concat!(
+    "Run a command with `sh -c` in a fresh process, so variables and `cd` do not carry over to the ",
+    "next call. Returns stdout, then `[stderr]` and stderr, then `[exit code N]` unless it is 0."
+);
 
 /// `retrieve_context`'s description without the SDK's options list and examples, which repeat
 /// its input schema; every call pays for it.
@@ -974,10 +988,7 @@ mod tests {
         let mut section = String::from("(preamble)");
         let mut text = String::new();
         for line in prompt.split_inclusive('\n') {
-            if let Some(title) = line
-                .strip_prefix("# ")
-                .or(line.strip_prefix("## Skills").map(|_| "Skills"))
-            {
+            if let Some(title) = line.strip_prefix("# ") {
                 parts.push((section, text.len()));
                 section = title.trim().to_owned();
                 text.clear();
@@ -1073,15 +1084,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retrieve_context_keeps_its_schema_under_the_shorter_description() {
+    async fn reworded_tools_keep_their_schema_under_the_new_description() {
         let options = HarnessFactoryOptions::default();
         let mut harness = harness_options(&options, spec()).unwrap();
         harness.model = Some(ModelOption::Instance(MockMessageModel::shared(vec![])));
         let agent = build(&options, harness).await.unwrap();
+        for (name, description) in REWORDED {
+            let tool = agent.with_tool_registry(|registry| registry.get(name));
+            let tool = tool.unwrap_or_else(|| panic!("{name} is registered"));
+            assert_eq!(tool.description(), *description);
+        }
         let tool = agent
             .with_tool_registry(|registry| registry.get(RETRIEVAL_TOOL_NAME))
             .unwrap();
-        assert_eq!(tool.description(), RETRIEVAL_DESCRIPTION);
         let schema = tool.spec().input_schema.clone().unwrap();
         assert!(schema["properties"]["line_range"].is_object(), "{schema}");
     }

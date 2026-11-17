@@ -392,9 +392,9 @@ impl Swarm {
         let swarm = format!(
             "# Swarm\n\
              You are {who}, one of a group of cooperating agents. Your working directory is `{}`; every `shell` call starts there, so there is no need to `cd` into it.{branch}{env}\n\
-             You can start other agents to work in parallel (`spawn_agent`), message any agent \
-             (`send_message`), wait for messages (`wait`), see who exists (`list_agents`) and stop agents \
-             (`cancel_agent`). Whether and how to split the work is your call.\n\
+             Other agents can work in parallel with you; whether and how to split the work is your call. \
+             Within one turn, file, shell, job and agent-tool calls run one after another in your order (an \
+             `edit`, then the test that needs it); MCP tools, `web_fetch` and `skills` start at once.\n\
              Messages from other agents reach you as `<message from=\"...\">` blocks, either appended to a \
              tool result or as a new turn. Your final reply at the end of each turn is delivered to {reports_to}.{silent}",
             node.cwd.display()

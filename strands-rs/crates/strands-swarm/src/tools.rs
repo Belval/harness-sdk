@@ -58,11 +58,11 @@ const DEFAULT_WAIT_SECONDS: u64 = 600;
 const MAX_WAIT_SECONDS: u64 = 3600;
 
 const SPAWN_DESCRIPTION: &str = concat!(
-    "Start an agent on `task` concurrently; returns its id at once. It has your tools. Its final reply ",
-    "each turn comes to you as a message; message it any time and it goes on with its context. The task ",
-    "is all it knows. It works in `cwd` (default: yours); worktree=true gives it its own git worktree ",
-    "and branch off that HEAD (uncommitted changes excluded); you integrate the branch. At the agent ",
-    "limit it is `queued` until a slot frees."
+    "Start an agent on `task`; returns at once. It has your tools (MCP ones it enables ",
+    "itself). Its final reply each turn comes to you as a message. A message to it later resumes it ",
+    "with its context. The task is all it knows. It works in `cwd` (default: yours); ",
+    "worktree=true gives it its own git worktree and branch off that HEAD (uncommitted changes ",
+    "excluded); you integrate the branch. At the agent limit it waits `queued` for a slot."
 );
 
 const SEND_DESCRIPTION: &str = concat!(
@@ -139,8 +139,7 @@ struct ListInput {
 struct ReloadInput {
     /// Absolute path of the built `strands-swarm` binary.
     binary: String,
-    /// `idle` (default): once no tool call but `wait` is in flight, at most 10 min later. `now`:
-    /// at once, interrupting tool calls.
+    /// `idle` (default): once no tool call but `wait` is in flight, at most 10 min later. `now`: at once, interrupting tool calls.
     #[serde(default)]
     #[schemars(schema_with = "reload_when_schema")]
     when: ReloadWhen,
