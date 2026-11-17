@@ -586,6 +586,7 @@ fn print_event(event: &SwarmEvent) {
             eprintln!("reload pending (waiting for {tool_calls} tool calls)")
         }
         SwarmEvent::Model { id, model } => eprintln!("[{id}] model {model}"),
+        SwarmEvent::Moved { id, cwd } => eprintln!("[{id}] cwd {}", cwd.display()),
         SwarmEvent::Reclaimed { collected, .. } => collected
             .iter()
             .flat_map(|agent| agent.lines())

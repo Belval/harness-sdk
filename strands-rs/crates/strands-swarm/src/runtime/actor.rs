@@ -1,6 +1,8 @@
 //! The actor loop that drives one agent turn by turn, and forwarding of its stream events.
 
 use super::*;
+use strands_agents::hooks::BeforeToolCallEvent;
+use strands_agents::tools::FunctionTool;
 
 impl Swarm {
     /// Run `node`'s actor; once it exits, reclaim the disk of agents that are now fully stopped.
@@ -41,8 +43,9 @@ impl Swarm {
             return None;
         }
         let in_flight = agent.with_messages(|messages| resume::in_flight(messages));
-        let status = resume::git_status(&node.cwd).await;
-        let notice = resume::notice(&in_flight, ran, &node.cwd, status.as_deref());
+        let workdir = node.workdir.get();
+        let status = resume::git_status(&workdir).await;
+        let notice = resume::notice(&in_flight, ran, &workdir, status.as_deref());
         let folded = agent.with_messages(|messages| resume::append_notice(messages, &notice));
         Some(match folded {
             true => InvokeInput::None,
@@ -90,7 +93,7 @@ impl Swarm {
         let spec = AgentSpec {
             id: node.id.clone(),
             name: node.name.clone(),
-            cwd: node.cwd.clone(),
+            workdir: node.workdir.clone(),
             model,
             instructions: self.instructions(&node, node.goal.as_deref()),
             tools: swarm_tools(self.clone(), &node.id),
@@ -110,6 +113,7 @@ impl Swarm {
             Err(error) => return self.fail_construction(&node, error),
         };
         self.install_mail_hook(&agent, &node.id);
+        self.install_cd_hook(&agent, &node);
         self.install_poll_hint(&agent, &node.id);
         self.install_model_gate(&agent, &node);
         self.install_keep_warm(&agent, &node);
@@ -370,6 +374,46 @@ impl Swarm {
         });
     }
 
+    /// A `shell` call that is only `cd DIR` moves `node` there ([`crate::workdir`]) instead of
+    /// running a command that would change nothing.
+    fn install_cd_hook(&self, agent: &Agent, node: &Arc<Node>) {
+        let swarm = self.clone();
+        let node = Arc::downgrade(node);
+        agent
+            .hooks()
+            .add_sync_callback(move |event: &mut BeforeToolCallEvent| {
+                let Some(node) = node.upgrade().filter(|_| event.tool_use.name == "shell") else {
+                    return Ok(());
+                };
+                let command = event.tool_use.input.get("command").and_then(|c| c.as_str());
+                let Some(dir) = command.and_then(|c| crate::workdir::lone_cd(c, &node.workdir.get())) else {
+                    return Ok(());
+                };
+                swarm.move_to(&node, &event.agent, dir.clone());
+                let text = crate::workdir::moved_text(&dir);
+                let tool = FunctionTool::builder("shell")
+                    .description("")
+                    .handler(move |_input, _ctx| std::future::ready(Ok(text.clone())));
+                event.selected_tool = Some(Arc::new(tool));
+                Ok(())
+            });
+    }
+
+    /// Move `node` to `dir`: its commands, the system prompt's working directory, the saved
+    /// state and the UI.
+    fn move_to(&self, node: &Node, agent: &Agent, dir: PathBuf) {
+        let from = node.workdir.get();
+        node.workdir.set(dir.clone());
+        if let Some(prompt) = agent.system_prompt() {
+            agent.set_system_prompt(Some(crate::workdir::moved_prompt(prompt, &from, &dir)));
+        }
+        self.persist();
+        self.emit(SwarmEvent::Moved {
+            id: node.id.clone(),
+            cwd: dir,
+        });
+    }
+
     pub(super) fn instructions(&self, node: &Node, goal: Option<&str>) -> String {
         let who = format!("agent {} (\"{}\")", node.id, node.name);
         let reports_to = match node.parent.as_str() {
@@ -400,7 +444,7 @@ impl Swarm {
              `edit`, then the test that needs it); MCP tools, `web_fetch` and `skills` start at once.\n\
              Messages from other agents reach you as `<message from=\"...\">` blocks, either appended to a \
              tool result or as a new turn. Your final reply at the end of each turn is delivered to {reports_to}.{silent}",
-            node.cwd.display()
+            node.workdir.get().display()
         );
         match goal {
             Some(goal) => format!(

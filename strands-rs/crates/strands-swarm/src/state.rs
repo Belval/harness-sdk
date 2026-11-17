@@ -59,8 +59,11 @@ pub struct AgentState {
     pub name: Option<String>,
     /// Parent id.
     pub parent: String,
-    /// Working directory.
+    /// Where it was started: its worktree, if it has one.
     pub cwd: PathBuf,
+    /// Where a lone `cd` moved it, if it did ([`crate::workdir`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<PathBuf>,
     /// Own branch.
     pub branch: Option<String>,
     /// Initial task.

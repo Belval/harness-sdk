@@ -758,6 +758,7 @@ mod tests {
             name: None,
             parent: crate::USER.into(),
             cwd: cwd.to_path_buf(),
+            workdir: None,
             branch: branch.map(str::to_owned),
             task: String::new(),
             model: None,

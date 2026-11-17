@@ -144,6 +144,7 @@ impl Journal {
                 ("tool_done", json!({"id": id, "tool": name, "ok": ok}))
             }
             SwarmEvent::Model { id, model } => ("model", json!({"id": id, "model": model})),
+            SwarmEvent::Moved { id, cwd } => ("moved", json!({"id": id, "cwd": cwd})),
             SwarmEvent::Budget { tokens } => ("budget", json!({"tokens": tokens})),
             SwarmEvent::Compacted { id, before, after } => {
                 ("compacted", json!({"id": id, "before": before, "after": after}))

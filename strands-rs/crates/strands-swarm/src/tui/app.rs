@@ -431,6 +431,7 @@ impl App {
             SwarmEvent::ToolFinished { id, name, ok } => self.with(&id, |view| view.finish_tool(&name, ok)),
             SwarmEvent::Mail { to, mail } => self.apply_mail(&to, mail),
             SwarmEvent::Model { id, model } => self.with(&id, |view| view.model = Some(model)),
+            SwarmEvent::Moved { id, cwd } => self.with(&id, |view| view.cwd = cwd),
             SwarmEvent::MailRead { id } => self.with(&id, AgentView::mark_read),
             SwarmEvent::Image { id, source, bytes } => {
                 let entry = self.image_entry(source, &bytes);

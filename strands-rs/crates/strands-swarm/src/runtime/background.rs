@@ -62,7 +62,7 @@ impl Swarm {
         let job = self
             .inner
             .jobs
-            .start(owner, name, command, &node.cwd, &node.env)
+            .start(owner, name, command, &node.workdir.get(), &node.env)
             .await?;
         self.journal_event(
             "job",

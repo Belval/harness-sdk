@@ -84,7 +84,14 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   as their final reply, which costs the parent a turn.
 - **Working directory.** An agent works where its spawner does unless `spawn_agent` gets a `cwd`
   (absolute or relative), e.g. another repository; with `worktree` the worktree is cut from the
-  repository there.
+  repository there. An agent moves itself with a `shell` call that is only `cd DIR` (one word or
+  quoted; relative, absolute or `~`): instead of running, it moves the agent's later `shell` and
+  `run_background` calls, the children it spawns without a `cwd`, the working directory its system
+  prompt and environment block (`AGENTS.md`, READMEs) name, and what `list_agents` and the TUI
+  show. The move is saved (`workdir` in `swarm.json`, `moved` in `events.jsonl`) and kept across
+  restarts. A `cd` to something that is not a directory runs as usual, so the shell reports it.
+  Where the agent started stays its home for worktree, branch and reclaim bookkeeping.
+  A move edits the system prompt, so the agent's next call writes its prompt cache anew.
 - **Goals.** A `goal` (`spawn_agent`, `/goal`, `--goal`) puts a judge in the loop that sends the
   agent back to work until the goal is met. It runs after every turn and sees the goal, the task
   and the latest ~40k characters of the conversation.

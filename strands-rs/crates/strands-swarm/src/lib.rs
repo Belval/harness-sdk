@@ -44,6 +44,7 @@ pub mod tools;
 pub mod tui;
 pub mod version;
 pub mod watchdog;
+pub mod workdir;
 pub mod worktree;
 
 pub use catalog::ToolCatalog;

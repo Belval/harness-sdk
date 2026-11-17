@@ -828,7 +828,7 @@ fn describe(swarm: &Swarm, info: &AgentInfo) -> String {
         info.id,
         info.status,
         swarm.label(&info.parent),
-        info.cwd.display()
+        info.workdir.display()
     )
 }
 

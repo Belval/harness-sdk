@@ -192,8 +192,10 @@ pub struct AgentSpec {
     pub id: String,
     /// Swarm-unique human-readable name, chosen by the spawner or derived from the task.
     pub name: String,
-    /// Working directory for shell commands and the environment context.
-    pub cwd: PathBuf,
+    /// Working directory for shell commands and the environment context, live: a lone `cd`
+    /// moves it, and a factory that runs commands in it ([`crate::workdir::WorkdirSandbox`])
+    /// follows.
+    pub workdir: crate::workdir::Workdir,
     /// Model override chosen by the spawner (`provider/name` or a Bedrock id).
     pub model: Option<String>,
     /// Swarm instructions to append to the agent's system prompt.
@@ -388,8 +390,10 @@ pub struct AgentInfo {
     pub name: String,
     /// Parent id ([`USER`] for the root).
     pub parent: String,
-    /// Working directory.
+    /// Where it was started: its worktree, if it has one.
     pub cwd: PathBuf,
+    /// Where it works now: `cwd` until a lone `cd` moved it.
+    pub workdir: PathBuf,
     /// Branch, when the agent has its own worktree.
     pub branch: Option<String>,
     /// Status.
@@ -458,6 +462,13 @@ pub enum SwarmEvent {
         to: String,
         /// The message.
         mail: Mail,
+    },
+    /// An agent moved to another working directory (a lone `cd`, [`crate::workdir`]).
+    Moved {
+        /// Id.
+        id: String,
+        /// The new working directory.
+        cwd: PathBuf,
     },
     /// An agent's model was set: at construction and on every [`Swarm::set_model`].
     Model {
@@ -604,7 +615,10 @@ struct Node {
     id: String,
     name: String,
     parent: String,
+    /// Where it was started: its worktree, if it has one.
     cwd: PathBuf,
+    /// Where it works now: `cwd` until a lone `cd` moves it ([`crate::workdir`]).
+    workdir: crate::workdir::Workdir,
     branch: Option<String>,
     status: Mutex<AgentStatus>,
     mailbox: Mutex<VecDeque<Mail>>,
@@ -680,6 +694,7 @@ impl Node {
             name: self.name.clone(),
             parent: self.parent.clone(),
             cwd: self.cwd.clone(),
+            workdir: self.workdir.get(),
             branch: self.branch.clone(),
             status,
             unread,
@@ -860,7 +875,7 @@ impl Swarm {
 
         let spawner_cwd = parent_node
             .as_ref()
-            .map_or_else(|| self.inner.config.cwd.clone(), |node| node.cwd.clone());
+            .map_or_else(|| self.inner.config.cwd.clone(), |node| node.workdir.get());
         let base_cwd = match &request.cwd {
             Some(dir) => {
                 // No trailing `/`, `.` or `..` in prompts and listings, and a worktree keeps the
@@ -902,6 +917,7 @@ impl Swarm {
                 id: id.clone(),
                 name: names::choose(request.name.as_deref(), &request.task, taken),
                 parent: parent.to_owned(),
+                workdir: crate::workdir::Workdir::new(&cwd),
                 cwd,
                 branch,
                 status: Mutex::new(match queued {
@@ -927,7 +943,7 @@ impl Swarm {
             parent: parent.to_owned(),
             name: node.name.clone(),
             task: request.task.clone(),
-            cwd: node.cwd.clone(),
+            cwd: node.workdir.get(),
             branch: node.branch.clone(),
         });
         if let (USER, Some(journal)) = (parent, &self.inner.journal) {
@@ -1221,7 +1237,7 @@ impl Swarm {
 }
 
 /// `path` without `.` and with each `..` taking the component before it off, as text.
-fn lexically_normal(path: &Path) -> PathBuf {
+pub(crate) fn lexically_normal(path: &Path) -> PathBuf {
     let mut normal = PathBuf::new();
     for part in path.components() {
         match part {

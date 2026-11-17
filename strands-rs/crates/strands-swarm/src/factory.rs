@@ -11,7 +11,6 @@ use strands_agents::context_manager::{
     ContextManagerConfig, ContextManagerOption, StashConfig, StashOption, AGENTIC_TRUNCATE_THRESHOLD,
 };
 use strands_agents::plugins::vended::{GoalLoop, JudgeConfig, Skill};
-use strands_agents::sandbox::LocalSandbox;
 use strands_agents::session::{SaveLatestStrategy, SessionManagerOptions};
 use strands_agents::storage::{namespace, LocalFileStorage};
 use strands_agents::tools::{OrderedToolExecutor, Tool, ToolContext, ToolRef};
@@ -21,8 +20,8 @@ use strands_agents::{Agent, FileStorage, Result, SessionManager};
 use strands_harness::defaults::{DEFAULT_BUILTIN_TOOLS, DEFAULT_MODEL};
 use strands_harness::{
     create_harness, resolve_model, AwsSettings, BackgroundTasksOption, BuiltinToolsConfig, Effort,
-    EnvironmentContext, EnvironmentContextConfig, HarnessAgentOptions, MemoryOption, ModelOption,
-    ResolveModelOptions, SandboxOption, SessionOption, SkillsOption,
+    HarnessAgentOptions, MemoryOption, ModelOption, ResolveModelOptions, SandboxOption, SessionOption,
+    SkillsOption,
 };
 
 use crate::catalog::ToolCatalog;
@@ -165,10 +164,11 @@ const READ_DESCRIPTION: &str = concat!(
 const WRITE_DESCRIPTION: &str = "Write a file, creating it or overwriting it.";
 
 /// `shell`'s description for the text [`crate::shell_text::ShellText`] makes of its result (the
-/// SDK's describes its JSON fields).
+/// SDK's describes its JSON fields), and for a lone `cd` ([`crate::workdir`]).
 const SHELL_DESCRIPTION: &str = concat!(
-    "Run a command with `sh -c` in a fresh process, so variables and `cd` do not carry over to the ",
-    "next call. Returns stdout, then `[stderr]` and stderr, then `[exit code N]` unless it is 0."
+    "Run a command with `sh -c` in a fresh process, so variables and `cd` do not carry over; a lone ",
+    "`cd DIR` moves your working directory. Returns stdout, then `[stderr]` and stderr, then ",
+    "`[exit code N]` unless it is 0."
 );
 
 /// `web_fetch`'s description without the harness's walk through how it works.
@@ -351,10 +351,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         .iter()
         .copied()
         .filter(|name| !EXCLUDED_BUILTINS.contains(name));
-    let environment = EnvironmentContext::new(EnvironmentContextConfig {
-        name: None,
-        root: Some(spec.cwd.clone()),
-    });
+    let environment = crate::workdir::Environment::new(spec.workdir.clone()).injector();
     let mut plugins: Vec<Arc<dyn Plugin>> =
         vec![Arc::new(environment), Arc::new(crate::shell_text::ShellText)];
     if let Some(goal) = &spec.goal {
@@ -363,10 +360,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
             GoalLoop::goal(goal.clone()).with_judge(judge),
         )));
     }
-    let mut sandbox = LocalSandbox::with_base_dir(spec.cwd);
-    if !spec.env.is_empty() {
-        sandbox = sandbox.with_env(spec.env.into_iter().collect());
-    }
+    let sandbox = crate::workdir::WorkdirSandbox::new(spec.workdir, spec.env.into_iter().collect());
     let compact_at = spec.compact_at.or(options.compact_at);
     let control = ContextControl::new(compact_at);
     let mut tools = spec.tools;
@@ -421,8 +415,12 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
 mod prefix_tests;
 
 #[cfg(test)]
+mod workdir_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workdir::Workdir;
     use strands_agents::context_manager::ContextManager;
     use strands_agents::testing::{MockMessageModel, MockResponse};
     use strands_agents::types::{
@@ -588,7 +586,7 @@ mod tests {
         AgentSpec {
             id: "a1".into(),
             name: "t".into(),
-            cwd: std::env::temp_dir(),
+            workdir: Workdir::new(std::env::temp_dir()),
             model: None,
             instructions: String::new(),
             tools: Vec::new(),
@@ -771,7 +769,7 @@ mod tests {
         batch.extend(probed.map(|name| tool_call(name, name, serde_json::json!({}))));
         batch.push(tool_call("read", "read", serde_json::json!({ "path": file })));
         let spec = AgentSpec {
-            cwd: dir.path().to_owned(),
+            workdir: Workdir::new(dir.path()),
             tools: probed.map(probe).into(),
             ..spec()
         };
@@ -907,7 +905,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
         let spec = AgentSpec {
-            cwd: cwd.clone(),
+            workdir: Workdir::new(&cwd),
             ..spec()
         };
         let pwd = tool_call("shell", "s1", serde_json::json!({ "command": "pwd" }));
@@ -958,7 +956,7 @@ mod tests {
     async fn a_cancelled_shell_call_keeps_its_partial_output_as_plain_text() {
         let dir = tempfile::tempdir().unwrap();
         let spec = AgentSpec {
-            cwd: dir.path().to_path_buf(),
+            workdir: Workdir::new(dir.path()),
             ..spec()
         };
         let options = HarnessFactoryOptions::default();

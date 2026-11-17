@@ -118,6 +118,7 @@ impl Swarm {
             id: saved.id.clone(),
             name: names::choose(saved.name.as_deref(), &saved.task, taken),
             parent: saved.parent,
+            workdir: crate::workdir::Workdir::new(saved.workdir.as_ref().unwrap_or(&saved.cwd)),
             cwd: saved.cwd,
             branch: saved.branch,
             status: Mutex::new(status.clone()),
@@ -149,7 +150,7 @@ impl Swarm {
             parent: node.parent.clone(),
             name: node.name.clone(),
             task: node.task.clone(),
-            cwd: node.cwd.clone(),
+            cwd: node.workdir.get(),
             branch: node.branch.clone(),
         });
         let _ = self.inner.events.send(SwarmEvent::Status {
@@ -406,6 +407,7 @@ pub(super) fn node_state(node: &Node) -> AgentState {
         name: Some(node.name.clone()),
         parent: node.parent.clone(),
         cwd: node.cwd.clone(),
+        workdir: Some(node.workdir.get()).filter(|dir| *dir != node.cwd),
         branch: node.branch.clone(),
         task: node.task.clone(),
         model,
