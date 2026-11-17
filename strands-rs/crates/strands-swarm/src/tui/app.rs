@@ -487,11 +487,16 @@ impl App {
             .unwrap_or_else(|| self.selected.min(tree.len().saturating_sub(1)));
     }
 
-    /// Id of the selected agent.
-    pub fn selected_id(&self) -> Option<String> {
+    /// The selected agent.
+    pub fn selected_view(&self) -> Option<&AgentView> {
         let tree = self.tree();
         let index = self.selected.min(tree.len().saturating_sub(1));
-        tree.get(index).map(|(_, view)| view.id.clone())
+        tree.get(index).map(|(_, view)| *view)
+    }
+
+    /// Id of the selected agent.
+    pub fn selected_id(&self) -> Option<String> {
+        self.selected_view().map(|view| view.id.clone())
     }
 
     /// Move the selection by `delta` rows, clamped.

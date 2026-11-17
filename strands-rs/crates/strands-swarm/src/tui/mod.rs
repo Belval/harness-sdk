@@ -136,8 +136,7 @@ pub async fn run(
 fn enter_plain(app: &App) -> std::io::Result<()> {
     use std::io::Write;
     let text = app
-        .selected_id()
-        .and_then(|id| app.agents.get(&id))
+        .selected_view()
         .map_or_else(|| "(no agent selected)\n".to_owned(), view::plain_log);
     let mut out = std::io::stdout();
     set_mouse_capture(false);
@@ -331,7 +330,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
         KeyCode::Enter if !app.input_is_command() && app.complete() => {}
         KeyCode::Enter => {
             let line = app.take_input();
-            return parse_command(&line, app.selected_id().is_some());
+            return parse_command(&line, app.selected_view().is_some());
         }
         _ => {}
     }

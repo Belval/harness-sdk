@@ -197,7 +197,7 @@ fn draw_agents(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
                 .title(" agents "),
         )
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default().with_selected(app.selected_id().map(|_| app.selected));
+    let mut state = ListState::default().with_selected(app.selected_view().map(|_| app.selected));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -333,8 +333,7 @@ fn status_glyph(status: &AgentStatus, tick: usize) -> (&'static str, Color) {
 }
 
 fn draw_log(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
-    let selected = app.selected_id().and_then(|id| app.agents.get(&id));
-    let Some(view) = selected else {
+    let Some(view) = app.selected_view() else {
         let hint = Paragraph::new("Type a task below and press enter to start the root agent.")
             .block(Block::default().borders(Borders::TOP).title(" log "));
         frame.render_widget(hint, area);
@@ -422,7 +421,7 @@ fn draw_thumbnails(
 pub fn log_text(app: &App, area: Rect) -> ratatui::buffer::Buffer {
     let log = areas(app, area).log;
     let mut buffer = ratatui::buffer::Buffer::empty(area);
-    if let Some(view) = app.selected_id().and_then(|id| app.agents.get(&id)) {
+    if let Some(view) = app.selected_view() {
         let (lines, _) = log_lines(view, app, 0);
         let (paragraph, _) = log_paragraph(app, view, lines, log);
         ratatui::widgets::Widget::render(paragraph, log, &mut buffer);
@@ -485,7 +484,7 @@ fn log_offset(app: &App, rows: usize, height: u16) -> u16 {
 /// For each row of the log's text area `inner`: whether it continues the row above (a wrapped
 /// line), so a copied selection can rejoin it.
 pub fn log_continuations(app: &App, inner: Rect) -> Vec<bool> {
-    let Some(view) = app.selected_id().and_then(|id| app.agents.get(&id)) else {
+    let Some(view) = app.selected_view() else {
         return Vec::new();
     };
     let mut rows = Vec::new();
@@ -709,13 +708,10 @@ fn block_lines(heading: &str, body: &str, color: Color) -> Vec<Line<'static>> {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let target = app
-        .selected_id()
-        .and_then(|id| app.agents.get(&id).map(AgentView::label))
-        .map_or_else(
-            || " new root task ".to_owned(),
-            |label| format!(" message → {label} "),
-        );
+    let target = app.selected_view().map(AgentView::label).map_or_else(
+        || " new root task ".to_owned(),
+        |label| format!(" message → {label} "),
+    );
     // Scroll so the cursor stays in view, both down a long message and along a long line.
     let (line, col) = app.cursor_line_col();
     let rows = usize::from(area.height.saturating_sub(1)).max(1);
