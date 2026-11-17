@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
 use crate::sandbox::{ExecuteOptions, LocalSandbox, Sandbox, SandboxError, SandboxRef};
@@ -27,6 +28,13 @@ pub const SANDBOX_SHELL_DESCRIPTION: &str = "Executes shell commands and returns
 
 /// Exit code reported for a command killed by its timeout (the `timeout(1)` convention).
 const TIMEOUT_EXIT_CODE: i32 = 124;
+
+/// Exit code reported for a command killed because its call was cancelled (`128 + SIGKILL`).
+const CANCELLED_EXIT_CODE: i32 = 137;
+
+/// How long a cancelled call waits for the sandbox to kill the command and hand back its output
+/// before it gives up on the output.
+const CANCEL_GRACE: Duration = Duration::from_secs(1);
 
 /// Result of a shell command (`ShellOutput` in TS).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +61,15 @@ pub enum ShellError {
         /// Timeout in seconds, as requested.
         seconds: f64,
         /// Output captured before the command was killed, with `exit_code` 124.
+        partial: ShellOutput,
+    },
+    /// The call was cancelled and the command killed (Rust-only). Like [`ShellError::Timeout`],
+    /// the message carries the output captured before the kill on a second line.
+    #[error("Execution cancelled after {seconds:.1} seconds\n{}", serde_json::to_string(partial).unwrap_or_default())]
+    Cancelled {
+        /// How long the command had run.
+        seconds: f64,
+        /// Output captured before the command was killed, with `exit_code` 137.
         partial: ShellOutput,
     },
     /// The command could not be spawned or its output could not be read
@@ -165,11 +182,24 @@ impl ShellTool {
         command: &str,
         timeout: Option<f64>,
     ) -> std::result::Result<ShellOutput, ShellError> {
+        self.run_in(sandbox, command, timeout, None).await
+    }
+
+    /// [`Self::execute_in`], killing the command once `cancel` fires.
+    async fn run_in(
+        &self,
+        sandbox: &dyn Sandbox,
+        command: &str,
+        timeout: Option<f64>,
+        cancel: Option<CancellationToken>,
+    ) -> std::result::Result<ShellOutput, ShellError> {
         let seconds = timeout.unwrap_or(self.config.timeout.as_secs_f64());
         let options = ExecuteOptions {
             timeout: Some(Duration::from_secs_f64(seconds)),
+            cancel,
             ..ExecuteOptions::default()
         };
+        let started = std::time::Instant::now();
         match sandbox.execute(command, options).await {
             Ok(result) => Ok(ShellOutput {
                 output: result.stdout,
@@ -186,6 +216,14 @@ impl ShellTool {
                     output: stdout,
                     error: stderr,
                     exit_code: TIMEOUT_EXIT_CODE,
+                },
+            }),
+            Err(SandboxError::Aborted { stdout, stderr }) => Err(ShellError::Cancelled {
+                seconds: started.elapsed().as_secs_f64(),
+                partial: ShellOutput {
+                    output: stdout,
+                    error: stderr,
+                    exit_code: CANCELLED_EXIT_CODE,
                 },
             }),
             Err(error) => Err(ShellError::Execution(error.to_string())),
@@ -246,11 +284,25 @@ impl Tool for ShellTool {
                 Err(_) => self.fallback_sandbox(),
             },
         };
-        let run = self.execute_in(sandbox.as_ref(), &input.command, input.timeout);
+        if ctx.cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        // The sandbox kills the command when the call is cancelled and returns what it had
+        // written; one that does not within CANCEL_GRACE is dropped, and the output with it.
+        let run = self.run_in(
+            sandbox.as_ref(),
+            &input.command,
+            input.timeout,
+            Some(ctx.cancel.clone()),
+        );
+        tokio::pin!(run);
         let outcome = tokio::select! {
             biased;
-            () = ctx.cancel.cancelled() => return Err(Error::Cancelled),
-            outcome = run => outcome,
+            outcome = &mut run => outcome,
+            () = ctx.cancel.cancelled() => match tokio::time::timeout(CANCEL_GRACE, &mut run).await {
+                Ok(outcome) => outcome,
+                Err(_) => return Err(Error::Cancelled),
+            },
         };
 
         match outcome {
@@ -315,20 +367,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cancelled_call_kills_the_whole_process_group() {
-        let context = ctx(serde_json::json!({ "command": "sleep 4 & sleep 10" }));
+    async fn a_cancelled_call_kills_the_whole_process_group_and_keeps_its_output() {
+        let context = ctx(serde_json::json!({ "command": "echo partial; sleep 4 & sleep 10" }));
         let cancel = context.cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             cancel.cancel();
         });
         let started = std::time::Instant::now();
-        let error = ShellTool::new().invoke(context).await.unwrap_err();
+        let result = ShellTool::new().invoke(context).await.unwrap();
         let elapsed = started.elapsed();
-        assert!(matches!(error, Error::Cancelled), "{error}");
         assert!(
             elapsed < Duration::from_secs(2),
             "the cancelled call waited for the process tree: {elapsed:?}"
+        );
+        assert_eq!(result.status, ToolResultStatus::Error);
+        let text = result.text();
+        let (first, second) = text.split_once('\n').unwrap();
+        assert!(
+            first.starts_with("Error: Execution cancelled after 0."),
+            "{first}"
+        );
+        assert!(first.ends_with(" seconds"), "{first}");
+        assert_eq!(
+            serde_json::from_str::<ShellOutput>(second).unwrap(),
+            ShellOutput {
+                output: "partial\n".to_owned(),
+                error: String::new(),
+                exit_code: CANCELLED_EXIT_CODE,
+            }
         );
     }
 

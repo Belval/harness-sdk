@@ -147,7 +147,10 @@ fn launch(
         .as_ref()
         .is_some_and(|cancel| cancel.is_cancelled())
     {
-        return Err(SandboxError::Aborted);
+        return Err(SandboxError::Aborted {
+            stdout: String::new(),
+            stderr: String::new(),
+        });
     }
 
     let mut cmd = Command::new(&spawn.program);
@@ -236,7 +239,10 @@ async fn drive(running: Running, options: &ExecuteOptions) -> SandboxResult<Exec
         () = cancelled => {
             kill_group(pid);
             let _ = child.kill().await;
-            Err(SandboxError::Aborted)
+            Err(SandboxError::Aborted {
+                stdout: stdout.read(DRAIN_GRACE).await,
+                stderr: stderr.read(DRAIN_GRACE).await,
+            })
         }
         status = waited => match status {
             Ok(status) => {
@@ -545,6 +551,6 @@ mod tests {
         .collect()
         .await;
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Err(SandboxError::Aborted)));
+        assert!(matches!(events[0], Err(SandboxError::Aborted { .. })));
     }
 }

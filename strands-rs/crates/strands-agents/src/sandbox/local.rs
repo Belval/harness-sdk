@@ -315,7 +315,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, SandboxError::Aborted), "{error}");
+        assert!(matches!(error, SandboxError::Aborted { .. }), "{error}");
     }
 
     #[tokio::test]
@@ -329,7 +329,7 @@ mod tests {
         let started = std::time::Instant::now();
         let error = LocalSandbox::new()
             .execute(
-                "sleep 4 & sleep 10",
+                "echo early; echo warn >&2; sleep 4 & sleep 10",
                 ExecuteOptions {
                     cancel: Some(cancel),
                     ..ExecuteOptions::default()
@@ -337,8 +337,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, SandboxError::Aborted), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
+        match error {
+            SandboxError::Aborted { stdout, stderr } => {
+                assert_eq!((stdout.as_str(), stderr.as_str()), ("early\n", "warn\n"));
+            }
+            other => panic!("expected an abort, got {other}"),
+        }
     }
 
     #[tokio::test]

@@ -133,9 +133,15 @@ pub enum SandboxError {
         /// Standard error captured before the kill.
         stderr: String,
     },
-    /// The execution was cancelled (`SandboxAbortError`).
+    /// The execution was cancelled (`SandboxAbortError`), carrying the output captured before
+    /// the kill (Rust-only; empty when the command never started).
     #[error("Execution aborted")]
-    Aborted,
+    Aborted {
+        /// Standard output captured before the kill.
+        stdout: String,
+        /// Standard error captured before the kill.
+        stderr: String,
+    },
     /// A file or directory does not exist (`SandboxPathNotFoundError`).
     #[error("Path not found: {0}")]
     PathNotFound(String),
@@ -394,7 +400,14 @@ mod tests {
             stderr: String::new(),
         };
         assert_eq!(error.to_string(), "Execution timed out after 1.5 seconds");
-        assert_eq!(SandboxError::Aborted.to_string(), "Execution aborted");
+        assert_eq!(
+            SandboxError::Aborted {
+                stdout: String::new(),
+                stderr: String::new()
+            }
+            .to_string(),
+            "Execution aborted"
+        );
         assert_eq!(
             SandboxError::PathNotFound("/x".to_owned()).to_string(),
             "Path not found: /x"
