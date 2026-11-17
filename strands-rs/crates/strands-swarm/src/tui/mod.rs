@@ -398,7 +398,7 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
         (Command::Budget(None), _) => Ok(budget_notice(swarm)),
         (Command::Budget(Some(tokens)), _) => match tokens.as_str() {
             "off" | "none" => Ok(None),
-            tokens => crate::budget::parse_tokens(tokens).map(Some),
+            tokens => crate::text::parse_tokens(tokens).map(Some),
         }
         .map(|tokens| {
             swarm.set_budget(tokens);
@@ -473,9 +473,9 @@ fn max_agents_notice(swarm: &Swarm) -> String {
 }
 
 fn budget_notice(swarm: &Swarm) -> String {
-    let used = crate::budget::compact(swarm.tokens_used());
+    let used = crate::text::compact(swarm.tokens_used());
     match swarm.budget() {
-        Some(budget) => format!("{used} of {} tokens used", crate::budget::compact(budget)),
+        Some(budget) => format!("{used} of {} tokens used", crate::text::compact(budget)),
         None => format!("{used} tokens used, no budget"),
     }
 }

@@ -619,7 +619,7 @@ fn list_agents(swarm: &Swarm, include_cancelled: bool, jobs: &[Job]) -> String {
     lines.push(format!(
         "Swarm total: est. {} / {} tokens (estimates from list prices).",
         cost.total().render(),
-        crate::budget::compact(tokens)
+        crate::text::compact(tokens)
     ));
     lines.join("\n")
 }

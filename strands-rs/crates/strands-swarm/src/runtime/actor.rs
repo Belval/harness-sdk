@@ -410,9 +410,5 @@ pub(crate) fn summarize_input(input: &serde_json::Value) -> String {
         .iter()
         .find_map(|key| input.get(*key).and_then(|v| v.as_str()).map(str::to_owned))
         .unwrap_or_else(|| input.to_string());
-    let line = text.lines().next().unwrap_or_default();
-    match line.chars().count() > 120 {
-        true => format!("{}…", line.chars().take(120).collect::<String>()),
-        false => line.to_owned(),
-    }
+    crate::text::clip(text.lines().next().unwrap_or_default(), 120)
 }

@@ -1,4 +1,4 @@
-//! Token budget helpers: parsing and formatting token counts for `--budget-tokens` and `/budget`.
+//! Small text helpers: token counts parsed and shown compactly, and clipping to a few chars.
 
 /// Parse a token count: `500000`, `500k`, `2.5M`, `1G` (case-insensitive, `_` allowed).
 pub fn parse_tokens(text: &str) -> Result<u64, String> {
@@ -24,15 +24,12 @@ pub fn compact(n: u64) -> String {
     }
 }
 
-/// The error a model call fails with once the budget is spent.
-pub fn exhausted_message(used: u64, budget: u64) -> String {
-    format!(
-        "Token budget exhausted: the swarm has used {} of {} tokens, so no further model calls run. \
-         Report this to whoever is waiting on you; you will be told when the user raises the budget \
-         (TUI `/budget N`).",
-        compact(used),
-        compact(budget)
-    )
+/// `text` cut to its first `max` chars, with "…" appended when that dropped anything.
+pub fn clip(text: &str, max: usize) -> String {
+    match text.chars().count() > max {
+        true => text.chars().take(max).chain(['…']).collect(),
+        false => text.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -56,5 +53,11 @@ mod tests {
         assert_eq!(compact(950), "950");
         assert_eq!(compact(12_345), "12.3k");
         assert_eq!(compact(4_500_000), "4.5M");
+    }
+
+    #[test]
+    fn clips_to_a_char_count_marking_the_cut() {
+        assert_eq!(clip("short", 5), "short");
+        assert_eq!(clip("élan vital", 4), "élan…");
     }
 }

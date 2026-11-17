@@ -438,18 +438,18 @@ impl CostReport {
             let stats = agent.ledger.call_stats().map_or_else(String::new, |stats| {
                 format!(
                     "{}/call {:.0}%",
-                    crate::budget::compact(stats.median_input),
+                    crate::text::compact(stats.median_input),
                     stats.cache_hit * 100.0
                 )
             });
             let model = agent.main_model().map(short_model).unwrap_or("-");
             lines.push(row([
-                &truncate(&agent.label, 24),
-                &truncate(model, 22),
-                &crate::budget::compact(t.input),
-                &crate::budget::compact(t.output),
-                &crate::budget::compact(t.cache_read),
-                &crate::budget::compact(t.cache_write),
+                &crate::text::clip(&agent.label, 23),
+                &crate::text::clip(model, 21),
+                &crate::text::compact(t.input),
+                &crate::text::compact(t.output),
+                &crate::text::compact(t.cache_read),
+                &crate::text::compact(t.cache_write),
                 &agent.estimate(&self.prices).render(),
                 &stats,
             ]));
@@ -457,10 +457,10 @@ impl CostReport {
         lines.push(row([
             "total",
             "",
-            &crate::budget::compact(sum.input),
-            &crate::budget::compact(sum.output),
-            &crate::budget::compact(sum.cache_read),
-            &crate::budget::compact(sum.cache_write),
+            &crate::text::compact(sum.input),
+            &crate::text::compact(sum.output),
+            &crate::text::compact(sum.cache_read),
+            &crate::text::compact(sum.cache_write),
             &self.total().render(),
             "",
         ]));
@@ -495,7 +495,7 @@ impl Spend {
         let own = format!(
             "est. {} / {} tokens",
             self.own.render(),
-            crate::budget::compact(self.own_tokens)
+            crate::text::compact(self.own_tokens)
         );
         match self.descendants {
             0 => own,
@@ -503,7 +503,7 @@ impl Spend {
                 "{own} (with {n} descendant{} {} / {})",
                 if n == 1 { "" } else { "s" },
                 self.subtree.render(),
-                crate::budget::compact(self.subtree_tokens)
+                crate::text::compact(self.subtree_tokens)
             ),
         }
     }
@@ -513,13 +513,6 @@ impl Spend {
 pub fn short_model(model: &str) -> &str {
     let model = model.rsplit('/').next().unwrap_or(model);
     model.rsplit_once("anthropic.").map_or(model, |(_, rest)| rest)
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    match text.chars().count() > max {
-        true => text.chars().take(max - 1).chain(['…']).collect(),
-        false => text.to_owned(),
-    }
 }
 
 #[cfg(test)]

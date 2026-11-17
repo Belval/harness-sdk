@@ -384,10 +384,7 @@ fn preview(text: &str) -> String {
         .find(|l| !l.trim().is_empty())
         .unwrap_or_default()
         .trim();
-    match line.chars().count() > 60 {
-        true => format!("{}…", line.chars().take(60).collect::<String>()),
-        false => line.to_owned(),
-    }
+    crate::text::clip(line, 60)
 }
 
 fn age(calls: usize) -> String {

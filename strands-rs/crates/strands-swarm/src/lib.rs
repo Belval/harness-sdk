@@ -13,7 +13,6 @@
 //! The runtime enforces only resource limits (live agent count) and cancellation, which cascades
 //! down the spawn tree.
 
-pub mod budget;
 pub mod catalog;
 pub mod compaction;
 pub mod cost;
@@ -35,6 +34,7 @@ pub mod selftest;
 pub mod skills;
 pub mod state;
 pub mod status;
+pub mod text;
 pub mod tools;
 pub mod tui;
 pub mod version;

@@ -24,7 +24,6 @@ use strands_agents::{Agent, Error, Model, Result};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::budget;
 use crate::gc::{self, Collected};
 use crate::images;
 use crate::jobs::{self, Job, Jobs};

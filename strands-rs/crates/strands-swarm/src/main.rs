@@ -69,11 +69,11 @@ struct Cli {
     land: Option<PathBuf>,
     /// Swarm-wide token budget (input + output, e.g. `5M`); once spent, model calls stop until it
     /// is raised (TUI `/budget N`). A resumed run keeps its last budget.
-    #[arg(long, value_parser = strands_swarm::budget::parse_tokens)]
+    #[arg(long, value_parser = strands_swarm::text::parse_tokens)]
     budget_tokens: Option<u64>,
     /// Summarize an agent's older turns once a call's input reaches this many tokens (e.g. `200k`,
     /// `1.5M`), or 85% of the model's window if that is smaller.
-    #[arg(long, value_parser = strands_swarm::budget::parse_tokens, default_value = "200k")]
+    #[arg(long, value_parser = strands_swarm::text::parse_tokens, default_value = "200k")]
     compact_at: u64,
     /// File with extra instructions given to every agent.
     #[arg(long)]

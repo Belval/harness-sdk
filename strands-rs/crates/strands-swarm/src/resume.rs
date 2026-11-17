@@ -60,10 +60,7 @@ pub fn notice(in_flight: &[ToolUseBlock], cwd: &Path, git_status: Option<&str>) 
     } else {
         text.push_str("\nInterrupted before finishing (any effects may be partial):");
         for call in in_flight {
-            let mut input = call.input.to_string();
-            if input.chars().count() > INPUT_CHARS {
-                input = input.chars().take(INPUT_CHARS).collect::<String>() + "…";
-            }
+            let input = crate::text::clip(&call.input.to_string(), INPUT_CHARS);
             text.push_str(&format!("\n- {} {input}", call.name));
         }
     }

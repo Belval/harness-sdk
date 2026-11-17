@@ -9,6 +9,7 @@ use ratatui::Frame;
 use super::app::{AgentView, App, LogEntry};
 use super::select::{self, Pane};
 use crate::runtime::{AgentStatus, USER};
+use crate::text::compact;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Narrowest agent tree; shrinking it further hides it.
@@ -672,14 +673,6 @@ fn draw_completions(frame: &mut Frame, input: Rect, app: &App) {
     let mut state = ListState::default().with_selected(Some(app.completion.min(completions.len() - 1)));
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(list, area, &mut state);
-}
-
-fn compact(n: u64) -> String {
-    match n {
-        0..=999 => n.to_string(),
-        1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
-        _ => format!("{:.1}M", n as f64 / 1e6),
-    }
 }
 
 #[cfg(test)]

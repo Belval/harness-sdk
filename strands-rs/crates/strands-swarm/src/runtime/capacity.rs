@@ -70,7 +70,7 @@ impl Swarm {
         let stopped: Vec<String> = std::mem::take(&mut *self.inner.over_budget.lock());
         let limit = tokens.map_or_else(
             || "lifted".to_owned(),
-            |t| format!("raised to {}", budget::compact(t)),
+            |t| format!("raised to {}", crate::text::compact(t)),
         );
         for id in stopped {
             let note = format!("[The token budget was {limit}. Continue where you left off.]");
@@ -105,7 +105,15 @@ impl Swarm {
     pub(super) fn budget_exhausted(&self) -> Option<String> {
         let budget = self.budget()?;
         let used = self.tokens_used();
-        (used >= budget).then(|| budget::exhausted_message(used, budget))
+        (used >= budget).then(|| {
+            format!(
+                "Token budget exhausted: the swarm has used {} of {} tokens, so no further model \
+                 calls run. Report this to whoever is waiting on you; you will be told when the user \
+                 raises the budget (TUI `/budget N`).",
+                crate::text::compact(used),
+                crate::text::compact(budget)
+            )
+        })
     }
 
     /// Gate every model call: refuse it once the token budget is spent, and hold a swarm-wide
