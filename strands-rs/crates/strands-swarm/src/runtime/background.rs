@@ -56,9 +56,11 @@ impl Swarm {
 
     /// Start `command` as a background job of agent `owner`: in its working directory and
     /// environment, detached from this process so a restart does not stop it. When it ends, the
-    /// owner gets a `job` message with its exit code and the tail of its output.
+    /// owner gets a `job` message with its exit code and the tail of its output. Waits first
+    /// while the host is overloaded ([`Swarm::host_busy`]).
     pub async fn start_job(&self, owner: &str, command: &str, name: Option<String>) -> Result<Job> {
         let node = self.known(owner)?;
+        self.wait_for_host(owner, &node.turn_token()).await?;
         let job = self
             .inner
             .jobs

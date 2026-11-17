@@ -153,6 +153,7 @@ impl Journal {
                 "compact_failed",
                 json!({"id": id, "tokens": tokens, "error": error}),
             ),
+            SwarmEvent::HostHeld { id, reason } => ("host_held", json!({"id": id, "reason": reason})),
             SwarmEvent::Reloaded { from, to, changes } => {
                 ("changes", json!({"from": from, "to": to, "commits": changes}))
             }

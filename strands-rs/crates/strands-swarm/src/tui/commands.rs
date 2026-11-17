@@ -44,6 +44,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "show or change how many model calls may run at once (0: no limit)",
     },
     SlashCommand {
+        name: "/max-load",
+        args: "[N|off|default]",
+        help: "show or change the host load above which new model calls and jobs wait",
+    },
+    SlashCommand {
         name: "/budget",
         args: "[N|off]",
         help: "show, set or remove the swarm-wide token budget",
@@ -130,6 +135,8 @@ pub enum Command {
     MaxAgents(Option<String>),
     /// `/max-calls [N|default]`: show or change the model-call limit (`0`: none).
     MaxCalls(Option<String>),
+    /// `/max-load [N|off|default]`: show or change the host load limit.
+    MaxLoad(Option<String>),
     /// Add to the user's memory, or show it (`None`).
     Remember(Option<String>),
     /// Drop memory lines containing the text.
@@ -193,6 +200,9 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     if let Some(limit) = line.strip_prefix("/max-calls ") {
         return Some(Command::MaxCalls(Some(limit.trim().to_owned())));
     }
+    if let Some(limit) = line.strip_prefix("/max-load ") {
+        return Some(Command::MaxLoad(Some(limit.trim().to_owned())));
+    }
     if let Some(budget) = line.strip_prefix("/budget ") {
         return Some(Command::Budget(Some(budget.trim().to_owned())));
     }
@@ -209,6 +219,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         "/budget" => return Some(Command::Budget(None)),
         "/max-agents" => return Some(Command::MaxAgents(None)),
         "/max-calls" => return Some(Command::MaxCalls(None)),
+        "/max-load" => return Some(Command::MaxLoad(None)),
         "/remember" => return Some(Command::Remember(None)),
         "/gc" => return Some(Command::Gc),
         "/schedules" => return Some(Command::Schedules),
@@ -292,6 +303,11 @@ mod tests {
                 who: "a10".into(),
                 text: String::new()
             })
+        );
+        assert_eq!(parse_command("/max-load", true), Some(Command::MaxLoad(None)));
+        assert_eq!(
+            parse_command("/max-load 96", true),
+            Some(Command::MaxLoad(Some("96".into())))
         );
         assert_eq!(parse_command("/gc", false), Some(Command::Gc));
         assert_eq!(parse_command("/schedules", false), Some(Command::Schedules));

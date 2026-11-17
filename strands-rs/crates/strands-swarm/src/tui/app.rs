@@ -154,6 +154,8 @@ pub struct AgentView {
     pub queued: Option<(usize, usize)>,
     /// Its next model call waits for a pending reload.
     pub held: bool,
+    /// Why it waits for the host ([`crate::Swarm::host_busy`]), while it does.
+    pub host_held: Option<String>,
 }
 
 impl AgentView {
@@ -192,6 +194,9 @@ impl AgentView {
             AgentStatus::Queued => return Some("queued until an agent slot frees…".to_owned()),
             AgentStatus::Starting => return Some("starting…".to_owned()),
             AgentStatus::Running if self.held => return Some("waiting for the reload…".to_owned()),
+            AgentStatus::Running if self.host_held.is_some() => {
+                return self.host_held.as_ref().map(|why| format!("waiting: {why}"));
+            }
             AgentStatus::Running if self.queued.is_some() => {
                 let (calls, limit) = self.queued.unwrap_or_default();
                 return Some(crate::text::queued_for_call(calls, limit));
@@ -212,7 +217,7 @@ impl AgentView {
         if self.status != AgentStatus::Running {
             return None;
         }
-        if self.queued.is_some() || self.held {
+        if self.queued.is_some() || self.held || self.host_held.is_some() {
             return Some(Waiting::Slot);
         }
         match self.latest() {
@@ -418,6 +423,7 @@ impl App {
                     unseen: true,
                     queued: None,
                     held: false,
+                    host_held: None,
                 };
                 self.agents.insert(id, view);
             }
@@ -447,6 +453,7 @@ impl App {
                 limit,
             } => self.with(&id, |view| view.queued = queued.then_some((calls, limit))),
             SwarmEvent::HeldForReload { id, held } => self.with(&id, |view| view.held = held),
+            SwarmEvent::HostHeld { id, reason } => self.with(&id, |view| view.host_held = reason),
             SwarmEvent::Budget { tokens } => self.budget = tokens,
             SwarmEvent::ReloadPending { tool_calls } => self.reload_pending = Some(tool_calls),
             SwarmEvent::Reloaded { from, to, changes } => {
@@ -1029,6 +1036,18 @@ mod tests {
         app.apply(held(false));
         assert_eq!(activity(&app).as_deref(), Some("thinking…"));
         assert_eq!(app.agents["a1"].waiting(), None);
+        let host = |reason: Option<&str>| SwarmEvent::HostHeld {
+            id: "a1".into(),
+            reason: reason.map(str::to_owned),
+        };
+        app.apply(host(Some("host load 180/128 (/max-load to change)")));
+        assert_eq!(
+            activity(&app).as_deref(),
+            Some("waiting: host load 180/128 (/max-load to change)")
+        );
+        assert_eq!(app.agents["a1"].waiting(), Some(Waiting::Slot));
+        app.apply(host(None));
+        assert_eq!(activity(&app).as_deref(), Some("thinking…"));
         app.apply(SwarmEvent::ToolStarted {
             id: "a1".into(),
             name: "wait".into(),

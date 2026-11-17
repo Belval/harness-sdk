@@ -62,6 +62,9 @@ impl Swarm {
             limits: Some(crate::status::Limits {
                 agents: (started, self.max_agents()),
                 calls: (self.calls_in_flight(), self.max_calls()),
+                load: Some(self.max_load())
+                    .filter(|max| *max > 0.0)
+                    .and_then(|max| Some((self.host()?.load, max))),
             }),
             base: cache.base,
             agents,

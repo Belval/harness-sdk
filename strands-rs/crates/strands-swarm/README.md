@@ -39,7 +39,8 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
               [--instructions FILE] [--memory FILE | --no-memory]
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
-              [--max-agents N] [--max-concurrent-calls N] [--budget-tokens N] [--compact-at TOKENS]
+              [--max-agents N] [--max-concurrent-calls N] [--max-load N] [--min-free-mem SIZE]
+              [--budget-tokens N] [--compact-at TOKENS]
               [--allow-land] [--land-into GLOB]... [--gate CMD]...
               [--notify] [--status-base BRANCH] [--prices FILE] [--min-free-disk SIZE] [--headless]
               [--journal | --gc | --cost] [TASK]
@@ -205,6 +206,20 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     tell a retry loop that went quiet from one that recovered without being woken on every retry.
     The judge sees only replies, not failed turns.
   - The next message picks up where the failed call stopped.
+- **Host load.** New work waits while the host is overloaded: its 1-minute load average is above
+  `--max-load N` (default twice the CPUs; `0` turns it off), or its available memory
+  (`MemAvailable`) is below `--min-free-mem SIZE` (default 5% of its memory, at most 8 GB; `0`
+  turns it off).
+  - What waits: a new model call (before it queues for a model slot), a background job's start
+    (`run_background`, land jobs too) and an agent's `spawn_agent`. Nothing already running is
+    held or slowed: a build in flight keeps going, and the user's own spawns are not held.
+  - A held agent says why, like a queued call: `waiting: host load 180/128 (/max-load to
+    change)` in its log line, `/status` and `list_agents`; `/status` starts with
+    `agents 3/100 · calls 8/8 · load 45/128`. Holds are logged as `host_held` in `events.jsonl`.
+  - The host is read from `/proc` at most once a second, and held callers look again each
+    second; off Linux nothing is held.
+  - `/max-load N` changes the limit for the running process, `/max-load off` lifts it and
+    `/max-load default` returns to the flag.
 - **Tokens.** `--budget-tokens N` (e.g. `5M`) caps the swarm's input + output tokens.
   - Once spent, model calls fail with a "budget exhausted" error that travels up to you.
     Each agent reports it once: mail that wakes it again (a schedule firing) is refused without
@@ -351,7 +366,7 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
 | `/cancel` | Stop the selected agent and its subtree for good. |
 | `/status` | Each live agent's state, activity, todos, unmerged commits and merge outlook, jobs and schedules, without a model call. |
 | `/cost` | Estimated spend (see [Cost](#cost)); its intro and footnote wrap, its table is clipped on narrow terminals. |
-| `/budget`, `/max-agents`, `/max-calls` | See [Limits](#limits). |
+| `/budget`, `/max-agents`, `/max-calls`, `/max-load` | See [Limits](#limits). |
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
 | `/schedules` | All schedules. |
 | `/gc` | Retry reclaiming the disk of cancelled worktree agents. |

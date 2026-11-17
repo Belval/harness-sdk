@@ -2807,6 +2807,91 @@ async fn model_calls_beyond_the_swarm_cap_queue() {
     assert!(queued >= 1, "no agent was queued");
 }
 
+/// Collect events until agent `id`'s host hold changes; the new reason.
+async fn host_held(events: &mut UnboundedReceiver<SwarmEvent>, id: &str) -> Option<String> {
+    let wait = async {
+        loop {
+            match events.recv().await.expect("event stream closed") {
+                SwarmEvent::HostHeld { id: held, reason } if held == id => return reason,
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap()
+}
+
+#[tokio::test]
+async fn an_overloaded_host_holds_new_model_calls_and_jobs_until_it_recovers() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let map = scripts_of(vec![("a1", vec![say("hi")])]);
+    let load = Arc::new(AtomicU64::new(50));
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.max_load = 10.0;
+    config.host_probe = {
+        let load = load.clone();
+        Arc::new(move || {
+            Some(strands_swarm::runtime::HostStats {
+                load: load.load(Ordering::SeqCst) as f64,
+                mem_available: 1 << 40,
+            })
+        })
+    };
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+
+    // The first model call waits, and says why.
+    let why = "host load 50/10 (/max-load to change)";
+    assert_eq!(host_held(&mut events, "a1").await.as_deref(), Some(why));
+    assert_eq!(swarm.waiting_for_call("a1"), Some(format!("waiting: {why}")));
+    let limits = swarm.status().limits.unwrap();
+    assert!(
+        limits.describe().ends_with(" · load 50/10"),
+        "{}",
+        limits.describe()
+    );
+
+    // A raised limit lets it through within a poll.
+    swarm.set_max_load(Some(100.0));
+    assert_eq!(host_held(&mut events, "a1").await, None);
+    assert_eq!(reply_to(&mut events, USER).await, "hi");
+
+    // Back at the flag's limit, a job waits to start until the load drops.
+    swarm.set_max_load(None);
+    let start = tokio::spawn({
+        let swarm = swarm.clone();
+        async move { swarm.start_job("a1", "true", None).await }
+    });
+    assert_eq!(host_held(&mut events, "a1").await.as_deref(), Some(why));
+    assert!(swarm.jobs().await.is_empty(), "no job starts while held");
+    load.store(5, Ordering::SeqCst);
+    assert_eq!(host_held(&mut events, "a1").await, None);
+    start.await.unwrap().unwrap();
+    assert_eq!(swarm.jobs().await.len(), 1);
+    assert_eq!(swarm.waiting_for_call("a1"), None);
+}
+
+#[tokio::test]
+async fn low_host_memory_holds_new_work_and_no_limit_holds_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let map = scripts_of(vec![]);
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.host_probe = Arc::new(|| {
+        Some(strands_swarm::runtime::HostStats {
+            load: 500.0,
+            mem_available: 1 << 30,
+        })
+    });
+    let (swarm, _events) = Swarm::new(config.clone());
+    assert_eq!(swarm.host_busy(), None, "off by default");
+    config.min_free_mem = 8 << 30;
+    let (swarm, _events) = Swarm::new(config);
+    assert_eq!(
+        swarm.host_busy().as_deref(),
+        Some("host memory 1.0 GB available, below 8.0 GB")
+    );
+}
+
 /// Delegates to a mock once the test hands out a permit of `gate`.
 struct GatedModel {
     inner: MockMessageModel,

@@ -55,6 +55,14 @@ struct Cli {
     /// Maximum number of model calls in flight across the swarm; more queue. 0 means no limit.
     #[arg(long, default_value_t = 32)]
     max_concurrent_calls: usize,
+    /// New model calls, background jobs and agents' spawns wait while the host's 1-minute load
+    /// average is above this (default: twice the CPUs; `0` turns it off; TUI `/max-load`).
+    #[arg(long, value_name = "LOAD")]
+    max_load: Option<f64>,
+    /// They also wait while the host's available memory is below this (e.g. `8G`; default 5% of
+    /// its memory, at most 8 GB; `0` turns it off).
+    #[arg(long, value_name = "SIZE", value_parser = strands_swarm::text::parse_bytes)]
+    min_free_mem: Option<u64>,
     /// Ring the terminal bell when an agent messages you (TUI only; tmux and most terminals turn
     /// it into a window flag or desktop notification).
     #[arg(long)]
@@ -360,6 +368,12 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.models = Some(models);
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
+    config.max_load = cli
+        .max_load
+        .unwrap_or_else(strands_swarm::runtime::default_max_load);
+    config.min_free_mem = cli
+        .min_free_mem
+        .unwrap_or_else(strands_swarm::runtime::default_min_free_mem);
     config.keep_warm = (!cli.no_keep_warm && cli.cache_ttl.as_deref() != Some("1h"))
         .then_some(strands_swarm::runtime::KEEP_WARM_EVERY);
     config.status_base = cli.status_base;
@@ -579,6 +593,10 @@ fn print_event(event: &SwarmEvent) {
         | SwarmEvent::ModelQueued { .. }
         | SwarmEvent::HeldForReload { .. }
         | SwarmEvent::History { .. } => {}
+        SwarmEvent::HostHeld { id, reason } => match reason {
+            Some(reason) => eprintln!("[{id}] waiting: {reason}"),
+            None => eprintln!("[{id}] no longer held by the host"),
+        },
         SwarmEvent::Reloaded { from, to, changes } => {
             eprintln!("{}", strands_swarm::version::notice(from, to, changes));
         }

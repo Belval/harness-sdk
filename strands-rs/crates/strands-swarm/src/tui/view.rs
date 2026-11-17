@@ -592,6 +592,13 @@ fn popup(app: &App, body: Rect) -> Option<Paragraph<'static>> {
     let (title, lines, wrap) = if let Some(report) = &app.status {
         let doing = |id: &str| {
             let view = app.agents.get(id)?;
+            if let Some(why) = view
+                .host_held
+                .as_ref()
+                .filter(|_| view.status == AgentStatus::Running)
+            {
+                return Some(format!("waiting: {why}"));
+            }
             let queued = view.queued.filter(|_| view.status == AgentStatus::Running);
             if let Some((calls, limit)) = queued {
                 return Some(crate::text::queued_for_call(calls, limit));

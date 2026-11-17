@@ -420,6 +420,21 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             swarm.set_max_calls(limit);
             max_calls_notice(swarm)
         }),
+        (Command::MaxLoad(None), _) => Ok(max_load_notice(swarm)),
+        (Command::MaxLoad(Some(limit)), _) => match limit.as_str() {
+            "default" => Ok(None),
+            "off" => Ok(Some(0.0)),
+            n => n
+                .parse::<f64>()
+                .ok()
+                .filter(|n| *n >= 0.0)
+                .map(Some)
+                .ok_or_else(|| strands_agents::Error::other(format!("Not a load: {n}"))),
+        }
+        .map(|limit| {
+            swarm.set_max_load(limit);
+            max_load_notice(swarm)
+        }),
         (Command::Budget(None), _) => Ok(budget_notice(swarm)),
         (Command::Budget(Some(tokens)), _) => match tokens.as_str() {
             "off" | "none" => Ok(None),
@@ -502,6 +517,17 @@ fn max_calls_notice(swarm: &Swarm) -> String {
     match swarm.max_calls() {
         0 => format!("model calls unlimited ({calls} in flight)"),
         limit => format!("up to {limit} model calls at once ({calls} in flight)"),
+    }
+}
+
+fn max_load_notice(swarm: &Swarm) -> String {
+    let load = swarm
+        .host()
+        .map(|host| format!(" (now {:.0})", host.load))
+        .unwrap_or_default();
+    match swarm.max_load() {
+        limit if limit > 0.0 => format!("new model calls and jobs wait above host load {limit:.0}{load}"),
+        _ => format!("no host load limit{load}"),
     }
 }
 

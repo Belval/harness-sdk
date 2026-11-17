@@ -199,10 +199,13 @@ pub struct Limits {
     pub agents: (usize, usize),
     /// Model calls in flight, and the cap (`/max-calls`; `0` is none).
     pub calls: (usize, usize),
+    /// The host's load average and the limit above which new work waits (`/max-load`), when
+    /// there is a limit and the load is known.
+    pub load: Option<(f64, f64)>,
 }
 
 impl Limits {
-    /// `agents 3/100 · calls 8/8`.
+    /// `agents 3/100 · calls 8/8 · load 45/128`.
     pub fn describe(&self) -> String {
         let (calls, limit) = self.calls;
         let limit = if limit == 0 {
@@ -210,8 +213,12 @@ impl Limits {
         } else {
             limit.to_string()
         };
+        let load = self
+            .load
+            .map(|(load, max)| format!(" · load {load:.0}/{max:.0}"))
+            .unwrap_or_default();
         format!(
-            "agents {}/{} · calls {calls}/{limit}",
+            "agents {}/{} · calls {calls}/{limit}{load}",
             self.agents.0, self.agents.1
         )
     }

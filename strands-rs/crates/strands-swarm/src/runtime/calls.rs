@@ -84,8 +84,12 @@ impl Swarm {
         self.inner.calls.slots.lock().in_flight
     }
 
-    /// What agent `id` is waiting for, if it waits for a model-call slot.
+    /// What agent `id` is waiting for, if it waits for a model-call slot or the host
+    /// ([`Swarm::held_for_host`]).
     pub fn waiting_for_call(&self, id: &str) -> Option<String> {
+        if let Some(held) = self.held_for_host(id) {
+            return Some(held);
+        }
         let calls = self.inner.calls.slots.lock();
         calls
             .waiting

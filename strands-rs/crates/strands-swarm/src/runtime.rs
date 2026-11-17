@@ -43,6 +43,7 @@ mod calls;
 mod capacity;
 mod collect;
 mod disk;
+mod host;
 mod landing;
 mod mailbox;
 mod persist;
@@ -58,6 +59,7 @@ pub use actor::SILENT_REPLY;
 use background::jobs_dir;
 use capacity::started;
 pub use disk::{free_space, FreeSpace, DISK_CHECK_EVERY, DISK_SENDER, DISK_WARNED_FILE};
+pub use host::{default_max_load, default_min_free_mem, host_stats, HostProbe, HostStats, HOST_POLL};
 use persist::history_event;
 pub use warm::{KEEP_WARM_EVERY, KEEP_WARM_MAX};
 
@@ -309,6 +311,14 @@ pub struct SwarmConfig {
     /// How long a running background job's log may stay unchanged before its owner gets an FYI
     /// note that it may be hung.
     pub job_quiet: Duration,
+    /// Hold new model calls, background jobs and agents spawned by agents while the host's
+    /// 1-minute load average is above this ([`Swarm::max_load`]); `0` (the default) is off.
+    pub max_load: f64,
+    /// Hold them likewise while the host's available memory is below this many bytes; `0` (the
+    /// default) is off.
+    pub min_free_mem: u64,
+    /// Reads the host's load and memory for those holds ([`host_stats`]).
+    pub host_probe: HostProbe,
 }
 
 impl SwarmConfig {
@@ -341,6 +351,9 @@ impl SwarmConfig {
             default_model: None,
             keep_warm: None,
             job_quiet: Duration::from_secs(30 * 60),
+            max_load: 0.0,
+            min_free_mem: 0,
+            host_probe: Arc::new(host_stats),
         }
     }
 }
@@ -548,6 +561,14 @@ pub enum SwarmEvent {
         calls: usize,
         /// The call limit then (`0`: none).
         limit: usize,
+    },
+    /// Agent `id` started waiting (or waits for something else now) while the host is
+    /// overloaded ([`Swarm::host_busy`]), or stopped (`None`).
+    HostHeld {
+        /// Id.
+        id: String,
+        /// Why, e.g. `host load 180/128 (/max-load to change)`; `None` once it goes on.
+        reason: Option<String>,
     },
     /// An agent's model call started or stopped being held for a pending reload
     /// ([`Swarm::reload`] with [`ReloadWhen::Idle`]).
@@ -810,6 +831,8 @@ struct Inner {
     watching_jobs: AtomicBool,
     /// Jobs whose end report is posted but not yet marked on disk ([`Swarm::jobs`]).
     reports_posted: Mutex<std::collections::BTreeSet<String>>,
+    /// Holds new work while the host is overloaded ([`Swarm::wait_for_host`]).
+    host: host::HostGate,
 }
 
 /// Handle to a running swarm. Cheap to clone.
@@ -858,6 +881,7 @@ impl Swarm {
             jobs: Jobs::new(jobs_dir(&config)),
             watching_jobs: AtomicBool::new(false),
             reports_posted: Mutex::default(),
+            host: host::HostGate::default(),
             config,
         };
         let swarm = Self {
@@ -897,13 +921,18 @@ impl Swarm {
     }
 
     /// Spawn an agent under `parent` ([`USER`] for a root agent). Returns its id. At the agent
-    /// limit the agent is [`AgentStatus::Queued`] instead, and starts once a slot frees.
+    /// limit the agent is [`AgentStatus::Queued`] instead, and starts once a slot frees. An
+    /// agent's spawn waits first while the host is overloaded ([`Swarm::host_busy`]).
     pub async fn spawn(&self, parent: &str, mut request: SpawnRequest) -> Result<String> {
         let parent_node = if parent == USER {
             None
         } else {
             Some(self.known(parent)?)
         };
+        // The user's spawns are not held: the TUI awaits them.
+        if let Some(node) = &parent_node {
+            self.wait_for_host(parent, &node.turn_token()).await?;
+        }
         let default = self.inner.config.default_model.as_deref();
         request.model = request.model.map(|model| expand_model(&model, default));
 
