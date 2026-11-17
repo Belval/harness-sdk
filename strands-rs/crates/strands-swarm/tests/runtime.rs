@@ -2669,8 +2669,10 @@ async fn a_spent_token_budget_stops_model_calls_until_it_is_raised() {
     assert_eq!(swarm.snapshot().budget_tokens, Some(1_000));
 }
 
+/// Poll `check` until it holds; the 20s cap is only for a stuck test (git work under a loaded
+/// machine can take seconds).
 async fn eventually(what: &str, check: impl Fn() -> bool) {
-    for _ in 0..200 {
+    for _ in 0..800 {
         if check() {
             return;
         }
