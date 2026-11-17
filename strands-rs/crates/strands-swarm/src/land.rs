@@ -203,6 +203,14 @@ pub fn target_dir(shared: Option<&Path>, run_id: &str, land_dir: &Path) -> PathB
     }
 }
 
+/// [`tidy`] the `land` dir of `jobs` unless a land job runs; `None` then, or when it did nothing.
+pub async fn tidy_when_idle(jobs: &crate::jobs::Jobs, target: Option<&Path>) -> Option<crate::gc::Collected> {
+    if jobs.any_running(|job| job.command.contains(LAND_FLAG)).await {
+        return None;
+    }
+    Some(tidy(&jobs.dir().join("land"), target).await).filter(|tidied| !tidied.is_empty())
+}
+
 /// Clean up `land_dir` (the swarm's `jobs/land`) after land jobs, as [`crate::gc::Collected`]
 /// under the id `land`. Call it only while no land job runs.
 /// - The scratch worktree a job killed outright (`kill -9`, a reboot) left is unregistered from

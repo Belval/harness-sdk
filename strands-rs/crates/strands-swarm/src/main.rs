@@ -209,13 +209,10 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         let (dir, saved) = load_run(cli.run.as_deref().unwrap_or_default()).await?;
         let mut collected = strands_swarm::gc::collect_run(&saved, cli.status_base.as_deref()).await;
         let jobs = strands_swarm::jobs::Jobs::new(dir.join("jobs"));
-        let land = |job: &strands_swarm::jobs::JobMeta| job.command.contains(strands_swarm::land::LAND_FLAG);
-        if !jobs.any_running(land).await {
-            let land = dir.join("jobs/land");
-            let shared = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
-            let target = strands_swarm::land::target_dir(shared.as_deref(), &saved.run_id, &land);
-            collected.push(strands_swarm::land::tidy(&land, Some(&target)).await);
-        }
+        let shared = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+        let target =
+            strands_swarm::land::target_dir(shared.as_deref(), &saved.run_id, &jobs.dir().join("land"));
+        collected.extend(strands_swarm::land::tidy_when_idle(&jobs, Some(&target)).await);
         let journal = strands_swarm::journal::Journal::open(&dir);
         for agent in collected.iter().filter(|c| !c.is_empty()) {
             journal.event("gc", agent.journal_fields());

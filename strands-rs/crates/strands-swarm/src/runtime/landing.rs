@@ -108,16 +108,10 @@ impl Swarm {
             .await
     }
 
-    /// [`crate::land::tidy`] once no land job runs (`None` while one does); with `target`, the
-    /// checks' shared target dir goes too.
+    /// [`crate::land::tidy_when_idle`]; with `target`, the checks' shared target dir goes too.
     pub(super) async fn tidy_landings(&self, target: bool) -> Option<Collected> {
-        let land = |job: &crate::jobs::JobMeta| job.command.contains(crate::land::LAND_FLAG);
-        if self.inner.jobs.any_running(land).await {
-            return None;
-        }
-        let config = &self.inner.config;
-        let target = target.then(|| land_target_dir(config));
-        Some(crate::land::tidy(&jobs_dir(config).join("land"), target.as_deref()).await)
+        let target = target.then(|| land_target_dir(&self.inner.config));
+        crate::land::tidy_when_idle(&self.inner.jobs, target.as_deref()).await
     }
 
     /// Branches `node` may land: its own (a root agent's is the one it has checked out), then

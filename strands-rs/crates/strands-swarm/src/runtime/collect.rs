@@ -29,11 +29,7 @@ impl Swarm {
     pub(super) fn tidy_landings_in_background(&self) {
         let swarm = self.clone();
         tokio::spawn(async move {
-            if let Some(tidied) = swarm
-                .tidy_landings(false)
-                .await
-                .filter(|tidied| !tidied.is_empty())
-            {
+            if let Some(tidied) = swarm.tidy_landings(false).await {
                 swarm.emit(SwarmEvent::Reclaimed {
                     collected: vec![tidied],
                     requested: false,
@@ -73,7 +69,7 @@ impl Swarm {
         for node in self.collectable(false) {
             collected.push(self.collect_node(&node).await);
         }
-        collected.extend(self.tidy_landings(true).await.filter(|tidied| !tidied.is_empty()));
+        collected.extend(self.tidy_landings(true).await);
         self.emit(SwarmEvent::Reclaimed {
             collected: collected.clone(),
             requested: true,
@@ -169,7 +165,7 @@ impl Swarm {
         }
         // Nothing reuses a finished ephemeral run's land checks' target dir.
         if ephemeral && self.inner.config.reclaim_disk {
-            collected.extend(self.tidy_landings(true).await.filter(|tidied| !tidied.is_empty()));
+            collected.extend(self.tidy_landings(true).await);
         }
         if !collected.is_empty() {
             self.emit(SwarmEvent::Reclaimed {
