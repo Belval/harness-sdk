@@ -5,10 +5,10 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 
 | Tool | What it does |
 | --- | --- |
-| `spawn_agent` | Start an agent on a task (optionally in another directory, in its own git worktree, with a model or a goal). Non-blocking. |
+| `spawn_agent` | Start an agent on a task (optionally in another directory, in its own git worktree, with a model, a goal or its own compaction point). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports, which returns at once when none is pending); a user message always ends it. With `all`, until every agent in `from` has sent something; a timeout (default 10 min, at most an hour) returns what came and who is still missing. Mail stays unread (and saved) until it returns, so a restart meanwhile loses none. |
-| `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model and estimated spend. |
+| `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model (and an agent's own compaction point) and estimated spend. |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to a mailbox (default: your own) later and/or repeatedly (`every: "30m"`, at least a minute); list or cancel schedules. |
@@ -79,7 +79,9 @@ points to `--headless`.
   the prompt cache: their prompts are never sent twice, so a cache write would cost 25% extra.
 - **Context.**
   - An agent's older turns are summarized once a call's input reaches the compaction point:
-    `--compact-at` (default `200k`) or 85% of the model's window, whichever is smaller.
+    85% of the model's window (850k tokens for a 1M window), or `--compact-at TOKENS` if that
+    is smaller. `spawn_agent`'s `compact_at` sets one agent's point instead, saved with the agent
+    across restarts; an agent spawned without one follows `--compact-at` as the run is started.
   - The point follows the window on a `/model` switch. The log notes 90%.
   - A summary brings the input down to half the point: how many of the oldest turns go into it
     follows their token counts. The task message stays verbatim, and so do the latest four

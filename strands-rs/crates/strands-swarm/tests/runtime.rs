@@ -2073,8 +2073,8 @@ fn usage(input: u64, cache_read: u64, output: u64) -> strands_agents::types::Usa
     }
 }
 
-/// A mock with a known context window, so utilization can be reported.
-struct Windowed(Arc<MockMessageModel>);
+/// A mock with a known context window (tokens), so utilization can be reported.
+struct Windowed(Arc<MockMessageModel>, u64);
 
 impl Model for Windowed {
     fn model_id(&self) -> Option<String> {
@@ -2082,7 +2082,7 @@ impl Model for Windowed {
     }
 
     fn context_window_limit(&self) -> Option<u64> {
-        Some(4000)
+        Some(self.1)
     }
 
     fn stream<'a>(
@@ -2098,7 +2098,7 @@ impl Model for Windowed {
 fn windowed_factory(scripts: &Scripts) -> AgentFactory {
     let scripts = scripts.clone();
     Arc::new(move |spec: AgentSpec| {
-        let model = Windowed(scripts.lock()[&spec.id].clone());
+        let model = Windowed(scripts.lock()[&spec.id].clone(), 4000);
         Box::pin(async move {
             Agent::builder()
                 .id(spec.id)
@@ -2108,6 +2108,160 @@ fn windowed_factory(scripts: &Scripts) -> AgentFactory {
                 .build()
         })
     })
+}
+
+/// Each agent's spec'd compaction point, in build order.
+type Points = Arc<Mutex<Vec<(String, Option<u64>)>>>;
+
+/// [`windowed_factory`] with a `window`-token window that records each [`AgentSpec::compact_at`].
+fn points_factory(scripts: &Scripts, window: u64, points: &Points) -> AgentFactory {
+    let (scripts, points) = (scripts.clone(), points.clone());
+    Arc::new(move |spec: AgentSpec| {
+        points.lock().push((spec.id.clone(), spec.compact_at));
+        let model = Windowed(scripts.lock()[&spec.id].clone(), window);
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(spec.tools)
+                .no_sandbox()
+                .build()
+        })
+    })
+}
+
+/// The `context` share of the first `Usage` event for `id`.
+async fn first_context(events: &mut UnboundedReceiver<SwarmEvent>, id: &str) -> Option<f64> {
+    let wait = async {
+        while let Some(event) = events.recv().await {
+            if let SwarmEvent::Usage {
+                id: agent, context, ..
+            } = event
+            {
+                if agent == id {
+                    return context;
+                }
+            }
+        }
+        panic!("event stream closed");
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .expect("timed out waiting for usage")
+}
+
+#[tokio::test]
+async fn without_compact_at_the_point_is_85_percent_of_the_model_window() {
+    // 1M (Opus 5.5) compacts at 850k, no longer at 200k: 170k is 20% of the point, not 85%.
+    for (window, share) in [(1_000_000, 0.2), (200_000, 1.0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = scripts_of(vec![(
+            "a1",
+            vec![MockResponse::with_usage(
+                Message::assistant("done"),
+                usage(170_000, 0, 1),
+            )],
+        )]);
+        let points = Points::default();
+        let config = SwarmConfig::new(points_factory(&scripts, window, &points), dir.path());
+        assert_eq!(config.compact_at, None);
+        let (swarm, mut events) = Swarm::new(config);
+        let id = spawn_root(&swarm, "go").await;
+        let context = first_context(&mut events, &id).await.unwrap();
+        assert!((context - share).abs() < 1e-9, "{window}: {context}");
+        assert_eq!(*points.lock(), vec![(id, None)]);
+        swarm.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn compact_at_is_set_swarm_wide_or_per_spawn_and_survives_a_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let scripts = scripts_of(vec![
+        (
+            "a1",
+            vec![
+                tool_call(
+                    "spawn_agent",
+                    "s1",
+                    json!({"task": "t", "name": "small", "compact_at": 100_000}),
+                ),
+                tool_call("spawn_agent", "s2", json!({"task": "t", "name": "plain"})),
+                tool_call("list_agents", "l1", json!({})),
+                say("spawned"),
+                say("noted"),
+                say("noted"),
+            ],
+        ),
+        (
+            "a2",
+            vec![MockResponse::with_usage(
+                Message::assistant("small done"),
+                usage(50_000, 0, 1),
+            )],
+        ),
+        ("a3", vec![say("plain done")]),
+    ]);
+    let points = Points::default();
+    let mut config = SwarmConfig::new(points_factory(&scripts, 1_000_000, &points), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    // `--compact-at 300k`: under 85% of the 1M window, so it is the point.
+    config.compact_at = Some(300_000);
+    let (swarm, mut events) = Swarm::new(config.clone());
+    spawn_root(&swarm, "go").await;
+    // a2's own point: 50k of 100k.
+    assert_eq!(first_context(&mut events, "a2").await, Some(0.5));
+    let built = points.lock().clone();
+    let expected = [
+        ("a1", Some(300_000)),
+        ("a2", Some(100_000)),
+        ("a3", Some(300_000)),
+    ];
+    let expected: Vec<_> = expected.iter().map(|(id, at)| (id.to_string(), *at)).collect();
+    assert_eq!(built, expected);
+    assert_eq!(swarm.agent("a2").unwrap().compact_at, Some(100_000));
+    assert_eq!(swarm.agent("a3").unwrap().compact_at, None, "follows the swarm's");
+    let listed = async {
+        while scripts.lock()["a1"].call_count() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), listed)
+        .await
+        .unwrap();
+    // `list_agents` shows an agent's own point only.
+    let listing = sent_text(&scripts.lock()["a1"], 3);
+    assert_eq!(listing.matches("compacts at").count(), 1, "{listing}");
+    assert!(listing.contains("compacts at 100.0k"), "{listing}");
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&state_dir)
+        .await
+        .unwrap()
+        .expect("state saved");
+    let saved_points: Vec<_> = saved.agents.iter().map(|a| a.compact_at).collect();
+    assert_eq!(saved_points, vec![None, Some(100_000), None]);
+
+    // Resumed without `--compact-at`: a2 keeps its own, the others follow the new default.
+    points.lock().clear();
+    config.compact_at = None;
+    let (resumed, _events) = Swarm::resume(config, saved).await.unwrap();
+    let rebuilt = async {
+        while points.lock().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), rebuilt)
+        .await
+        .unwrap();
+    let mut rebuilt = points.lock().clone();
+    rebuilt.sort();
+    let expected = [("a1", None), ("a2", Some(100_000)), ("a3", None)];
+    let expected: Vec<_> = expected.iter().map(|(id, at)| (id.to_string(), *at)).collect();
+    assert_eq!(rebuilt, expected);
+    assert_eq!(resumed.agent("a2").unwrap().compact_at, Some(100_000));
+    resumed.shutdown().await;
 }
 
 type Report = (u64, u64, Option<f64>);
@@ -2158,7 +2312,7 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
     let mut config = SwarmConfig::new(windowed_factory(&scripts), dir.path());
     config.state_dir = Some(state_dir.clone());
     // The compaction point is min(85% of the 4000-token window, 2000) = 2000 tokens.
-    config.compact_at = 2000;
+    config.compact_at = Some(2000);
     let (swarm, mut events) = Swarm::new(config.clone());
     let id = spawn_root(&swarm, "count").await;
 
@@ -2965,7 +3119,7 @@ async fn without_memory_there_are_no_memory_tools() {
 fn goal_factory(scripts: &Scripts) -> AgentFactory {
     let scripts = scripts.clone();
     Arc::new(move |spec: AgentSpec| {
-        let model = Windowed(scripts.lock()[&spec.id].clone());
+        let model = Windowed(scripts.lock()[&spec.id].clone(), 4000);
         Box::pin(async move {
             let mut builder = Agent::builder()
                 .id(spec.id)
@@ -3707,7 +3861,7 @@ fn summarizing_factory(scripts: &Scripts) -> AgentFactory {
     use strands_agents::context_manager::{ContextManagerConfig, ContextManagerOption, StashOption};
     let scripts = scripts.clone();
     Arc::new(move |spec: AgentSpec| {
-        let model = Windowed(scripts.lock()[&spec.id].clone());
+        let model = Windowed(scripts.lock()[&spec.id].clone(), 4000);
         let summarize = Offload::summarize(OffloadTarget::All).when(OffloadConditions {
             utilization: Some(0.0),
             preserve_recent: Some(1.0),

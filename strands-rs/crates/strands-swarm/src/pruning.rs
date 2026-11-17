@@ -565,7 +565,7 @@ mod tests {
             .no_sandbox()
             .build()
             .unwrap();
-        let compact = Arc::new(CompactAt::new(1_000));
+        let compact = Arc::new(CompactAt::new(Some(1_000)));
         let prune = CachePrune::new(Some(compact.clone()), CACHE_TTL);
         let mut messages = prunable();
         let mut ctx = ctx(&mut messages, &agent, 0.5);

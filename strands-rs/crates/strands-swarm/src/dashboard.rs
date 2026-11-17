@@ -35,15 +35,16 @@ const DESCRIPTION: &str = concat!(
 /// Shared between an agent's `context` tool and its context pipeline: the stash, a pending
 /// summarize request, and the tool results of the latest listing.
 pub struct ContextControl {
-    compact_at: u64,
+    compact_at: Option<u64>,
     stash: RwLock<Option<Arc<Stash>>>,
     summarize: AtomicBool,
     listed: Mutex<Vec<String>>,
 }
 
 impl ContextControl {
-    /// A control for an agent whose older turns are summarized at `compact_at` tokens.
-    pub fn new(compact_at: u64) -> Arc<Self> {
+    /// A control for an agent whose older turns are summarized at `compact_at` tokens, or at
+    /// 85% of its window when `None` or smaller.
+    pub fn new(compact_at: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
             compact_at,
             stash: RwLock::new(None),
@@ -450,6 +451,50 @@ mod tests {
             .unwrap_or_else(|| panic!("no result {tool_use_id} in call {call}"))
     }
 
+    /// A mock with a 1M-token window, Opus 5.5's.
+    struct Million(Arc<MockMessageModel>);
+
+    impl strands_agents::Model for Million {
+        fn model_id(&self) -> Option<String> {
+            self.0.model_id()
+        }
+
+        fn context_window_limit(&self) -> Option<u64> {
+            Some(1_000_000)
+        }
+
+        fn stream<'a>(
+            &'a self,
+            messages: &'a [Message],
+            options: &'a strands_agents::models::StreamOptions,
+        ) -> strands_agents::models::ModelEventStream<'a> {
+            self.0.stream(messages, options)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_point_is_85_percent_of_the_window_unless_compact_at_is_smaller() {
+        // Not the 200k the swarm used to cut every window at.
+        for (compact_at, point) in [(None, "850,000"), (Some(300_000), "300,000")] {
+            let model = MockMessageModel::shared(vec![
+                call("context", "c1", serde_json::json!({})),
+                MockResponse::message(Message::assistant("done")),
+            ]);
+            let control = ContextControl::new(compact_at);
+            let agent = Agent::builder()
+                .model(Million(model.clone()))
+                .tools([control.tool()])
+                .build()
+                .unwrap();
+            agent.invoke("go").await.unwrap();
+            let listing = result_text(&model, 1, "c1");
+            assert!(
+                listing.contains(&format!("% of the {point}-token point")),
+                "{listing}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_agent_lists_its_biggest_results_and_offloads_one_it_can_read_back() {
         let model = MockMessageModel::shared(vec![
@@ -467,7 +512,7 @@ mod tests {
             call("context", "c2", serde_json::json!({ "offload": [1, 9] })),
             MockResponse::message(Message::assistant("done")),
         ]);
-        let control = ContextControl::new(200_000);
+        let control = ContextControl::new(None);
         let manager = ContextManagerOption::Config(ContextManagerConfig {
             strategies: Some(vec![control.strategy()]),
             stash: StashOption::Enabled,

@@ -59,10 +59,10 @@ const MAX_WAIT_SECONDS: u64 = 3600;
 
 const SPAWN_DESCRIPTION: &str = concat!(
     "Start an agent on `task`; returns at once. It has your tools (MCP ones it enables ",
-    "itself). Its final reply each turn comes to you as a message. A message to it later resumes it ",
-    "with its context. The task is all it knows. It works in `cwd` (default: yours); ",
-    "worktree=true gives it its own git worktree and branch off that HEAD (uncommitted changes ",
-    "excluded); you integrate the branch. At the agent limit it waits `queued` for a slot."
+    "itself). Its final reply each turn reaches you; messaging it resumes it with its context. ",
+    "The task is all it knows. It works in `cwd` (default: yours); worktree=true: its own git ",
+    "worktree and branch off that HEAD (no uncommitted changes); you merge it. At the agent ",
+    "limit it is `queued`."
 );
 
 const SEND_DESCRIPTION: &str = concat!(
@@ -90,18 +90,21 @@ const CANCEL_RECLAIM_WAIT: Duration = Duration::from_secs(10);
 struct SpawnInput {
     /// Goal, context, constraints, what to report back.
     task: String,
-    /// Short role name, e.g. `tui-tests`; usable as its address.
+    /// Role name, e.g. `tui-tests`; also its address.
     name: String,
     #[serde(default)]
     worktree: bool,
     #[serde(default)]
     cwd: String,
-    /// Model id, or opus/sonnet/haiku, instead of the default. Cost vs opus: sonnet ≈ 0.6×, haiku ≈ 0.2× (mechanical work).
+    /// Model id or opus/sonnet/haiku. Cost vs opus: sonnet 0.6×, haiku 0.2× (mechanical work).
     #[serde(default)]
     model: Option<String>,
-    /// Checkable completion criterion: a judge sends the agent back to work until it is met.
+    /// Checkable criterion; a judge sends it back to work until met.
     #[serde(default)]
     goal: Option<String>,
+    /// Context summary point (tokens); default 85% of its window.
+    #[serde(default)]
+    compact_at: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -471,6 +474,7 @@ async fn spawn_tool(swarm: Swarm, me: String, input: SpawnInput, _ctx: ToolConte
         cwd: Some(input.cwd).filter(|cwd| !cwd.is_empty()).map(Into::into),
         model: input.model,
         goal: input.goal,
+        compact_at: input.compact_at,
     };
     let id = swarm.spawn(&me, request).await?;
     let Some(info) = swarm.agent(&id) else {
@@ -660,7 +664,8 @@ fn resolve(swarm: &Swarm, me: &str, who: &str) -> Result<String> {
 }
 
 /// `parser (a2): running, parent root (a1), cwd /repo, branch swarm/run/a2 (2 not on main, 1
-/// behind, merges cleanly), jobs j3 (gates), model claude-sonnet-4-5, est. $1.20 / 3.4M tokens`.
+/// behind, merges cleanly), jobs j3 (gates), model claude-sonnet-4-5, compacts at 300.0k, est.
+/// $1.20 / 3.4M tokens` (the compaction point only when spawned with its own).
 /// One line per agent; cancelled ones are only counted unless `include_cancelled`; then the
 /// swarm's total.
 fn list_agents(
@@ -702,6 +707,10 @@ fn list_agents(
     let spend = |info: &AgentInfo| -> String {
         let model = info.model.as_deref().map(crate::cost::short_model);
         let model = model.map(|m| format!(", model {m}")).unwrap_or_default();
+        let point = info
+            .compact_at
+            .map(|at| format!(", compacts at {}", crate::text::compact(at)));
+        let model = model + &point.unwrap_or_default();
         let spend = cost.spend(&info.id).map(|s| format!(", {}", s.describe()));
         model + &spend.unwrap_or_default()
     };

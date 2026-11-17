@@ -123,6 +123,7 @@ impl Swarm {
             model: Mutex::new(saved.model),
             goal: saved.goal,
             env,
+            compact_at: saved.compact_at,
             usage: Mutex::new(Tokens {
                 input: saved.input_tokens,
                 output: saved.output_tokens,
@@ -364,6 +365,7 @@ pub(super) fn node_state(node: &Node) -> AgentState {
         status,
         mailbox,
         env: node.env.clone(),
+        compact_at: node.compact_at,
         input_tokens: usage.input,
         output_tokens: usage.output,
         cache_read_tokens: usage.cache_read,

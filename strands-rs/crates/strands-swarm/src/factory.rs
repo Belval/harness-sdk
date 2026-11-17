@@ -26,7 +26,7 @@ use strands_harness::{
 };
 
 use crate::catalog::ToolCatalog;
-use crate::compaction::{CompactAt, CompactedSink, DEFAULT_COMPACT_AT};
+use crate::compaction::{CompactAt, CompactedSink};
 use crate::dashboard::ContextControl;
 use crate::pruning::{CachePrune, CACHE_TTL, CACHE_TTL_1H};
 use crate::runtime::{expand_model, AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
@@ -93,7 +93,8 @@ pub struct HarnessFactoryOptions {
     /// `skills` tool. Neither when empty.
     pub skills: Arc<Vec<Skill>>,
     /// Summarize older turns once a call's input reaches this many tokens (or 85% of the
-    /// model's window, if smaller); [`DEFAULT_COMPACT_AT`] when `None`.
+    /// model's window, if smaller); `None` uses the 85% alone. An agent's
+    /// [`AgentSpec::compact_at`] takes precedence.
     pub compact_at: Option<u64>,
     /// TTL of the prompt-cache points (`"5m"`, `"1h"`); the provider default (5m) when `None`.
     pub cache_ttl: Option<String>,
@@ -259,13 +260,13 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// The `auto` pipeline with coding-sized limits: the preset offloads any tool result over 1,500
 /// tokens, which stashes most file reads and command outputs and costs a retrieval call each.
 /// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
-/// summarize old turns at `compact_at` tokens (see [`CompactAt`]). Earlier turns' reasoning and
+/// summarize old turns at 85% of the window or `compact_at` tokens (see [`CompactAt`]). Earlier turns' reasoning and
 /// older large `shell`/`read` results are pruned only when the prompt cache is lost anyway (see
 /// [`CachePrune`]). With `stash_dir` the full outputs behind truncated results are kept there,
 /// so `retrieve_context` still finds them after a restart. `control` (the agent's `context`
 /// tool) gets the stash and can request a summary; each summary is reported to `on_compacted`.
 fn context_manager(
-    compact_at: u64,
+    compact_at: Option<u64>,
     stash_dir: Option<&std::path::Path>,
     control: &Arc<ContextControl>,
     on_compacted: Option<CompactedSink>,
@@ -347,7 +348,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
     if !spec.env.is_empty() {
         sandbox = sandbox.with_env(spec.env.into_iter().collect());
     }
-    let compact_at = options.compact_at.unwrap_or(DEFAULT_COMPACT_AT);
+    let compact_at = spec.compact_at.or(options.compact_at);
     let control = ContextControl::new(compact_at);
     let mut tools = spec.tools;
     tools.extend(options.tools.iter().cloned());
@@ -423,7 +424,7 @@ mod tests {
     }
 
     fn manager(
-        compact_at: u64,
+        compact_at: Option<u64>,
         stash_dir: Option<&std::path::Path>,
         control: &Arc<ContextControl>,
     ) -> Arc<ContextManager> {
@@ -440,7 +441,7 @@ mod tests {
             .model(Arc::new(MockMessageModel::new(Vec::new())))
             .build()
             .unwrap();
-        let manager = manager(DEFAULT_COMPACT_AT, None, &ContextControl::new(DEFAULT_COMPACT_AT));
+        let manager = manager(None, None, &ContextControl::new(None));
         let mut messages = vec![Message::user("start")];
         messages.extend(exchange("file-read", 16_000));
         messages.extend(exchange("huge-log", 200_000));
@@ -473,7 +474,7 @@ mod tests {
         let agent = Agent::builder().model(model.clone()).build().unwrap();
         // The mock has no known window, so the context manager assumes 200k: 5k tokens is 2.5%,
         // far below the 85% mark, but past `compact_at`.
-        let manager = manager(4_000, None, &ContextControl::new(4_000));
+        let manager = manager(Some(4_000), None, &ContextControl::new(Some(4_000)));
 
         let mut below = chat(6);
         let changed = manager
@@ -507,8 +508,8 @@ mod tests {
             "SUMMARY on request",
         ))]);
         let agent = Agent::builder().model(model.clone()).build().unwrap();
-        let control = ContextControl::new(DEFAULT_COMPACT_AT);
-        let manager = manager(DEFAULT_COMPACT_AT, None, &control);
+        let control = ContextControl::new(None);
+        let manager = manager(None, None, &control);
         control.request_summary();
 
         let mut messages = chat(6);
@@ -535,11 +536,7 @@ mod tests {
         let stash_of = |agent: Agent| {
             let dir = dir.path().to_owned();
             async move {
-                let manager = manager(
-                    DEFAULT_COMPACT_AT,
-                    Some(&dir),
-                    &ContextControl::new(DEFAULT_COMPACT_AT),
-                );
+                let manager = manager(None, Some(&dir), &ContextControl::new(None));
                 manager.init_agent(&agent).await.unwrap();
                 manager.stash().unwrap()
             }
@@ -579,6 +576,7 @@ mod tests {
             session_dir: None,
             env: Default::default(),
             on_compacted: None,
+            compact_at: None,
         }
     }
 

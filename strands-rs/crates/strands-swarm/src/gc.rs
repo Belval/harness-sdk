@@ -721,6 +721,7 @@ mod tests {
             status: status.into(),
             mailbox: Vec::new(),
             env,
+            compact_at: None,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,

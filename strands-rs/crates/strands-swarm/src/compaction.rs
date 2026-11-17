@@ -1,6 +1,6 @@
-//! When to summarize an agent's older turns: at a fixed token count (`--compact-at`), not only
-//! near the end of the model's window. A 1M-token window would otherwise let every call carry
-//! up to ~850k tokens before anything is compacted.
+//! When to summarize an agent's older turns: by default at 85% of its model's window (850k
+//! tokens of a 1M window), or at a fixed token count (`--compact-at`, `spawn_agent`'s
+//! `compact_at`) when that is smaller.
 
 use std::sync::Arc;
 
@@ -20,19 +20,16 @@ use strands_agents::models::{
 use strands_agents::types::{ContentBlock, Message, Role, SystemPrompt};
 use strands_agents::{Error, Model, Result};
 
-/// Default `--compact-at`: summarize once a call's input reaches 200k tokens.
-pub const DEFAULT_COMPACT_AT: u64 = 200_000;
-
-/// The input size (tokens) at which older turns are summarized: `compact_at`, or the context
-/// manager's own 85% mark when the window is smaller.
-pub fn compaction_point(window: u64, compact_at: u64) -> u64 {
+/// The input size (tokens) at which older turns are summarized: the context manager's own 85%
+/// mark of `window`, or `compact_at` when given and smaller.
+pub fn compaction_point(window: u64, compact_at: Option<u64>) -> u64 {
     let auto = (window as f64 * AUTO_SUMMARIZE_UTILIZATION) as u64;
-    auto.min(compact_at).max(1)
+    compact_at.map_or(auto, |at| auto.min(at)).max(1)
 }
 
 /// The utilization (share of `window`) at which to summarize:
 /// `min(AUTO_SUMMARIZE_UTILIZATION, compact_at / window)`.
-pub fn compaction_utilization(window: u64, compact_at: u64) -> f64 {
+pub fn compaction_utilization(window: u64, compact_at: Option<u64>) -> f64 {
     compaction_point(window, compact_at) as f64 / window.max(1) as f64
 }
 
@@ -93,7 +90,7 @@ pub type CompactedSink = Arc<dyn Fn(Compaction) + Send + Sync>;
 /// first message (the task) stays verbatim; the summary goes after it in the same message and is
 /// folded into the next summary. On request it keeps only the latest [`SUMMARY_KEEPS`] messages.
 pub struct CompactAt {
-    compact_at: u64,
+    compact_at: Option<u64>,
     control: Option<Arc<ContextControl>>,
     sink: Option<CompactedSink>,
     /// Set by [`CompactAt::arm`] to `Some(requested)`: run on this pipeline pass even if an
@@ -111,8 +108,8 @@ pub struct CompactAt {
 }
 
 impl CompactAt {
-    /// Compact at `compact_at` tokens.
-    pub fn new(compact_at: u64) -> Self {
+    /// Compact at `compact_at` tokens, or at 85% of the window when `None` or smaller.
+    pub fn new(compact_at: Option<u64>) -> Self {
         Self {
             compact_at,
             control: None,
@@ -401,7 +398,7 @@ mod tests {
 
     type Events = Arc<Mutex<Vec<Compaction>>>;
 
-    fn compact(compact_at: u64, control: Option<Arc<ContextControl>>) -> (Arc<CompactAt>, Events) {
+    fn compact(compact_at: Option<u64>, control: Option<Arc<ContextControl>>) -> (Arc<CompactAt>, Events) {
         let events: Events = Arc::default();
         let sink = Arc::clone(&events);
         let mut strategy = CompactAt::new(compact_at)
@@ -420,7 +417,10 @@ mod tests {
         ContextManager::from(ContextManagerOption::Config(config)).unwrap()
     }
 
-    fn manager(compact_at: u64, control: Option<Arc<ContextControl>>) -> (Arc<ContextManager>, Events) {
+    fn manager(
+        compact_at: Option<u64>,
+        control: Option<Arc<ContextControl>>,
+    ) -> (Arc<ContextManager>, Events) {
         let (compact, events) = compact(compact_at, control);
         (pipeline(vec![compact]), events)
     }
@@ -471,7 +471,7 @@ mod tests {
     async fn a_conversation_at_1_4x_the_point_ends_below_half_of_it_after_one_call() {
         let (agent, model) = agent(&["SUMMARY one"]);
         // The mock has no window, so 200k is assumed: the point is `compact_at`.
-        let (manager, events) = manager(10_000, None);
+        let (manager, events) = manager(Some(10_000), None);
         let mut messages = tool_loop(45);
         let before = heuristic(&messages);
         assert!((13_500..15_500).contains(&before), "{before} tokens");
@@ -527,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn after_an_edit_it_still_counts_what_the_estimate_misses() {
         let (agent, _) = agent(&["SUMMARY one"]);
-        let (compact, events) = compact(10_000, None);
+        let (compact, events) = compact(Some(10_000), None);
         let manager = pipeline(vec![Arc::new(ArmThenEdit(Arc::clone(&compact))), compact]);
         let mut messages = tool_loop(45);
         // The provider counts twice the characters' estimate (system prompt, tools, a tokenizer
@@ -597,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn stays_out_of_the_way_below_the_point() {
         let (agent, model) = agent(&["unused"]);
-        let (manager, events) = manager(10_000, None);
+        let (manager, events) = manager(Some(10_000), None);
         let mut messages = tool_loop(10);
         let changed = pass(&manager, &agent, &mut messages, 9_999, false).await;
         assert!(!changed);
@@ -609,7 +609,7 @@ mod tests {
     async fn a_second_pass_runs_when_the_first_summary_leaves_it_above_the_point() {
         let long = format!("LONG {}", "s".repeat(48_000));
         let (agent, model) = agent(&[&long, "SHORT"]);
-        let (manager, events) = manager(10_000, None);
+        let (manager, events) = manager(Some(10_000), None);
         let mut messages = tool_loop(45);
         let before = heuristic(&messages);
 
@@ -632,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_summary_leaves_the_context_alone_and_is_reported() {
         let (agent, _model) = agent(&[""]);
-        let (manager, events) = manager(10_000, None);
+        let (manager, events) = manager(Some(10_000), None);
         let mut messages = tool_loop(45);
         let original = messages.clone();
         let before = heuristic(&messages);
@@ -651,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn nothing_to_summarize_is_not_a_failure() {
         let (agent, model) = agent(&["unused"]);
-        let (manager, events) = manager(100, None);
+        let (manager, events) = manager(Some(100), None);
         let mut messages = tool_loop(1);
         let changed = pass(&manager, &agent, &mut messages, 5_000, false).await;
         assert!(!changed);
@@ -662,8 +662,8 @@ mod tests {
     #[tokio::test]
     async fn after_a_failed_summary_it_backs_off_until_the_input_grows_or_calls_pass() {
         let (agent, model) = agent(&["", "", "", "SUMMARY at last", "SUMMARY again"]);
-        let control = ContextControl::new(10_000);
-        let (manager, events) = manager(10_000, Some(Arc::clone(&control)));
+        let control = ContextControl::new(Some(10_000));
+        let (manager, events) = manager(Some(10_000), Some(Arc::clone(&control)));
         let mut messages = tool_loop(45);
         let tokens = heuristic(&messages);
 
@@ -710,7 +710,7 @@ mod tests {
             cancelled: std::sync::atomic::AtomicBool::new(false),
         });
         let agent = Agent::builder().model(cut_short).build().unwrap();
-        let (manager, events) = manager(10_000, None);
+        let (manager, events) = manager(Some(10_000), None);
         let mut messages = tool_loop(45);
         let tokens = heuristic(&messages);
 
@@ -745,7 +745,7 @@ mod tests {
     #[tokio::test]
     async fn overflow_retries_during_a_backoff() {
         let (agent, model) = agent(&["", "SUMMARY"]);
-        let (manager, _events) = manager(10_000, None);
+        let (manager, _events) = manager(Some(10_000), None);
         let mut messages = tool_loop(45);
         let tokens = heuristic(&messages);
         pass(&manager, &agent, &mut messages, tokens, false).await;
@@ -758,8 +758,8 @@ mod tests {
     #[tokio::test]
     async fn on_request_it_keeps_only_the_latest_messages() {
         let (agent, _model) = agent(&["SUMMARY on request"]);
-        let control = ContextControl::new(10_000);
-        let (manager, events) = manager(10_000, Some(Arc::clone(&control)));
+        let control = ContextControl::new(Some(10_000));
+        let (manager, events) = manager(Some(10_000), Some(Arc::clone(&control)));
         control.request_summary();
         let mut messages = tool_loop(10);
         let tokens = heuristic(&messages);
@@ -776,12 +776,21 @@ mod tests {
     }
 
     #[test]
+    fn by_default_compacts_at_85_percent_of_the_window() {
+        // A 1M window (Opus 5.5) is used to 850k, not cut at 200k as before.
+        assert_eq!(compaction_point(1_000_000, None), 850_000);
+        assert!((compaction_utilization(1_000_000, None) - AUTO_SUMMARIZE_UTILIZATION).abs() < 1e-9);
+        assert_eq!(compaction_point(200_000, None), 170_000);
+        assert_eq!(compaction_point(0, None), 1);
+    }
+
+    #[test]
     fn compacts_at_the_smaller_of_compact_at_and_85_percent() {
-        assert_eq!(compaction_point(1_000_000, 200_000), 200_000);
-        assert!((compaction_utilization(1_000_000, 200_000) - 0.2).abs() < 1e-9);
-        assert_eq!(compaction_point(200_000, 200_000), 170_000);
-        assert!((compaction_utilization(200_000, 200_000) - AUTO_SUMMARIZE_UTILIZATION).abs() < 1e-9);
-        assert_eq!(compaction_point(200_000, 1_500_000), 170_000);
-        assert_eq!(compaction_point(1_000_000, 50_000), 50_000);
+        assert_eq!(compaction_point(1_000_000, Some(200_000)), 200_000);
+        assert!((compaction_utilization(1_000_000, Some(200_000)) - 0.2).abs() < 1e-9);
+        assert_eq!(compaction_point(200_000, Some(200_000)), 170_000);
+        assert!((compaction_utilization(200_000, Some(200_000)) - AUTO_SUMMARIZE_UTILIZATION).abs() < 1e-9);
+        assert_eq!(compaction_point(200_000, Some(1_500_000)), 170_000);
+        assert_eq!(compaction_point(1_000_000, Some(50_000)), 50_000);
     }
 }

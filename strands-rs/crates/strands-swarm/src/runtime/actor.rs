@@ -103,6 +103,7 @@ impl Swarm {
                 .map(|dir| dir.join(SESSIONS_DIR)),
             env: self.shell_env(&node),
             on_compacted: Some(self.compaction_sink(&node.id)),
+            compact_at: node.compact_at(&self.inner.config),
         };
         let agent = match (self.inner.config.factory)(spec).await {
             Ok(agent) => agent,
@@ -345,7 +346,7 @@ impl Swarm {
         // not the agent's context.
         if let Some(agent) = node.agent().filter(|_| own_call) {
             let window = crate::compaction::window_of(agent.model().as_ref());
-            let point = crate::compaction::compaction_point(window, self.inner.config.compact_at);
+            let point = crate::compaction::compaction_point(window, node.compact_at(&self.inner.config));
             *node.context.lock() = Some(counts.input as f64 / point as f64);
         }
         self.emit_usage(node);

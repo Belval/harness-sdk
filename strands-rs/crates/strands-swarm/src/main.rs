@@ -88,10 +88,11 @@ struct Cli {
     /// cargo target dirs' filesystem drops below this (e.g. `20G`, `512M`); `0` turns it off.
     #[arg(long, value_parser = strands_swarm::text::parse_bytes, default_value = "20G")]
     min_free_disk: u64,
-    /// Summarize an agent's older turns once a call's input reaches this many tokens (e.g. `200k`,
-    /// `1.5M`), or 85% of the model's window if that is smaller.
-    #[arg(long, value_parser = strands_swarm::text::parse_tokens, default_value = "200k")]
-    compact_at: u64,
+    /// Summarize an agent's older turns once a call's input reaches this many tokens (e.g. `300k`,
+    /// `1.5M`), or 85% of the model's window if that is smaller. Without it, 85% of the window
+    /// (850k tokens for a 1M window). `spawn_agent`'s `compact_at` overrides it for one agent.
+    #[arg(long, value_parser = strands_swarm::text::parse_tokens)]
+    compact_at: Option<u64>,
     /// File with extra instructions given to every agent.
     #[arg(long)]
     instructions: Option<PathBuf>,
@@ -346,7 +347,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         tools,
         catalog,
         skills: std::sync::Arc::new(skills.for_agents()),
-        compact_at: Some(cli.compact_at),
+        compact_at: cli.compact_at,
         cache_ttl: cli.cache_ttl.clone(),
     };
     let (task, goal) = (cli.task, cli.goal);

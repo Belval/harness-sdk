@@ -76,6 +76,9 @@ pub struct AgentState {
     /// Environment variables for the agent's commands.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Compaction point from `spawn_agent` (tokens); `None` follows the swarm's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_at: Option<u64>,
     /// Input tokens used so far (cache reads and writes included), across restarts.
     #[serde(default)]
     pub input_tokens: u64,

@@ -210,6 +210,9 @@ pub struct AgentSpec {
     /// Where the agent's context pipeline reports each summary of older turns
     /// ([`SwarmEvent::Compacted`]); a factory without summarization may ignore it.
     pub on_compacted: Option<crate::compaction::CompactedSink>,
+    /// Input size (tokens) at which to summarize older turns, or 85% of the window when that is
+    /// smaller; `None` uses the 85% alone ([`crate::compaction::compaction_point`]).
+    pub compact_at: Option<u64>,
 }
 
 /// Builds the [`Agent`] for an [`AgentSpec`].
@@ -258,10 +261,11 @@ pub struct SwarmConfig {
     /// Model for every agent's side calls (the goal judge, context summarization); `None` uses the
     /// agent's own model. Side calls are gated and counted like the agent's own calls either way.
     pub side_model: Option<Arc<dyn Model>>,
-    /// Input size (tokens) at which the factory summarizes older turns
-    /// ([`crate::compaction::compaction_point`]); the context share in [`SwarmEvent::Usage`] is
-    /// relative to it.
-    pub compact_at: u64,
+    /// Input size (tokens) at which the factory summarizes older turns, unless an agent was
+    /// spawned with its own ([`SpawnRequest::compact_at`]); `None` (the default) is 85% of the
+    /// agent's model window ([`crate::compaction::compaction_point`]). The context share in
+    /// [`SwarmEvent::Usage`] is relative to that point.
+    pub compact_at: Option<u64>,
     /// Longest an idle-mode reload waits for in-flight tool calls before it restarts anyway.
     pub reload_idle_timeout: Duration,
     /// The commit this binary was built from ([`crate::version::COMMIT`]), saved with the state;
@@ -309,7 +313,7 @@ impl SwarmConfig {
             reclaim_disk: true,
             memory: None,
             side_model: None,
-            compact_at: crate::compaction::DEFAULT_COMPACT_AT,
+            compact_at: None,
             reload_idle_timeout: RELOAD_IDLE_TIMEOUT,
             commit: crate::version::COMMIT.map(str::to_owned),
             source: PathBuf::from(crate::version::SOURCE),
@@ -355,6 +359,9 @@ pub struct SpawnRequest {
     pub model: Option<String>,
     /// Optional completion criterion; the agent keeps working until it is met.
     pub goal: Option<String>,
+    /// Summarize this agent's older turns at this many tokens (or 85% of its window, if
+    /// smaller); `None` uses [`SwarmConfig::compact_at`].
+    pub compact_at: Option<u64>,
 }
 
 /// What a `schedule` call (or the user) asks for; see [`Swarm::schedule`].
@@ -391,6 +398,8 @@ pub struct AgentInfo {
     pub unread: usize,
     /// Model in use: the live agent's model id, else its override (`None`: the default).
     pub model: Option<String>,
+    /// Its own compaction point from `spawn_agent` (`None`: the swarm default).
+    pub compact_at: Option<u64>,
 }
 
 /// Everything observable that happens in the swarm, in order.
@@ -611,6 +620,8 @@ struct Node {
     model: Mutex<Option<String>>,
     goal: Option<String>,
     env: BTreeMap<String, String>,
+    /// Compaction point override from the spawn; `None` follows [`SwarmConfig::compact_at`].
+    compact_at: Option<u64>,
     /// Tokens used so far, across restarts.
     usage: Mutex<Tokens>,
     /// Tokens by model and recent calls, for cost estimates; across restarts.
@@ -673,6 +684,7 @@ impl Node {
             status,
             unread,
             model,
+            compact_at: self.compact_at,
         }
     }
 
@@ -682,6 +694,12 @@ impl Node {
             .and_then(|agent| agent.model().model_id())
             .or_else(|| self.last_model.lock().clone())
             .or_else(|| self.model.lock().clone())
+    }
+
+    /// Where older turns are summarized: the spawn's override, else the swarm's `--compact-at`,
+    /// else (`None`) 85% of the window.
+    fn compact_at(&self, config: &SwarmConfig) -> Option<u64> {
+        self.compact_at.or(config.compact_at)
     }
 
     /// The built agent, while it is held.
@@ -895,6 +913,7 @@ impl Swarm {
                 model: Mutex::new(request.model.clone()),
                 goal: request.goal.clone(),
                 env,
+                compact_at: request.compact_at,
                 // No actor runs until a queued agent starts.
                 finished: AtomicBool::new(queued),
                 ..Node::default()
