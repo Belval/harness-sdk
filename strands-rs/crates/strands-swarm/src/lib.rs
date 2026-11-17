@@ -28,6 +28,7 @@ pub mod mcp;
 pub mod memory;
 pub mod names;
 pub mod orphans;
+pub mod prefix;
 pub mod pruning;
 pub mod reserve;
 pub mod resume;

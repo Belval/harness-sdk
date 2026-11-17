@@ -299,8 +299,9 @@ pub struct SwarmConfig {
     pub land_into: Vec<String>,
     /// Commands [`Swarm::land`] runs when the caller names no checks (`--gate`).
     pub gates: Vec<String>,
-    /// The `strands-swarm` binary that carries out a landing (`--land PLAN`); `None` is this
-    /// process's own executable.
+    /// The `strands-swarm` binary that carries out a landing (`--land PLAN`) and that
+    /// `reload_swarm` compares a new binary's fixed prefix with; `None` is this process's own
+    /// executable.
     pub exe: Option<PathBuf>,
     /// Prices for [`Swarm::cost`] estimates (`--prices`).
     pub prices: Arc<crate::cost::Prices>,

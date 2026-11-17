@@ -158,12 +158,15 @@ struct ReloadInput {
     #[serde(default)]
     #[schemars(schema_with = "reload_when_schema")]
     when: ReloadWhen,
+    /// Only report the reload's prompt-cache cost; install nothing.
+    #[serde(default)]
+    check: bool,
 }
 
 const RELOAD_DESCRIPTION: &str = concat!(
     "Hot-reload the whole swarm into a built strands-swarm binary: it is self-tested and installed, ",
-    "then every agent is saved and resumed under it with its conversation and mail (mid-turn agents get ",
-    "a restart notice). A newer reload supersedes a pending one; a crashing binary is rolled back."
+    "then every agent is saved and resumed under it with its conversation and mail. A newer reload ",
+    "supersedes a pending one; a crashing binary is rolled back."
 );
 
 fn reload_when_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -171,16 +174,21 @@ fn reload_when_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 }
 
 async fn reload_tool(swarm: Swarm, _me: String, input: ReloadInput, _ctx: ToolContext) -> Result<String> {
-    swarm
-        .reload(std::path::Path::new(&input.binary), input.when)
-        .await?;
-    Ok(match input.when {
-        ReloadWhen::Now => "Reload scheduled; the swarm is restarting now.".to_owned(),
+    let binary = std::path::Path::new(&input.binary);
+    if input.check {
+        return swarm.reload_check(binary).await;
+    }
+    let note = swarm.reload(binary, input.when).await?;
+    let done = match input.when {
+        ReloadWhen::Now => "Reload scheduled; the swarm is restarting now.",
         ReloadWhen::Idle => concat!(
             "Installed and self-tested. The swarm restarts once no agent has a tool call ",
             "in flight (at most 10 minutes from now); carry on until then."
-        )
-        .to_owned(),
+        ),
+    };
+    Ok(match note.is_empty() {
+        true => done.to_owned(),
+        false => format!("{done} {note}"),
     })
 }
 

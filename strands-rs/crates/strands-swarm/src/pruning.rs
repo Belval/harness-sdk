@@ -247,7 +247,8 @@ pub fn note_model_call(agent: &Agent) {
     agent.state().set(LAST_CALL_KEY, now.as_millis() as u64);
 }
 
-fn last_call(agent: &Agent) -> Option<SystemTime> {
+/// When `agent` last sent its prompt (a call or a keep-warm refresh), as [`note_model_call`] noted.
+pub(crate) fn last_call(agent: &Agent) -> Option<SystemTime> {
     let millis = agent.state().get(LAST_CALL_KEY)?.as_u64()?;
     Some(UNIX_EPOCH + Duration::from_millis(millis))
 }

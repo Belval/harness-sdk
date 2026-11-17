@@ -19,12 +19,14 @@ impl Swarm {
     /// the reload fails and the swarm keeps its binary. It is copied to `<run>/bin/current`, the
     /// running one kept as `<run>/bin/previous` for the supervisor's crash rollback. A newer
     /// reload replaces only `current`: the pending binary never ran, so it is no rollback target.
-    pub async fn reload(&self, binary: &Path, when: ReloadWhen) -> Result<()> {
+    /// Returns what the reload does to the agents' prompt caches ([`Swarm::reload_check`]).
+    pub async fn reload(&self, binary: &Path, when: ReloadWhen) -> Result<String> {
         let dir = self.inner.config.state_dir.as_ref().ok_or_else(|| {
             Error::other("Hot reload needs a persistent run (start the swarm with --run <name>).")
         })?;
         check_binary(binary).await?;
         selftest::check_binary(binary, dir, SELF_TEST_TIMEOUT).await?;
+        let note = self.cache_note(binary).await;
         let mut installed = self.inner.reload_installed.lock().await;
         install_binary(binary, &dir.join("bin"), !*installed).await?;
         *installed = true;
@@ -38,7 +40,101 @@ impl Swarm {
             ReloadWhen::Now => self.inner.reload.cancel(),
             ReloadWhen::Idle => self.reload_when_idle(generation),
         }
-        Ok(())
+        Ok(note)
+    }
+
+    /// What reloading into `binary` does to the agents' prompt caches, without reloading: whether
+    /// its fixed prefix ([`crate::prefix`]) differs from the running binary's and, if so, what the
+    /// agents with a warm cache would pay to rewrite theirs.
+    pub async fn reload_check(&self, binary: &Path) -> Result<String> {
+        check_binary(binary).await?;
+        let note = self.cache_note(binary).await;
+        Ok(match note.is_empty() {
+            true => format!(
+                "{} prints no fixed prefix to compare (it predates --print-prefix).",
+                binary.display()
+            ),
+            false => note,
+        })
+    }
+
+    /// [`Swarm::reload_check`]'s note; empty when either binary cannot print its prefix.
+    async fn cache_note(&self, binary: &Path) -> String {
+        // The running binary, even after a newer one was installed over its path.
+        let proc = Path::new("/proc/self/exe");
+        let running = match (&self.inner.config.exe, proc.exists()) {
+            (Some(exe), _) => exe.clone(),
+            (None, true) => proc.to_path_buf(),
+            (None, false) => match std::env::current_exe() {
+                Ok(path) => path,
+                Err(_) => return String::new(),
+            },
+        };
+        let allow_land = self.allows_land();
+        let (old, new) = tokio::join!(prefix_of(&running, allow_land), prefix_of(binary, allow_land));
+        let (Some(old), Some(new)) = (old, new) else {
+            return String::new();
+        };
+        let changes = old.changes(&new);
+        if changes.is_empty() {
+            return "Its fixed prefix (system prompt and tool specs) is the running binary's: prompt \
+                    caches survive the restart."
+                .to_owned();
+        }
+        let (agents, tokens, usd) = self.warm_caches();
+        let agents = match agents {
+            1 => "1 agent has".to_owned(),
+            n => format!("{n} agents have"),
+        };
+        let shown = changes.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+        let more = match changes.len().saturating_sub(6) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
+        };
+        format!(
+            "It changes the fixed prefix every call starts with ({shown}{more}), so each agent's next \
+             call rewrites its whole prompt cache instead of reading it. {agents} a warm cache now: {} tokens, est. {} more than a reload that keeps the prefix. Prefix changes \
+             cost less batched into one reload.",
+            crate::text::compact(tokens),
+            crate::cost::dollars(usd)
+        )
+    }
+
+    /// Agents whose prompt cache is warm (their last call or keep-warm refresh within
+    /// [`crate::pruning::CACHE_TTL`]), the tokens of their last calls, and the estimated extra USD
+    /// of writing those instead of reading them.
+    pub fn warm_caches(&self) -> (usize, u64, f64) {
+        let prices = &self.inner.config.prices;
+        let default = self.inner.config.default_model.clone();
+        let ttl = crate::pruning::CACHE_TTL;
+        let now = self.now().timestamp();
+        let mut warm = (0, 0, 0.0);
+        for node in self.nodes() {
+            let Some(last) = node.ledger.lock().recent.back().copied() else {
+                continue;
+            };
+            let refreshed = node
+                .agent()
+                .and_then(|agent| crate::pruning::last_call(&agent))
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age < ttl);
+            if !refreshed && now - last.at >= ttl.as_secs() as i64 {
+                continue;
+            }
+            let tokens = last.input;
+            let model = node.model_id().or_else(|| default.clone()).unwrap_or_default();
+            let extra = prices.price(&model).map_or(0.0, |price| {
+                let counts = |read, write| crate::cost::Counts {
+                    input: tokens,
+                    cache_read: read,
+                    cache_write: write,
+                    ..Default::default()
+                };
+                price.cost(&counts(0, tokens)) - price.cost(&counts(tokens, 0))
+            });
+            warm = (warm.0 + 1, warm.1 + tokens, warm.2 + extra);
+        }
+        warm
     }
 
     /// Signal the reload once nothing is in flight, unless a newer reload took over first.
@@ -161,4 +257,26 @@ pub(super) async fn install_binary(binary: &Path, bin_dir: &Path, keep_previous:
             .map_err(io)?;
     }
     tokio::fs::rename(&staged, &current).await.map_err(io)
+}
+
+/// `binary --print-prefix` ([`crate::prefix::canonical`]); `None` when it cannot say (a binary
+/// from before the flag, a failure, a minute without an answer).
+async fn prefix_of(binary: &Path, allow_land: bool) -> Option<crate::prefix::Prefix> {
+    let mut command = tokio::process::Command::new(binary);
+    command.arg("--print-prefix");
+    if allow_land {
+        command.arg("--allow-land");
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
 }

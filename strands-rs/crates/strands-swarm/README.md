@@ -679,6 +679,20 @@ swarmctl status
 - On failure or after 60 s, `reload_swarm` returns the error with its stderr tail and the swarm
   keeps its binary.
 
+**Prompt caches across a reload.**
+
+- Providers cache tools, then the system prompt, then messages, so a restart keeps every agent's
+  cache only if the new binary sends the same fixed prefix. A live run's restart that kept it hit
+  the cache on 55 of 61 calls after it; reloads that changed a tool description read nothing back,
+  and with ~80 busy agents each such reload rewrites ~12M tokens (~$70).
+- `NEW --print-prefix` prints a root agent's system prompt and tool specs on a canonical setup
+  (the one the fixed-prefix budget test pins; `--allow-land` adds `land`). `reload_swarm`
+  compares the running binary's with the new one's and says in its result whether caches
+  survive, or which tools and prompt sections change, how many agents have a warm cache (a call
+  or keep-warm refresh in the last 5 minutes) and their last calls' tokens and estimated extra
+  cost. `check: true` reports only that, without self-testing or installing, so prefix changes
+  can be batched into one reload. A binary from before `--print-prefix` gets no note.
+
 **Reload timing.**
 
 - A binary that passes is installed at once. `when: "now"` restarts right away.

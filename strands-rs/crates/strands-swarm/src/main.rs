@@ -136,6 +136,10 @@ struct Cli {
     /// and the TUI renders, then exit (0 on success). Used by `reload_swarm` on a new binary.
     #[arg(long, value_name = "RUN_DIR_COPY")]
     self_test: Option<PathBuf>,
+    /// Print the fixed prefix (system prompt and tool specs) of a root agent on a canonical setup
+    /// as JSON, then exit; `reload_swarm` compares it across binaries.
+    #[arg(long, hide = true)]
+    print_prefix: bool,
     /// Directory of skills (`<name>/SKILL.md`), or one skill directory, offered to every agent
     /// ahead of the default locations. Repeatable.
     #[arg(long = "skills-dir")]
@@ -197,6 +201,11 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
+    if cli.print_prefix {
+        let prefix = strands_swarm::prefix::canonical(cli.allow_land).await?;
+        println!("{}", serde_json::to_string(&prefix)?);
+        return Ok(Exit::Quit);
+    }
     if let Some(path) = &cli.land {
         let plan: strands_swarm::land::LandPlan = serde_json::from_slice(&std::fs::read(path)?)?;
         let stop = strands_swarm::land::stop_signal();

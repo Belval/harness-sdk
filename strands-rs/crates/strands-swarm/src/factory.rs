@@ -127,7 +127,7 @@ pub fn harness_factory(options: HarnessFactoryOptions) -> AgentFactory {
     })
 }
 
-async fn build(options: &HarnessFactoryOptions, harness: HarnessAgentOptions) -> Result<Agent> {
+pub(crate) async fn build(options: &HarnessFactoryOptions, harness: HarnessAgentOptions) -> Result<Agent> {
     let agent = create_harness(harness).await?;
     agent.with_tool_registry(|registry| {
         let reworded: Vec<ToolRef> = REWORDED
@@ -344,7 +344,10 @@ pub fn bounded_goal(goal: GoalLoop) -> GoalLoop {
     goal.with_max_attempts(GOAL_MAX_ATTEMPTS)
 }
 
-fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<HarnessAgentOptions> {
+pub(crate) fn harness_options(
+    options: &HarnessFactoryOptions,
+    spec: AgentSpec,
+) -> Result<HarnessAgentOptions> {
     let session = match &spec.session_dir {
         Some(dir) => agent_session(dir, &spec.id)?,
         None => SessionOption::Off,
@@ -1073,94 +1076,25 @@ mod tests {
         }
     }
 
-    /// The fixed prefix a root agent sends on every call, built the way a real run builds it
-    /// (persistent, swarm prompt and tools, memory, an MCP catalog, 20 skills), split
+    /// The fixed prefix a root agent sends on every call ([`crate::prefix::canonical`]), split
     /// into `(part, bytes)`: the system prompt sections, then one entry per tool spec.
     async fn fixed_prefix() -> Vec<(String, usize)> {
-        use crate::runtime::{SpawnRequest, Swarm, SwarmConfig, USER};
-        let dir = tempfile::tempdir().unwrap();
-        let tool = |name: &str| -> ToolRef {
-            Arc::new(
-                FunctionTool::builder(name)
-                    .description("x")
-                    .handler(|input: serde_json::Value, _ctx| async move { Result::Ok(input) }),
-            )
-        };
-        let servers = [
-            ("builder-mcp", 55),
-            ("chorus-mcp", 8),
-            ("slack-mcp", 115),
-            ("quick-evals", 95),
-        ];
-        let catalog = ToolCatalog::new(
-            vec![tool("builder-mcp_x")],
-            servers.iter().map(|(name, n)| (name.to_string(), *n)).collect(),
-        );
-        // Shaped like real plugin skills: a long first sentence, then when to use it.
-        let description = "Diagnose failed, stuck or blocked deployments of a service pipeline, \
-                           including infrastructure stack failures and rollbacks. Use when a \
-                           deployment failed, a promotion is blocked or an alarm rolled it back.";
-        let skills: Vec<Skill> = (0..20)
-            .map(|n| {
-                let name = format!("skill-{n}");
-                let mut skill = Skill::new(&name, description, "Steps.");
-                skill.path = Some(dir.path().join(name));
-                skill
-            })
-            .collect();
-        let options = HarnessFactoryOptions {
-            catalog: Some(Arc::new(catalog)),
-            skills: Arc::new(skills),
-            ..Default::default()
-        };
-        let model = MockMessageModel::shared(vec![MockResponse::message(Message::assistant("ok"))]);
-        let shared = model.clone();
-        let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
-            let options = options.clone();
-            let model = shared.clone();
-            Box::pin(async move {
-                let mut harness = harness_options(&options, spec)?;
-                harness.model = Some(ModelOption::Instance(model));
-                build(&options, harness).await
-            })
-        });
-        let mut config = SwarmConfig::new(factory, dir.path());
-        config.memory = Some(Arc::new(crate::Memory::new(dir.path().join("memory.md"))));
-        config.state_dir = Some(dir.path().join("run"));
-        let (swarm, _events) = Swarm::new(config);
-        let request = SpawnRequest {
-            task: "go".into(),
-            ..Default::default()
-        };
-        swarm.spawn(USER, request).await.unwrap();
-        while model.call_count() == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        swarm.shutdown().await;
-        let calls = model.calls();
-        let options = &calls[0].1;
-        let prompt = options.system_prompt.as_ref().unwrap().text();
-        let path = dir.path().display().to_string();
-        let prompt = prompt.replace(&path, "/home/user/project");
+        let prefix = crate::prefix::canonical(false).await.unwrap();
         if let Ok(out) = std::env::var("STRANDS_SWARM_DUMP_PREFIX") {
-            let specs = serde_json::to_string_pretty(&options.tool_specs).unwrap();
-            std::fs::write(&out, format!("{prompt}\n\n=== TOOLS ===\n{specs}")).unwrap();
+            let specs: Vec<&str> = prefix.tools.iter().map(|(_, spec)| spec.as_str()).collect();
+            std::fs::write(
+                &out,
+                format!("{}\n\n=== TOOLS ===\n{}", prefix.system, specs.join("\n")),
+            )
+            .unwrap();
         }
-        let mut parts = Vec::new();
-        let mut section = String::from("(preamble)");
-        let mut text = String::new();
-        for line in prompt.split_inclusive('\n') {
-            if let Some(title) = line.strip_prefix("# ") {
-                parts.push((section, text.len()));
-                section = title.trim().to_owned();
-                text.clear();
-            }
-            text.push_str(line);
-        }
-        parts.push((section, text.len()));
-        for spec in &options.tool_specs {
-            let json = serde_json::to_string(spec).unwrap();
-            parts.push((format!("tool {}", spec.name), json.len()));
+        let mut parts: Vec<(String, usize)> = prefix
+            .sections()
+            .into_iter()
+            .map(|(title, text)| (title, text.len()))
+            .collect();
+        for (name, spec) in &prefix.tools {
+            parts.push((format!("tool {name}"), spec.len()));
         }
         parts
     }
@@ -1173,7 +1107,9 @@ mod tests {
     async fn the_fixed_prefix_stays_within_its_budget() {
         // About 4.8k tokens by Bedrock's count for Claude with these 20 skills (each skill line
         // ~25 tokens; a real run's 58 skills ~1.5k tokens).
-        const BUDGET_BYTES: usize = 16_400;
+        // Raised from 16,400 for `reload_swarm`'s `check` (~20 tokens a call, ~$0.30 a day on a
+        // 250-agent run), which tells a ~$70 prefix-changing reload apart before it happens.
+        const BUDGET_BYTES: usize = 16_500;
         const TOOL_BUDGET_BYTES: usize = 1_100;
         // 20 skill lines of at most ~110 bytes plus the heading.
         const SKILLS_BUDGET_BYTES: usize = 2_500;

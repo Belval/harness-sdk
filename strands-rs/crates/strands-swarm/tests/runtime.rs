@@ -2178,6 +2178,59 @@ async fn reload_needs_a_persistent_run() {
     assert!(error.to_string().contains("--run"), "{error}");
 }
 
+#[tokio::test]
+async fn reload_check_tells_whether_a_binary_changes_the_cached_prefix_and_what_that_costs() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_strands-swarm"));
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![MockResponse::with_usage(
+            Message::assistant("done"),
+            usage(10_000, 90_000, 10),
+        )],
+    )]);
+    let mut config = persistent_swarm(&scripts, dir.path());
+    config.exe = Some(exe.into());
+    let prices = r#"{"test-model": {"input": 10, "output": 50}}"#;
+    config.prices = Arc::new(strands_swarm::cost::Prices::with_overrides(prices).unwrap());
+    let (swarm, mut events) = Swarm::new(config);
+    let id = spawn_root(&swarm, "go").await;
+    usage_until_reply(&mut events, &id).await;
+    // Its call just ended: a reload that changes the prefix rewrites its 100k tokens, at
+    // $12.50 per 1M instead of $1.
+    let (agents, tokens, usd) = swarm.warm_caches();
+    assert_eq!((agents, tokens), (1, 100_000));
+    assert!((usd - 1.15).abs() < 1e-9, "{usd}");
+
+    let same = swarm.reload_check(exe).await.unwrap();
+    assert!(same.contains("prompt caches survive the restart"), "{same}");
+
+    // A binary whose `wait` reads differently.
+    let printed = std::process::Command::new(exe)
+        .arg("--print-prefix")
+        .output()
+        .unwrap();
+    let mut prefix: serde_json::Value = serde_json::from_slice(&printed.stdout).unwrap();
+    let tools = prefix["tools"].as_array_mut().unwrap();
+    let wait = tools.iter_mut().find(|tool| tool[0] == "wait").unwrap();
+    wait[1] = json!(wait[1].as_str().unwrap().replace("Block", "Pause"));
+    let json = dir.path().join("prefix.json");
+    std::fs::write(&json, prefix.to_string()).unwrap();
+    let other = dir.path().join("other-swarm");
+    std::fs::write(&other, format!("#!/bin/sh\ncat {}\n", json.display())).unwrap();
+    std::fs::set_permissions(&other, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let changed = swarm.reload_check(&other).await.unwrap();
+    assert!(changed.contains("(tool wait)"), "{changed}");
+    assert!(
+        changed.contains("1 agent has a warm cache now: 100.0k tokens, est. $1.15 more"),
+        "{changed}"
+    );
+
+    let old = swarm.reload_check(Path::new("/bin/true")).await.unwrap();
+    assert!(old.contains("prints no fixed prefix"), "{old}");
+    swarm.shutdown().await;
+}
+
 /// Resolves model `id` to the mock registered under `model:<id>`; anything else is rejected.
 fn mock_resolver(scripts: &Scripts) -> ModelResolver {
     let scripts = scripts.clone();
