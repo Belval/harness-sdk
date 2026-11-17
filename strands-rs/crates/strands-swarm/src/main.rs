@@ -367,8 +367,25 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         }
         None => Swarm::new(config),
     };
-    // A resumed run already has its root; the task and goal only seed a new one.
-    let root = if resumed { None } else { root };
+    // A resumed run already has its root: a task goes to it as a message (a new root only when
+    // none is left), and the goal only seeds a new one.
+    let live_root = || {
+        swarm
+            .agents()
+            .into_iter()
+            .find(|agent| agent.parent == USER && agent.status.is_live())
+    };
+    let (root, expect_reply) = match (resumed, root, live_root()) {
+        (true, Some(request), Some(agent)) if !request.task.is_empty() => {
+            swarm.send(USER, &agent.id, request.task)?;
+            (None, true)
+        }
+        (true, _, Some(_)) => (None, false),
+        (_, root, _) => {
+            let new = root.is_some();
+            (root, new)
+        }
+    };
 
     if !cli.headless {
         return Ok(strands_swarm::tui::run(swarm, events, root, cli.notify).await?);
@@ -378,9 +395,9 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         None if !resumed => return Err("--headless needs a task or a --goal".into()),
         None => {}
     }
-    let exit = run_headless(&swarm, events).await;
+    let exit = run_headless(&swarm, events, expect_reply).await;
     swarm.shutdown().await;
-    Ok(exit)
+    exit
 }
 
 fn print_skills(skills: &Skills) {
@@ -409,23 +426,37 @@ fn root_request(task: Option<String>, goal: Option<String>) -> Option<SpawnReque
     })
 }
 
-/// Print events until the root has replied and no agent is busy.
-async fn run_headless(swarm: &Swarm, mut events: UnboundedReceiver<SwarmEvent>) -> Exit {
-    let mut replied = false;
+/// Print events until the root has replied (or, with `expect_reply` unset, at once) and no agent
+/// is busy. Fails when the last reply to the user was an error.
+async fn run_headless(
+    swarm: &Swarm,
+    mut events: UnboundedReceiver<SwarmEvent>,
+    expect_reply: bool,
+) -> Result<Exit, Box<dyn std::error::Error>> {
+    let mut replied = !expect_reply;
+    let mut failed = false;
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     loop {
         tokio::select! {
             Some(event) = events.recv() => {
-                replied |= matches!(&event, SwarmEvent::Mail { to, .. } if to == USER);
+                if let SwarmEvent::Mail { to, mail } = &event {
+                    if to == USER {
+                        replied = true;
+                        failed = mail.kind == "error";
+                    }
+                }
                 print_event(&event);
             }
             _ = ticker.tick() => {}
-            _ = tokio::signal::ctrl_c() => return Exit::Quit,
-            _ = swarm.reload_requested() => return Exit::Reload,
+            _ = tokio::signal::ctrl_c() => return Ok(Exit::Quit),
+            _ = swarm.reload_requested() => return Ok(Exit::Reload),
         }
         let all_stopped = swarm.agents().iter().all(|agent| !agent.status.is_live());
         if all_stopped || (replied && !swarm.is_busy()) {
-            return Exit::Quit;
+            return match failed {
+                true => Err("the root agent's last turn failed".into()),
+                false => Ok(Exit::Quit),
+            };
         }
     }
 }
