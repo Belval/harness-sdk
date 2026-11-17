@@ -841,19 +841,9 @@ impl Swarm {
             .map_or_else(|| self.inner.config.cwd.clone(), |node| node.cwd.clone());
         let base_cwd = match &request.cwd {
             Some(dir) => {
-                // Lexically normalized: no trailing `/`, `.` or `..` in prompts and listings, and
-                // a worktree keeps the subdirectory (which needs a path below the toplevel).
-                let mut normal = PathBuf::new();
-                for part in spawner_cwd.join(dir).components() {
-                    match part {
-                        std::path::Component::ParentDir => {
-                            normal.pop();
-                        }
-                        std::path::Component::CurDir => {}
-                        part => normal.push(part),
-                    }
-                }
-                let dir = normal;
+                // No trailing `/`, `.` or `..` in prompts and listings, and a worktree keeps the
+                // subdirectory (which needs a path below the toplevel).
+                let dir = lexically_normal(&spawner_cwd.join(dir));
                 if !dir.is_dir() {
                     return Err(Error::other(format!("cwd {} is not a directory.", dir.display())));
                 }
@@ -1205,6 +1195,21 @@ impl Swarm {
             self.start_queued();
         }
     }
+}
+
+/// `path` without `.` and with each `..` taking the component before it off, as text.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => normal.push(part),
+        }
+    }
+    normal
 }
 
 #[cfg(test)]
