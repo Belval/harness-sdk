@@ -1581,9 +1581,12 @@ async fn a_resumed_run_restores_conversations_and_wakes_interrupted_agents() {
     );
     let a2_call = sent_text(&scripts.lock()["a2"].clone(), 0);
     assert!(a2_call.contains("The swarm was restarted"), "{a2_call}");
-    // The cut wait is listed like any other cut call, not shown as having returned.
-    assert!(a2_call.contains("Interrupted before finishing"), "{a2_call}");
-    assert!(a2_call.contains("- wait {"), "{a2_call}");
+    // The cut wait is listed, not shown as having returned, and not as an effect cut halfway.
+    assert!(!a2_call.contains("Interrupted before finishing"), "{a2_call}");
+    assert!(
+        a2_call.contains("- wait {") && a2_call.contains("cut short, but nothing it waited for is lost"),
+        "{a2_call}"
+    );
     let a2_wait = history["a2"]
         .iter()
         .flat_map(|m| m.tool_results())
@@ -1662,7 +1665,7 @@ async fn a_hard_crash_mid_batch_keeps_its_calls_and_the_results_that_came_in() {
     assert_eq!(results[1].tool_use_id, "t2");
     let notice = sent[2].text();
     assert!(
-        notice.contains("Interrupted before finishing") && notice.contains("- wait"),
+        notice.contains("- wait") && notice.contains("cut short"),
         "the notice names the cut call: {notice}"
     );
     assert!(!crashed.join("sessions/a1").join("open-batch.json").exists());

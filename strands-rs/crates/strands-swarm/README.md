@@ -136,7 +136,9 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   work. The notice lists the tool calls the restart cut short, each with how long it had run, and
   `git status --short --branch` of its directory. After a hard crash, "how long" runs to the
   run's last write (an event, a save, or swarmctl noting the exit). When a cut call had run a
-  minute or more, it also says that background jobs survive restarts. The cut turn ends with "Interrupted: the swarm
+  minute or more, it also says that background jobs survive restarts. A cut `wait` is listed
+  apart, with the note that nothing it waited for is lost and polling is not needed (agents whose
+  waits restarts cut had taken to polling on a schedule). The cut turn ends with "Interrupted: the swarm
   restarted." rather than the SDK's "Cancelled by user", which a real `/stop` keeps. An agent
   that had finished its turn rests until its next message; a goal agent whose turn failed
   retries.

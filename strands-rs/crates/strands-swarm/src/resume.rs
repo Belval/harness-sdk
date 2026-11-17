@@ -27,6 +27,10 @@ const SLOW_CALL_SECS: u64 = 60;
 const SLOW_CALL_HINT: &str = "Foreground calls hold up a hot reload, which cuts them after at most 10 \
     minutes, and die with any restart. Background jobs survive both: for anything slow, use \
     run_background and wait for its message instead of re-running it in the foreground or polling.";
+/// Said when the restart cut a `wait`. Agents whose long waits were cut by reloads took to
+/// polling on a 10-minute schedule, each poll rewriting their whole cached context.
+const WAIT_CUT: &str = "cut short, but nothing it waited for is lost: background jobs run on, and \
+    their ends and any mail still reach you. Call `wait` again; no need to poll.";
 
 /// The calls of the last assistant message that never completed: unanswered, or cancelled. The
 /// SDK's closing message of a cancelled turn ([`CANCELLED_MESSAGE`]) does not count as the last.
@@ -96,12 +100,15 @@ pub fn notice(
     git_status: Option<&str>,
 ) -> String {
     let mut text = format!("{NOTICE_PREFIX} and your conversation restored.");
+    // A `wait` has no effects to be partial; what it waited for still arrives.
+    let (waits, cut): (Vec<&ToolUseBlock>, Vec<&ToolUseBlock>) =
+        in_flight.iter().partition(|call| call.name == "wait");
     if in_flight.is_empty() {
         text.push_str("\nNo tool call was in flight.");
-    } else {
+    } else if !cut.is_empty() {
         text.push_str("\nInterrupted before finishing (any effects may be partial):");
         let mut slow = false;
-        for call in in_flight {
+        for call in cut {
             let input = crate::text::clip(&call.input.to_string(), INPUT_CHARS);
             let secs = ran.get(&call.tool_use_id).copied();
             slow |= secs.is_some_and(|secs| secs >= SLOW_CALL_SECS);
@@ -112,6 +119,10 @@ pub fn notice(
             text.push('\n');
             text.push_str(SLOW_CALL_HINT);
         }
+    }
+    if let Some(wait) = waits.first() {
+        let input = crate::text::clip(&wait.input.to_string(), INPUT_CHARS);
+        text.push_str(&format!("\n- wait {input}: {WAIT_CUT}"));
     }
     if let Some(status) = git_status {
         text.push_str(&format!(
@@ -355,6 +366,34 @@ mod tests {
         assert!(slow.contains("- shell (cut after 9m 12s)"), "{slow}");
         assert!(slow.contains(&format!("\n{SLOW_CALL_HINT}]")), "{slow}");
         assert_eq!(duration(3_780), "1h 3m");
+    }
+
+    #[test]
+    fn a_cut_wait_is_not_an_effect_that_may_be_partial_and_need_not_become_polling() {
+        let wait = ToolUseBlock::new("wait", "w1", json!({"from": ["jobs"], "timeout_seconds": 3600}));
+        let alone = notice(
+            std::slice::from_ref(&wait),
+            &BTreeMap::new(),
+            Path::new("/w"),
+            None,
+        );
+        assert!(
+            !alone.contains("may be partial") && !alone.contains("No tool call"),
+            "{alone}"
+        );
+        assert!(
+            alone.contains(&format!(
+                "\n- wait {{\"from\":[\"jobs\"],\"timeout_seconds\":3600}}: {WAIT_CUT}]"
+            )),
+            "{alone}"
+        );
+
+        let shell = calls(&["t1"]).tool_uses().next().unwrap().clone();
+        let both = notice(&[shell, wait], &BTreeMap::new(), Path::new("/w"), None);
+        assert!(
+            both.contains("may be partial):\n- shell {\"command\":\"run t1\"}\n- wait {"),
+            "{both}"
+        );
     }
 
     #[test]
