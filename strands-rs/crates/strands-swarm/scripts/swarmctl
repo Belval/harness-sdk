@@ -92,6 +92,14 @@ describe() {
   esac
 }
 
+# Give the pane back after a swarm that could not (killed, crashed): cooked mode, the main
+# screen, the cursor, no mouse reporting. Otherwise what follows prints as a staircase over the TUI.
+restore_terminal() {
+  [[ -t 1 ]] || return 0
+  stty sane 2>/dev/null || true
+  printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?25h\e[?1049l'
+}
+
 # OOM kills so far in this process's cgroup (cgroup v2 memory.events, which the swarm shares);
 # empty when they cannot be counted.
 oom_kills() {
@@ -121,6 +129,7 @@ supervise() {
     { "$dir/bin/current" --run "$run" "${args[@]}" 2>&1 1>&3 3>&- | capped_log "$dir/stderr.log"; } 3>&1
     code=${PIPESTATUS[0]}
     set -e
+    restore_terminal
     [[ -f "$dir/stop" ]] && break
     local now elapsed why delay
     now=$(date +%s); elapsed=$((now - started))

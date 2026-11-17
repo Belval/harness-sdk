@@ -230,6 +230,30 @@ fn a_new_binary_killed_when_oom_kills_cannot_be_counted_is_rolled_back() {
 }
 
 #[test]
+fn the_supervisor_gives_the_terminal_back_after_a_swarm_that_could_not() {
+    let run = Run::new();
+    let raw = r#"echo run >> "$RUN/calls"
+[ "$(wc -l < "$RUN/calls")" -ge 2 ] && { stty -a > "$RUN/stty"; touch "$RUN/stop"; exit 0; }
+stty raw -echo; kill -15 $$"#;
+    run.binary(&run.bin("current"), raw, "2 days ago");
+    // `script` gives the supervisor a terminal, as tmux does.
+    let status = std::process::Command::new("script")
+        .args(["-qec", &format!("bash {SCRIPT} supervise r"), "/dev/null"])
+        .env("XDG_STATE_HOME", run.home.path())
+        .env("HOME", run.home.path())
+        .env("SWARMCTL_RESTART_DELAY", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status();
+    if status.is_err() {
+        eprintln!("skipped: no script(1)");
+        return;
+    }
+    let stty = run.read("stty");
+    assert!(stty.contains(" icanon") && stty.contains(" echo "), "{stty}");
+}
+
+#[test]
 fn a_reload_starts_the_new_binary_s_trial_even_if_it_was_installed_long_ago() {
     let run = Run::new();
     let crasher = run.dir().join("crasher");
