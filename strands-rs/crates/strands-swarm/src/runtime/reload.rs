@@ -17,19 +17,23 @@ impl Swarm {
     /// The binary must answer `--version` within 30 s and pass its own `--self-test` on a
     /// temporary copy of the run within [`SELF_TEST_TIMEOUT`] (see [`crate::selftest`]); otherwise
     /// the reload fails and the swarm keeps its binary. It is copied to `<run>/bin/current`, the
-    /// old one kept as `<run>/bin/previous` for the supervisor's crash rollback.
+    /// running one kept as `<run>/bin/previous` for the supervisor's crash rollback. A newer
+    /// reload replaces only `current`: the pending binary never ran, so it is no rollback target.
     pub async fn reload(&self, binary: &Path, when: ReloadWhen) -> Result<()> {
         let dir = self.inner.config.state_dir.as_ref().ok_or_else(|| {
             Error::other("Hot reload needs a persistent run (start the swarm with --run <name>).")
         })?;
         check_binary(binary).await?;
         selftest::check_binary(binary, dir, SELF_TEST_TIMEOUT).await?;
-        install_binary(binary, &dir.join("bin")).await?;
+        let mut installed = self.inner.reload_installed.lock().await;
+        install_binary(binary, &dir.join("bin"), !*installed).await?;
+        *installed = true;
         self.journal_event(
             "reload",
             serde_json::json!({ "binary": binary, "when": format!("{when:?}") }),
         );
         let generation = self.inner.reload_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        drop(installed);
         match when {
             ReloadWhen::Now => self.inner.reload.cancel(),
             ReloadWhen::Idle => self.reload_when_idle(generation),
@@ -144,13 +148,14 @@ pub(super) async fn check_binary(binary: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn install_binary(binary: &Path, bin_dir: &Path) -> Result<()> {
+/// Copy `binary` to `<bin_dir>/current`, first moving the old one to `previous` if `keep_previous`.
+pub(super) async fn install_binary(binary: &Path, bin_dir: &Path, keep_previous: bool) -> Result<()> {
     let io = |e: std::io::Error| Error::other(format!("Failed to install the new binary: {e}"));
     tokio::fs::create_dir_all(bin_dir).await.map_err(io)?;
     let current = bin_dir.join("current");
     let staged = bin_dir.join("current.new");
     tokio::fs::copy(binary, &staged).await.map_err(io)?;
-    if tokio::fs::try_exists(&current).await.map_err(io)? {
+    if keep_previous && tokio::fs::try_exists(&current).await.map_err(io)? {
         tokio::fs::rename(&current, bin_dir.join("previous"))
             .await
             .map_err(io)?;

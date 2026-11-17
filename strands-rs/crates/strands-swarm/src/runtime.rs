@@ -717,6 +717,9 @@ struct Inner {
     /// An idle-mode reload is pending: agents' model calls wait for the restart
     /// ([`Swarm::hold_for_reload`]).
     reload_held: AtomicBool,
+    /// Held while a reload installs its binary; true once this process has installed one, so
+    /// `<run>/bin/previous` already holds the binary that is running.
+    reload_installed: tokio::sync::Mutex<bool>,
     model_calls: Option<Arc<Semaphore>>,
     budget: Mutex<Option<u64>>,
     /// Live-agent limit set at runtime with [`Swarm::set_max_agents`]; overrides the config.
@@ -774,6 +777,7 @@ impl Swarm {
             reload: CancellationToken::new(),
             reload_generation: AtomicU64::new(0),
             reload_held: AtomicBool::new(false),
+            reload_installed: tokio::sync::Mutex::new(false),
             model_calls: (config.max_concurrent_calls > 0)
                 .then(|| Arc::new(Semaphore::new(config.max_concurrent_calls))),
             budget: Mutex::new(config.budget_tokens),

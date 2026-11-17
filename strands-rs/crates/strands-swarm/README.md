@@ -450,8 +450,9 @@ supervisor's notes to `supervisor.log`, each rotated to `<log>.1` at 8 MB (`SWAR
   when it is not up (first TUI frame drawn, or headless running) within 180 s.
 - A new binary is on trial for 10 minutes (`SWARMCTL_TRIAL_WINDOW`) from its reload (or
   `swarmctl start`). If it fails (non-zero exit, a signal, 70, 71) on trial, the supervisor puts
-  the previous binary back and keeps the failed one as `bin/failed`. A binary that ran longer is
-  restarted, never rolled back, and a rolled-back one is not rolled back again.
+  the previous binary back and keeps the failed one as `bin/failed`. The previous binary is the
+  one that ran: a reload that supersedes a pending one replaces only `bin/current`. A binary that
+  ran longer is restarted, never rolled back, and a rolled-back one is not rolled back again.
 - Quick failures in a row (each within 60 s of starting) back off from 5 s, doubling up to 5
   minutes. The tmux pane shows each failure with the tail of `stderr.log`, and `swarmctl status`
   the supervisor's last note.

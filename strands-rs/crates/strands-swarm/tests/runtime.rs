@@ -1826,12 +1826,15 @@ async fn a_resumed_agent_sends_the_same_system_prompt_and_tools() {
 }
 
 #[tokio::test]
-async fn reload_installs_the_binary_keeps_the_previous_one_and_signals_the_host() {
+async fn reload_installs_the_binary_keeps_the_running_one_and_signals_the_host() {
     let dir = tempfile::tempdir().unwrap();
     let map = Scripts::default();
     let config = persistent_swarm(&map, dir.path());
     let (swarm, _events) = Swarm::new(config);
     let bin = dir.path().join("run/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("current"), "running").unwrap();
+    let read = |name: &str| std::fs::read(bin.join(name)).unwrap();
 
     swarm
         .reload(Path::new("/bin/true"), ReloadWhen::Idle)
@@ -1840,13 +1843,17 @@ async fn reload_installs_the_binary_keeps_the_previous_one_and_signals_the_host(
     tokio::time::timeout(Duration::from_secs(1), swarm.reload_requested())
         .await
         .expect("reload not signalled");
-    assert!(bin.join("current").exists());
+    assert_eq!(read("current"), std::fs::read("/bin/true").unwrap());
+    assert_eq!(read("previous"), b"running");
 
+    // A second reload before the restart replaces the pending binary, which never ran: the
+    // rollback target stays the binary that is running.
     swarm
-        .reload(Path::new("/bin/true"), ReloadWhen::Now)
+        .reload(Path::new("/bin/echo"), ReloadWhen::Now)
         .await
         .unwrap();
-    assert!(bin.join("previous").exists());
+    assert_eq!(read("current"), std::fs::read("/bin/echo").unwrap());
+    assert_eq!(read("previous"), b"running");
 
     let error = swarm
         .reload(Path::new("/bin/false"), ReloadWhen::Now)
