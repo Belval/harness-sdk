@@ -54,9 +54,14 @@ impl Model for StubModel {
 
     fn stream<'a>(
         &'a self,
-        _messages: &'a [Message],
+        messages: &'a [Message],
         _options: &'a StreamOptions,
     ) -> BoxStream<'a, Result<ModelStreamEvent>> {
+        // Refuse what the providers refuse, so a binary that sends a broken conversation fails
+        // here instead of on every turn of the live run.
+        if let Some(error) = unpaired_tool_call(messages) {
+            return Box::pin(futures::stream::iter([Err(Error::model(error))]));
+        }
         let events = vec![
             ModelStreamEvent::MessageStart {
                 role: Role::Assistant,
@@ -73,6 +78,51 @@ impl Model for StubModel {
         ];
         Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
     }
+}
+
+/// Where `messages` breaks the providers' pairing rule, worded like Bedrock: each tool call is
+/// answered in the next message, and each result answers a call of the message before it.
+fn unpaired_tool_call(messages: &[Message]) -> Option<String> {
+    for (at, message) in messages.iter().enumerate() {
+        let calls = |m: &Message| {
+            m.tool_uses()
+                .map(|c| c.tool_use_id.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        let results = |m: &Message| {
+            m.tool_results()
+                .map(|r| r.tool_use_id.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        if message.role == Role::Assistant {
+            let answered = messages
+                .get(at + 1)
+                .filter(|next| next.role == Role::User)
+                .map(results);
+            let missing: Vec<String> = calls(message)
+                .into_iter()
+                .filter(|id| !answered.as_ref().is_some_and(|answered| answered.contains(id)))
+                .collect();
+            if !missing.is_empty() {
+                return Some(format!(
+                    "messages.{at}: `tool_use` ids were found without `tool_result` blocks immediately after: {}",
+                    missing.join(", ")
+                ));
+            }
+        } else {
+            let before = at
+                .checked_sub(1)
+                .map(|b| &messages[b])
+                .filter(|b| b.role == Role::Assistant);
+            let called = before.map(calls).unwrap_or_default();
+            if let Some(stray) = results(message).into_iter().find(|id| !called.contains(id)) {
+                return Some(format!(
+                    "messages.{at}: unexpected `tool_use_id` found in `tool_result` blocks: {stray}"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Agents on the stub model, restoring their conversations from `sessions`.
@@ -306,4 +356,50 @@ async fn run_self_test(binary: &Path, copy: &Path, timeout: Duration) -> Result<
         output.status,
         tail.join("\n")
     )))
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+    use futures::StreamExt;
+    use serde_json::json;
+    use strands_agents::types::{ContentBlock, ToolResultBlock, ToolUseBlock};
+
+    fn call(id: &str) -> Message {
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::ToolUse(ToolUseBlock::new("shell", id, json!({})))],
+        )
+    }
+
+    async fn first(messages: &[Message]) -> Result<ModelStreamEvent> {
+        let options = StreamOptions::default();
+        let event = StubModel.stream(messages, &options).next().await.unwrap();
+        event
+    }
+
+    #[tokio::test]
+    async fn the_stub_refuses_a_call_without_its_result_like_the_providers() {
+        let broken = [Message::user("go"), call("t1"), Message::user("mail")];
+        let error = first(&broken).await.unwrap_err().to_string();
+        assert!(
+            error.contains("messages.1: `tool_use` ids were found without `tool_result`"),
+            "{error}"
+        );
+        assert!(error.contains("t1"));
+
+        let stray = [
+            Message::user("go"),
+            Message::assistant("hi"),
+            Message::new(
+                Role::User,
+                vec![ContentBlock::ToolResult(ToolResultBlock::error("t9", "x"))],
+            ),
+        ];
+        assert!(first(&stray).await.unwrap_err().to_string().contains("t9"));
+
+        let mut repaired = broken.to_vec();
+        crate::resume::pair_tool_calls(&mut repaired);
+        assert!(first(&repaired).await.is_ok(), "a repaired conversation passes");
+    }
 }
