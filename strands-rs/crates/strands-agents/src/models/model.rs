@@ -41,6 +41,37 @@ pub struct StreamOptions {
     pub dynamic_trailing_blocks: Option<usize>,
     /// Invoking-agent metadata.
     pub agent_metadata: Option<AgentMetadata>,
+    /// Send no prompt-cache points for this call, neither the model's own nor those in the
+    /// messages or system prompt: for a one-off prompt whose prefix will not be sent again,
+    /// where a cache write would cost extra and never be read. Rust-only.
+    pub no_cache: bool,
+}
+
+/// `messages` and `options` without their cache points, when [`StreamOptions::no_cache`] asks
+/// for that; `None` otherwise. Providers format the returned pair instead, with caching off.
+pub(crate) fn uncached(
+    messages: &[Message],
+    options: &StreamOptions,
+) -> Option<(Vec<Message>, StreamOptions)> {
+    if !options.no_cache {
+        return None;
+    }
+    let messages = messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            message
+                .content
+                .retain(|block| !matches!(block, ContentBlock::CachePoint(_)));
+            message
+        })
+        .collect();
+    let mut options = options.clone();
+    options.no_cache = false;
+    if let Some(SystemPrompt::Blocks(blocks)) = &mut options.system_prompt {
+        blocks.retain(|block| !matches!(block, SystemContentBlock::CachePoint(_)));
+    }
+    Some((messages, options))
 }
 
 /// Options for [`Model::count_tokens`]. Construct with `..Default::default()`.

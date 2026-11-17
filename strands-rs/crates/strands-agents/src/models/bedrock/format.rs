@@ -103,6 +103,13 @@ pub(crate) fn format_request(
     messages: &[Message],
     options: &StreamOptions,
 ) -> Result<FormattedRequest> {
+    if let Some((messages, options)) = crate::models::model::uncached(messages, options) {
+        let config = BedrockModelConfig {
+            cache_config: None,
+            ..config.clone()
+        };
+        return format_request(&config, &messages, &options);
+    }
     let model_id = config
         .model_id
         .clone()
@@ -1276,6 +1283,47 @@ mod tests {
         };
         let request = format(&config, &[user(vec![ContentBlock::text("hi")])], &options);
         assert_eq!(system_cache_ttls(&request), vec![None]);
+    }
+
+    #[test]
+    fn no_cache_sends_no_cache_points_at_all() {
+        let mut config = claude();
+        with_cache(&mut config, CacheConfig::default());
+        let point = || CachePointBlock {
+            cache_type: crate::types::CacheType::Default,
+            ttl: None,
+        };
+        let options = StreamOptions {
+            system_prompt: Some(SystemPrompt::Blocks(vec![
+                SystemContentBlock::Text("sys".into()),
+                SystemContentBlock::CachePoint(point()),
+            ])),
+            no_cache: true,
+            ..Default::default()
+        };
+        let messages = [user(vec![
+            ContentBlock::text("a"),
+            ContentBlock::CachePoint(point()),
+            ContentBlock::text("b"),
+        ])];
+        let request = format(&config, &messages, &options);
+        assert!(system_cache_ttls(&request).is_empty());
+        assert!(msg_cache_ttls(&request, 0).is_empty());
+        assert_eq!(request.messages[0].content().len(), 2);
+
+        let cached = format(
+            &config,
+            &messages,
+            &StreamOptions {
+                no_cache: false,
+                ..options
+            },
+        );
+        assert_eq!(
+            system_cache_ttls(&cached).len(),
+            1,
+            "the same request caches without it"
+        );
     }
 
     #[test]

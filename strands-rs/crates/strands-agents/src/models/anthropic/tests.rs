@@ -555,6 +555,46 @@ fn skips_dynamic_trailing_blocks_when_placing_a_cache_point() {
 }
 
 #[test]
+fn no_cache_sends_no_cache_control_at_all() {
+    let config = AnthropicModelConfig {
+        cache_config: Some(AnthropicCacheConfig::default()),
+        ..config()
+    };
+    let (model, _) = model_with(config, vec![]);
+    let point = || CachePointBlock {
+        cache_type: CacheType::Default,
+        ttl: None,
+    };
+    let options = StreamOptions {
+        system_prompt: Some(SystemPrompt::Blocks(vec![
+            SystemContentBlock::Text("prefix".to_owned()),
+            SystemContentBlock::CachePoint(point()),
+        ])),
+        tool_specs: vec![ToolSpec {
+            name: "calc".to_owned(),
+            description: "adds".to_owned(),
+            input_schema: Some(json!({"type": "object"})),
+            output_schema: None,
+            annotations: None,
+        }],
+        no_cache: true,
+        ..Default::default()
+    };
+    let messages = vec![Message::new(
+        Role::User,
+        vec![
+            ContentBlock::text("a"),
+            ContentBlock::CachePoint(point()),
+            ContentBlock::text("b"),
+        ],
+    )];
+    let request = model.format_request(&messages, &options).unwrap();
+    assert!(!request.to_string().contains("cache_control"), "{request}");
+    assert_eq!(request["messages"][0]["content"].as_array().unwrap().len(), 2);
+    assert_eq!(request["system"][0]["text"], "prefix");
+}
+
+#[test]
 fn honors_an_explicit_cache_point_block() {
     let (model, _) = model_with(config(), vec![]);
     let messages = vec![Message::new(

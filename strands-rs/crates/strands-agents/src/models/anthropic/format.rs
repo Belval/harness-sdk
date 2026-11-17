@@ -85,6 +85,13 @@ pub fn format_request(
     messages: &[Message],
     options: &StreamOptions,
 ) -> Result<JsonValue> {
+    if let Some((messages, options)) = crate::models::model::uncached(messages, options) {
+        let config = AnthropicModelConfig {
+            cache_config: None,
+            ..config.clone()
+        };
+        return format_request(&config, model_id, max_tokens, &messages, &options);
+    }
     if model_id.is_empty() {
         return Err(Error::model("Model ID is required".to_owned()));
     }
