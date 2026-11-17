@@ -104,6 +104,9 @@ pub struct CompactAt {
     armed_request: AtomicBool,
     /// Set when a compaction changed nothing; cleared by the next one that does.
     backoff: Mutex<Option<Backoff>>,
+    /// Set by [`CompactAt::arm`]: real tokens per estimated token of the messages, from the
+    /// pass's projection before any strategy edited them. See [`CompactAt::tokens`].
+    scale: Mutex<Option<f64>>,
 }
 
 impl CompactAt {
@@ -116,6 +119,7 @@ impl CompactAt {
             armed: AtomicBool::new(false),
             armed_request: AtomicBool::new(false),
             backoff: Mutex::new(None),
+            scale: Mutex::new(None),
         }
     }
 
@@ -134,6 +138,9 @@ impl CompactAt {
     /// Whether this pipeline pass will compact; if so, it will even if an earlier strategy
     /// brings utilization back under the point. Takes a pending summarize request.
     pub fn arm(&self, ctx: &ContextState<'_>) -> bool {
+        let window = window_of(ctx.agent.model().as_ref());
+        let estimated = heuristic(ctx.messages).max(1);
+        *self.scale.lock() = Some(input_tokens(ctx, window) as f64 / estimated as f64);
         let due = self.due(ctx);
         if let Some(requested) = due {
             self.armed.store(true, Ordering::SeqCst);
@@ -187,6 +194,18 @@ impl CompactAt {
         }
     }
 
+    /// This pass's input in real tokens. The projection starts from the provider's count, but
+    /// once a strategy edits the messages the SDK re-estimates them alone, by characters: no
+    /// system prompt or tools, and code and JSON weigh more than four characters a token. That
+    /// read 30-40% low (113k for a 186k-token input), so compaction stopped ~50k above its
+    /// target. Scale the messages' estimate by the ratio seen before any edit instead.
+    fn tokens(&self, ctx: &ContextState<'_>, window: u64) -> u64 {
+        match self.scale.lock().take() {
+            Some(scale) => (heuristic(ctx.messages) as f64 * scale).round() as u64,
+            None => input_tokens(ctx, window),
+        }
+    }
+
     async fn compact(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
         let armed = self.armed.swap(false, Ordering::SeqCst);
         let armed_request = self.armed_request.swap(false, Ordering::SeqCst);
@@ -197,7 +216,7 @@ impl CompactAt {
         let requested = armed_request || due == Some(true);
         let window = window_of(ctx.agent.model().as_ref());
         let point = compaction_point(window, self.compact_at);
-        let before = input_tokens(ctx, window);
+        let before = self.tokens(ctx, window);
         let target = if requested { 0 } else { point / 2 };
         // Armed, but an earlier strategy (pruning) already took it under the target.
         if !requested && !ctx.overflow && before <= target {
@@ -457,6 +476,85 @@ mod tests {
             .iter()
             .all(|b| matches!(b, ContentBlock::Text(_))));
         assert!(input[0].text().contains("[tool call shell]"));
+    }
+
+    /// Arms `compact` and then edits the context, like the swarm's cache pruning, so the SDK
+    /// re-estimates it from the messages alone.
+    struct ArmThenEdit(Arc<CompactAt>);
+
+    #[async_trait]
+    impl ContextStrategy for ArmThenEdit {
+        fn name(&self) -> &str {
+            "arm-then-edit"
+        }
+
+        async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
+            self.0.arm(ctx);
+            ctx.messages.last_mut().unwrap().content =
+                vec![ContentBlock::ToolResult(ToolResultBlock::success(
+                    format!("t{}", 44),
+                    vec![ToolResultContent::Text("trimmed".into())],
+                ))];
+            Ok(true)
+        }
+    }
+
+    struct Shared(Arc<CompactAt>);
+
+    #[async_trait]
+    impl ContextStrategy for Shared {
+        fn name(&self) -> &str {
+            "compact"
+        }
+
+        async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
+            self.0.apply(ctx).await
+        }
+    }
+
+    #[tokio::test]
+    async fn after_an_edit_it_still_counts_what_the_estimate_misses() {
+        let (agent, _) = agent(&["SUMMARY one"]);
+        let events: Events = Arc::default();
+        let sink = Arc::clone(&events);
+        let compact = Arc::new(
+            CompactAt::new(10_000)
+                .on_compacted(Some(Arc::new(move |compaction| sink.lock().push(compaction)))),
+        );
+        let config = ContextManagerConfig {
+            strategies: Some(vec![
+                Arc::new(ArmThenEdit(Arc::clone(&compact))),
+                Arc::new(Shared(Arc::clone(&compact))),
+            ]),
+            ..Default::default()
+        };
+        let manager = ContextManager::from(ContextManagerOption::Config(config)).unwrap();
+        let mut messages = tool_loop(45);
+        // The provider counts twice the characters' estimate (system prompt, tools, a tokenizer
+        // that weighs code more), as a long-running swarm agent's calls do.
+        let real = |messages: &[Message]| 2 * heuristic(messages);
+        let projected = real(&messages);
+
+        manager
+            .run_strategies_on(&agent, &mut messages, Some(projected), false)
+            .await
+            .unwrap();
+
+        let reported = events.lock().clone();
+        let [Compaction::Done { before, after }] = reported[..] else {
+            panic!("{reported:?}");
+        };
+        assert!(before > projected * 9 / 10, "before={before}, real={projected}");
+        assert!(
+            real(&messages) <= 6_000,
+            "half the point, in real tokens: {}",
+            real(&messages)
+        );
+        assert!(
+            after.abs_diff(real(&messages)) < 1_000,
+            "after={after}, real={}",
+            real(&messages)
+        );
     }
 
     #[tokio::test]
