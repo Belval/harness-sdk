@@ -101,14 +101,10 @@ pub fn notice(
         let mut slow = false;
         for call in in_flight {
             let input = crate::text::clip(&call.input.to_string(), INPUT_CHARS);
-            match ran.get(&call.tool_use_id) {
-                Some(&secs) => {
-                    slow |= secs >= SLOW_CALL_SECS;
-                    let after = duration(secs);
-                    text.push_str(&format!("\n- {} (cut after {after}) {input}", call.name));
-                }
-                None => text.push_str(&format!("\n- {} {input}", call.name)),
-            }
+            let secs = ran.get(&call.tool_use_id).copied();
+            slow |= secs.is_some_and(|secs| secs >= SLOW_CALL_SECS);
+            let after = secs.map_or(String::new(), |secs| format!(" (cut after {})", duration(secs)));
+            text.push_str(&format!("\n- {}{after} {input}", call.name));
         }
         if slow {
             text.push('\n');
@@ -139,14 +135,13 @@ fn duration(secs: u64) -> String {
 /// fold it into a trailing user message. Returns `false` when the conversation ends with a plain
 /// assistant message (or is empty), so the notice can be sent as normal input.
 pub fn append_notice(messages: &mut Vec<Message>, notice: &str) -> bool {
-    let Some(last) = messages.last_mut() else {
+    let notice = match fold_into_open_turn(messages, InvokeInput::Text(notice.to_owned())) {
+        InvokeInput::Text(notice) => ContentBlock::Text(notice),
+        _ => return true,
+    };
+    let Some(last) = messages.last() else {
         return false;
     };
-    let notice = ContentBlock::Text(notice.to_owned());
-    if last.role == Role::User {
-        last.content.push(notice);
-        return true;
-    }
     let mut content: Vec<ContentBlock> = last
         .tool_uses()
         .map(|call| {
