@@ -331,8 +331,9 @@ pub fn edit() -> FunctionTool {
             let occurrences = content.split(&input.old_str).count() - 1;
             if occurrences == 0 {
                 return Err(err(format!(
-                    "old_str did not appear verbatim in {}.",
-                    input.path
+                    "old_str did not appear verbatim in {}.\n{}",
+                    input.path,
+                    super::edit_hint::no_match_hint(&content, &input.old_str)
                 )));
             }
             if occurrences > 1 {
@@ -537,6 +538,12 @@ mod tests {
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(text_of(&result).contains(&format!("old_str did not appear verbatim in {}.", path.display())));
+
+        // With a hint: here, the file's line that old_str only differs from by escapes.
+        tokio::fs::write(&path, "x = \"a\"\n").await.unwrap();
+        let escaped = serde_json::json!({ "path": path, "old_str": "x = \\\"a\\\"", "new_str": "y" });
+        let text = text_of(&invoke(&edit(), escaped).await);
+        assert!(text.contains("old_str holds escapes"), "{text}");
     }
 
     #[tokio::test]

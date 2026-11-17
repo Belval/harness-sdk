@@ -4,6 +4,7 @@
 //!
 //! Not ported: `programmatic-tool-caller` (Node-only, depends on a JS runtime inside the tool).
 
+mod edit_hint;
 pub mod file_tools;
 pub mod subagent;
 #[cfg(feature = "http")]
