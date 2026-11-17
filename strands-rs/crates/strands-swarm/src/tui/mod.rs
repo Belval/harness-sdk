@@ -723,6 +723,53 @@ mod tests {
     }
 
     #[test]
+    fn restored_mail_shows_as_the_live_log_shows_it() {
+        let mail = |from: &str, kind: &'static str, text: &str| Mail {
+            from: from.into(),
+            from_label: from.into(),
+            kind,
+            text: text.into(),
+            images: vec![],
+        };
+        let (reply, mine) = (
+            mail("parser (a2)", "reply", "all green\nno conflicts"),
+            mail(USER, "message", "ship it"),
+        );
+        let mut live = App::default();
+        spawn(&mut live, "a1", USER);
+        for mail in [reply.clone(), mine.clone()] {
+            live.apply(SwarmEvent::Mail {
+                to: "a1".into(),
+                mail,
+            });
+        }
+        let mut restored = App::default();
+        spawn(&mut restored, "a1", USER);
+        let text = crate::runtime::render_mail(&[reply, mine]) + "\n\nplease check";
+        restored.apply(SwarmEvent::History {
+            id: "a1".into(),
+            messages: vec![Message::new(Role::User, vec![text.into()])],
+            omitted: 1,
+        });
+        let block = |shown: String| -> String {
+            let rows: Vec<&str> = shown.lines().collect();
+            let start = rows
+                .iter()
+                .position(|row| row.contains("✉ parser"))
+                .expect(&shown);
+            rows[start..start + 6]
+                .iter()
+                .map(|row| row.replace(" · queued", "").trim_end().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let shown = block(screen(&restored));
+        assert_eq!(shown, block(screen(&live)));
+        assert!(screen(&restored).contains("please check"));
+        assert!(!screen(&restored).contains("<message"), "{shown}");
+    }
+
+    #[test]
     fn scrolling_pages_through_a_capped_log() {
         let mut app = App::default();
         spawn(&mut app, "a1", USER);

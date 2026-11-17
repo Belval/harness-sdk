@@ -592,16 +592,48 @@ pub fn history_entries(messages: &[Message]) -> Vec<LogEntry> {
     blocks()
         .filter_map(|(role, block)| match block {
             ContentBlock::Text(text) if text.trim().is_empty() => None,
-            ContentBlock::Text(text) if role == Role::User => Some(LogEntry::Input(text.clone())),
-            ContentBlock::Text(text) => Some(LogEntry::Text(text.clone())),
-            ContentBlock::ToolUse(call) => Some(LogEntry::Tool {
+            ContentBlock::Text(text) if role == Role::User => Some(restored_input(text)),
+            ContentBlock::Text(text) => Some(vec![LogEntry::Text(text.clone())]),
+            ContentBlock::ToolUse(call) => Some(vec![LogEntry::Tool {
                 name: call.name.clone(),
                 summary: summarize_input(&call.input),
                 ok: Some(!failed.contains(call.tool_use_id.as_str())),
-            }),
+            }]),
             _ => None,
         })
+        .flatten()
         .collect()
+}
+
+/// A restored user turn: the mail it delivered (as [`Mail::render`] wrote it) shown as the live
+/// log shows mail, then whatever text is left as input.
+///
+/// [`Mail::render`]: crate::runtime::Mail::render
+fn restored_input(text: &str) -> Vec<LogEntry> {
+    let mut entries = Vec::new();
+    let mut rest = text.trim();
+    while let Some(after) = rest.strip_prefix("<message from=\"") {
+        let Some((from, after)) = after.split_once("\" kind=\"") else {
+            break;
+        };
+        let Some((kind, after)) = after.split_once("\">\n") else {
+            break;
+        };
+        let Some((body, after)) = after.split_once("\n</message>") else {
+            break;
+        };
+        entries.push(LogEntry::MailIn {
+            from: from.to_owned(),
+            kind: kind.to_owned(),
+            text: body.to_owned(),
+            read: None,
+        });
+        rest = after.trim_start();
+    }
+    if !rest.is_empty() {
+        entries.push(LogEntry::Input(rest.to_owned()));
+    }
+    entries
 }
 
 #[cfg(test)]
