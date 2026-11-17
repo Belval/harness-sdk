@@ -232,7 +232,9 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   - Each job is `<id>.json`, `<id>.log`, `<id>.exit` and, once its owner was told, `<id>.reported`
     in `<run>/jobs` (a temp directory without `--run`).
   - The swarm polls jobs and mails the owner when one ends, also for jobs started before a restart.
-    A job whose process vanished without an exit code (a reboot) is reported as such.
+    A job whose process vanished without an exit code (a reboot) is reported as such. When the
+    log is empty and the command redirected its output (`> build.log 2>&1`), the report names the
+    files it redirected to instead of only "(no output)".
   - A killed job is not reported. Cancelling an agent kills its whole subtree's jobs.
   - A `shell` call that sleeps 30 s or more (`sleep 240; tail job.log`) while its agent has a job
     running gets one line appended to its result: the job is still running, and `wait` with

@@ -133,7 +133,7 @@ impl Swarm {
         let id = &job.meta.id;
         let tail = self.inner.jobs.tail(id, jobs::TAIL_LINES).await;
         let output = match tail.is_empty() {
-            true => "(no output)".to_owned(),
+            true => empty_output(&job.meta.command),
             false => format!("last lines:\n{tail}"),
         };
         let text = format!(
@@ -160,6 +160,78 @@ impl Swarm {
 
 /// How often the job watcher looks for ended jobs.
 pub(super) const JOB_POLL: Duration = Duration::from_millis(500);
+
+/// The report's output line for a job whose log is empty: a command that redirected its output
+/// is told so, with the files it names, so its agent knows where to look.
+fn empty_output(command: &str) -> String {
+    let targets = redirect_targets(command);
+    let files: Vec<&str> = targets
+        .iter()
+        .map(String::as_str)
+        .filter(|target| *target != "/dev/null")
+        .collect();
+    match (files.as_slice(), targets.is_empty()) {
+        (_, true) => "(no output)".to_owned(),
+        ([], false) => "(no output: the command redirected it to /dev/null)".to_owned(),
+        (files, false) => format!(
+            "(no output in the log: the command redirected it to {}; read that instead)",
+            files
+                .iter()
+                .map(|file| format!("`{file}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The files a shell command redirects output to (`> f`, `>> f`, `2> f`, `&> f`, `>|f`), in
+/// order, without duplicates and quotes. Descriptor copies (`2>&1`) and quoted `>` are skipped.
+fn redirect_targets(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut targets = Vec::<String>::new();
+    let mut quote = None;
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        at += 1;
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') => at += 1,
+            (Some(_), _) => {}
+            (None, '\\') => at += 1,
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '>') => {
+                if matches!(chars.get(at), Some('>' | '|')) {
+                    at += 1;
+                }
+                if chars.get(at) == Some(&'&') {
+                    // `>&2`, `>&-`: a descriptor copy, not a file.
+                    continue;
+                }
+                while chars.get(at).is_some_and(|c| c.is_whitespace()) {
+                    at += 1;
+                }
+                let mut word = String::new();
+                let mut inner = None;
+                while let Some(&c) = chars.get(at) {
+                    match (inner, c) {
+                        (Some(q), c) if c == q => inner = None,
+                        (Some(_), c) => word.push(c),
+                        (None, '\'' | '"') => inner = Some(c),
+                        (None, c) if c.is_whitespace() || ";&|<>()".contains(c) => break,
+                        (None, c) => word.push(c),
+                    }
+                    at += 1;
+                }
+                if !word.is_empty() && !targets.contains(&word) {
+                    targets.push(word);
+                }
+            }
+            (None, _) => {}
+        }
+    }
+    targets
+}
 
 /// Every this many polls the watcher also checks that running jobs' processes still exist.
 pub(super) const JOB_ALIVE_EVERY: u64 = 60;
@@ -210,6 +282,40 @@ pub fn poll_hint(running: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_targets_are_the_files_a_command_writes_to() {
+        let cases: [(&str, &[&str]); 8] = [
+            ("cargo test > test.log 2>&1", &["test.log"]),
+            (
+                "make >>build.log 2> 'err file.log'",
+                &["build.log", "err file.log"],
+            ),
+            ("cmd &> out.log; tail out.log >| out.log", &["out.log"]),
+            ("cd x && ./run.sh >\"$LOG\" 2>&1 &", &["$LOG"]),
+            ("echo '>' \"a > b\" \\> c 1>&2", &[]),
+            ("quiet >/dev/null 2>&1", &["/dev/null"]),
+            ("exec >(tee log)", &[]),
+            ("ls", &[]),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(redirect_targets(command), expected, "{command}");
+        }
+    }
+
+    /// A job whose log is empty because it wrote elsewhere says where, instead of "(no output)".
+    #[test]
+    fn an_empty_log_names_the_files_the_command_redirected_to() {
+        assert_eq!(
+            empty_output("cargo test -p x > /tmp/t.log 2>&1"),
+            "(no output in the log: the command redirected it to `/tmp/t.log`; read that instead)"
+        );
+        assert_eq!(
+            empty_output("quiet > /dev/null"),
+            "(no output: the command redirected it to /dev/null)"
+        );
+        assert_eq!(empty_output("true"), "(no output)");
+    }
 
     #[test]
     fn the_longest_sleep_of_a_command_is_found() {

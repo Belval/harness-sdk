@@ -4422,6 +4422,26 @@ async fn a_background_job_mails_its_exit_code_and_output_tail_to_the_idle_agent_
     }
 }
 
+/// A job that writes its output to its own file reports where it went, not just "(no output)".
+#[tokio::test]
+async fn a_job_that_redirected_its_output_names_the_file_in_its_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = "echo built > build.log 2>&1";
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("run_background", "r1", json!({ "command": command })),
+            say("started"),
+            say("saw it"),
+        ],
+    )]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    spawn_root(&swarm, "build it").await;
+    let [_, report] = mails_to(&mut events, [(USER, "reply"), ("a1", "job")]).await;
+    assert!(report.contains("redirected it to `build.log`"), "{report}");
+    swarm.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_job_is_marked_reported_only_once_its_report_is_saved() {
     let dir = tempfile::tempdir().unwrap();
