@@ -139,7 +139,7 @@ struct Cli {
     #[arg(long, requires = "run")]
     journal: bool,
     /// Reclaim the disk of the run's cancelled worktree agents (their private `CARGO_TARGET_DIR`,
-    /// and their worktree when it has no uncommitted changes; branches stay), report, and exit.
+    /// their worktree when it has no uncommitted changes, their branch once merged), report, exit.
     /// Needs `--run`. A live swarm does this by itself; the TUI's `/gc` retries.
     #[arg(long, requires = "run")]
     gc: bool,

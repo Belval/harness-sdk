@@ -77,8 +77,13 @@ const LIST_DESCRIPTION: &str = concat!(
     "jobs, model, estimated spend."
 );
 
-const CANCEL_DESCRIPTION: &str =
-    "Stop an agent, its descendants and their jobs. Worktrees and branches stay.";
+const CANCEL_DESCRIPTION: &str = concat!(
+    "Stop an agent, its descendants and their jobs. A clean worktree is removed, and its branch ",
+    "too once the base contains it; anything else stays and the result says why."
+);
+
+/// How long `cancel_agent` waits to report what reclaiming the cancelled worktrees did.
+const CANCEL_RECLAIM_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SpawnInput {
@@ -579,7 +584,16 @@ fn cancel_tool(swarm: Swarm, me: String) -> ToolRef {
                     return Result::Ok("You cannot cancel yourself; end your turn instead.".to_owned());
                 }
                 swarm.cancel(&id)?;
-                Result::Ok(format!("Cancelled {} and its descendants.", swarm.label(&id)))
+                let mut lines = vec![format!("Cancelled {} and its descendants.", swarm.label(&id))];
+                for (agent, reclaimed) in swarm.reclaimed_after_cancel(&id, CANCEL_RECLAIM_WAIT).await {
+                    match reclaimed {
+                        Some(collected) => lines.extend(collected.lines()),
+                        None => lines.push(format!(
+                            "{agent}: still stopping; its worktree and branch are reclaimed once it stops if safe."
+                        )),
+                    }
+                }
+                Result::Ok(lines.join("\n"))
             }
         });
     Arc::new(tool)

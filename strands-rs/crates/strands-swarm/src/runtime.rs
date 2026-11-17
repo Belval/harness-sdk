@@ -580,6 +580,8 @@ struct Node {
     finished: AtomicBool,
     /// Background disk reclamation has been started for this agent.
     collected: AtomicBool,
+    /// What the last reclamation of this agent did.
+    reclaimed: Mutex<Option<Collected>>,
     /// Context window utilization of the last model call, across restarts.
     context: Mutex<Option<f64>>,
     /// Cancels the turn in progress only ([`Swarm::interrupt`]); a child of `cancel`.
@@ -817,6 +819,7 @@ impl Swarm {
                 // No actor runs until a queued agent starts.
                 finished: AtomicBool::new(queued),
                 collected: AtomicBool::new(false),
+                reclaimed: Mutex::new(None),
                 context: Mutex::new(None),
                 turn: Mutex::new(None),
                 paused: AtomicBool::new(false),
@@ -988,6 +991,8 @@ impl Swarm {
         let stopped = futures::future::join_all(actors);
         if tokio::time::timeout(SHUTDOWN_GRACE, stopped).await.is_err() {
             tracing::warn!("agents still running after the shutdown grace period");
+        } else {
+            self.collect_on_exit().await;
         }
         if let Some(journal) = &self.inner.journal {
             journal.event("shutdown", serde_json::json!({}));

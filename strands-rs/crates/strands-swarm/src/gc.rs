@@ -2,10 +2,12 @@
 //!
 //! A worktree agent owns two directories: its git worktree at `<repo>.swarm/<run>/<agent>` and,
 //! when the swarm has a shared `CARGO_TARGET_DIR`, a private target dir at
-//! `<target>-worktrees/<run>/<agent>`. Once the agent is cancelled, its target dir is deleted and
-//! its worktree is removed if it is clean. Nothing else is ever touched: each path must have
-//! exactly that shape before anything is deleted, the worktree goes through `git worktree remove`
-//! (which refuses dirty trees as a second guard), and the branch always stays.
+//! `<target>-worktrees/<run>/<agent>`, and its branch `swarm/<run>/<agent>`. Once the agent is
+//! cancelled, its target dir is deleted, its worktree is removed if it is clean, and its branch is
+//! deleted once no worktree has it checked out and every commit on it is reachable from the base
+//! branch. Nothing else is ever touched: each path must have exactly that shape before anything
+//! is deleted, the worktree goes through `git worktree remove` (which refuses dirty trees as a
+//! second guard), and the branch ref is only deleted if it still points at the commit checked.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -21,12 +23,19 @@ pub struct Collected {
     pub removed: Vec<(PathBuf, u64)>,
     /// Directories left in place, and why.
     pub kept: Vec<(PathBuf, String)>,
+    /// The agent's branch, deleted because the base branch contains all of it.
+    pub deleted_branch: Option<String>,
+    /// The agent's branch left in place, and why.
+    pub kept_branch: Option<(String, String)>,
 }
 
 impl Collected {
     /// Nothing removed and nothing worth reporting kept.
     pub fn is_empty(&self) -> bool {
-        self.removed.is_empty() && self.kept.is_empty()
+        self.removed.is_empty()
+            && self.kept.is_empty()
+            && self.deleted_branch.is_none()
+            && self.kept_branch.is_none()
     }
 
     /// Bytes reclaimed.
@@ -44,7 +53,15 @@ impl Collected {
             .kept
             .iter()
             .map(|(path, why)| format!("{}: kept {} ({why})", self.id, path.display()));
-        removed.chain(kept).collect()
+        let deleted = self
+            .deleted_branch
+            .iter()
+            .map(|branch| format!("{}: deleted branch {branch} (merged)", self.id));
+        let kept_branch = self
+            .kept_branch
+            .iter()
+            .map(|(branch, why)| format!("{}: kept branch {branch} ({why})", self.id));
+        removed.chain(kept).chain(deleted).chain(kept_branch).collect()
     }
 
     /// Fields of the `gc` journal event.
@@ -59,7 +76,17 @@ impl Collected {
             .iter()
             .map(|(path, why)| json!({ "path": path, "reason": why }))
             .collect();
-        json!({ "id": self.id, "removed": removed, "kept": kept })
+        let kept_branch = self
+            .kept_branch
+            .as_ref()
+            .map(|(branch, why)| json!({ "branch": branch, "reason": why }));
+        json!({
+            "id": self.id,
+            "removed": removed,
+            "kept": kept,
+            "deleted_branch": self.deleted_branch,
+            "kept_branch": kept_branch,
+        })
     }
 }
 
@@ -67,8 +94,16 @@ impl Collected {
 pub fn summary(collected: &[Collected]) -> String {
     let bytes: u64 = collected.iter().map(Collected::bytes).sum();
     let agents = collected.iter().filter(|c| !c.removed.is_empty()).count();
-    let kept: usize = collected.iter().map(|c| c.kept.len()).sum();
+    let kept: usize = collected
+        .iter()
+        .map(|c| c.kept.len() + usize::from(c.kept_branch.is_some()))
+        .sum();
+    let deleted = collected.iter().filter(|c| c.deleted_branch.is_some()).count();
     let mut text = format!("reclaimed {} from {agents} cancelled agents", human(bytes));
+    if deleted > 0 {
+        let plural = if deleted == 1 { "" } else { "es" };
+        text.push_str(&format!("; deleted {deleted} merged branch{plural}"));
+    }
     if kept > 0 {
         text.push_str(&format!("; kept {kept} (see the events journal)"));
     }
@@ -88,19 +123,22 @@ pub async fn collect_run(state: &crate::state::SwarmState) -> Vec<Collected> {
     let mut out = Vec::new();
     for agent in state.agents.iter().filter(|agent| agent.status == "cancelled") {
         let branch = agent.branch.as_deref();
-        out.push(collect(&state.run_id, &agent.id, branch, &agent.cwd, &agent.env).await);
+        let collected = collect(&state.run_id, &agent.id, branch, &agent.cwd, &agent.env, None);
+        out.push(collected.await);
     }
     out
 }
 
-/// Reclaim the directories cancelled agent `id` of run `run_id` owns. Only worktree agents
-/// (`branch` set) own any; `cwd` is where the agent worked, `env` its command environment.
+/// Reclaim the directories and branch cancelled agent `id` of run `run_id` owns. Only worktree
+/// agents (`branch` set) own any; `cwd` is where the agent worked, `env` its command environment.
+/// The branch must be merged into `base` (default: the branch the main checkout has out).
 pub async fn collect(
     run_id: &str,
     id: &str,
     branch: Option<&str>,
     cwd: &Path,
     env: &BTreeMap<String, String>,
+    base: Option<&str>,
 ) -> Collected {
     let mut out = Collected {
         id: id.to_owned(),
@@ -112,10 +150,78 @@ pub async fn collect(
     if let Some(dir) = private_target_dir(run_id, id, env) {
         remove_dir(&dir, &mut out).await;
     }
-    if let Some(root) = worktree_root(run_id, id, cwd).await {
+    let Some((root, repo)) = layout(run_id, id, cwd) else {
+        return out;
+    };
+    if root.exists() {
+        if worktree_root(run_id, id, &root).await.as_ref() != Some(&root) {
+            return out;
+        }
         remove_worktree(&root, branch, &mut out).await;
     }
+    if !root.exists() && branch == format!("swarm/{run_id}/{id}") {
+        delete_merged_branch(&repo, branch, base, &mut out).await;
+    }
     out
+}
+
+/// The agent's worktree root `/…/<repo>.swarm/<run_id>/<id>` among `cwd` and its ancestors, and
+/// the main checkout `/…/<repo>` it belongs to. Path shape only: either may be gone.
+fn layout(run_id: &str, id: &str, cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let swarm_dir = |owner: &str| owner.len() > ".swarm".len() && owner.ends_with(".swarm");
+    let root = cwd
+        .ancestors()
+        .find(|dir| owned_path(dir, run_id, id, swarm_dir))?;
+    let owner = root.parent()?.parent()?;
+    let name = owner.file_name()?.to_str()?.strip_suffix(".swarm")?;
+    Some((root.to_path_buf(), owner.parent()?.join(name)))
+}
+
+/// Delete `branch` in `repo` if no worktree has it checked out and `base` contains every commit
+/// on it; otherwise record why it stays.
+async fn delete_merged_branch(repo: &Path, branch: &str, base: Option<&str>, out: &mut Collected) {
+    let reference = format!("refs/heads/{branch}");
+    if !repo.is_dir() {
+        return;
+    }
+    let Ok(commit) = git(repo, &["rev-parse", "--verify", "--quiet", &reference]).await else {
+        return; // Already gone.
+    };
+    let mut keep = |why: String| out.kept_branch = Some((branch.to_owned(), why));
+    let checked_out = match git(repo, &["worktree", "list", "--porcelain"]).await {
+        Ok(list) => list.lines().any(|line| line == format!("branch {reference}")),
+        Err(error) => return keep(error),
+    };
+    if checked_out {
+        return keep("checked out in a worktree".to_owned());
+    }
+    let base = match base {
+        Some(base) => base.to_owned(),
+        None => match git(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await {
+            Ok(base) => base,
+            Err(_) => return keep("no base branch to compare with".to_owned()),
+        },
+    };
+    if base == branch {
+        return keep("it is the base".to_owned());
+    }
+    let unmerged = git(repo, &["rev-list", "--count", &format!("{base}..{commit}"), "--"]).await;
+    match unmerged.as_deref().map(str::trim) {
+        Ok("0") => {}
+        Ok("1") => return keep(format!("1 commit not on {base}")),
+        Ok(count) => return keep(format!("{count} commits not on {base}")),
+        Err(error) => return keep(error.clone()),
+    }
+    // Deleted only if it still points at the commit checked above.
+    match git(repo, &["update-ref", "-d", &reference, &commit]).await {
+        Ok(_) => out.deleted_branch = Some(branch.to_owned()),
+        // A concurrent pass deleted it first.
+        Err(_)
+            if git(repo, &["rev-parse", "--verify", "--quiet", &reference])
+                .await
+                .is_err() => {}
+        Err(error) => keep(error),
+    }
 }
 
 /// The agent's private `CARGO_TARGET_DIR`, if it has one of the shape
@@ -305,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removes_the_target_dir_and_a_clean_worktree_but_keeps_the_branch() {
+    async fn removes_the_target_dir_a_clean_worktree_and_its_merged_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, worktree) = repo_with_worktree(tmp.path());
         let target = tmp.path().join("target-worktrees/r1/a2");
@@ -321,26 +427,86 @@ mod tests {
             Some("swarm/r1/a2"),
             &worktree.join("sub"),
             &env(&target),
+            None,
         )
         .await;
 
-        assert!(collected.kept.is_empty(), "{collected:?}");
+        assert!(
+            collected.kept.is_empty() && collected.kept_branch.is_none(),
+            "{collected:?}"
+        );
         assert_eq!(collected.removed.len(), 2, "{collected:?}");
+        assert_eq!(collected.deleted_branch.as_deref(), Some("swarm/r1/a2"));
         assert_eq!(collected.removed[0], (target.clone(), 5000));
         assert!(!target.exists() && !worktree.exists());
         assert!(
             tmp.path().join("target-worktrees/r1").exists(),
             "only the agent's own dir goes"
         );
-        assert!(branch_exists(&repo, "swarm/r1/a2"));
+        assert!(
+            !branch_exists(&repo, "swarm/r1/a2"),
+            "nothing on it the base lacks"
+        );
         let lines = collected.lines();
+        assert_eq!(lines[2], "a2: deleted branch swarm/r1/a2 (merged)");
         assert!(
             lines[0].starts_with("a2: removed ") && lines[0].ends_with("(4.9 KB)"),
             "{lines:?}"
         );
 
-        let again = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &env(&target)).await;
+        let again = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &env(&target), None).await;
         assert!(again.is_empty(), "idempotent: {again:?}");
+    }
+
+    #[tokio::test]
+    async fn keeps_a_branch_with_commits_the_base_lacks_until_they_are_merged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, worktree) = repo_with_worktree(tmp.path());
+        fs::write(worktree.join("work.txt"), "done").unwrap();
+        run(&worktree, &["add", "."]);
+        run(&worktree, &["commit", "-qm", "work"]);
+        let base = crate::worktree::test_git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        let none = BTreeMap::new();
+
+        let collected = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, None).await;
+        assert!(!worktree.exists(), "the clean worktree goes: {collected:?}");
+        let why = format!("1 commit not on {base}");
+        assert_eq!(
+            collected.kept_branch,
+            Some(("swarm/r1/a2".to_owned(), why.clone()))
+        );
+        assert!(collected
+            .lines()
+            .contains(&format!("a2: kept branch swarm/r1/a2 ({why})")));
+        assert!(branch_exists(&repo, "swarm/r1/a2"));
+
+        // A branch someone has checked out stays too.
+        let elsewhere = tmp.path().join("elsewhere");
+        run(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                elsewhere.to_str().unwrap(),
+                "swarm/r1/a2",
+            ],
+        );
+        let busy = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, Some(&base)).await;
+        let why = ("swarm/r1/a2".to_owned(), "checked out in a worktree".to_owned());
+        assert_eq!(busy.kept_branch, Some(why));
+        run(&repo, &["worktree", "remove", elsewhere.to_str().unwrap()]);
+
+        // Once merged, a later pass (e.g. on resume) deletes it.
+        run(&repo, &["merge", "-q", "--ff-only", "swarm/r1/a2"]);
+        let merged = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, None).await;
+        assert_eq!(
+            merged.deleted_branch.as_deref(),
+            Some("swarm/r1/a2"),
+            "{merged:?}"
+        );
+        assert!(!branch_exists(&repo, "swarm/r1/a2"));
+        assert!(summary(&[merged]).contains("deleted 1 merged branch"));
     }
 
     #[tokio::test]
@@ -351,19 +517,24 @@ mod tests {
         let target = tmp.path().join("target-worktrees/r1/a2");
         fs::create_dir_all(&target).unwrap();
 
-        let shared = collect("r1", "a2", None, &worktree, &env(&target)).await;
+        let shared = collect("r1", "a2", None, &worktree, &env(&target), None).await;
         assert!(
             shared.is_empty() && target.exists(),
             "a non-worktree agent owns nothing"
         );
 
-        let collected = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &env(&target)).await;
+        let collected = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &env(&target), None).await;
         assert_eq!(
             collected.kept,
             [(worktree.clone(), "uncommitted changes".to_owned())]
         );
         assert!(worktree.join("new.txt").exists());
         assert!(!target.exists(), "the target dir goes regardless");
+        assert!(collected.deleted_branch.is_none() && collected.kept_branch.is_none());
+        assert!(
+            branch_exists(&_repo, "swarm/r1/a2"),
+            "a kept worktree keeps its branch"
+        );
     }
 
     #[tokio::test]
@@ -371,13 +542,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, worktree) = repo_with_worktree(tmp.path());
         // The main checkout, or a worktree of another agent, is never removed.
-        let main = collect("r1", "a2", Some("swarm/r1/a2"), &repo, &BTreeMap::new()).await;
+        let main = collect("r1", "a2", Some("swarm/r1/a2"), &repo, &BTreeMap::new(), None).await;
         assert!(main.is_empty() && repo.exists(), "{main:?}");
-        let other = collect("r1", "a3", Some("swarm/r1/a2"), &worktree, &BTreeMap::new()).await;
+        let other = collect("r1", "a3", Some("swarm/r1/a2"), &worktree, &BTreeMap::new(), None).await;
         assert!(other.is_empty() && worktree.exists(), "{other:?}");
         // A worktree switched to another branch is reported, not removed.
         run(&worktree, &["checkout", "-q", "-b", "elsewhere"]);
-        let switched = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &BTreeMap::new()).await;
+        let switched = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &BTreeMap::new(), None).await;
         assert_eq!(switched.kept.len(), 1, "{switched:?}");
         assert!(worktree.exists());
     }

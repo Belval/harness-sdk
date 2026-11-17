@@ -45,7 +45,8 @@ impl Swarm {
     }
 
     /// Reclaim the disk of every cancelled worktree agent that has stopped: delete its private
-    /// `CARGO_TARGET_DIR`, and remove its worktree if it is clean. Branches are never deleted.
+    /// `CARGO_TARGET_DIR`, remove its worktree if it is clean, then delete its branch if the base
+    /// ([`SwarmConfig::status_base`], default the main checkout's branch) contains all of it.
     /// Runs on its own whenever an agent stops and on resume; call it to retry (e.g. after
     /// committing in a kept worktree). The outcome is also published as
     /// [`SwarmEvent::Reclaimed`], which the journal records.
@@ -74,7 +75,62 @@ impl Swarm {
                 ..Default::default()
             };
         }
-        let run_id = &self.inner.config.run_id;
-        gc::collect(run_id, &node.id, node.branch.as_deref(), &node.cwd, &node.env).await
+        let config = &self.inner.config;
+        let base = config.status_base.as_deref();
+        let branch = node.branch.as_deref();
+        let collected = gc::collect(&config.run_id, &node.id, branch, &node.cwd, &node.env, base).await;
+        *node.reclaimed.lock() = Some(collected.clone());
+        collected
+    }
+
+    /// After [`Swarm::cancel`]: what reclaiming the cancelled worktree agents of `id`'s subtree
+    /// did, once all of them are done or `timeout` passes (`None` for those still stopping).
+    pub async fn reclaimed_after_cancel(
+        &self,
+        id: &str,
+        timeout: Duration,
+    ) -> Vec<(String, Option<Collected>)> {
+        let owners: Vec<Arc<Node>> = self
+            .subtree(id)
+            .into_iter()
+            .filter(|node| node.branch.is_some())
+            .collect();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let done = owners.iter().all(|node| node.reclaimed.lock().is_some());
+            if done || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        owners
+            .iter()
+            .map(|node| (node.id.clone(), node.reclaimed.lock().clone()))
+            .collect()
+    }
+
+    /// On shutdown of a run that cannot be resumed (no `--run`), reclaim every worktree agent's
+    /// disk as if it were cancelled; a persistent run only reclaims cancelled agents not yet
+    /// reclaimed, the rest resume into their worktrees.
+    pub(super) async fn collect_on_exit(&self) {
+        let ephemeral = self.inner.config.state_dir.is_none();
+        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        let mut collected = Vec::new();
+        for node in nodes.iter().filter(|node| node.branch.is_some()) {
+            let cancelled = *node.status.lock() == AgentStatus::Cancelled;
+            if !(ephemeral || cancelled) || node.collected.swap(true, Ordering::SeqCst) {
+                continue;
+            }
+            let done = self.collect_node(node).await;
+            if !done.is_empty() {
+                collected.push(done);
+            }
+        }
+        if !collected.is_empty() {
+            self.emit(SwarmEvent::Reclaimed {
+                collected,
+                requested: false,
+            });
+        }
     }
 }

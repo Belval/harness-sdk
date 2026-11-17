@@ -131,6 +131,7 @@ impl Swarm {
             ledger: Mutex::new(saved.ledger),
             finished: AtomicBool::new(matches!(status, AgentStatus::Cancelled | AgentStatus::Queued)),
             collected: AtomicBool::new(false),
+            reclaimed: Mutex::new(None),
             context: Mutex::new(saved.context),
             turn: Mutex::new(None),
             paused: AtomicBool::new(saved.paused),

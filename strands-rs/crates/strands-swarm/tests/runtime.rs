@@ -1951,7 +1951,10 @@ async fn cancelling_a_worktree_agent_reclaims_its_target_dir_and_clean_worktree(
     })
     .await;
     let branch = format!("swarm/{}/{owner}", swarm.run_id());
-    assert!(branch_exists(&repo, &branch), "the branch stays");
+    eventually("the branch, with nothing main lacks, is deleted", || {
+        !branch_exists(&repo, &branch)
+    })
+    .await;
     // `/gc` runs in the background and reports through an event, even when nothing is left.
     swarm.gc_in_background();
     let report = async {
@@ -2021,12 +2024,69 @@ async fn a_dirty_worktree_is_kept_until_gc_finds_it_clean_and_resume_collects_ca
         .unwrap();
     let (resumed, _events) = Swarm::resume(config, saved).await.unwrap();
     eventually("the worktree is removed on resume", || !checkout.exists()).await;
-    assert!(branch_exists(
-        &repo,
-        &format!("swarm/{}/{owner}", resumed.run_id())
-    ));
-    assert!(resumed.gc().await.iter().all(|c| c.is_empty()), "nothing left");
+    let branch = format!("swarm/{}/{owner}", resumed.run_id());
+    assert!(branch_exists(&repo, &branch), "its commit is not on main");
+    let left = resumed.gc().await;
+    assert!(
+        left.iter().all(|c| c.removed.is_empty() && c.kept.is_empty()),
+        "{left:?}"
+    );
+    let why = left[0].kept_branch.as_ref().map(|(_, why)| why.as_str());
+    assert_eq!(why, Some("1 commit not on main"), "{left:?}");
     resumed.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelling_says_what_it_kept_and_a_run_without_state_cleans_up_on_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);
+    let cancel = vec![
+        tool_call("cancel_agent", "c1", json!({"id": "a1"})),
+        say("cancelled"),
+    ];
+    let scripts = scripts_of(vec![
+        ("a1", vec![say("ok")]),
+        ("a2", vec![say("ok")]),
+        ("a3", cancel),
+    ]);
+    // No state dir: nothing can resume this run once it exits.
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(mock_factory(&scripts), &repo));
+    let worktree = || SpawnRequest {
+        task: "t".into(),
+        worktree: true,
+        ..Default::default()
+    };
+    let committed = swarm.spawn(USER, worktree()).await.unwrap();
+    let untouched = swarm.spawn(USER, worktree()).await.unwrap();
+    reply_to(&mut events, USER).await;
+    reply_to(&mut events, USER).await;
+    let committed_dir = swarm.agent(&committed).unwrap().cwd;
+    let untouched_dir = swarm.agent(&untouched).unwrap().cwd;
+    std::fs::write(committed_dir.join("work.txt"), "done").unwrap();
+    git(&committed_dir, &["add", "."]);
+    git(&committed_dir, &["commit", "-qm", "work"]);
+
+    spawn_root(&swarm, "cancel a1").await;
+    while reply_to(&mut events, USER).await != "cancelled" {}
+    let calls = scripts.lock()["a3"].calls();
+    let result = format!("{:?}", calls.last().unwrap().0.last().unwrap());
+    let run = swarm.run_id().to_owned();
+    let kept = format!("a1: kept branch swarm/{run}/a1 (1 commit not on main)");
+    assert!(result.contains(&kept), "{result}");
+    let root = committed_dir.display().to_string();
+    let removed = format!("a1: removed {}", root.trim_end_matches('/'));
+    assert!(result.contains(&removed), "{result}");
+    assert!(!committed_dir.exists() && branch_exists(&repo, &format!("swarm/{run}/a1")));
+
+    // On exit the live agent's clean worktree and its branch, which main contains, go too.
+    assert!(untouched_dir.exists());
+    swarm.shutdown().await;
+    assert!(!untouched_dir.exists());
+    assert!(!branch_exists(&repo, &format!("swarm/{run}/a2")));
+    assert!(
+        branch_exists(&repo, &format!("swarm/{run}/a1")),
+        "unmerged work stays"
+    );
 }
 
 fn system_prompt(model: &MockMessageModel, call: usize) -> String {

@@ -1016,7 +1016,7 @@ mod tests {
         let reclaimed = crate::gc::Collected {
             id: "a3".into(),
             removed: vec![(PathBuf::from("/t-worktrees/r/a3"), 3 << 30)],
-            kept: Vec::new(),
+            ..Default::default()
         };
         app.apply(SwarmEvent::Reclaimed {
             collected: vec![crate::gc::Collected::default()],

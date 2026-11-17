@@ -9,7 +9,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents). |
 | `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model and estimated spend. |
-| `cancel_agent` | Stop an agent and everything it spawned, background jobs included. |
+| `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to a mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
 | `run_background` | Run a shell command as a background job; its owner gets the exit code and last 40 output lines when it ends. |
@@ -306,9 +306,16 @@ Typing text without a command messages the selected agent.
 - **Disk.**
   - Once a cancelled worktree agent and its subtree have stopped (or on resume), its private target
     dir is deleted.
-  - Its worktree is removed with `git worktree remove` unless it has uncommitted changes. Its
-    branch is never deleted.
-  - Nothing outside those two exact paths is touched, and each removal is logged as a `gc` event.
+  - Its worktree is removed with `git worktree remove` unless it has uncommitted changes.
+  - Its branch `swarm/<run>/<agent>` is deleted once no worktree has it checked out and the base
+    (`--status-base`, default the main checkout's branch) contains every commit on it; otherwise
+    it stays, e.g. `kept branch swarm/r/a3 (2 commits not on main)`. A later pass (resume, `/gc`,
+    `--gc`) deletes it once merged.
+  - `cancel_agent` waits up to 10 s for this and its result says what was removed and kept.
+  - A run without `--run` cannot be resumed, so on exit every worktree agent is treated as
+    cancelled.
+  - Nothing outside those exact paths and that branch is touched, and each removal is logged as a
+    `gc` event.
 - **Memory.**
   - One Markdown file is shared by every agent and run: `~/.config/strands-swarm/memory.md`, or
     `--memory FILE`, or off with `--no-memory`.
