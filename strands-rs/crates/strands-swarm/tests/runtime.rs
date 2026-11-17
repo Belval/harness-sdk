@@ -2896,7 +2896,12 @@ async fn a_worktree_still_kept_on_resume_is_not_journaled_again() {
             .unwrap()
             .unwrap();
         let (resumed, _events) = Swarm::resume(config.clone(), saved).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Its pass must end before the next resume: one that outlives its swarm would find the
+        // worktree clean below and race the next swarm's pass over it.
+        let passes = resumed
+            .reclaimed_after_cancel(&owner, Duration::from_secs(20))
+            .await;
+        assert!(passes.iter().all(|(_, pass)| pass.is_some()), "{passes:?}");
         resumed.shutdown().await;
         assert!(checkout.join("wip.txt").exists());
         assert_eq!(journaled(), 1, "the same kept worktree was journaled again");
