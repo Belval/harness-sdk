@@ -226,6 +226,9 @@ impl CompactAt {
             match summarize_down_to(ctx.messages, tokens, target, &model).await {
                 Ok(Some(after)) => tokens = after,
                 Ok(None) => break,
+                // A shutdown or reload cut the summary short: not a failure, nothing to back off.
+                Err(Error::Cancelled) if passes == 0 => return Ok(false),
+                Err(Error::Cancelled) => break,
                 Err(error) => {
                     failure = Some(error.to_string());
                     break;
@@ -308,9 +311,11 @@ async fn summarize_down_to(
     };
     let mut content = earlier;
     content.extend(flatten_messages_to_content(&messages[1..cut]));
-    let summary = summarize(model, content)
-        .await
-        .inspect_err(|error| tracing::warn!("error=<{error}> | summarizing older turns failed"))?;
+    let summary = summarize(model, content).await.inspect_err(|error| {
+        if !matches!(error, Error::Cancelled) {
+            tracing::warn!("error=<{error}> | summarizing older turns failed");
+        }
+    })?;
     let text = format_summarized(
         &format!("{} messages", cut - 1),
         removed.round() as u64,
@@ -364,6 +369,7 @@ mod tests {
     use super::*;
 
     use strands_agents::context_manager::{ContextManager, ContextManagerConfig, ContextManagerOption};
+    use strands_agents::models::ModelEventStream;
     use strands_agents::testing::{MockMessageModel, MockResponse};
     use strands_agents::types::{ToolResultBlock, ToolResultContent, ToolUseBlock};
     use strands_agents::Agent;
@@ -648,6 +654,46 @@ mod tests {
         let mut messages = tool_loop(45);
         assert!(pass(&manager, &agent, &mut messages, tokens, false).await);
         assert_eq!(model.call_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_summary_is_no_failure_and_starts_no_backoff() {
+        let (_, model) = agent(&["SUMMARY after the reload"]);
+        let cut_short = Arc::new(CancelledOnce {
+            inner: Arc::clone(&model),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let agent = Agent::builder().model(cut_short).build().unwrap();
+        let (manager, events) = manager(10_000, None);
+        let mut messages = tool_loop(45);
+        let tokens = heuristic(&messages);
+
+        assert!(!pass(&manager, &agent, &mut messages, tokens, false).await);
+        assert!(events.lock().is_empty(), "{:?}", events.lock());
+        // The next call at the same size retries at once.
+        assert!(pass(&manager, &agent, &mut messages, tokens, false).await);
+        assert_eq!(model.call_count(), 1);
+        assert!(matches!(events.lock()[..], [Compaction::Done { .. }]));
+    }
+
+    /// A summarizer whose first call a shutdown cuts short (as the swarm's side model does), then
+    /// `inner`.
+    struct CancelledOnce {
+        inner: Arc<MockMessageModel>,
+        cancelled: std::sync::atomic::AtomicBool,
+    }
+
+    impl Model for CancelledOnce {
+        fn model_id(&self) -> Option<String> {
+            self.inner.model_id()
+        }
+
+        fn stream<'a>(&'a self, messages: &'a [Message], options: &'a StreamOptions) -> ModelEventStream<'a> {
+            if self.cancelled.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return self.inner.stream(messages, options);
+            }
+            Box::pin(futures::stream::iter([Err(Error::Cancelled)]))
+        }
     }
 
     #[tokio::test]
