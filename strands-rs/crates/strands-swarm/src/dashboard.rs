@@ -178,7 +178,7 @@ impl ContextControl {
             }
         }
         let mut messages = agent.messages();
-        let (mut done, mut freed) = (0, 0);
+        let (mut done, mut freed, mut offloaded) = (0, 0, Vec::new());
         for message in messages.iter_mut().filter(|m| m.role == Role::User) {
             for block in &mut message.content {
                 let ContentBlock::ToolResult(result) = block else {
@@ -211,12 +211,19 @@ impl ContextControl {
                 result.content = vec![ToolResultContent::Text(stub)];
                 freed += before.saturating_sub(result_tokens(&result.content));
                 done += 1;
+                offloaded.extend(refs);
             }
         }
         if done > 0 {
             agent.set_messages(messages);
         }
         let mut note = format!("Offloaded {done} tool results (~{} tokens).", group(freed as u64));
+        if !offloaded.is_empty() {
+            note.push_str(&format!(
+                " `retrieve_context` reads them back by reference: {}.",
+                offloaded.join(", ")
+            ));
+        }
         if !unknown.is_empty() {
             note.push_str(&format!(" Not in the latest listing: {}.", unknown.join(", ")));
         }
@@ -284,6 +291,7 @@ fn items(messages: &[Message]) -> Vec<Item> {
         for block in &message.content {
             match block {
                 ContentBlock::ToolResult(result) => {
+                    let refs = stash_refs(&result.content);
                     let what = match calls.get(result.tool_use_id.as_str()) {
                         Some((name, input)) => {
                             format!("{name} result `{}`", crate::runtime::summarize_input(input))
@@ -293,9 +301,10 @@ fn items(messages: &[Message]) -> Vec<Item> {
                     items.push(Item {
                         tokens: result_tokens(&result.content),
                         age: later_calls,
-                        what,
+                        // A stub names its stash keys, for `retrieve_context`.
+                        what: what + &format_stash_refs(&refs),
                         tool_use_id: Some(result.tool_use_id.clone()),
-                        stashed: !stash_refs(&result.content).is_empty(),
+                        stashed: !refs.is_empty(),
                     });
                 }
                 other => rest += block_tokens(other),
@@ -489,6 +498,11 @@ mod tests {
         // The next model call sees the stub instead of the output.
         let report = result_text(&model, 4, "c2");
         assert!(report.contains("Offloaded 1 tool results"), "{report}");
+        assert!(report.contains("by reference: big_0."), "{report}");
+        assert!(
+            report.contains("shell result `cargo test` [ref: big_0]"),
+            "{report}"
+        );
         assert!(report.contains("Not in the latest listing: 9."), "{report}");
         assert!(report.contains("1 results in context are previews"), "{report}");
         let stub = result_text(&model, 4, "big");
