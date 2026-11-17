@@ -391,7 +391,8 @@ impl Jobs {
         }
     }
 
-    /// The last `lines` lines of job `id`'s output.
+    /// The last `lines` lines of job `id`'s output, as a terminal would show them
+    /// ([`crate::text::plain`]).
     pub async fn tail(&self, id: &str, lines: usize) -> String {
         let Ok(mut file) = tokio::fs::File::open(self.log_path(id)).await else {
             return String::new();
@@ -404,6 +405,7 @@ impl Jobs {
         let mut bytes = Vec::new();
         let _ = file.read_to_end(&mut bytes).await;
         let text = String::from_utf8_lossy(&bytes);
+        let text = crate::text::plain(&text);
         let all: Vec<&str> = text.trim_end().lines().collect();
         // A tail cut mid-file starts mid-line; drop that partial line.
         let partial = usize::from(from > 0 && all.len() > 1);
@@ -465,6 +467,19 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("job {id} did not end");
+    }
+
+    #[tokio::test]
+    async fn a_tail_is_the_text_a_terminal_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path().join("jobs"));
+        let command = r"printf '\033[1m\033[32mok\033[0m\n 10%%\r 90%%\r100%%\r\nend\n'";
+        jobs.start("a1", None, command, dir.path(), &BTreeMap::new())
+            .await
+            .unwrap();
+        until_ended(&jobs, "j1").await;
+        assert_eq!(jobs.tail("j1", 2).await, "100%\nend");
+        assert_eq!(jobs.tail("j1", 3).await, "ok\n100%\nend");
     }
 
     #[tokio::test]

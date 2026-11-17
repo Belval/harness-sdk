@@ -4,7 +4,8 @@
 //! reaches the model JSON-encoded: every quote of a file it `cat`s arrives as `\"` and every line
 //! break as `\n`. Models copy that into `edit`'s `old_str`, which then matches nothing (in a test
 //! run, four of seven agents lost a turn to it). [`ShellText`] turns the block into the text a
-//! terminal would show, with stderr and a failing exit code marked.
+//! terminal would show, with stderr and a failing exit code marked and without the escape
+//! sequences and `\r` overwrites a terminal would interpret ([`crate::text::plain`]).
 
 use async_trait::async_trait;
 use strands_agents::hooks::AfterToolCallEvent;
@@ -42,14 +43,17 @@ impl Plugin for ShellText {
 /// stdout as is, then `[stderr]` and stderr, then `[exit code N]` unless it is 0;
 /// `(no output)` when all three are empty.
 pub fn render(output: &ShellOutput) -> String {
-    let mut text = output.output.trim_end_matches('\n').to_owned();
+    let mut text = crate::text::plain(&output.output)
+        .trim_end_matches('\n')
+        .to_owned();
     let section = |text: &mut String, part: &str| {
         if !text.is_empty() {
             text.push('\n');
         }
         text.push_str(part);
     };
-    let error = output.error.trim_end_matches('\n');
+    let error = crate::text::plain(&output.error);
+    let error = error.trim_end_matches('\n');
     if !error.is_empty() {
         section(&mut text, &format!("[stderr]\n{error}"));
     }
@@ -85,6 +89,18 @@ mod tests {
         );
         assert_eq!(render(&output("", "", 1)), "[exit code 1]");
         assert_eq!(render(&output("", "warn", 0)), "[stderr]\nwarn");
+    }
+
+    #[test]
+    fn colours_and_progress_overwrites_are_dropped() {
+        assert_eq!(
+            render(&output(
+                "\x1b[32m✓\x1b[39m 3 passed\n",
+                " 1/3\r 3/3\n\x1b[31mFAIL\x1b[0m\n",
+                1
+            )),
+            "✓ 3 passed\n[stderr]\n 3/3\nFAIL\n[exit code 1]"
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Small text helpers: token counts parsed and shown compactly, and clipping to a few chars.
+//! Small text helpers: token counts parsed and shown compactly, clipping to a few chars, and
+//! terminal output reduced to the text it shows.
 
 /// Parse a token count: `500000`, `500k`, `2.5M`, `1G` (case-insensitive, `_` allowed).
 pub fn parse_tokens(text: &str) -> Result<u64, String> {
@@ -49,9 +50,78 @@ pub fn clip(text: &str, max: usize) -> String {
     }
 }
 
+/// Terminal output as the text a terminal leaves on screen: without ANSI escape sequences
+/// (colours, cursor moves, OSC titles and hyperlinks) and with each `\r`-overwritten line (progress
+/// bars, spinners) reduced to what was written last. Test runners and build tools colour their
+/// output even into a pipe; in one run 11 results carried 710 such sequences, tokens the model pays
+/// for and has to read around.
+pub fn plain(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['\x1b', '\r']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: parameters and intermediates up to a final byte in `@`..=`~`.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC (and the other string sequences): up to BEL or ST (`ESC \`).
+                Some(']' | 'P' | '_' | '^' | 'X') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                // Two-character sequences (`ESC 7`, `ESC (B`'s first part, …).
+                _ => {}
+            },
+            '\r' if chars.peek() == Some(&'\n') => {}
+            // A carriage return starts the line over; a trailing one overwrites nothing.
+            '\r' if chars.peek().is_some() => {
+                let start = out.rfind('\n').map_or(0, |i| i + 1);
+                out.truncate(start);
+            }
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_drops_escape_sequences_and_overwritten_progress() {
+        assert!(matches!(
+            plain("no escapes\n\tat all"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            plain("\x1b[31m\x1b[1mError\x1b[22m: boom\x1b[39m\n\x1b[2K\x1b[1Gdone"),
+            "Error: boom\ndone"
+        );
+        assert_eq!(
+            plain("\x1b]8;;http://x\x07link\x1b]8;;\x07 \x1b]0;title\x1b\\ok \x1b(Bplain"),
+            "link ok Bplain"
+        );
+        assert_eq!(plain("a\r\nb\r\n"), "a\nb\n", "CRLF is a line break");
+        assert_eq!(plain("start\n 10%\r 50%\r100%\nnext\r"), "start\n100%\nnext");
+        assert_eq!(
+            plain("cut \x1b[3"),
+            "cut ",
+            "an unterminated sequence ends the text"
+        );
+    }
 
     #[test]
     fn parses_sizes_in_binary_units() {
