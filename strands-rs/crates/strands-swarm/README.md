@@ -194,6 +194,10 @@ error.
     `[schedule sN] message` (kind `schedule`) at the given times.
   - `{cancel: id}` removes one and `{}` lists them. Repeats are at least a minute apart.
   - An agent that polls something schedules itself and ends its turn instead of a long `wait`.
+  - From its second fire on, a repeat adds what the receiver spent since the last one:
+    `(You used 330.0k tokens, est. $0.21, since this schedule last fired 2m ago: about $6.30/h at
+    this interval.)`. A poll over a large context costs about that each time even when nothing
+    changed, so the agent can see what its loop costs and pick the interval.
   - Schedules are saved with the run. One that came due while the swarm was down fires once on
     resume, then keeps its interval.
   - Schedules of a cancelled agent (receiver or creator) are dropped.

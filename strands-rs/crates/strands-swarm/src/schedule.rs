@@ -26,6 +26,22 @@ pub struct Schedule {
     /// Repeat interval in seconds; `None` fires once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub every_secs: Option<u64>,
+    /// When it last fired and what the receiver had spent by then, so the next fire can say what
+    /// the receiver spent in between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired: Option<Fired>,
+}
+
+/// A fire of a [`Schedule`] and the receiver's spend so far at that moment.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Fired {
+    /// When.
+    pub at: DateTime<Utc>,
+    /// The receiver's input + output tokens so far.
+    pub tokens: u64,
+    /// Its estimated USD so far; `None` when its model has no price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
 }
 
 impl Schedule {
@@ -39,6 +55,43 @@ impl Schedule {
         let missed = ((now - self.next).num_seconds() / every.num_seconds()).max(0);
         self.next += every * (missed as i32 + 1);
         true
+    }
+
+    /// The text this posts at `now`, given the receiver's spend so far: after a repeat's first
+    /// fire it says what the receiver spent since the last one (and per hour at this interval),
+    /// so a polling agent sees what its loop costs.
+    pub fn text(&self, now: Fired) -> String {
+        let text = format!("[schedule {}] {}", self.id, self.message);
+        let (Some(every), Some(last)) = (self.every_secs, self.fired) else {
+            return text;
+        };
+        let tokens = now.tokens.saturating_sub(last.tokens);
+        if tokens == 0 {
+            return text;
+        }
+        let ago = human((now.at - last.at).to_std().unwrap_or_default());
+        let tokens = crate::text::compact(tokens);
+        let spent = match (now.usd, last.usd) {
+            (Some(now), Some(last)) => {
+                let usd = (now - last).max(0.0);
+                let rate = usd * 3600.0 / every.max(1) as f64;
+                let render = |usd| {
+                    crate::cost::Estimate {
+                        usd,
+                        unknown: false,
+                        any: true,
+                    }
+                    .render()
+                };
+                format!(
+                    "{tokens} tokens, est. {}, since this schedule last fired {ago} ago: about {}/h at this interval",
+                    render(usd),
+                    render(rate)
+                )
+            }
+            _ => format!("{tokens} tokens since this schedule last fired {ago} ago"),
+        };
+        format!("{text}\n(You used {spent}.)")
     }
 
     /// One line: `s1 every 30m, next in 12m (2026-11-17 09:00 UTC): check the queue`.
@@ -196,6 +249,7 @@ mod tests {
             message: "check".into(),
             next: utc("2026-11-16T10:00:00Z"),
             every_secs: Some(1800),
+            fired: None,
         };
         // Down from 10:00 to 11:40: one fire now, the next on the 30-minute grid.
         assert!(schedule.advance(utc("2026-11-16T11:40:00Z")));
@@ -215,6 +269,7 @@ mod tests {
             message: "check the queue\nand report".into(),
             next: utc("2026-11-17T09:00:00Z"),
             every_secs: Some(1800),
+            fired: None,
         };
         let now = utc("2026-11-17T08:48:00Z");
         assert_eq!(
@@ -232,5 +287,52 @@ mod tests {
         assert_eq!(human(Duration::from_secs(3 * 86_400 + 61)), "3d");
         assert_eq!(human(Duration::from_secs(45)), "45s");
         assert_eq!(human(Duration::from_secs(29 * 60 + 59)), "30m");
+    }
+
+    #[test]
+    fn a_repeat_says_what_its_receiver_spent_since_the_last_fire() {
+        let mut schedule = Schedule {
+            id: "poll".into(),
+            owner: "a1".into(),
+            to: "a1".into(),
+            message: "poll slack".into(),
+            next: utc("2026-11-17T09:00:00Z"),
+            every_secs: Some(120),
+            fired: None,
+        };
+        let at = |time: &str, tokens, usd| Fired {
+            at: utc(time),
+            tokens,
+            usd,
+        };
+        let first = at("2026-11-17T09:00:00Z", 1_000_000, Some(10.0));
+        assert_eq!(
+            schedule.text(first),
+            "[schedule poll] poll slack",
+            "nothing to compare yet"
+        );
+        schedule.fired = Some(first);
+        assert_eq!(
+            schedule.text(at("2026-11-17T09:02:00Z", 1_330_000, Some(10.21))),
+            "[schedule poll] poll slack\n(You used 330.0k tokens, est. $0.21, since this schedule last \
+             fired 2m ago: about $6.30/h at this interval.)"
+        );
+        assert_eq!(
+            schedule.text(at("2026-11-17T09:02:00Z", 1_000_000, Some(10.0))),
+            "[schedule poll] poll slack",
+            "nothing spent, nothing said"
+        );
+        schedule.fired = Some(at("2026-11-17T09:00:00Z", 1_000_000, None));
+        assert_eq!(
+            schedule.text(at("2026-11-17T09:04:00Z", 1_002_000, None)),
+            "[schedule poll] poll slack\n(You used 2.0k tokens since this schedule last fired 4m ago.)",
+            "unpriced: tokens only"
+        );
+        schedule.every_secs = None;
+        assert_eq!(
+            schedule.text(at("2026-11-17T09:04:00Z", 1_002_000, None)),
+            "[schedule poll] poll slack",
+            "a one-shot has no loop to price"
+        );
     }
 }

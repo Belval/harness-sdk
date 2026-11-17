@@ -58,6 +58,7 @@ impl Swarm {
                 message,
                 next,
                 every_secs: every.map(|every| every.as_secs()),
+                fired: None,
             };
             match list.iter_mut().find(|s| s.id == schedule.id) {
                 Some(old) => *old = schedule.clone(),
@@ -134,13 +135,31 @@ impl Swarm {
             self.prune_schedules();
             let now = self.now();
             let due: Vec<Schedule> = {
-                let mut list = self.inner.schedules.lock();
-                let due: Vec<Schedule> = list.iter().filter(|s| s.next <= now).cloned().collect();
-                list.retain_mut(|s| s.next > now || s.advance(now));
-                due
+                let list = self.inner.schedules.lock();
+                list.iter().filter(|s| s.next <= now).cloned().collect()
             };
+            let cost = (!due.is_empty()).then(|| self.cost());
+            let fired: std::collections::HashMap<String, schedules::Fired> = due
+                .iter()
+                .map(|s| {
+                    let spend = cost.as_ref().and_then(|cost| cost.spend(&s.to));
+                    let fired = schedules::Fired {
+                        at: now,
+                        tokens: spend.map_or(0, |spend| spend.own_tokens),
+                        usd: spend.filter(|s| !s.own.unknown).map(|s| s.own.usd),
+                    };
+                    (s.id.clone(), fired)
+                })
+                .collect();
+            self.inner.schedules.lock().retain_mut(|s| {
+                if s.next > now {
+                    return true;
+                }
+                s.fired = fired.get(&s.id).copied();
+                s.advance(now)
+            });
             for schedule in &due {
-                let text = format!("[schedule {}] {}", schedule.id, schedule.message);
+                let text = schedule.text(fired[&schedule.id]);
                 if let Err(error) = self.post(&schedule.owner, &schedule.to, "schedule", text) {
                     tracing::warn!(%error, id = %schedule.id, "scheduled message not delivered");
                 }

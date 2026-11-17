@@ -3108,8 +3108,13 @@ fn every(minutes: u64, to: &str, message: &str) -> strands_swarm::ScheduleReques
 #[tokio::test(start_paused = true)]
 async fn a_recurring_schedule_wakes_its_agent_until_it_is_cancelled() {
     let dir = tempfile::tempdir().unwrap();
-    let scripts = scripts_of(vec![("a1", vec![say("started"), say("tick 1"), say("tick 2")])]);
-    let (swarm, mut events) = Swarm::new(SwarmConfig::new(mock_factory(&scripts), dir.path()));
+    let tick = |text: &str| MockResponse::with_usage(Message::assistant(text), usage(0, 1_000_000, 0));
+    let scripts = scripts_of(vec![("a1", vec![say("started"), tick("tick 1"), tick("tick 2")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.prices = Arc::new(
+        strands_swarm::cost::Prices::with_overrides(r#"{"test-model": {"input": 5, "output": 25}}"#).unwrap(),
+    );
+    let (swarm, mut events) = Swarm::new(config);
     let root = spawn_root(&swarm, "monitor").await;
     assert_eq!(reply_to(&mut events, USER).await, "started");
 
@@ -3129,6 +3134,15 @@ async fn a_recurring_schedule_wakes_its_agent_until_it_is_cancelled() {
 
     tokio::time::sleep(Duration::from_secs(30 * 60)).await;
     assert_eq!(reply_to(&mut events, USER).await, "tick 2");
+    // The second fire says what the first fire's turn cost: 1M cached tokens at $0.50/1M.
+    let woken = sent_text(&scripts.lock()["a1"].clone(), 2);
+    assert!(
+        woken.contains(
+            "(You used 1.0M tokens, est. $0.50, since this schedule last fired 30m ago: \
+             about $1.00/h at this interval.)"
+        ),
+        "{woken}"
+    );
     swarm.unschedule("s1").unwrap();
     assert!(swarm.schedules().is_empty());
     tokio::time::sleep(Duration::from_secs(3 * 3600)).await;
