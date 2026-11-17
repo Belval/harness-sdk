@@ -49,19 +49,23 @@ impl Swarm {
         })
     }
 
-    /// Where agent `id`'s context pipeline reports a summary: a [`SwarmEvent::Compacted`]. It
-    /// holds the swarm weakly, as the agent it is handed to is owned by the swarm.
+    /// Where agent `id`'s context pipeline reports a summary ([`SwarmEvent::Compacted`]) or a
+    /// failed one ([`SwarmEvent::CompactFailed`]). It holds the swarm weakly, as the agent it is
+    /// handed to is owned by the swarm.
     fn compaction_sink(&self, id: &str) -> crate::compaction::CompactedSink {
         let inner = Arc::downgrade(&self.inner);
         let id = id.to_owned();
-        Arc::new(move |before, after| {
-            if let Some(inner) = inner.upgrade() {
-                Swarm { inner }.emit(SwarmEvent::Compacted {
-                    id: id.clone(),
-                    before,
-                    after,
-                });
-            }
+        Arc::new(move |compaction| {
+            let Some(inner) = inner.upgrade() else { return };
+            let id = id.clone();
+            Swarm { inner }.emit(match compaction {
+                crate::compaction::Compaction::Done { before, after } => {
+                    SwarmEvent::Compacted { id, before, after }
+                }
+                crate::compaction::Compaction::Failed { tokens, error } => {
+                    SwarmEvent::CompactFailed { id, tokens, error }
+                }
+            });
         })
     }
 

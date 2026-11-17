@@ -148,6 +148,10 @@ impl Journal {
             SwarmEvent::Compacted { id, before, after } => {
                 ("compacted", json!({"id": id, "before": before, "after": after}))
             }
+            SwarmEvent::CompactFailed { id, tokens, error } => (
+                "compact_failed",
+                json!({"id": id, "tokens": tokens, "error": error}),
+            ),
             SwarmEvent::Reloaded { from, to, changes } => {
                 ("changes", json!({"from": from, "to": to, "commits": changes}))
             }
@@ -319,6 +323,11 @@ mod tests {
             before: 300,
             after: 100,
         });
+        journal.record(&SwarmEvent::CompactFailed {
+            id: "a1".into(),
+            tokens: 300,
+            error: "throttled".into(),
+        });
         journal.flush().await;
 
         let entries = read(dir.path()).unwrap();
@@ -330,7 +339,7 @@ mod tests {
 
         let events = fs::read_to_string(dir.path().join(EVENTS_FILE)).unwrap();
         let lines: Vec<Value> = events.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert_eq!(lines[0]["event"], "status");
         assert_eq!(lines[0]["status"], "running");
         assert!(lines[0]["ts"].as_str().unwrap().ends_with('Z'));
@@ -343,6 +352,8 @@ mod tests {
             ),
             (Some("a1"), Some(300), Some(100))
         );
+        assert_eq!(lines[2]["event"], "compact_failed");
+        assert_eq!(lines[2]["error"], "throttled");
     }
 
     #[tokio::test]

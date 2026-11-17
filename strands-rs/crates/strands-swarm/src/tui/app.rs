@@ -365,6 +365,14 @@ impl App {
                     compact(after)
                 )))
             }),
+            SwarmEvent::CompactFailed { id, tokens, error } => {
+                let note = format!(
+                    "context not compacted: summarizing older turns failed ({error}); {} tokens sent as they are",
+                    compact(tokens)
+                );
+                self.notice = Some(format!("{id}: {note}"));
+                self.with(&id, |view| view.push(LogEntry::Status(note)));
+            }
         }
     }
 
@@ -1041,6 +1049,23 @@ mod tests {
             .iter()
             .any(|entry| matches!(entry, LogEntry::Status(note)
             if note == "context compacted: older turns summarized, 305.0k → 98.1k tokens")));
+    }
+
+    #[test]
+    fn a_failed_compaction_is_noted_in_the_log_and_the_footer() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        app.apply(SwarmEvent::CompactFailed {
+            id: "a1".into(),
+            tokens: 305_000,
+            error: "throttled".into(),
+        });
+        let note = "context not compacted: summarizing older turns failed (throttled); 305.0k tokens sent as they are";
+        assert!(app.agents["a1"]
+            .log
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::Status(n) if n == note)));
+        assert_eq!(app.notice, Some(format!("a1: {note}")));
     }
 
     #[test]

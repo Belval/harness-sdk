@@ -431,6 +431,9 @@ fn print_event(event: &SwarmEvent) {
         SwarmEvent::Compacted { id, before, after } => {
             eprintln!("[{id}] context compacted: {before} -> {after} tokens")
         }
+        SwarmEvent::CompactFailed { id, tokens, error } => {
+            eprintln!("[{id}] context not compacted ({tokens} tokens): {error}")
+        }
         SwarmEvent::Text { .. }
         | SwarmEvent::Usage { .. }
         | SwarmEvent::MailRead { .. }

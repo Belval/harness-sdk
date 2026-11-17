@@ -47,8 +47,27 @@ pub fn window_of(model: &dyn Model) -> u64 {
 /// above the compaction point (a summary much longer than expected, say).
 const MAX_PASSES: usize = 2;
 
-/// Told `(before, after)` input tokens each time [`CompactAt`] summarizes.
-pub type CompactedSink = Arc<dyn Fn(u64, u64) + Send + Sync>;
+/// What [`CompactAt`] reports when it summarized, or tried to and failed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Compaction {
+    /// Older turns were summarized.
+    Done {
+        /// Projected input tokens before.
+        before: u64,
+        /// Estimated input tokens after.
+        after: u64,
+    },
+    /// The summarizer failed; the context was left as it was.
+    Failed {
+        /// Projected input tokens, still to be sent.
+        tokens: u64,
+        /// The summarizer's error.
+        error: String,
+    },
+}
+
+/// Told each [`Compaction`], so a failure is seen rather than only logged.
+pub type CompactedSink = Arc<dyn Fn(Compaction) + Send + Sync>;
 
 /// Summarizes an agent's older turns once the projected input reaches the compaction point of
 /// its current model (so a `/model` switch moves the point with the window), on overflow, or
@@ -88,7 +107,7 @@ impl CompactAt {
         self
     }
 
-    /// Report each compaction to `sink`.
+    /// Report each compaction, and each failed one, to `sink`.
     pub fn on_compacted(mut self, sink: Option<CompactedSink>) -> Self {
         self.sink = sink;
         self
@@ -139,35 +158,54 @@ impl ContextStrategy for CompactAt {
         let model = ctx.agent.aux_model();
         let mut tokens = before;
         let mut passes = 0;
+        let mut failure = None;
         while passes < MAX_PASSES && (passes == 0 || tokens >= point) {
             match summarize_down_to(ctx.messages, tokens, target, &model).await {
-                Some(after) => tokens = after,
-                None => break,
+                Ok(Some(after)) => tokens = after,
+                Ok(None) => break,
+                Err(error) => {
+                    failure = Some(error.to_string());
+                    break;
+                }
             }
             passes += 1;
+        }
+        if let (0, Some(error)) = (passes, failure) {
+            self.report(Compaction::Failed { tokens, error });
         }
         if passes == 0 {
             return Ok(false);
         }
         tracing::info!("before=<{before}>, after=<{tokens}>, passes=<{passes}> | compacted the context");
-        if let Some(sink) = &self.sink {
-            sink(before, tokens);
-        }
+        self.report(Compaction::Done {
+            before,
+            after: tokens,
+        });
         Ok(true)
+    }
+}
+
+impl CompactAt {
+    fn report(&self, compaction: Compaction) {
+        if let Some(sink) = &self.sink {
+            sink(compaction);
+        }
     }
 }
 
 /// One pass: summarize the leading messages (after the first) that bring `tokens` (the projected
 /// input, system prompt and tools included) down to `target`, keeping at least the latest
-/// [`SUMMARY_KEEPS`]. Returns the estimated input afterwards, or `None` when nothing could be
-/// summarized or the summarizer failed (the context is then left as it was).
+/// [`SUMMARY_KEEPS`]. Returns the estimated input afterwards, `None` when nothing could be
+/// summarized, or the summarizer's error; either way the context is then left as it was.
 async fn summarize_down_to(
     messages: &mut Vec<Message>,
     tokens: u64,
     target: u64,
     model: &Arc<dyn Model>,
-) -> Option<u64> {
-    let first = messages.first().filter(|m| m.role == Role::User)?;
+) -> Result<Option<u64>> {
+    let Some(first) = messages.first().filter(|m| m.role == Role::User) else {
+        return Ok(None);
+    };
     let (task, earlier): (Vec<ContentBlock>, Vec<ContentBlock>) = first
         .content
         .iter()
@@ -181,7 +219,9 @@ async fn summarize_down_to(
     // up to it overestimates what a message weighs, which errs towards summarizing more.
     let scale = tokens as f64 / sizes.iter().sum::<u64>().max(1) as f64;
     let excess = tokens.saturating_sub(target) as f64;
-    let last = messages.len().checked_sub(SUMMARY_KEEPS)?;
+    let Some(last) = messages.len().checked_sub(SUMMARY_KEEPS) else {
+        return Ok(None);
+    };
     // `cut` is the first message kept after the summary; an assistant message, so the summary's
     // range ends with a user message and no tool call loses its result.
     let mut removed = heuristic_blocks(&earlier) as f64 * scale;
@@ -195,16 +235,14 @@ async fn summarize_down_to(
             }
         }
     }
-    let (cut, removed) = cut?;
+    let Some((cut, removed)) = cut else {
+        return Ok(None);
+    };
     let mut content = earlier;
     content.extend(flatten_messages_to_content(&messages[1..cut]));
-    let summary = match summarize(model, content).await {
-        Ok(summary) => summary,
-        Err(error) => {
-            tracing::warn!("error=<{error}> | summarizing older turns failed");
-            return None;
-        }
-    };
+    let summary = summarize(model, content)
+        .await
+        .inspect_err(|error| tracing::warn!("error=<{error}> | summarizing older turns failed"))?;
     let text = format_summarized(
         &format!("{} messages", cut - 1),
         removed.round() as u64,
@@ -215,7 +253,7 @@ async fn summarize_down_to(
     kept.push(ContentBlock::Text(text));
     messages[0].content = kept;
     messages.drain(1..cut);
-    Some((tokens as f64 - removed + added).max(0.0).round() as u64)
+    Ok(Some((tokens as f64 - removed + added).max(0.0).round() as u64))
 }
 
 fn is_summary(block: &ContentBlock) -> bool {
@@ -282,14 +320,13 @@ mod tests {
         messages
     }
 
-    type Events = Arc<Mutex<Vec<(u64, u64)>>>;
+    type Events = Arc<Mutex<Vec<Compaction>>>;
 
     fn manager(compact_at: u64, control: Option<Arc<ContextControl>>) -> (Arc<ContextManager>, Events) {
         let events: Events = Arc::default();
         let sink = Arc::clone(&events);
-        let mut strategy = CompactAt::new(compact_at).on_compacted(Some(Arc::new(move |before, after| {
-            sink.lock().push((before, after))
-        })));
+        let mut strategy = CompactAt::new(compact_at)
+            .on_compacted(Some(Arc::new(move |compaction| sink.lock().push(compaction))));
         if let Some(control) = control {
             strategy = strategy.on_request(control);
         }
@@ -357,9 +394,10 @@ mod tests {
         );
         assert!(messages[0].text().contains("SUMMARY one"));
         let reported = events.lock().clone();
-        assert_eq!(reported.len(), 1);
-        assert_eq!(reported[0].0, before);
-        assert!(reported[0].1 <= 5_000, "{reported:?}");
+        assert!(
+            matches!(reported[..], [Compaction::Done { before: b, after }] if b == before && after <= 5_000),
+            "{reported:?}"
+        );
         // The summarizer saw the turns as text: Bedrock refuses tool calls in a user message.
         let (input, _) = &model.calls()[0];
         assert!(input[0]
@@ -411,7 +449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_summary_leaves_the_context_alone() {
+    async fn a_failed_summary_leaves_the_context_alone_and_is_reported() {
         let (agent, _model) = agent(&[""]);
         let (manager, events) = manager(10_000, None);
         let mut messages = tool_loop(45);
@@ -423,6 +461,26 @@ mod tests {
             .unwrap();
         assert!(!changed);
         assert_eq!(messages, original);
+        assert_eq!(
+            events.lock()[..],
+            [Compaction::Failed {
+                tokens: before,
+                error: "the summarizer returned no text".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_to_summarize_is_not_a_failure() {
+        let (agent, model) = agent(&["unused"]);
+        let (manager, events) = manager(100, None);
+        let mut messages = tool_loop(1);
+        let changed = manager
+            .run_strategies_on(&agent, &mut messages, Some(5_000), false)
+            .await
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(model.call_count(), 0);
         assert!(events.lock().is_empty());
     }
 

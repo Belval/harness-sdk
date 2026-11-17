@@ -11,6 +11,7 @@ use serde_json::json;
 use strands_agents::testing::{MockMessageModel, MockResponse};
 use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
 use strands_agents::{Agent, Model};
+use strands_swarm::compaction::Compaction;
 use strands_swarm::{
     AgentFactory, AgentSpec, AgentStatus, LandRequest, ModelResolver, ReloadWhen, SpawnRequest, Swarm,
     SwarmConfig, SwarmEvent, GOAL_MAX_ATTEMPTS, USER,
@@ -3222,11 +3223,19 @@ async fn list_agents_shows_each_agents_estimated_spend_and_its_subtrees() {
 }
 
 #[tokio::test]
-async fn a_compaction_reported_by_the_factorys_pipeline_becomes_a_swarm_event() {
+async fn compactions_reported_by_the_factorys_pipeline_become_swarm_events() {
     let dir = tempfile::tempdir().unwrap();
     let factory: AgentFactory = Arc::new(|spec: AgentSpec| {
         // Stands in for the context pipeline summarizing before a model call.
-        (spec.on_compacted.as_ref().expect("a compaction sink"))(300_000, 90_000);
+        let sink = spec.on_compacted.as_ref().expect("a compaction sink");
+        sink(Compaction::Failed {
+            tokens: 300_000,
+            error: "throttled".into(),
+        });
+        sink(Compaction::Done {
+            before: 300_000,
+            after: 90_000,
+        });
         Box::pin(async move {
             Agent::builder()
                 .id(spec.id)
@@ -3248,14 +3257,18 @@ async fn a_compaction_reported_by_the_factorys_pipeline_becomes_a_swarm_event() 
         .await
         .unwrap();
     let compacted = async {
+        let mut failed = None;
         loop {
-            if let Some(SwarmEvent::Compacted { id, before, after }) = events.recv().await {
-                return (id, before, after);
+            match events.recv().await {
+                Some(SwarmEvent::CompactFailed { id, tokens, error }) => failed = Some((id, tokens, error)),
+                Some(SwarmEvent::Compacted { id, before, after }) => return (failed, (id, before, after)),
+                _ => {}
             }
         }
     };
     let compacted = tokio::time::timeout(Duration::from_secs(10), compacted)
         .await
         .expect("timed out waiting for the compaction");
-    assert_eq!(compacted, ("a1".to_owned(), 300_000, 90_000));
+    let failed = Some(("a1".to_owned(), 300_000, "throttled".to_owned()));
+    assert_eq!(compacted, (failed, ("a1".to_owned(), 300_000, 90_000)));
 }

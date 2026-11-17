@@ -445,6 +445,15 @@ pub enum SwarmEvent {
         /// Estimated input tokens after.
         after: u64,
     },
+    /// Summarizing an agent's older turns failed; its context was left as it was.
+    CompactFailed {
+        /// Id.
+        id: String,
+        /// Projected input tokens, sent unsummarized.
+        tokens: u64,
+        /// The summarizer's error.
+        error: String,
+    },
     /// The token budget was set or lifted (`None`).
     Budget {
         /// New budget.
