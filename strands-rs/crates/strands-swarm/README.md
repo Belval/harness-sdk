@@ -329,6 +329,8 @@ Other text messages the selected agent, or starts a root agent when there is non
 - The input box edits like a shell line: ←/→, Home/End (Ctrl-A/E), Ctrl-←/→ by word, Delete,
   Ctrl-W/Ctrl-U (Alt-Backspace). Tab completes the highlighted command.
 - Alt-Enter (or Shift-Enter where reported) inserts a new line.
+- A long line wraps (at a space where one fits) instead of scrolling sideways; the box grows to
+  6 rows, then scrolls with the cursor.
 - ↑/↓ go through sent messages while the input holds text (Ctrl-P/N from an empty one). On an
   empty input they select agents.
 

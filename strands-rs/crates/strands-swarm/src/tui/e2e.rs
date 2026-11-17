@@ -463,3 +463,43 @@ async fn the_cost_popup_wraps_its_prose_at_80_columns() {
     }
     swarm.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_long_input_line_wraps_in_a_growing_box() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = HashMap::from([("a1", vec![say("root: done")])]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory(scripts, &Sinks::default()), dir.path()));
+    let mut app = App::default();
+    let mut screen = Screen::sized(80, 24);
+    screen.type_line(&swarm, &mut app, "fix the bug").await;
+    screen.until(&mut app, &mut events, "root: done").await;
+    let words: Vec<String> = (1..=30).map(|n| format!("word{n:02}")).collect();
+    let mut shown = String::new();
+    for code in words.join(" ").chars().map(KeyCode::Char) {
+        shown = screen.press(&swarm, &mut app, code).await;
+    }
+    let rows: Vec<&str> = shown.lines().collect();
+    let top = rows
+        .iter()
+        .position(|row| row.starts_with(" message → "))
+        .expect(&shown);
+    // 30 words of 7 columns wrap onto three rows at whole words, all in view.
+    let input: Vec<&str> = rows[top + 1..rows.len() - 1]
+        .iter()
+        .map(|row| row.trim_end())
+        .collect();
+    assert_eq!(input.len(), 3, "{shown}");
+    assert!(input[0].starts_with("word01 word02"), "{shown}");
+    assert!(
+        input
+            .iter()
+            .all(|row| row.ends_with(|c: char| c.is_ascii_digit())),
+        "{shown}"
+    );
+    assert_eq!(input.join(" "), words.join(" "), "{shown}");
+    // The cursor sits after the last word.
+    let cursor = screen.terminal.get_cursor_position().unwrap();
+    assert_eq!(usize::from(cursor.x), input[2].chars().count(), "{shown}");
+    assert_eq!(usize::from(cursor.y), top + 3, "{shown}");
+    swarm.shutdown().await;
+}

@@ -166,14 +166,6 @@ impl App {
         self.cursor = None;
         self.completion = 0;
     }
-
-    /// `(line, column)` of the cursor, in chars, for drawing.
-    pub fn cursor_line_col(&self) -> (usize, usize) {
-        let before = &self.input[..self.cursor()];
-        let line = before.matches('\n').count();
-        let col = before.rsplit('\n').next().unwrap_or_default().chars().count();
-        (line, col)
-    }
 }
 
 fn line_start(text: &str, at: usize) -> usize {
@@ -270,9 +262,8 @@ mod tests {
         let mut app = app("first\nsecond");
         app.home();
         assert_eq!(shown(&app), "first\n|second");
-        assert_eq!(app.cursor_line_col(), (1, 0));
         app.move_char(-1);
-        assert_eq!(app.cursor_line_col(), (0, 5));
+        assert_eq!(shown(&app), "first|\nsecond");
         app.home();
         app.end();
         assert_eq!(shown(&app), "first|\nsecond");

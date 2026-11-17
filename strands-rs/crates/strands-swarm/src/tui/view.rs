@@ -15,7 +15,7 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 /// Narrowest agent tree; shrinking it further hides it.
 const MIN_TREE: usize = 10;
 const HINT: &str = "/ commands · f1 keys";
-/// Most input lines shown at once; a longer message scrolls with the cursor.
+/// Most input rows shown at once (lines wrap); a longer message scrolls with the cursor.
 const MAX_INPUT_LINES: usize = 6;
 
 /// Key bindings, for the F1 popup.
@@ -86,7 +86,8 @@ impl Areas {
 
 /// Lay out a screen of `area` for `app`.
 pub fn areas(app: &App, area: Rect) -> Areas {
-    let lines = app.input.split('\n').count().clamp(1, MAX_INPUT_LINES) as u16;
+    let (rows, (cursor, _)) = input_rows(app, usize::from(area.width));
+    let lines = rows.len().max(cursor + 1).clamp(1, MAX_INPUT_LINES) as u16;
     let [header, body, input, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(5),
@@ -745,20 +746,49 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         || " new root task ".to_owned(),
         |label| format!(" message → {label} "),
     );
-    // Scroll so the cursor stays in view, both down a long message and along a long line.
-    let (line, col) = app.cursor_line_col();
-    let rows = usize::from(area.height.saturating_sub(1)).max(1);
-    let cols = usize::from(area.width).max(1);
-    let top = line.saturating_sub(rows - 1);
-    let left = col.saturating_sub(cols - 1);
-    let scroll = (to_u16(top), to_u16(left));
-    let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::TOP).title(target))
-        .scroll(scroll);
+    // Wrapped at the box's width, scrolled so the cursor's row stays in view.
+    let (rows, (row, col)) = input_rows(app, usize::from(area.width));
+    let height = usize::from(area.height.saturating_sub(1)).max(1);
+    let top = row.saturating_sub(height - 1);
+    let lines: Vec<Line> = rows
+        .iter()
+        .skip(top)
+        .take(height)
+        .map(|range| Line::raw(&app.input[range.clone()]))
+        .collect();
+    let input = Paragraph::new(lines).block(Block::default().borders(Borders::TOP).title(target));
     frame.render_widget(input, area);
-    let x = area.x.saturating_add(to_u16(col - left));
-    let y = area.y.saturating_add(1).saturating_add(to_u16(line - top));
+    let x = area.x.saturating_add(to_u16(col));
+    let y = area.y.saturating_add(1).saturating_add(to_u16(row - top));
     frame.set_cursor_position((x.min(area.right().saturating_sub(1)), y));
+}
+
+/// The input wrapped at `width` columns: each row's byte range in it, and the cursor's row and
+/// column. A line breaks after its last space that fits, else mid-word. A cursor after a full
+/// row goes to the start of the next, which may be one past the last.
+fn input_rows(app: &App, width: usize) -> (Vec<std::ops::Range<usize>>, (usize, usize)) {
+    let (input, width) = (app.input.as_str(), width.max(1));
+    let mut rows = Vec::new();
+    let mut start = 0;
+    for line in input.split('\n') {
+        let end = start + line.len();
+        let mut at = start;
+        while let Some((cut, _)) = input[at..end].char_indices().nth(width) {
+            let len = input[at..at + cut].rfind(' ').map_or(cut, |space| space + 1);
+            rows.push(at..at + len);
+            at += len;
+        }
+        rows.push(at..end);
+        start = end + 1;
+    }
+    let cursor = app.cursor();
+    let row = rows.iter().rposition(|row| row.start <= cursor).unwrap_or(0);
+    let col = input[rows[row].start..cursor].chars().count();
+    let cursor = match col >= width {
+        true => (row + 1, 0),
+        false => (row, col),
+    };
+    (rows, cursor)
 }
 
 fn to_u16(n: usize) -> u16 {
@@ -1230,12 +1260,33 @@ mod tests {
         let cursor = terminal.get_cursor_position().unwrap();
         assert_eq!((cursor.x, cursor.y), (3, input.y + 1));
 
-        // A long line scrolls sideways so the cursor stays visible.
+        // A long line wraps, growing the box, with the cursor after its last character.
         app.input = "x".repeat(100);
         app.cursor = None;
         terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let input = areas(&app, Rect::new(0, 0, 40, 20)).input;
+        assert_eq!(input.height, 4, "a border and rows of 40, 40 and 20");
         let cursor = terminal.get_cursor_position().unwrap();
-        assert_eq!(cursor.x, 39);
+        assert_eq!((cursor.x, cursor.y), (20, input.y + 3));
+        // After a full row, the cursor starts the next.
+        app.input = "x".repeat(80);
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let input = areas(&app, Rect::new(0, 0, 40, 20)).input;
+        assert_eq!(input.height, 4);
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!((cursor.x, cursor.y), (0, input.y + 3));
+        // Past the most rows, the box scrolls to keep the cursor in view.
+        app.input = "x".repeat(400);
+        app.cursor = Some(45);
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let input = areas(&app, Rect::new(0, 0, 40, 20)).input;
+        assert_eq!(input.height, 1 + MAX_INPUT_LINES as u16);
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!((cursor.x, cursor.y), (5, input.y + 2));
+        app.cursor = None;
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!((cursor.x, cursor.y), (0, input.bottom() - 1));
     }
 
     #[test]
