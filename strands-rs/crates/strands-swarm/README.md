@@ -124,7 +124,10 @@ and exit.
 - **Where it shows.**
   - `/cost` (or `--run NAME --cost`) shows per agent: input, output, cache-read and cache-write
     tokens, the model, an estimated `$`, and the median input per call and cache hit rate over the
-    last 50 calls.
+    last 50 calls. Below the table, side calls get their own rows by purpose: the goal `judge`,
+    the context `summarizer` and `other` calls on the auxiliary model (told apart by the system
+    prompt they send, so a custom judge or summarizer prompt counts as `other`). They are already
+    part of each agent's totals.
   - The TUI header shows `est. $12.30`.
   - `list_agents` gives models the same numbers: `est. $4.10 / 12.3M tokens`, a subtree total
     (`with 3 descendants $9.80 / 30.1M`) and a swarm total. A coordinator can spot an expensive
@@ -257,7 +260,8 @@ Typing text without a command messages the selected agent.
 - **Journal.**
   - A persistent run keeps `journal.jsonl` with every message to and from the user, and
     `events.jsonl` with compact lifecycle events: spawns, status changes, tool calls, model
-    switches, compactions (`before`/`after` tokens) and failed ones, resumes, reloads, shutdowns
+    switches, compactions (`before`/`after` tokens) and failed ones, side calls (`side_call`:
+    purpose, model and tokens of each judge or summarizer call), resumes, reloads, shutdowns
     and disk reclaimed.
   - Both are JSON lines with a UTC `ts`, written by a background thread and rotated to `<file>.1`
     at 8 MB.

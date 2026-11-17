@@ -92,6 +92,42 @@ pub struct Ledger {
     /// The last [`RECENT_CALLS`] own calls (side calls such as the goal judge left out).
     #[serde(default)]
     pub recent: VecDeque<Call>,
+    /// Side calls by purpose ([`SidePurpose`]) and model; also counted in `by_model`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub side: BTreeMap<String, BTreeMap<String, Counts>>,
+}
+
+/// What a side call (one not carrying the agent's own context) was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidePurpose {
+    /// The goal judge reviewing a finished turn.
+    Judge,
+    /// Summarizing older turns ([`crate::compaction::CompactAt`]).
+    Summarizer,
+    /// Anything else on the agent's auxiliary model.
+    Other,
+}
+
+impl SidePurpose {
+    /// Told apart by the system prompt each one sends.
+    pub fn of(system_prompt: Option<&str>) -> Self {
+        use strands_agents::context_manager::strategies::SUMMARIZATION_SYSTEM_PROMPT;
+        use strands_agents::plugins::vended::goal::JUDGE_SYSTEM_PROMPT;
+        match system_prompt {
+            Some(prompt) if prompt.starts_with(JUDGE_SYSTEM_PROMPT) => Self::Judge,
+            Some(prompt) if prompt.starts_with(SUMMARIZATION_SYSTEM_PROMPT) => Self::Summarizer,
+            _ => Self::Other,
+        }
+    }
+
+    /// `judge`, `summarizer` or `other`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Judge => "judge",
+            Self::Summarizer => "summarizer",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// Median input and cache hit rate over recent calls.
@@ -109,6 +145,13 @@ impl Ledger {
     /// Whether nothing was recorded.
     pub fn is_empty(&self) -> bool {
         self.by_model.is_empty() && self.recent.is_empty()
+    }
+
+    /// Count one side call for `purpose` on `model` (in `by_model` too).
+    pub fn record_side(&mut self, purpose: SidePurpose, model: &str, counts: Counts) {
+        self.record(model, counts, false);
+        let by_model = self.side.entry(purpose.name().to_owned()).or_default();
+        by_model.entry(model.to_owned()).or_default().add(&counts);
     }
 
     /// Count one model call on `model`; `own` calls also feed [`Ledger::call_stats`].
@@ -267,6 +310,25 @@ pub struct Estimate {
 }
 
 impl Estimate {
+    /// `counts` on `model` (none for no tokens; unknown without a model or a price).
+    fn of(prices: &Prices, model: Option<&str>, counts: &Counts) -> Self {
+        if counts.is_empty() {
+            return Self::default();
+        }
+        match model.and_then(|model| prices.price(model)) {
+            Some(price) => Self {
+                usd: price.cost(counts),
+                unknown: false,
+                any: true,
+            },
+            None => Self {
+                usd: 0.0,
+                unknown: true,
+                any: true,
+            },
+        }
+    }
+
     fn add(&mut self, other: Estimate) {
         self.usd += other.usd;
         self.unknown |= other.unknown;
@@ -312,24 +374,8 @@ impl AgentCost {
     /// Estimated USD of everything this agent spent.
     pub fn estimate(&self, prices: &Prices) -> Estimate {
         let mut total = Estimate::default();
-        let mut priced = |model: Option<&str>, counts: &Counts| {
-            if counts.is_empty() {
-                return;
-            }
-            let estimate = match model.and_then(|model| prices.price(model)) {
-                Some(price) => Estimate {
-                    usd: price.cost(counts),
-                    unknown: false,
-                    any: true,
-                },
-                None => Estimate {
-                    usd: 0.0,
-                    unknown: true,
-                    any: true,
-                },
-            };
-            total.add(estimate);
-        };
+        let mut priced =
+            |model: Option<&str>, counts: &Counts| total.add(Estimate::of(prices, model, counts));
         let mut tracked = Counts::default();
         for (model, counts) in &self.ledger.by_model {
             priced(Some(model), counts);
@@ -417,6 +463,21 @@ impl CostReport {
         Some(spend)
     }
 
+    /// Side calls across the swarm by purpose: tokens and estimate.
+    pub fn side_calls(&self) -> BTreeMap<String, (Counts, Estimate)> {
+        let mut out: BTreeMap<String, (Counts, Estimate)> = BTreeMap::new();
+        for agent in &self.agents {
+            for (purpose, by_model) in &agent.ledger.side {
+                let (total, estimate) = out.entry(purpose.clone()).or_default();
+                for (model, counts) in by_model {
+                    total.add(counts);
+                    estimate.add(Estimate::of(&self.prices, Some(model), counts));
+                }
+            }
+        }
+        out
+    }
+
     /// The report as a text table.
     pub fn lines(&self) -> Vec<String> {
         let row = |cells: [&str; 8]| {
@@ -479,6 +540,23 @@ impl CostReport {
             &self.total().render(),
             "",
         ]));
+        let side = self.side_calls();
+        if !side.is_empty() {
+            lines.push(String::new());
+            lines.push("side calls, part of the totals above:".to_owned());
+            for (purpose, (counts, estimate)) in &side {
+                lines.push(row([
+                    &format!("  {purpose}"),
+                    &format!("{} calls", counts.calls),
+                    &crate::text::compact(counts.input),
+                    &crate::text::compact(counts.output),
+                    &crate::text::compact(counts.cache_read),
+                    &crate::text::compact(counts.cache_write),
+                    &estimate.render(),
+                    "",
+                ]));
+            }
+        }
         lines.push(String::new());
         lines.push(format!(
             "last {RECENT_CALLS} calls: median input tokens per call and the share of it read \
@@ -677,6 +755,70 @@ mod tests {
         assert!(row.contains("$3.90"), "{row}");
         assert!(row.ends_with("1.0M/call 80%"), "{row}");
         assert!(lines[4].starts_with("total"), "{}", lines[4]);
+    }
+
+    #[test]
+    fn side_calls_are_told_apart_by_their_system_prompt() {
+        use strands_agents::context_manager::strategies::SUMMARIZATION_SYSTEM_PROMPT;
+        use strands_agents::plugins::vended::goal::JUDGE_SYSTEM_PROMPT;
+        let judge = format!("{JUDGE_SYSTEM_PROMPT}\n\nGoal: ship it");
+        assert_eq!(SidePurpose::of(Some(&judge)), SidePurpose::Judge);
+        assert_eq!(
+            SidePurpose::of(Some(SUMMARIZATION_SYSTEM_PROMPT)),
+            SidePurpose::Summarizer
+        );
+        assert_eq!(SidePurpose::of(Some("You are a poet.")), SidePurpose::Other);
+        assert_eq!(SidePurpose::of(None), SidePurpose::Other);
+    }
+
+    #[test]
+    fn side_calls_count_in_the_totals_and_get_their_own_rows() {
+        let opus = "global.anthropic.claude-opus-5";
+        let mut ledger = Ledger::default();
+        ledger.record(opus, counts(1_000_000, 0, 0, 0), true);
+        ledger.record_side(SidePurpose::Judge, opus, counts(200_000, 0, 0, 0));
+        ledger.record_side(SidePurpose::Judge, opus, counts(200_000, 0, 0, 0));
+        ledger.record_side(SidePurpose::Summarizer, opus, counts(600_000, 0, 0, 0));
+        assert_eq!(
+            ledger.by_model[opus].input, 2_000_000,
+            "side calls are in the totals"
+        );
+        assert_eq!(
+            ledger.call_stats().unwrap().calls,
+            1,
+            "but not in the own-call stats"
+        );
+        let report = CostReport {
+            agents: vec![AgentCost {
+                id: "a1".into(),
+                parent: "user".into(),
+                label: "a1".into(),
+                totals: counts(2_000_000, 0, 0, 0),
+                ledger: ledger.clone(),
+                fallback_model: None,
+            }],
+            prices: Prices::default(),
+        };
+        let side = report.side_calls();
+        assert_eq!(side["judge"].0.calls, 2);
+        assert_eq!(side["judge"].0.input, 400_000);
+        assert_eq!(side["judge"].1.render(), "$2.00");
+        assert_eq!(side["summarizer"].1.render(), "$3.00");
+        let lines = report.lines();
+        let at = lines
+            .iter()
+            .position(|line| line == "side calls, part of the totals above:")
+            .expect("no side-call section");
+        assert!(lines[at + 1].starts_with("  judge"), "{}", lines[at + 1]);
+        assert!(lines[at + 1].contains("2 calls"), "{}", lines[at + 1]);
+        assert!(lines[at + 1].ends_with("$2.00"), "{}", lines[at + 1]);
+        assert!(lines[at + 2].starts_with("  summarizer"), "{}", lines[at + 2]);
+        // The ledger persists with its side map and reads back.
+        let json = serde_json::to_string(&ledger).unwrap();
+        let back: Ledger = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.side, ledger.side);
+        let old: Ledger = serde_json::from_str(r#"{"by_model":{}}"#).unwrap();
+        assert!(old.side.is_empty(), "ledgers saved before side calls still load");
     }
 
     #[test]

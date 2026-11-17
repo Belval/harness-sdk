@@ -279,25 +279,55 @@ impl Swarm {
     /// `own_call` says whether the call carried the agent's context (not a side call's), `model`
     /// which model answered (for cost estimates).
     pub(super) fn add_usage(&self, node: &Node, usage: &Usage, model: Option<String>, own_call: bool) {
-        let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
-        let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
-        let input = usage.input_tokens + cache_read + cache_write;
+        let counts = usage_counts(usage);
+        let model = model.unwrap_or_else(|| "unknown".to_owned());
+        node.ledger.lock().record(&model, counts, own_call);
+        self.add_totals(node, counts, own_call);
+    }
+
+    /// [`Swarm::add_usage`] for a side call, tagged with what it was for. Each one is also an
+    /// `side_call` event in `events.jsonl`.
+    fn add_side_usage(
+        &self,
+        node: &Node,
+        usage: &Usage,
+        model: Option<String>,
+        purpose: crate::cost::SidePurpose,
+    ) {
+        let counts = usage_counts(usage);
+        let model = model.unwrap_or_else(|| "unknown".to_owned());
+        node.ledger.lock().record_side(purpose, &model, counts);
+        if let Some(journal) = &self.inner.journal {
+            journal.event(
+                "side_call",
+                serde_json::json!({
+                    "id": node.id,
+                    "purpose": purpose.name(),
+                    "model": model,
+                    "input": counts.input,
+                    "output": counts.output,
+                    "cache_read": counts.cache_read,
+                    "cache_write": counts.cache_write,
+                }),
+            );
+        }
+        self.add_totals(node, counts, false);
+    }
+
+    fn add_totals(&self, node: &Node, counts: crate::cost::Counts, own_call: bool) {
+        let crate::cost::Counts {
+            input,
+            cache_read,
+            cache_write,
+            ..
+        } = counts;
         {
             let mut total = node.usage.lock();
             total.input += input;
-            total.output += usage.output_tokens;
+            total.output += counts.output;
             total.cache_read += cache_read;
             total.cache_write += cache_write;
         }
-        let counts = crate::cost::Counts {
-            calls: 1,
-            input,
-            output: usage.output_tokens,
-            cache_read,
-            cache_write,
-        };
-        let model = model.unwrap_or_else(|| "unknown".to_owned());
-        node.ledger.lock().record(&model, counts, own_call);
         // Relative to the compaction point, so 100% means older turns are summarized before the
         // next call; the window is the one the context manager assumes. A side call's input is
         // not the agent's context.
@@ -406,6 +436,8 @@ impl Model for SideModel {
             let model = self.current().ok_or_else(gone)?;
             // Side calls (the goal judge) belong to the turn: an interrupt stops them too.
             let cancel = node.turn_token();
+            let prompt = options.system_prompt.as_ref().map(|prompt| prompt.text());
+            let purpose = crate::cost::SidePurpose::of(prompt.as_deref());
             let _permit = self.swarm.admit_model_call(&node.id, &cancel).await?;
             let mut events = model.stream(messages, options);
             loop {
@@ -416,11 +448,25 @@ impl Model for SideModel {
                 let Some(event) = next else { break };
                 let event = event?;
                 if let ModelStreamEvent::Metadata { usage: Some(usage), .. } = &event {
-                    self.swarm.add_usage(&node, usage, model.model_id(), false);
+                    let model = model.model_id();
+                    self.swarm.add_side_usage(&node, usage, model, purpose);
                 }
                 yield event;
             }
         })
+    }
+}
+
+/// One model call's tokens from its usage metadata; `input` includes cache reads and writes.
+fn usage_counts(usage: &Usage) -> crate::cost::Counts {
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
+    crate::cost::Counts {
+        calls: 1,
+        input: usage.input_tokens + cache_read + cache_write,
+        output: usage.output_tokens,
+        cache_read,
+        cache_write,
     }
 }
 

@@ -2049,6 +2049,7 @@ async fn the_goal_judge_runs_on_the_side_model_and_counts_toward_the_agents_toke
     let judge = MockMessageModel::shared(vec![verdict(true, usage(20, 30, 5))]);
     let mut config = SwarmConfig::new(goal_factory(&scripts), dir.path());
     config.side_model = Some(judge.clone());
+    config.state_dir = Some(dir.path().join("run"));
     let (swarm, mut events) = Swarm::new(config);
     let id = spawn_with_goal(&swarm).await;
 
@@ -2065,7 +2066,26 @@ async fn the_goal_judge_runs_on_the_side_model_and_counts_toward_the_agents_toke
     assert_eq!(seen, [(100, 10, fill), (150, 15, fill)]);
     assert_eq!(swarm.tokens_used(), 165);
     assert_eq!(swarm.snapshot().agents[0].cache_read_tokens, 30);
+    // `/cost` and the event log tell the judge's share apart.
+    let side = swarm.cost().side_calls();
+    assert_eq!(side.keys().collect::<Vec<_>>(), ["judge"]);
+    let judged = &side["judge"].0;
+    assert_eq!((judged.calls, judged.input, judged.output), (1, 50, 5));
+    assert_eq!(judged.cache_read, 30);
     swarm.shutdown().await;
+    let log = std::fs::read_to_string(dir.path().join("run/events.jsonl")).unwrap();
+    let calls: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| event["event"] == "side_call")
+        .collect();
+    assert_eq!(calls.len(), 1, "{log}");
+    assert_eq!(calls[0]["id"], id.as_str());
+    assert_eq!(calls[0]["purpose"], "judge");
+    assert_eq!(
+        (calls[0]["input"].as_u64(), calls[0]["output"].as_u64()),
+        (Some(50), Some(5))
+    );
 }
 
 #[tokio::test]
@@ -2624,6 +2644,7 @@ async fn context_summarization_runs_on_the_side_model_and_counts_toward_the_agen
     )]);
     let mut config = SwarmConfig::new(summarizing_factory(&scripts), dir.path());
     config.side_model = Some(summarizer.clone());
+    config.state_dir = Some(dir.path().join("run"));
     let (swarm, mut events) = Swarm::new(config);
     let id = spawn_root(&swarm, "go").await;
 
@@ -2633,7 +2654,19 @@ async fn context_summarization_runs_on_the_side_model_and_counts_toward_the_agen
     let (input, output, _) = *seen.last().unwrap();
     assert_eq!((input, output), (140 + 30 * summaries, 14 + 3 * summaries));
     assert_eq!(swarm.tokens_used(), input + output);
+    let side = swarm.cost().side_calls();
+    assert_eq!(side.keys().collect::<Vec<_>>(), ["summarizer"]);
+    assert_eq!(side["summarizer"].0.calls, summaries);
+    assert_eq!(side["summarizer"].0.input, 30 * summaries);
     swarm.shutdown().await;
+    let log = std::fs::read_to_string(dir.path().join("run/events.jsonl")).unwrap();
+    let purposes: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "side_call")
+        .map(|event| event["purpose"].clone())
+        .collect();
+    assert_eq!(purposes, vec![json!("summarizer"); summaries as usize]);
 }
 
 fn every(minutes: u64, to: &str, message: &str) -> strands_swarm::ScheduleRequest {
