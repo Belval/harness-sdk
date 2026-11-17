@@ -56,17 +56,10 @@ impl Swarm {
         let config = &self.inner.config;
         let mut paths: Vec<PathBuf> = config.state_dir.iter().cloned().collect();
         paths.push(config.cwd.clone());
-        if let Some(shared) = &config.cargo_target_dir {
-            paths.push(shared.clone());
-            paths.push(PathBuf::from(format!("{}-worktrees", shared.display())));
-        }
-        let agents = self.inner.agents.lock();
-        paths.extend(agents.values().map(|node| node.cwd.clone()));
-        paths.extend(
-            self.target_dirs_of(agents.values())
-                .into_iter()
-                .map(|(_, dir)| dir),
-        );
+        paths.extend(config.cargo_target_dir.clone());
+        paths.extend(self.private_targets_root());
+        paths.extend(self.nodes().iter().map(|node| node.cwd.clone()));
+        paths.extend(self.target_dirs().into_iter().map(|(_, dir)| dir));
         paths.sort();
         paths.dedup();
         paths
@@ -74,12 +67,9 @@ impl Swarm {
 
     /// Every agent's private target dir that exists, with the agent's label and state.
     fn target_dirs(&self) -> Vec<(String, PathBuf)> {
-        self.target_dirs_of(self.inner.agents.lock().values())
-    }
-
-    fn target_dirs_of<'a>(&self, nodes: impl Iterator<Item = &'a Arc<Node>>) -> Vec<(String, PathBuf)> {
         let run = &self.inner.config.run_id;
-        nodes
+        self.nodes()
+            .iter()
             .filter_map(|node| {
                 let dir = crate::gc::private_target_dir(run, &node.id, &node.env)?;
                 let status = match &*node.status.lock() {

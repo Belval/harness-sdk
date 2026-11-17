@@ -1025,16 +1025,21 @@ impl Swarm {
     /// Environment for a new worktree agent: a private `CARGO_TARGET_DIR` when the swarm has a
     /// shared one.
     fn worktree_env(&self, id: &str) -> BTreeMap<String, String> {
-        let Some(shared) = &self.inner.config.cargo_target_dir else {
+        let Some(root) = self.private_targets_root() else {
             return BTreeMap::new();
         };
-        let private = PathBuf::from(format!("{}-worktrees", shared.display()))
-            .join(&self.inner.config.run_id)
-            .join(id);
+        let private = root.join(&self.inner.config.run_id).join(id);
         BTreeMap::from([(
             "CARGO_TARGET_DIR".to_owned(),
             private.to_string_lossy().into_owned(),
         )])
+    }
+
+    /// `<shared>-worktrees`, under which worktree agents get their private target dirs, when the
+    /// swarm has a shared `CARGO_TARGET_DIR`.
+    fn private_targets_root(&self) -> Option<PathBuf> {
+        let shared = self.inner.config.cargo_target_dir.as_ref()?;
+        Some(PathBuf::from(format!("{}-worktrees", shared.display())))
     }
 
     /// The id of the agent `who` names: an id, or else a unique agent name.
