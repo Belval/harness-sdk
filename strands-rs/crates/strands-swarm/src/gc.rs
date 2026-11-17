@@ -4,10 +4,11 @@
 //! when the swarm has a shared `CARGO_TARGET_DIR`, a private target dir at
 //! `<target>-worktrees/<run>/<agent>`, and its branch `swarm/<run>/<agent>`. Once the agent is
 //! cancelled, its target dir is deleted, its worktree is removed if it is clean, and its branch is
-//! deleted once no worktree has it checked out and every commit on it is reachable from the base
-//! branch. Nothing else is ever touched: each path must have exactly that shape before anything
-//! is deleted, the worktree goes through `git worktree remove` (which refuses dirty trees as a
-//! second guard), and the branch ref is only deleted if it still points at the commit checked.
+//! deleted once no worktree has it checked out and the base has every commit on it (reachable,
+//! or a cherry-picked copy by patch id). Nothing else is ever touched: each path must have
+//! exactly that shape before anything is deleted, the worktree goes through `git worktree remove`
+//! (which refuses dirty trees as a second guard), and the branch ref is only deleted if it still
+//! points at the commit checked.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -23,8 +24,9 @@ pub struct Collected {
     pub removed: Vec<(PathBuf, u64)>,
     /// Directories left in place, and why.
     pub kept: Vec<(PathBuf, String)>,
-    /// The agent's branch, deleted because the base branch contains all of it.
-    pub deleted_branch: Option<String>,
+    /// The agent's branch, deleted because the base has all of it, and how: `merged` (reachable
+    /// from it) or `all applied` (every commit has a patch-equivalent copy there).
+    pub deleted_branch: Option<(String, String)>,
     /// The agent's branch left in place, and why.
     pub kept_branch: Option<(String, String)>,
 }
@@ -56,7 +58,7 @@ impl Collected {
         let deleted = self
             .deleted_branch
             .iter()
-            .map(|branch| format!("{}: deleted branch {branch} (merged)", self.id));
+            .map(|(branch, how)| format!("{}: deleted branch {branch} ({how})", self.id));
         let kept_branch = self
             .kept_branch
             .iter()
@@ -84,7 +86,7 @@ impl Collected {
             "id": self.id,
             "removed": removed,
             "kept": kept,
-            "deleted_branch": self.deleted_branch,
+            "deleted_branch": self.deleted_branch.as_ref().map(|(branch, how)| json!({ "branch": branch, "how": how })),
             "kept_branch": kept_branch,
         })
     }
@@ -205,16 +207,20 @@ async fn delete_merged_branch(repo: &Path, branch: &str, base: Option<&str>, out
     if base == branch {
         return keep("it is the base".to_owned());
     }
-    let unmerged = git(repo, &["rev-list", "--count", &format!("{base}..{commit}"), "--"]).await;
-    match unmerged.as_deref().map(str::trim) {
-        Ok("0") => {}
-        Ok("1") => return keep(format!("1 commit not on {base}")),
-        Ok(count) => return keep(format!("{count} commits not on {base}")),
-        Err(error) => return keep(error.clone()),
-    }
+    // Merged, or every commit copied onto the base (cherry-pick, rebase) by patch id.
+    let how = match crate::status::applied(repo, &base, &commit).await {
+        Ok(found) if found.pending() == 0 && found.applied == 0 => "merged",
+        Ok(found) if found.pending() == 0 => "all applied",
+        Ok(found) => {
+            let count = found.pending();
+            let commits = if count == 1 { "commit" } else { "commits" };
+            return keep(format!("{count} {commits} not on {base}"));
+        }
+        Err(error) => return keep(error),
+    };
     // Deleted only if it still points at the commit checked above.
     match git(repo, &["update-ref", "-d", &reference, &commit]).await {
-        Ok(_) => out.deleted_branch = Some(branch.to_owned()),
+        Ok(_) => out.deleted_branch = Some((branch.to_owned(), how.to_owned())),
         // A concurrent pass deleted it first.
         Err(_)
             if git(repo, &["rev-parse", "--verify", "--quiet", &reference])
@@ -436,7 +442,8 @@ mod tests {
             "{collected:?}"
         );
         assert_eq!(collected.removed.len(), 2, "{collected:?}");
-        assert_eq!(collected.deleted_branch.as_deref(), Some("swarm/r1/a2"));
+        let deleted = ("swarm/r1/a2".to_owned(), "merged".to_owned());
+        assert_eq!(collected.deleted_branch, Some(deleted));
         assert_eq!(collected.removed[0], (target.clone(), 5000));
         assert!(!target.exists() && !worktree.exists());
         assert!(
@@ -500,13 +507,52 @@ mod tests {
         // Once merged, a later pass (e.g. on resume) deletes it.
         run(&repo, &["merge", "-q", "--ff-only", "swarm/r1/a2"]);
         let merged = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, None).await;
-        assert_eq!(
-            merged.deleted_branch.as_deref(),
-            Some("swarm/r1/a2"),
-            "{merged:?}"
-        );
+        let deleted = ("swarm/r1/a2".to_owned(), "merged".to_owned());
+        assert_eq!(merged.deleted_branch, Some(deleted), "{merged:?}");
         assert!(!branch_exists(&repo, "swarm/r1/a2"));
         assert!(summary(&[merged]).contains("deleted 1 merged branch"));
+    }
+
+    #[tokio::test]
+    async fn a_branch_cherry_picked_onto_the_base_counts_as_merged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, worktree) = repo_with_worktree(tmp.path());
+        for name in ["one", "two"] {
+            fs::write(worktree.join(name), name).unwrap();
+            run(&worktree, &["add", "."]);
+            run(&worktree, &["commit", "-qm", name]);
+        }
+        fs::write(repo.join("other"), "x").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "other work on main"]);
+        run(&repo, &["cherry-pick", "swarm/r1/a2~1"]);
+        let none = BTreeMap::new();
+
+        let half = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, None).await;
+        let base = crate::worktree::test_git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        let why = ("swarm/r1/a2".to_owned(), format!("1 commit not on {base}"));
+        assert_eq!(half.kept_branch, Some(why), "only one of two is applied");
+
+        // A branch that merged the base in is never "all applied": the merge commit may carry
+        // changes of its own (a conflict resolution), which `git cherry` does not compare.
+        let merged_in = tmp.path().join("merged-in");
+        let path = merged_in.to_str().unwrap();
+        run(
+            &repo,
+            &["worktree", "add", "-q", "-b", "side", path, "swarm/r1/a2"],
+        );
+        run(&merged_in, &["merge", "-q", "--no-edit", &base]);
+
+        run(&repo, &["cherry-pick", "swarm/r1/a2"]);
+        let all = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, None).await;
+        let deleted = ("swarm/r1/a2".to_owned(), "all applied".to_owned());
+        assert_eq!(all.deleted_branch, Some(deleted), "{all:?}");
+        assert!(!branch_exists(&repo, "swarm/r1/a2"));
+        assert!(all
+            .lines()
+            .contains(&"a2: deleted branch swarm/r1/a2 (all applied)".to_owned()));
+        let side = crate::status::applied(&repo, &base, "side").await.unwrap();
+        assert!(side.merges == 1 && side.pending() > 0, "{side:?}");
     }
 
     #[tokio::test]

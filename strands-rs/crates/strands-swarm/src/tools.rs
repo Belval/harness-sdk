@@ -79,7 +79,8 @@ const LIST_DESCRIPTION: &str = concat!(
 
 const CANCEL_DESCRIPTION: &str = concat!(
     "Stop an agent, its descendants and their jobs. A clean worktree is removed, and its branch ",
-    "too once the base contains it; anything else stays and the result says why."
+    "too once the base has all its commits (merged or cherry-picked); anything else stays and the ",
+    "result says why."
 );
 
 /// How long `cancel_agent` waits to report what reclaiming the cancelled worktrees did.

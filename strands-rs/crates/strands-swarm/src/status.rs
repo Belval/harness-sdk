@@ -42,6 +42,11 @@ pub struct BranchState {
     pub ahead: Vec<String>,
     /// Commits on the base not on the branch.
     pub behind: usize,
+    /// How many of its commits not on the base have a patch-equivalent commit there.
+    pub applied: usize,
+    /// How many have none, merge commits included; 0 with `applied > 0` means nothing is left
+    /// to integrate.
+    pub pending: usize,
     /// Whether merging the branch into the base would conflict.
     pub merge: Merge,
 }
@@ -68,10 +73,16 @@ impl BranchState {
             0 => format!("nothing beyond {base}"),
             n => format!("{n}{more} not on {base}"),
         };
+        let all_applied = self.applied > 0 && self.pending == 0;
+        match (all_applied, self.applied) {
+            (true, _) => text.push_str(" (all applied)"),
+            (false, 0) => {}
+            (false, n) => text.push_str(&format!(" ({n} applied)")),
+        }
         if self.behind > 0 {
             text.push_str(&format!(", {} behind", self.behind));
         }
-        if self.ahead.is_empty() {
+        if self.ahead.is_empty() || all_applied {
             return text;
         }
         match &self.merge {
@@ -191,11 +202,77 @@ pub async fn branch_state(dir: &Path, base: &str, branch: &str) -> Option<Branch
     let ahead = unmerged(dir, base, branch).await?;
     let behind = git(dir, &["rev-list", "--count", &format!("{branch}..{base}"), "--"]).await?;
     let behind = behind.trim().parse().ok()?;
-    let merge = match ahead.is_empty() || behind == 0 {
-        true => Merge::FastForward,
-        false => trial_merge(dir, base, branch).await,
+    let mut state = BranchState {
+        ahead,
+        behind,
+        ..Default::default()
     };
-    Some(BranchState { ahead, behind, merge })
+    if state.ahead.is_empty() || behind == 0 {
+        return Some(state);
+    }
+    // Only a base that moved can hold copies (cherry-picks, rebases) of the branch's commits.
+    if let Ok(found) = applied(dir, base, branch).await {
+        (state.applied, state.pending) = (found.applied, found.pending());
+    }
+    if state.applied == 0 || state.pending > 0 {
+        state.merge = trial_merge(dir, base, branch).await;
+    }
+    Some(state)
+}
+
+/// Which of the commits on `rev` not on `base` the base already has a copy of, by patch id
+/// (`git cherry`), e.g. after a cherry-pick or rebase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Applied {
+    /// Commits with a patch-equivalent commit on the base.
+    pub applied: usize,
+    /// Commits without one.
+    pub unapplied: usize,
+    /// Merge commits, which `git cherry` skips; their changes (e.g. conflict resolutions) are not
+    /// compared, so they count as not applied.
+    pub merges: usize,
+}
+
+impl Applied {
+    /// Commits whose changes the base may lack.
+    pub fn pending(&self) -> usize {
+        self.unapplied + self.merges
+    }
+}
+
+/// [`Applied`] for `rev` against `base`, in repository `dir`.
+pub async fn applied(dir: &Path, base: &str, rev: &str) -> Result<Applied, String> {
+    let git = |args: Vec<String>| async move {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::worktree::git(dir, &args)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let cherry = git(vec!["cherry".into(), base.into(), rev.into()]).await?;
+    let range = format!("{base}..{rev}");
+    let merges = git(vec![
+        "rev-list".into(),
+        "--merges".into(),
+        "--count".into(),
+        range,
+        "--".into(),
+    ])
+    .await?;
+    let mut out = Applied {
+        merges: merges
+            .trim()
+            .parse()
+            .map_err(|_| format!("bad count {merges:?}"))?,
+        ..Default::default()
+    };
+    for line in cherry.lines() {
+        match line.chars().next() {
+            Some('-') => out.applied += 1,
+            Some('+') => out.unapplied += 1,
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Merge `branch` into `base` without touching any checkout or ref (`git merge-tree`).
@@ -276,6 +353,7 @@ mod tests {
                         ahead: vec!["abc1234 feat: x".into()],
                         behind: 2,
                         merge: Merge::Conflicts(vec!["README.md".into(), "src/a.rs".into()]),
+                        ..Default::default()
                     }),
                     todos: vec![
                         todo("Test", TodoStatus::Completed),
@@ -346,6 +424,12 @@ mod tests {
             ahead: vec!["c".into(); ahead],
             behind,
             merge,
+            ..Default::default()
+        };
+        let applied = |ahead: usize, applied, merge| BranchState {
+            applied,
+            pending: ahead - applied,
+            ..state(ahead, 4, merge)
         };
         let cases = [
             (state(0, 0, Merge::FastForward), "nothing beyond main"),
@@ -359,6 +443,14 @@ mod tests {
             (
                 state(MAX_COMMITS, 1, Merge::Clean),
                 "20+ not on main, 1 behind, merges cleanly",
+            ),
+            (
+                applied(3, 3, Merge::FastForward),
+                "3 not on main (all applied), 4 behind",
+            ),
+            (
+                applied(3, 1, Merge::Clean),
+                "3 not on main (1 applied), 4 behind, merges cleanly",
             ),
         ];
         for (state, text) in cases {
@@ -408,5 +500,15 @@ mod tests {
             "the checkout is untouched"
         );
         assert_eq!(branch_state(repo, "main", "nope").await, None);
+
+        // Cherry-picked onto main, the branch's commit is there under another hash.
+        git(repo, &["checkout", "-q", "-b", "picked", "main~2"]);
+        write("c.txt", "c\n");
+        commit("add c");
+        git(repo, &["checkout", "-q", "main"]);
+        git(repo, &["cherry-pick", "picked"]);
+        let state = branch_state(repo, "main", "picked").await.unwrap();
+        assert_eq!((state.ahead.len(), state.applied, state.pending), (1, 1, 0));
+        assert_eq!(state.describe("main"), "1 not on main (all applied), 3 behind");
     }
 }

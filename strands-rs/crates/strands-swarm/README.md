@@ -242,8 +242,10 @@ Typing text without a command messages the selected agent.
   - Each branch also says how many base commits it lacks and how it would merge:
     `3 not on main, 5 behind, merges cleanly` or `… conflicts in README.md, src/tui/view.rs`.
     The trial merge is `git merge-tree --write-tree` (git ≥ 2.38), which touches no checkout or
-    ref, so the integrator sees conflicts before cherry-picking. `list_agents` shows the same,
-    fresh on every call.
+    ref, so the integrator sees conflicts before cherry-picking. Commits the base already has a
+    copy of (cherry-picked or rebased, same patch id per `git cherry`) are counted:
+    `3 not on main (all applied), 4 behind` means nothing is left to integrate. `list_agents`
+    shows the same, fresh on every call.
   - It refreshes while open; git runs in the background and is cached for 5 s.
   - Programmatically: `Swarm::status`.
 
@@ -308,9 +310,11 @@ Typing text without a command messages the selected agent.
     dir is deleted.
   - Its worktree is removed with `git worktree remove` unless it has uncommitted changes.
   - Its branch `swarm/<run>/<agent>` is deleted once no worktree has it checked out and the base
-    (`--status-base`, default the main checkout's branch) contains every commit on it; otherwise
-    it stays, e.g. `kept branch swarm/r/a3 (2 commits not on main)`. A later pass (resume, `/gc`,
-    `--gc`) deletes it once merged.
+    (`--status-base`, default the main checkout's branch) has every commit on it: reachable
+    (`merged`) or as a patch-equivalent copy (`all applied`, per `git cherry`; a merge commit on
+    the branch always counts as not applied). Otherwise it stays, e.g. `kept branch swarm/r/a3
+    (2 commits not on main)`. The ref is deleted only if it still points at the commit checked.
+    A later pass (resume, `/gc`, `--gc`) deletes it once merged.
   - `cancel_agent` waits up to 10 s for this and its result says what was removed and kept.
   - A run without `--run` cannot be resumed, so on exit every worktree agent is treated as
     cancelled.
