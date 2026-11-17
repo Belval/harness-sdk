@@ -1,6 +1,6 @@
 //! UI state: a fold over [`SwarmEvent`]s plus the input line. No terminal I/O here.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
@@ -454,29 +454,36 @@ impl App {
     }
 
     /// Agents in tree order (depth-first by spawn order) with their depth.
+    ///
+    /// Built several times a frame and twice per event, so in time linear in the agents: a long
+    /// run keeps every cancelled agent.
     pub fn tree(&self) -> Vec<(usize, &AgentView)> {
-        let mut out = Vec::with_capacity(self.agents.len());
-        self.walk(USER, 0, &mut out);
-        out
-    }
-
-    fn walk<'a>(&'a self, parent: &str, depth: usize, out: &mut Vec<(usize, &'a AgentView)>) {
-        for view in self.agents.values().filter(|view| view.parent == parent) {
-            if !self.show_cancelled && !self.has_live(view) {
-                continue;
-            }
-            out.push((depth, view));
-            self.walk(&view.id, depth + 1, out);
+        let mut children: HashMap<&str, Vec<&AgentView>> = HashMap::new();
+        for view in self.agents.values() {
+            children.entry(view.parent.as_str()).or_default().push(view);
         }
-    }
-
-    /// Whether `view` or any of its descendants is not cancelled.
-    fn has_live(&self, view: &AgentView) -> bool {
-        view.status.is_live()
-            || self
-                .agents
-                .values()
-                .any(|child| child.parent == view.id && self.has_live(child))
+        // Agents that are live or have a live descendant.
+        let mut live: HashSet<&str> = HashSet::new();
+        if !self.show_cancelled {
+            for view in self.agents.values().filter(|view| view.status.is_live()) {
+                let mut id = view.id.as_str();
+                while live.insert(id) {
+                    match self.agents.get(id) {
+                        Some(view) => id = view.parent.as_str(),
+                        None => break,
+                    }
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(self.agents.len());
+        let visible = |view: &AgentView| self.show_cancelled || live.contains(view.id.as_str());
+        let kids = |id: &str| children.get(id).into_iter().flatten().rev().copied();
+        let mut stack: Vec<(usize, &AgentView)> = kids(USER).filter(|v| visible(v)).map(|v| (0, v)).collect();
+        while let Some((depth, view)) = stack.pop() {
+            out.push((depth, view));
+            stack.extend(kids(&view.id).filter(|v| visible(v)).map(|v| (depth + 1, v)));
+        }
+        out
     }
 
     /// Cancelled agents left out of the tree.
@@ -988,6 +995,40 @@ mod tests {
                 LogEntry::Note("restarted".into()),
                 LogEntry::Status("error: boom".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn the_tree_is_depth_first_in_spawn_order_with_depths() {
+        let mut app = App::default();
+        for (id, parent) in [
+            ("a1", USER),
+            ("a2", "a1"),
+            ("a3", USER),
+            ("a4", "a2"),
+            ("a5", "a1"),
+            ("a6", "a4"),
+            ("a7", "a5"),
+        ] {
+            app.apply(spawned(id, parent));
+        }
+        let tree = |app: &App| {
+            app.tree()
+                .iter()
+                .map(|(depth, v)| format!("{depth}{}", v.id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tree(&app), ["0a1", "1a2", "2a4", "3a6", "1a5", "2a7", "0a3"]);
+        for id in ["a4", "a5", "a7"] {
+            app.apply(SwarmEvent::Status {
+                id: id.into(),
+                status: AgentStatus::Cancelled,
+            });
+        }
+        assert_eq!(
+            tree(&app),
+            ["0a1", "1a2", "2a4", "3a6", "0a3"],
+            "a4 keeps a live child"
         );
     }
 
