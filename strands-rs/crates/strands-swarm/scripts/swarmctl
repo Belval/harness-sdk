@@ -62,7 +62,8 @@ start() {
   # Like a reload, keep the binary that ran before for a rollback.
   [[ -f "$dir/bin/current" ]] && mv -f "$dir/bin/current" "$dir/bin/previous"
   mv "$dir/bin/current.new" "$dir/bin/current"
-  printf '%s\0' "$@" > "$dir/args"
+  # printf would write one empty argument for none.
+  if (( $# )); then printf '%s\0' "$@"; fi > "$dir/args"
   # Keep the environment the swarm needs (credentials config, PATH for MCP servers) across reboots.
   { export -p | grep -E '^declare -x (PATH|HOME|USER|LANG|TERM|XDG_CONFIG_HOME|AWS_[A-Z_]*|CARGO_[A-Z_]*|RUSTUP_[A-Z_]*|QUICK_EVALS_[A-Z_]*|SSH_AUTH_SOCK)='; } > "$dir/env" || true
   chmod 600 "$dir/env"

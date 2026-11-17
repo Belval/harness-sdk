@@ -188,10 +188,32 @@ exit 75"#;
 /// running: the supervisor and the swarm still find the run there.
 #[test]
 fn a_custom_state_home_reaches_the_supervisor_through_a_running_tmux_server() {
+    let Some(shown) = start_in_tmux(&["--headless"]) else {
+        return;
+    };
+    assert_eq!(
+        shown, "$STATE 3 --run r --headless",
+        "the supervisor never ran the binary under the custom state home"
+    );
+}
+
+/// With no arguments for the swarm, the supervisor passes none (not one empty TASK).
+#[test]
+fn a_start_without_arguments_replays_none() {
+    let Some(shown) = start_in_tmux(&[]) else {
+        return;
+    };
+    assert_eq!(shown, "$STATE 2 --run r");
+}
+
+/// `swarmctl start r <fake binary> args` in a private tmux server that already has a session:
+/// what the fake binary saw (`$XDG_STATE_HOME $# $*`, the state home as `$STATE`), or None
+/// without tmux.
+fn start_in_tmux(args: &[&str]) -> Option<String> {
     let tmux_works = std::process::Command::new("tmux").arg("-V").output();
     if !tmux_works.is_ok_and(|output| output.status.success()) {
         eprintln!("skipped: no tmux");
-        return;
+        return None;
     }
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
@@ -211,7 +233,7 @@ fn a_custom_state_home_reaches_the_supervisor_through_a_running_tmux_server() {
     let seen = tmp.path().join("seen");
     let binary = tmp.path().join("fake-swarm");
     let body = format!(
-        "#!/bin/sh\necho \"$XDG_STATE_HOME $*\" > '{}'\ntouch \"$XDG_STATE_HOME/strands-swarm/r/stop\"\n",
+        "#!/bin/sh\necho \"$XDG_STATE_HOME $# $*\" > '{}'\ntouch \"$XDG_STATE_HOME/strands-swarm/r/stop\"\n",
         seen.display()
     );
     std::fs::write(&binary, body).unwrap();
@@ -225,7 +247,7 @@ fn a_custom_state_home_reaches_the_supervisor_through_a_running_tmux_server() {
         .arg(SCRIPT)
         .args(["start", "r"])
         .arg(&binary)
-        .arg("--headless")
+        .args(args)
         .env("XDG_STATE_HOME", &state)
         .env("TMUX_TMPDIR", &sockets)
         .env("HOME", tmp.path())
@@ -239,9 +261,5 @@ fn a_custom_state_home_reaches_the_supervisor_through_a_running_tmux_server() {
     let shown = std::fs::read_to_string(&seen).unwrap_or_default();
     tmux(&["kill-server"]);
     assert!(started.status.success(), "{started:?}");
-    assert_eq!(
-        shown.trim(),
-        format!("{} --run r --headless", state.display()),
-        "the supervisor never ran the binary under the custom state home"
-    );
+    Some(shown.trim().replace(&state.display().to_string(), "$STATE"))
 }
