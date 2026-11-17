@@ -9,7 +9,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::json;
 use strands_agents::testing::{MockMessageModel, MockResponse};
-use strands_agents::types::{ContentBlock, Message, Role, ToolResultContent, ToolUseBlock};
+use strands_agents::types::{ContentBlock, Message, Role, ToolResultContent, ToolResultStatus, ToolUseBlock};
 use strands_agents::{Agent, Model};
 use strands_swarm::compaction::Compaction;
 use strands_swarm::status::Merge;
@@ -1276,7 +1276,15 @@ async fn a_resumed_run_restores_conversations_and_wakes_interrupted_agents() {
     );
     let a2_call = sent_text(&scripts.lock()["a2"].clone(), 0);
     assert!(a2_call.contains("The swarm was restarted"), "{a2_call}");
-    assert!(a2_call.contains("No tool call was in flight."), "{a2_call}");
+    // The cut wait is listed like any other cut call, not shown as having returned.
+    assert!(a2_call.contains("Interrupted before finishing"), "{a2_call}");
+    assert!(a2_call.contains("- wait {"), "{a2_call}");
+    let a2_wait = history["a2"]
+        .iter()
+        .flat_map(|m| m.tool_results())
+        .find(|r| r.tool_use_id == "w1")
+        .expect("the cut wait has a result");
+    assert_eq!(a2_wait.status, ToolResultStatus::Error);
     let a1_call = sent_text(&scripts.lock()["a1"].clone(), 0);
     assert!(
         a1_call.contains("spawned") && a1_call.contains("resumed"),

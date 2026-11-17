@@ -496,12 +496,16 @@ async fn wait_tool(swarm: Swarm, me: String, input: WaitInput, ctx: ToolContext)
                 "`all` needs `from`: the agents to wait for.",
             ));
         }
-        return Ok(wait_all(&swarm, &me, from, seconds, &ctx.cancel).await);
+        return wait_all(&swarm, &me, from, seconds, &ctx.cancel)
+            .await
+            .ok_or(strands_agents::Error::Cancelled);
     }
     let wait = swarm.wait(&me, &from, &ctx.cancel);
     let text = match tokio::time::timeout(Duration::from_secs(seconds), wait).await {
         Ok(WaitOutcome::Mail(mail)) => render_mail(&mail),
-        Ok(WaitOutcome::Cancelled) => "Wait cancelled.".to_owned(),
+        // A cut wait ends like any cut call ("Tool execution cancelled"), so a restart notice
+        // lists it with the others instead of the conversation reading as if it had returned.
+        Ok(WaitOutcome::Cancelled) => return Err(strands_agents::Error::Cancelled),
         Ok(WaitOutcome::Unreachable(notice)) => notice,
         Err(_) => timeout_summary(&swarm, &from, seconds),
     };
@@ -510,13 +514,14 @@ async fn wait_tool(swarm: Swarm, me: String, input: WaitInput, ctx: ToolContext)
 
 /// `wait` with `all`: collect mail until each of `from` has sent something, the user writes, or
 /// `seconds` pass; every message taken on the way is returned, with a note on who is missing.
+/// `None` when it was cut before taking any.
 async fn wait_all(
     swarm: &Swarm,
     me: &str,
     mut remaining: Vec<String>,
     seconds: u64,
     cancel: &CancellationToken,
-) -> String {
+) -> Option<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
     let mut mail = Vec::new();
     let note = loop {
@@ -532,6 +537,8 @@ async fn wait_all(
                     (false, false) => {}
                 }
             }
+            // Mail already taken must still reach the agent.
+            Ok(WaitOutcome::Cancelled) if mail.is_empty() => return None,
             Ok(WaitOutcome::Cancelled) => break Some("Wait cancelled.".to_owned()),
             Ok(WaitOutcome::Unreachable(notice)) => break Some(notice),
             Err(_) => {
@@ -547,7 +554,7 @@ async fn wait_all(
         }
         text.push_str(&note);
     }
-    text
+    Some(text)
 }
 
 /// `<why> before all of them sent something; still waiting on:` and their status lines.
