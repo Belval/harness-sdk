@@ -7,6 +7,7 @@
 //! overflow recovery.
 
 pub mod retrieval_tool;
+mod search;
 pub mod stash;
 pub mod strategies;
 

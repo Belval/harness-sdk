@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::context_manager::search::{self, SearchInput};
 use crate::context_manager::stash::Stash;
 use crate::tools::{FunctionTool, ToolRef};
 use crate::types::JsonValue;
@@ -18,7 +19,7 @@ const CHARS_PER_TOKEN: usize = 4;
 /// Tool description, verbatim from TS.
 pub const RETRIEVAL_TOOL_DESCRIPTION: &str = "Retrieve content that was offloaded from context.\n\nWhen content is offloaded (truncated, dropped, or summarized), the original is persisted and a reference key is left in its place. Use this tool with that reference to access the original content.\n\nOptions:\n  - pattern: regex/keyword to find matching lines with context\n  - line_range: { start, end } to read a specific span\n  - Without pattern/line_range: returns the full original content\n\nExamples:\n  { reference: \"1_toolu_abc_0\", pattern: \"error\" }\n  { reference: \"1_toolu_abc_0\", line_range: { start: 10, end: 25 } }\n  { reference: \"1_toolu_abc_0\" }";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 struct LineRange {
     start: usize,
     end: usize,
@@ -72,42 +73,6 @@ fn extract_text(data: &JsonValue) -> Option<String> {
     }
 }
 
-fn search_content(text: &str, input: &RetrievalInput, max_chars: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out: Vec<String> = Vec::new();
-    if let Some(range) = &input.line_range {
-        let start = range.start.saturating_sub(1);
-        let end = range.end.min(lines.len());
-        if start < end {
-            out.extend(lines[start..end].iter().map(|line| (*line).to_owned()));
-        }
-    } else if let Some(pattern) = &input.pattern {
-        let context = input.context_lines.unwrap_or(5);
-        let needle = pattern.to_lowercase();
-        let mut keep = vec![false; lines.len()];
-        for (index, line) in lines.iter().enumerate() {
-            if line.to_lowercase().contains(&needle) {
-                let from = index.saturating_sub(context);
-                let to = (index + context + 1).min(lines.len());
-                for flag in keep[from..to].iter_mut() {
-                    *flag = true;
-                }
-            }
-        }
-        for (index, line) in lines.iter().enumerate() {
-            if keep[index] {
-                out.push((*line).to_owned());
-            }
-        }
-    }
-    let joined = out.join("\n");
-    if joined.chars().count() > max_chars {
-        let truncated: String = joined.chars().take(max_chars).collect();
-        return format!("{truncated}\n\n[truncated]");
-    }
-    joined
-}
-
 /// Build the retrieval tool over `stash`.
 pub fn create_retrieval_tool(stash: Arc<Stash>, max_result_tokens: Option<usize>) -> ToolRef {
     let max_chars = max_result_tokens.unwrap_or(DEFAULT_MAX_RESULT_TOKENS) * CHARS_PER_TOKEN;
@@ -139,7 +104,15 @@ pub fn create_retrieval_tool(stash: Arc<Stash>, max_result_tokens: Option<usize>
                             .to_owned(),
                     ));
                 };
-                Ok(JsonValue::String(search_content(&text, &input, max_chars)))
+                let search = SearchInput {
+                    pattern: input.pattern.as_deref(),
+                    line_range: input.line_range.map(|range| search::LineRange {
+                        start: range.start,
+                        end: range.end,
+                    }),
+                    context_lines: input.context_lines.unwrap_or(5),
+                };
+                Ok(JsonValue::String(search::search_content(&text, &search, max_chars)))
             }
         });
     Arc::new(tool)

@@ -19,7 +19,7 @@ telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 anthropic = ["dep:reqwest"]
 http = ["dep:reqwest"]
 openai = ["dep:reqwest"]
-mcp = ["dep:rmcp", "dep:http", "dep:regex"]
+mcp = ["dep:rmcp", "dep:http"]
 # Internal, test-only: builds the `mcp_echo_server` binary (a minimal stdio MCP server used by
 # this crate's own e2e tests). Not part of the supported public feature set; do not enable it
 # from downstream crates.
@@ -53,7 +53,7 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
-regex = { workspace = true, optional = true }
+regex.workspace = true
 reqwest = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
