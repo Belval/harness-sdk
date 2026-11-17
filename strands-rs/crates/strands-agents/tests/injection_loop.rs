@@ -76,3 +76,60 @@ async fn the_default_user_turn_trigger_skips_a_tool_result_turn() {
         .iter()
         .any(|message| message.text().contains("ephemeral note")));
 }
+
+/// Edits the history on every call, as a context strategy that offloads or trims would, and
+/// records what each call's pipeline saw.
+struct EditEveryCall(Arc<parking_lot::Mutex<Vec<String>>>);
+
+#[async_trait::async_trait]
+impl strands_agents::context_manager::ContextStrategy for EditEveryCall {
+    fn name(&self) -> &str {
+        "edit-every-call"
+    }
+
+    async fn apply(
+        &self,
+        ctx: &mut strands_agents::context_manager::ContextState<'_>,
+    ) -> strands_agents::Result<bool> {
+        let last = ctx.messages.last_mut().expect("a message");
+        self.0.lock().push(last.text());
+        last.content.push(ContentBlock::text(" [edited]"));
+        Ok(true)
+    }
+}
+
+#[tokio::test]
+async fn an_injection_registered_first_still_stays_out_of_the_context_managers_edits() {
+    use strands_agents::context_manager::{ContextManagerConfig, ContextManagerOption};
+    let model = MockMessageModel::shared(vec![MockResponse::message(Message::assistant("done"))]);
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let config = ContextManagerConfig {
+        strategies: Some(vec![Arc::new(EditEveryCall(Arc::clone(&seen)))]),
+        ..Default::default()
+    };
+    let agent = Agent::builder()
+        .model(Arc::clone(&model) as Arc<dyn strands_agents::models::Model>)
+        .plugin(ContextInjector::inject("ephemeral note"))
+        .context_manager(ContextManagerOption::Config(config))
+        .build()
+        .expect("agent builds");
+
+    agent.invoke("go").await.expect("invoke");
+
+    assert_eq!(
+        seen.lock().as_slice(),
+        ["go"],
+        "the strategy sees the history, not the injection"
+    );
+    let sent = last_user_text(&model, 0);
+    assert!(
+        sent.contains("[edited]") && sent.ends_with("ephemeral note"),
+        "sent: {sent}"
+    );
+    let history = agent.messages();
+    assert_eq!(
+        history[0].text(),
+        "go [edited]",
+        "the edit is kept, the injection is not"
+    );
+}

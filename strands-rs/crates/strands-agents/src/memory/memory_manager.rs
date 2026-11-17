@@ -712,14 +712,18 @@ impl Plugin for MemoryManager {
             let injecting = Arc::clone(&manager);
             agent
                 .hooks()
-                .add_callback_boxed::<BeforeModelCallEvent, _>(move |event| {
-                    let manager = Arc::clone(&injecting);
-                    Box::pin(async move {
-                        let outcome = manager.inject_fold(&mut event.messages).await;
-                        event.dynamic_trailing_blocks += outcome.trailing_blocks;
-                        Ok(())
-                    })
-                });
+                // Last, like ContextInjector: after the context manager (see its module docs).
+                .add_callback_boxed_with_order::<BeforeModelCallEvent, _>(
+                    hook_order::SDK_LAST,
+                    move |event| {
+                        let manager = Arc::clone(&injecting);
+                        Box::pin(async move {
+                            let outcome = manager.inject_fold(&mut event.messages).await;
+                            event.dynamic_trailing_blocks += outcome.trailing_blocks;
+                            Ok(())
+                        })
+                    },
+                );
         }
         Ok(())
     }

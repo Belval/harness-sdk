@@ -5,13 +5,18 @@
 //! the delivery primitives live in [`crate::injection`]. TS does this with
 //! `InvokeModelStage.Input` middleware; Rust uses the equivalent seam, [`BeforeModelCallEvent`] —
 //! a per-call copy of the conversation. Durable history and the session are never touched.
+//!
+//! The hook runs last ([`hook_order::SDK_LAST`]), as TS's input phase runs after every hook: the
+//! context manager, which also runs there and mirrors its edits into the history, must see the
+//! conversation without the injected text, or it writes that text into the history and its
+//! strategies see every call's history as changed.
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 
 use crate::agent::Agent;
 use crate::error::Result;
-use crate::hooks::BeforeModelCallEvent;
+use crate::hooks::{hook_order, BeforeModelCallEvent};
 use crate::injection::{FoldOutcome, MessageInjection};
 use crate::plugins::Plugin;
 use crate::types::Message;
@@ -85,7 +90,7 @@ impl Plugin for ContextInjector {
         let injector = self.clone();
         agent
             .hooks()
-            .add_callback_boxed::<BeforeModelCallEvent, _>(move |event| {
+            .add_callback_boxed_with_order::<BeforeModelCallEvent, _>(hook_order::SDK_LAST, move |event| {
                 let injector = injector.clone();
                 Box::pin(async move {
                     let agent = event.agent.clone();
