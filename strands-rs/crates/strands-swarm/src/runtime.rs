@@ -363,10 +363,10 @@ impl SwarmConfig {
     }
 }
 
-/// The default [`SwarmConfig::build_jobs`]: a quarter of the CPUs, at least 1 and at most 8.
+/// The default [`SwarmConfig::build_jobs`]: a quarter of the CPUs, at least 1 and at most 16.
 pub fn default_build_jobs() -> usize {
     let cpus = std::thread::available_parallelism().map_or(1, usize::from);
-    (cpus / 4).clamp(1, 8)
+    (cpus / 4).clamp(1, 16)
 }
 
 /// What a `land` call asks for ([`Swarm::land`]).

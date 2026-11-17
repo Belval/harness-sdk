@@ -222,9 +222,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   - `/max-load N` changes the limit for the running process, `/max-load off` lifts it and
     `/max-load default` returns to the flag.
 - **Builds.** Agents' shell commands and background jobs (land checks included) get
-  `CARGO_BUILD_JOBS` set to `--build-jobs N` (default a quarter of the CPUs, 1 to 8; `0` sets
+  `CARGO_BUILD_JOBS` set to `--build-jobs N` (default a quarter of the CPUs, 1 to 16; `0` sets
   none) unless the swarm's own environment sets it. Without it every cargo build starts a
-  compiler per CPU: a few dozen agents building at once put a 64-core host at load 400. It only
+  compiler per CPU: a few dozen agents building at once put a 64-core host at load 400. Like any
+  `CARGO_BUILD_JOBS`, it overrides `build.jobs` in cargo's config files; `--build-jobs 0` keeps
+  theirs. It only
   bounds each build; to bound all of them together, cap compilers host-wide:
   - cargo runs every compiler through `build.rustc-wrapper` from `~/.cargo/config.toml`
     (`[build]` / `rustc-wrapper = "/path/to/rustc-slot"`) with the real `rustc` and its

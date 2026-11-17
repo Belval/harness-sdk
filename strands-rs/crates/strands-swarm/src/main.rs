@@ -64,7 +64,7 @@ struct Cli {
     #[arg(long, value_name = "SIZE", value_parser = strands_swarm::text::parse_bytes)]
     min_free_mem: Option<u64>,
     /// `CARGO_BUILD_JOBS` for agents' shell commands, jobs and land checks unless the
-    /// environment sets it (default: a quarter of the CPUs, 1 to 8; `0` sets none).
+    /// environment sets it (default: a quarter of the CPUs, 1 to 16; `0` sets none).
     #[arg(long, value_name = "N")]
     build_jobs: Option<usize>,
     /// Ring the terminal bell when an agent messages you (TUI only; tmux and most terminals turn

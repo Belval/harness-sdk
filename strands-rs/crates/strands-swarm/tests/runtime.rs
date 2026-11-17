@@ -1621,7 +1621,10 @@ async fn shells_and_jobs_get_capped_cargo_build_jobs_unless_the_environment_sets
         inner(spec)
     });
     let mut config = SwarmConfig::new(factory, dir.path());
-    assert!((1..=8).contains(&config.build_jobs.unwrap()), "capped by default");
+    assert!(
+        (1..=16).contains(&config.build_jobs.unwrap()),
+        "capped by default"
+    );
     config.build_jobs = Some(3);
     let (swarm, mut events) = Swarm::new(config);
     spawn_root(&swarm, "t").await;
