@@ -1013,6 +1013,12 @@ impl Swarm {
         if tokio::time::timeout(SHUTDOWN_GRACE, stopped).await.is_err() {
             tracing::warn!("agents still running after the shutdown grace period");
         } else {
+            // Every call was cut, its commands with it: a resume has none to kill.
+            if let Some(dir) = &self.inner.config.state_dir {
+                if let Err(error) = crate::orphans::mark_clean_stop(dir) {
+                    tracing::warn!(%error, "could not mark the stop as clean");
+                }
+            }
             self.collect_on_exit().await;
         }
         if let Some(journal) = &self.inner.journal {

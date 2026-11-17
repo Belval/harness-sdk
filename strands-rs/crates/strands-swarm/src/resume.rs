@@ -174,6 +174,19 @@ pub struct OpenBatch {
     pub results: Vec<ToolResultBlock>,
 }
 
+impl OpenBatch {
+    /// Whether a `shell` call of the batch had not finished.
+    pub fn cut_shell(&self) -> bool {
+        self.message.tool_uses().any(|call| {
+            call.name == "shell"
+                && !self
+                    .results
+                    .iter()
+                    .any(|result| result.tool_use_id == call.tool_use_id)
+        })
+    }
+}
+
 /// Put a batch a hard crash cut short back at the end of `messages`: its calls, the results that
 /// came in, and the SDK's cancellation for the rest, so [`in_flight`] lists those. Returns whether
 /// anything changed: nothing does when the conversation already holds the batch's results.
@@ -412,6 +425,12 @@ mod tests {
             ]
         );
         assert_eq!(ids(in_flight(&cut)), ["t2"], "the notice lists the cut call");
+        assert!(batch.cut_shell(), "t2 is a shell call that had not finished");
+        let finished = OpenBatch {
+            results: vec![ok("t1"), ok("t2")],
+            ..batch.clone()
+        };
+        assert!(!finished.cut_shell());
 
         // Crashed between the SDK adding the calls and adding their results.
         let mut half = vec![cut[0].clone(), message.clone()];

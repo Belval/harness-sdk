@@ -1455,6 +1455,88 @@ async fn a_crash_while_a_worktree_is_created_does_not_hand_its_id_to_the_next_sp
     assert_eq!(saved["next_id"], 2, "a1 was taken before its worktree existed");
     swarm.shutdown().await;
 }
+/// `sh -c "sleep 30; true"` in a session of its own, as a shell call runs, marked as `marker`'s.
+#[cfg(target_os = "linux")]
+fn marked_shell_call(marker: &str) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "sleep 30; true"])
+        .env(strands_swarm::orphans::SHELL_MARKER, marker);
+    strands_agents::sandbox::detach_from_terminal(&mut command);
+    command.spawn().unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn only_a_resume_after_a_hard_crash_kills_the_commands_of_cut_shell_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let envs = Arc::new(Mutex::new(Vec::new()));
+    let scripts = scripts_of(vec![("a1", vec![say("hi")])]);
+    let recording = |scripts: &Scripts| -> AgentFactory {
+        let (seen, inner) = (envs.clone(), session_factory(scripts, state_dir.join("sessions")));
+        Arc::new(move |spec: AgentSpec| {
+            seen.lock().push(spec.env.clone());
+            inner(spec)
+        })
+    };
+    let resume = |scripts: &Scripts| {
+        let mut config = SwarmConfig::new(recording(scripts), dir.path());
+        config.state_dir = Some(state_dir.clone());
+        let state_dir = state_dir.clone();
+        async move {
+            let saved = strands_swarm::state::load(&state_dir).await.unwrap().unwrap();
+            Swarm::resume(config, saved).await.unwrap().0
+        }
+    };
+    let mut config = SwarmConfig::new(recording(&scripts), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    reply_to(&mut events, USER).await;
+    swarm.shutdown().await;
+    let marker = strands_swarm::orphans::marker(&state_dir, "a1");
+    let given = envs.lock()[0].get(strands_swarm::orphans::SHELL_MARKER).cloned();
+    assert_eq!(given, Some(marker.clone()), "shell commands carry the marker");
+
+    // a1's saved batch has a shell call in flight, whose command still runs.
+    let cut_batch = || {
+        let batch = strands_swarm::resume::OpenBatch {
+            message: Message::new(
+                Role::Assistant,
+                vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                    "shell",
+                    "t1",
+                    json!({"command": "sleep 30"}),
+                ))],
+            ),
+            results: Vec::new(),
+        };
+        let path = state_dir
+            .join("sessions/a1")
+            .join(strands_swarm::resume::OPEN_BATCH_FILE);
+        std::fs::write(path, serde_json::to_vec(&batch).unwrap()).unwrap();
+    };
+    let mut running = marked_shell_call(&marker);
+    let scripts = scripts_of(vec![("a1", vec![say("ok")])]);
+
+    // After a clean stop (quit, reload) a resume kills nothing.
+    cut_batch();
+    resume(&scripts).await.shutdown().await;
+    assert!(
+        running.try_wait().unwrap().is_none(),
+        "a clean stop's resume leaves it"
+    );
+
+    // After a hard crash (no clean-stop mark) it kills the cut call's command.
+    cut_batch();
+    std::fs::remove_file(state_dir.join(strands_swarm::orphans::CLEAN_STOP_FILE)).unwrap();
+    let resumed = resume(&scripts).await;
+    let status = tokio::time::timeout(Duration::from_secs(5), running.wait()).await;
+    assert!(!status.unwrap().unwrap().success(), "killed");
+    resumed.shutdown().await;
+}
+
 /// The system prompt and tool specs an agent sends, serialized: the prompt cache is keyed on these
 /// bytes, so a resumed agent must send exactly what it sent before the restart.
 fn request_prefix(model: &MockMessageModel, call: usize) -> String {

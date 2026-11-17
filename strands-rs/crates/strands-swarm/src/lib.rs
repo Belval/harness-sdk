@@ -26,6 +26,7 @@ pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod names;
+pub mod orphans;
 pub mod pruning;
 pub mod resume;
 pub mod retry;

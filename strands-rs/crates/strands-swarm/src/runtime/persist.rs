@@ -17,6 +17,9 @@ impl Swarm {
             swarm.emit(SwarmEvent::Budget { tokens: Some(tokens) });
         }
         swarm.journal_event("resume", serde_json::json!({ "agents": state.agents.len() }));
+        if let Some(dir) = swarm.inner.config.state_dir.clone() {
+            swarm.kill_cut_calls(&dir, &state).await;
+        }
         if let (Some(from), Some(to)) = (state.commit.clone(), swarm.inner.config.commit.clone()) {
             if from != to {
                 let changes = crate::version::changes(&swarm.inner.config.source, &from, &to).await;
@@ -163,6 +166,35 @@ impl Swarm {
             max_agents: *self.inner.max_agents.lock(),
             commit: self.inner.config.commit.clone(),
             schedules: self.inner.schedules.lock().clone(),
+        }
+    }
+
+    /// After a hard crash (no clean-stop mark), kill the shell commands its cut calls left running
+    /// ([`crate::orphans`]). A clean stop has cut them already.
+    async fn kill_cut_calls(&self, dir: &Path, state: &SwarmState) {
+        if crate::orphans::take_clean_stop(dir) {
+            return;
+        }
+        let mut agents = Vec::new();
+        for agent in &state.agents {
+            let Some(path) = self.batch_file(&agent.id) else {
+                continue;
+            };
+            let Ok(bytes) = tokio::fs::read(&path).await else {
+                continue;
+            };
+            let batch = serde_json::from_slice::<resume::OpenBatch>(&bytes);
+            if batch.is_ok_and(|batch| batch.cut_shell()) {
+                agents.push(agent.id.clone());
+            }
+        }
+        let killed = crate::orphans::kill_cut_calls(dir, &agents).await;
+        if killed > 0 {
+            tracing::info!(
+                killed,
+                "killed the shell commands of calls a hard crash cut short"
+            );
+            self.journal_event("orphans_killed", serde_json::json!({ "groups": killed }));
         }
     }
 

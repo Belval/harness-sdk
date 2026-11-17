@@ -70,6 +70,19 @@ impl Swarm {
         })
     }
 
+    /// The environment of `node`'s shell commands: its own, plus in a persistent run the marker
+    /// a resume finds them by if this process dies hard ([`crate::orphans`]).
+    fn shell_env(&self, node: &Node) -> BTreeMap<String, String> {
+        let mut env = node.env.clone();
+        if let Some(dir) = &self.inner.config.state_dir {
+            env.insert(
+                crate::orphans::SHELL_MARKER.to_owned(),
+                crate::orphans::marker(dir, &node.id),
+            );
+        }
+        env
+    }
+
     async fn run_actor(self, node: Arc<Node>, start: Start) {
         // Read under its own statement: `instructions` takes the agents lock, and `snapshot` takes
         // the agents lock before per-agent locks.
@@ -88,7 +101,7 @@ impl Swarm {
                 .state_dir
                 .as_ref()
                 .map(|dir| dir.join(SESSIONS_DIR)),
-            env: node.env.clone(),
+            env: self.shell_env(&node),
             on_compacted: Some(self.compaction_sink(&node.id)),
         };
         let agent = match (self.inner.config.factory)(spec).await {
