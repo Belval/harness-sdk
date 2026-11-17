@@ -12,6 +12,8 @@ impl Swarm {
             .iter()
             .map(|node| {
                 let usage = *node.usage.lock();
+                // Not under another lock of the node (see `Node::info`).
+                let ledger = node.ledger.lock().clone();
                 crate::cost::AgentCost {
                     id: node.id.clone(),
                     parent: node.parent.clone(),
@@ -23,7 +25,7 @@ impl Swarm {
                         cache_read: usage.cache_read,
                         cache_write: usage.cache_write,
                     },
-                    ledger: node.ledger.lock().clone(),
+                    ledger,
                     fallback_model: node.model_id().or_else(|| default.clone()),
                 }
             })

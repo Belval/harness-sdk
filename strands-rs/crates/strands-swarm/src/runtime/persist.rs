@@ -336,8 +336,22 @@ pub(super) fn status_name(status: &AgentStatus) -> &'static str {
     }
 }
 
+/// The persistable view of one agent. Each lock is read on its own (see `Node::info`): guards
+/// taken inside the struct literal are all held until it is built, and holding `model` while
+/// waiting for `status` deadlocked against `Node::info`.
 pub(super) fn node_state(node: &Node) -> AgentState {
     let usage = *node.usage.lock();
+    let model = node.model.lock().clone();
+    let status = status_name(&node.status.lock()).to_owned();
+    let mailbox = node.mailbox.lock().iter().map(mail_state).collect();
+    let ledger = node.ledger.lock().clone();
+    let context = *node.context.lock();
+    let running_calls = node
+        .tool_calls
+        .lock()
+        .iter()
+        .map(|(id, started)| (id.clone(), started.elapsed().as_secs()))
+        .collect();
     AgentState {
         id: node.id.clone(),
         name: Some(node.name.clone()),
@@ -345,24 +359,19 @@ pub(super) fn node_state(node: &Node) -> AgentState {
         cwd: node.cwd.clone(),
         branch: node.branch.clone(),
         task: node.task.clone(),
-        model: node.model.lock().clone(),
+        model,
         goal: node.goal.clone(),
-        status: status_name(&node.status.lock()).to_owned(),
-        mailbox: node.mailbox.lock().iter().map(mail_state).collect(),
+        status,
+        mailbox,
         env: node.env.clone(),
         input_tokens: usage.input,
         output_tokens: usage.output,
         cache_read_tokens: usage.cache_read,
         cache_write_tokens: usage.cache_write,
-        ledger: node.ledger.lock().clone(),
-        context: *node.context.lock(),
+        ledger,
+        context,
         paused: node.paused.load(Ordering::SeqCst),
-        running_calls: node
-            .tool_calls
-            .lock()
-            .iter()
-            .map(|(id, started)| (id.clone(), started.elapsed().as_secs()))
-            .collect(),
+        running_calls,
     }
 }
 

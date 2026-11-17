@@ -639,16 +639,22 @@ impl Node {
         format!("{} ({})", self.name, self.id)
     }
 
+    /// Reads one lock at a time: guards taken inside the struct literal would all be held until
+    /// it is built, and holding `status` while waiting for `model` deadlocked against
+    /// [`persist::node_state`], which took them in the other order.
     fn info(&self) -> AgentInfo {
+        let status = self.status.lock().clone();
+        let unread = self.mailbox.lock().len();
+        let model = self.model_id();
         AgentInfo {
             id: self.id.clone(),
             name: self.name.clone(),
             parent: self.parent.clone(),
             cwd: self.cwd.clone(),
             branch: self.branch.clone(),
-            status: self.status.lock().clone(),
-            unread: self.mailbox.lock().len(),
-            model: self.model_id(),
+            status,
+            unread,
+            model,
         }
     }
 
@@ -1146,6 +1152,69 @@ impl Swarm {
 #[cfg(test)]
 mod tests {
     use super::expand_model;
+    use super::{persist, Node};
+    use std::time::Duration;
+
+    type TryLock = fn(&Node) -> bool;
+
+    const WAIT: Duration = Duration::from_millis(500);
+
+    /// While `hold` holds one of a node's locks (and calls back), `read` runs on another thread
+    /// and blocks on it; every lock in `free` must stay takeable meanwhile. A reader that kept one
+    /// lock while waiting for another deadlocked against one taking them in the other order.
+    fn reads_one_lock_at_a_time(
+        hold: impl FnOnce(&Node, &mut dyn FnMut()),
+        read: impl Fn(&Node) + Sync,
+        free: &[(&str, TryLock)],
+    ) {
+        let node = Node::default();
+        std::thread::scope(|scope| {
+            let mut reader = None;
+            hold(&node, &mut || {
+                reader = Some(scope.spawn(|| read(&node)));
+                // Time for the reader to get as far as the held lock.
+                std::thread::sleep(Duration::from_millis(100));
+                for (name, try_lock) in free {
+                    assert!(try_lock(&node), "`{name}` held while waiting for another lock");
+                }
+            });
+            reader.unwrap().join().unwrap();
+        });
+    }
+
+    #[test]
+    fn listing_an_agent_holds_none_of_its_locks_while_it_waits_for_another() {
+        reads_one_lock_at_a_time(
+            |node, during| {
+                let _held = node.model.lock();
+                during();
+            },
+            |node| drop(node.info()),
+            &[
+                ("status", |n| n.status.try_lock_for(WAIT).is_some()),
+                ("mailbox", |n| n.mailbox.try_lock_for(WAIT).is_some()),
+            ],
+        );
+    }
+
+    #[test]
+    fn saving_an_agent_holds_none_of_its_locks_while_it_waits_for_another() {
+        reads_one_lock_at_a_time(
+            |node, during| {
+                let _held = node.tool_calls.lock();
+                during();
+            },
+            |node| drop(persist::node_state(node)),
+            &[
+                ("usage", |n| n.usage.try_lock_for(WAIT).is_some()),
+                ("model", |n| n.model.try_lock_for(WAIT).is_some()),
+                ("status", |n| n.status.try_lock_for(WAIT).is_some()),
+                ("mailbox", |n| n.mailbox.try_lock_for(WAIT).is_some()),
+                ("ledger", |n| n.ledger.try_lock_for(WAIT).is_some()),
+                ("context", |n| n.context.try_lock_for(WAIT).is_some()),
+            ],
+        );
+    }
 
     #[test]
     fn a_tier_alias_takes_the_defaults_provider_prefix() {
