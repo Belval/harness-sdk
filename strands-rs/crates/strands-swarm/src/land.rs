@@ -139,6 +139,9 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
     if commits.is_empty() {
         return Ok(format!("Nothing to land: {into} already has {label}'s changes."));
     }
+    if let Some(dir) = checkout {
+        ensure_nothing_in_the_way(dir, old, &new, into).await?;
+    }
     let toplevel = git(&plan.repo, &["rev-parse", "--show-toplevel"])
         .await
         .map_err(|e| format!("Not landed: {e}"))?;
@@ -469,6 +472,31 @@ async fn ensure_clean(dir: &Path, into: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse, before any check runs, when the fast-forward from `old` to `new` in `into`'s checkout
+/// at `dir` would fail on untracked files there that the landing adds.
+async fn ensure_nothing_in_the_way(dir: &Path, old: &str, new: &str, into: &str) -> Result<(), String> {
+    let added = git(
+        dir,
+        &["diff", "--name-only", "--no-renames", "--diff-filter=A", old, new],
+    )
+    .await
+    .map_err(|e| format!("Not landed: {e}"))?;
+    if added.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["ls-files", "--others", "--exclude-standard", "--"];
+    args.extend(added.lines());
+    let blocking = git(dir, &args).await.map_err(|e| format!("Not landed: {e}"))?;
+    if blocking.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Not landed: {into} is checked out at {} with untracked files the landing adds; they \
+         must be moved, deleted or committed first. Nothing was changed.\n{blocking}",
+        dir.display()
+    ))
+}
+
 /// `<short hash> <subject>` of the commits in `from..to`, newest first.
 async fn log(dir: &Path, from: &str, to: &str) -> Result<String, String> {
     git(dir, &["log", "--format=%h %s", &format!("{from}..{to}"), "--"])
@@ -726,6 +754,27 @@ mod tests {
         assert_eq!(head(&fx.main, "main").await, main_before);
         assert!(!fx.main.join("b.txt").exists());
         assert_eq!(worktrees(&fx.main).await, 2);
+    }
+
+    #[tokio::test]
+    async fn untracked_files_the_landing_adds_are_refused_before_the_checks_run() {
+        let fx = fixture().await;
+        sh(&fx.main, "echo mine > b.txt && echo other > notes.txt").await;
+        let before = head(&fx.main, "main").await;
+        let ran = fx.land.join("ran");
+        let check = format!("touch '{}'", ran.display());
+
+        let error = run(&plan(&fx, &[check.as_str()])).await.unwrap_err();
+
+        assert!(error.contains("untracked files the landing adds"), "{error}");
+        assert!(error.ends_with("\nb.txt"), "only the file in the way: {error}");
+        assert!(!ran.exists(), "no check ran");
+        assert_eq!(head(&fx.main, "main").await, before);
+        assert_eq!(std::fs::read_to_string(fx.main.join("b.txt")).unwrap(), "mine\n");
+        assert_eq!(worktrees(&fx.main).await, 2, "scratch worktree removed");
+        // Untracked files elsewhere do not stand in the way.
+        std::fs::remove_file(fx.main.join("b.txt")).unwrap();
+        run(&plan(&fx, &[check.as_str()])).await.unwrap();
     }
 
     #[tokio::test]

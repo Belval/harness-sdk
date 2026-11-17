@@ -237,7 +237,8 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
   3. only then fast-forwards `into`: `git merge --ff-only` where it is checked out, else a
      compare-and-swap `update-ref`.
 - **Refusals.**
-  - It refuses when that checkout has uncommitted changes to tracked files. It gives up if `into`
+  - It refuses when that checkout has uncommitted changes to tracked files, or untracked files
+    where the landing adds files (checked before the checks run). It gives up if `into`
     moved meanwhile. Land jobs take turns from that check to the fast-forward (a lock in the
     repository's git dir), so of two that finish together one lands and the other is told so.
   - A conflict (with the files), a failing check (with its last 30 lines) or a refusal changes
