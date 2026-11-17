@@ -240,16 +240,7 @@ impl Swarm {
         let Some(path) = self.batch_file(&node.id) else {
             return;
         };
-        let written = match batch.as_ref() {
-            Some(open) => serde_json::to_vec(open)
-                .map_err(Into::into)
-                .and_then(|json| crate::files::replace(&path, &json, false)),
-            None => std::fs::remove_file(&path).or_else(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => Ok(()),
-                _ => Err(e),
-            }),
-        };
-        if let Err(error) = written {
+        if let Err(error) = resume::OpenBatch::save(&path, batch.as_ref()) {
             tracing::warn!(agent = %node.id, %error, "could not save the tool batch in progress");
         }
     }

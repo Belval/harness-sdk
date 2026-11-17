@@ -3,6 +3,12 @@
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(test)]
+thread_local! {
+    /// Files [`replace`] synced on this thread, for tests of what is written durably.
+    pub static SYNCED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Write `bytes` to `path` (creating its directory) through a temporary file beside it and a
 /// rename, so a crash leaves the old file or the new one, never half of one. `durable` also syncs
 /// the file before the rename and the directory after it, so that holds after a power loss too.
@@ -18,6 +24,8 @@ pub fn replace(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> 
     file.write_all(bytes)?;
     if durable {
         file.sync_all()?;
+        #[cfg(test)]
+        SYNCED.with(|synced| synced.set(synced.get() + 1));
     }
     drop(file);
     std::fs::rename(&tmp, path)?;

@@ -139,8 +139,9 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   retries.
 - **Hard crashes.** The SDK adds a batch of tool calls to the conversation only once all of them
   finished, so each agent's batch in progress is also written ahead to
-  `sessions/<agent>/open-batch.json`. After a kill -9, OOM kill or power loss the resumed agent gets
-  the batch back: the calls, the results that came in, and the cut calls in its notice. Only after
+  `sessions/<agent>/open-batch.json`, synced to disk on each change. After a kill -9, OOM kill or
+  power loss the resumed agent gets the batch back: the calls, the results that came in, and the
+  cut calls in its notice. Only after
   such a crash (no `clean-stop` mark from a quit or reload) does a resume (Linux) kill the process
   groups of the shell calls the batch had cut, found by `STRANDS_SWARM_SHELL=<run dir>#<agent>`;
   `nohup … &` leftovers of earlier calls and background jobs run on.

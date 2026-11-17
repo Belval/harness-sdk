@@ -177,6 +177,18 @@ pub struct OpenBatch {
 }
 
 impl OpenBatch {
+    /// Write `batch` to `path`, or remove the file for `None`. Synced like `swarm.json`, so the
+    /// batch survives a power loss, which is what it is written ahead for.
+    pub fn save(path: &std::path::Path, batch: Option<&OpenBatch>) -> std::io::Result<()> {
+        match batch {
+            Some(open) => crate::files::replace(path, &serde_json::to_vec(open)?, true),
+            None => std::fs::remove_file(path).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            }),
+        }
+    }
+
     /// Whether a `shell` call of the batch had not finished.
     pub fn cut_shell(&self) -> bool {
         self.message
@@ -407,6 +419,25 @@ mod tests {
         let input = fold_into_open_turn(&mut closed, InvokeInput::Text("next".into()));
         assert!(matches!(input, InvokeInput::Text(t) if t == "next"));
         assert_eq!(closed.len(), 2);
+    }
+
+    #[test]
+    fn a_saved_batch_is_synced_and_removed_once_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(OPEN_BATCH_FILE);
+        let batch = OpenBatch {
+            message: calls(&["t1"]),
+            results: Vec::new(),
+        };
+        let synced = || crate::files::SYNCED.with(std::cell::Cell::get);
+        let before = synced();
+        OpenBatch::save(&path, Some(&batch)).unwrap();
+        assert_eq!(synced(), before + 1, "written durably, as for a power loss");
+        let saved: OpenBatch = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.message, batch.message);
+        OpenBatch::save(&path, None).unwrap();
+        assert!(!path.exists());
+        OpenBatch::save(&path, None).unwrap();
     }
 
     #[test]
