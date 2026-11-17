@@ -25,7 +25,8 @@ const BIGGEST: usize = 5;
 impl Swarm {
     /// Every `every`, check the free space (`free`) on the filesystems the swarm writes to: the
     /// run dir, the agents' working directories and the swarm's cargo target dirs. Once it drops
-    /// below `min_free` bytes, tell the live root agents once, with the biggest per-agent target
+    /// below `min_free` bytes, delete the target dirs of [`Self::finished_agents`] and tell the
+    /// live root agents once, with what was deleted and the biggest per-agent target
     /// dirs; a new warning needs the space to recover first (by a tenth of `min_free`). A
     /// persistent run keeps that state on disk ([`DISK_WARNED_FILE`]), so a restart does not
     /// warn again. Runs until the swarm shuts down.
@@ -62,13 +63,88 @@ impl Swarm {
                 if let Some(marker) = &marker {
                     let _ = std::fs::write(marker, format!("{bytes}\n"));
                 }
+                let reclaimed = self.reclaim_finished_targets().await;
                 let targets = self.target_dirs();
                 let sizes = tokio::task::spawn_blocking(move || biggest(targets))
                     .await
                     .unwrap_or_default();
-                self.tell_roots(DISK_SENDER, "disk", disk_warning(&path, bytes, min_free, &sizes));
+                let text = disk_warning(&path, bytes, min_free, &reclaimed, &sizes);
+                self.tell_roots(DISK_SENDER, "disk", text);
             }
         }
+    }
+
+    /// Live worktree agents that look finished: idle, without a running background job, with a
+    /// clean worktree and nothing on their branches that the base lacks (`branches`, from
+    /// [`Self::branch_states`]), so cancelling one loses only its conversation. Each comes as
+    /// `(id, label, its private target dir if that exists)`.
+    pub async fn finished_agents(
+        &self,
+        branches: &std::collections::HashMap<String, crate::status::BranchState>,
+        jobs: &[Job],
+    ) -> Vec<(String, String, Option<PathBuf>)> {
+        let mut finished = Vec::new();
+        for node in self.nodes() {
+            let done = branches
+                .get(&node.id)
+                .is_some_and(|state| state.integrated() && state.others.is_empty());
+            let busy = jobs
+                .iter()
+                .any(|job| job.meta.owner == node.id && job.state == jobs::JobState::Running);
+            if node.branch.is_none() || !done || busy || !self.is_idle(&node.id) {
+                continue;
+            }
+            let clean = crate::worktree::git(&node.cwd, &["status", "--porcelain"]).await;
+            if !matches!(clean.as_deref(), Ok("")) {
+                continue;
+            }
+            let target = gc::private_target_dir(&self.inner.config.run_id, &node.id, &node.env);
+            let target = target.filter(|dir| dir.exists());
+            finished.push((node.id.clone(), node.label(), target));
+        }
+        finished
+    }
+
+    /// Whether agent `id` is idle (not working, waiting, stopped or cancelled).
+    fn is_idle(&self, id: &str) -> bool {
+        let nodes = self.inner.agents.lock();
+        nodes
+            .get(id)
+            .is_some_and(|node| matches!(*node.status.lock(), AgentStatus::Idle))
+    }
+
+    /// Delete the private target dirs of [`Self::finished_agents`], keeping their worktrees and
+    /// conversations: a rebuild is all it costs them. `(label, bytes freed)` per deleted dir.
+    async fn reclaim_finished_targets(&self) -> Vec<(String, u64)> {
+        if !self.inner.config.reclaim_disk {
+            return Vec::new();
+        }
+        let (_, branches) = self.branch_states().await;
+        let jobs = self.jobs().await;
+        let mut reclaimed = Vec::new();
+        for (id, label, target) in self.finished_agents(&branches, &jobs).await {
+            // A turn started since would be building into it.
+            let Some(target) = target.filter(|_| self.is_idle(&id)) else {
+                continue;
+            };
+            let dir = target.clone();
+            let freed = tokio::task::spawn_blocking(move || {
+                let bytes = gc::dir_size(&dir);
+                std::fs::remove_dir_all(&dir).map(|()| bytes)
+            })
+            .await;
+            match freed {
+                Ok(Ok(bytes)) => {
+                    tracing::info!(agent = %id, dir = %target.display(), bytes, "deleted a finished agent's target dir");
+                    reclaimed.push((label, bytes));
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(agent = %id, dir = %target.display(), %error, "could not delete a finished agent's target dir");
+                }
+                Err(_) => {}
+            }
+        }
+        reclaimed
     }
 
     /// Where the swarm writes: run dir, agents' working directories, shared and private target
@@ -151,8 +227,15 @@ fn biggest(dirs: Vec<(String, PathBuf)>) -> Vec<(String, PathBuf, u64)> {
     sized
 }
 
-/// The warning's text; its first line is the TUI's footer notice.
-fn disk_warning(path: &Path, free: u64, min_free: u64, sizes: &[(String, PathBuf, u64)]) -> String {
+/// The warning's text; its first line is the TUI's footer notice. `reclaimed`: the finished
+/// agents' target dirs just deleted.
+fn disk_warning(
+    path: &Path,
+    free: u64,
+    min_free: u64,
+    reclaimed: &[(String, u64)],
+    sizes: &[(String, PathBuf, u64)],
+) -> String {
     use crate::gc::human;
     let mut text = format!(
         "disk space low: {} free on the filesystem of {} (warning below {})\n",
@@ -160,6 +243,17 @@ fn disk_warning(path: &Path, free: u64, min_free: u64, sizes: &[(String, PathBuf
         path.display(),
         human(min_free)
     );
+    if !reclaimed.is_empty() {
+        let each: Vec<String> = reclaimed
+            .iter()
+            .map(|(label, bytes)| format!("{} {label}", human(*bytes)))
+            .collect();
+        text.push_str(&format!(
+            "Deleted the target dirs of idle agents with nothing left to merge (their next build \
+             rebuilds it): {}\n",
+            each.join(", ")
+        ));
+    }
     if !sizes.is_empty() {
         text.push_str("Biggest swarm-owned cargo target dirs:\n");
         for (label, dir, bytes) in sizes {
@@ -214,7 +308,7 @@ mod tests {
             std::fs::write(path.join("f"), vec![0; len]).unwrap();
         }
         let sizes = biggest(vec![("x (a2)".into(), small), ("y (a3) (cancelled)".into(), big)]);
-        let text = disk_warning(Path::new("/w"), 3 << 30, 20 << 30, &sizes);
+        let text = disk_warning(Path::new("/w"), 3 << 30, 20 << 30, &[], &sizes);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
@@ -222,5 +316,15 @@ mod tests {
         );
         assert!(lines[2].starts_with("  2.9 KB y (a3) (cancelled): /"), "{text}");
         assert!(lines[3].starts_with("  10 B x (a2): /"), "{text}");
+
+        let reclaimed = [("done (a4)".to_owned(), 12 << 30)];
+        let text = disk_warning(Path::new("/w"), 3 << 30, 20 << 30, &reclaimed, &sizes);
+        assert_eq!(
+            text.lines().nth(1),
+            Some(
+                "Deleted the target dirs of idle agents with nothing left to merge (their next \
+                 build rebuilds it): 12 GB done (a4)"
+            )
+        );
     }
 }

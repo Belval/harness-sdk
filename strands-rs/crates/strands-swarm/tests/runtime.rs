@@ -5301,3 +5301,86 @@ async fn the_task_a_run_was_started_with_is_saved() {
     assert_eq!(saved.task_flag.as_deref(), Some("build it"));
     swarm.shutdown().await;
 }
+
+/// A worktree agent that is idle with nothing left to merge is flagged in `list_agents`, and a
+/// low disk deletes its target dir (only that); one with unmerged work keeps everything.
+#[tokio::test]
+async fn finished_worktree_agents_are_flagged_and_lose_their_target_dir_when_disk_runs_low() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);
+    let scripts = scripts_of(vec![
+        ("a1", vec![say("ok"), say("noted")]),
+        ("a2", vec![say("ok"), say("noted")]),
+        (
+            "a3",
+            vec![
+                tool_call("list_agents", "l1", json!({})),
+                say("done"),
+                say("noted"),
+            ],
+        ),
+    ]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
+    config.cargo_target_dir = Some(dir.path().join("target"));
+    let (swarm, mut events) = Swarm::new(config);
+    let worktree = || SpawnRequest {
+        task: "t".into(),
+        worktree: true,
+        ..Default::default()
+    };
+    let (done, busy) = (
+        swarm.spawn(USER, worktree()).await.unwrap(),
+        swarm.spawn(USER, worktree()).await.unwrap(),
+    );
+    reply_to(&mut events, USER).await;
+    reply_to(&mut events, USER).await;
+    let checkout = |id: &str| swarm.agent(id).unwrap().cwd;
+    std::fs::write(checkout(&busy).join("work.txt"), "x").unwrap();
+    git(&checkout(&busy), &["add", "."]);
+    git(&checkout(&busy), &["commit", "-qm", "work"]);
+    let target = |id: &str| {
+        let target = dir
+            .path()
+            .join(format!("target-worktrees/{}/{id}", swarm.run_id()));
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(target.join("debug/lib.rlib"), vec![0; 4096]).unwrap();
+        target
+    };
+    let (done_target, busy_target) = (target(&done), target(&busy));
+    eventually("both are idle", || {
+        [&done, &busy]
+            .iter()
+            .all(|id| swarm.agent(id).unwrap().status == AgentStatus::Idle)
+    })
+    .await;
+
+    let lister = spawn_root(&swarm, "look").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let listed = sent_text(&scripts.lock()[&lister].clone(), 1);
+    let flag = "idle with nothing left to merge: cancel to reclaim its worktree and 4.0 KB target dir";
+    let line = |id: &str| {
+        let line = listed.split("\\n").find(|l| l.contains(&format!("({id})")));
+        line.unwrap_or_else(|| panic!("{listed}")).to_owned()
+    };
+    assert!(line(&done).contains(flag), "{listed}");
+    assert!(!line(&busy).contains("cancel to reclaim"), "{listed}");
+
+    let check: strands_swarm::runtime::FreeSpace = Arc::new(|_: &Path| Some(5 << 30));
+    tokio::spawn(
+        swarm
+            .clone()
+            .guard_disk(20 << 30, Duration::from_millis(10), check),
+    );
+    let warning = mail_to(&mut events, &lister, "disk").await;
+    assert!(
+        warning.contains("nothing left to merge (their next build rebuilds it): 4.0 KB"),
+        "{warning}"
+    );
+    assert!(!done_target.exists(), "the finished agent's target dir is gone");
+    assert!(checkout(&done).exists(), "its worktree stays");
+    assert!(
+        busy_target.exists(),
+        "an agent with unmerged work keeps its target dir"
+    );
+    swarm.shutdown().await;
+}

@@ -8,7 +8,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `spawn_agent` | Start an agent on a task (optionally in another directory, in its own git worktree, with a model, a goal or its own compaction point). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports, which returns at once when none is pending); a user message always ends it. With `all`, until every agent in `from` has sent something; a timeout (default 10 min, at most an hour) returns what came and who is still missing. Mail stays unread (and saved) until it returns, so a restart meanwhile loses none. |
-| `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files, other agents' branches changing the same files), running jobs, schedules, model (and an agent's own compaction point) and estimated spend. |
+| `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files, other agents' branches changing the same files), running jobs, schedules, model (and an agent's own compaction point), estimated spend, and which idle worktree agents have nothing left to merge (cancel to reclaim their disk). |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to a mailbox (default: your own) later and/or repeatedly (`every: "30m"`, at least a minute); list or cancel schedules. |
@@ -458,6 +458,13 @@ messages you.
     and the biggest target dirs (per agent, and the land checks' shared one); the TUI shows the
     first line in its footer. It warns again only after the space has recovered to 10% above the
     threshold, restarts included (`<run dir>/disk-warned`).
+  - Finished worktree agents are never cancelled for you (one may be kept on purpose), but a live
+    one that is idle, runs no background job, has a clean worktree and nothing on its branches
+    the base lacks is flagged in `list_agents`: `…, idle with nothing left to merge: cancel to
+    reclaim its worktree and 12 GB target dir`. When the disk guard warns, it first deletes the
+    private target dirs of such agents (never their worktree, branch or conversation; the next
+    build recreates it) and says so in the warning: `Deleted the target dirs of idle agents with
+    nothing left to merge (…): 12 GB done (a4)`. Off with `SwarmConfig::reclaim_disk`.
 - **Memory.**
   - One Markdown file is shared by every agent and run: `$XDG_CONFIG_HOME/strands-swarm/memory.md`
     (default `~/.config`), or `--memory FILE`, or off with `--no-memory`.

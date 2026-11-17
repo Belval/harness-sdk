@@ -630,7 +630,24 @@ async fn list_tool(swarm: Swarm, _me: String, input: ListInput, _ctx: ToolContex
         true => cancelled_branches(&swarm, branches.0.as_deref()).await,
         false => HashMap::new(),
     };
-    let text = list_agents(&swarm, input.include_cancelled, &jobs, &branches, &left);
+    let mut finished = HashMap::new();
+    for (id, _, target) in swarm.finished_agents(&branches.1, &jobs).await {
+        let bytes = match target {
+            Some(dir) => tokio::task::spawn_blocking(move || crate::gc::dir_size(&dir))
+                .await
+                .ok(),
+            None => None,
+        };
+        finished.insert(id, bytes);
+    }
+    let text = list_agents(
+        &swarm,
+        input.include_cancelled,
+        &jobs,
+        &branches,
+        &left,
+        &finished,
+    );
     Ok(text)
 }
 
@@ -667,13 +684,14 @@ fn resolve(swarm: &Swarm, me: &str, who: &str) -> Result<String> {
 /// behind, merges cleanly), jobs j3 (gates), model claude-sonnet-4-5, compacts at 300.0k, est.
 /// $1.20 / 3.4M tokens` (the compaction point only when spawned with its own).
 /// One line per agent; cancelled ones are only counted unless `include_cancelled`; then the
-/// swarm's total.
+/// swarm's total. `finished`: the [`Swarm::finished_agents`], with their target dirs' sizes.
 fn list_agents(
     swarm: &Swarm,
     include_cancelled: bool,
     jobs: &[Job],
     (base, branches): &(Option<String>, HashMap<String, BranchState>),
     cancelled: &HashMap<String, Option<BranchState>>,
+    finished: &HashMap<String, Option<u64>>,
 ) -> String {
     let agents = swarm.agents();
     let (shown, hidden): (Vec<_>, Vec<_>) = agents
@@ -714,9 +732,18 @@ fn list_agents(
         let spend = cost.spend(&info.id).map(|s| format!(", {}", s.describe()));
         model + &spend.unwrap_or_default()
     };
+    let reclaim = |id: &str| -> String {
+        let reclaim = match finished.get(id) {
+            None => return String::new(),
+            Some(Some(bytes)) => format!("its worktree and {} target dir", crate::gc::human(*bytes)),
+            Some(None) => "its worktree".to_owned(),
+        };
+        format!(", idle with nothing left to merge: cancel to reclaim {reclaim}")
+    };
     let mut lines = Vec::new();
     for info in &shown {
-        let line = describe(swarm, info) + &merge(&info.id) + &running(&info.id) + &spend(info);
+        let line =
+            describe(swarm, info) + &merge(&info.id) + &reclaim(&info.id) + &running(&info.id) + &spend(info);
         lines.push(line);
         let upcoming = schedules.iter().filter(|s| s.to == info.id);
         lines.extend(upcoming.map(|s| format!("  scheduled: {}", s.describe(swarm.now()))));
