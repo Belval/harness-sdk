@@ -188,13 +188,16 @@ const CONTEXT_WINDOW_LIMITS: &[(&str, u64)] = &[
 const BEDROCK_REGION_PREFIXES: &[&str] = &["us", "eu", "ap", "global", "apac", "au", "jp", "us-gov"];
 
 fn lookup(model_id: &str) -> Option<u64> {
+    // Bedrock and Bedrock Mantle name OpenAI's models `openai.<OpenAI id>`.
+    let model_id = model_id.strip_prefix("openai.").unwrap_or(model_id);
     CONTEXT_WINDOW_LIMITS
         .iter()
         .find(|(id, _)| *id == model_id)
         .map(|(_, limit)| *limit)
 }
 
-/// Context window limit for a model id, stripping one known Bedrock cross-region prefix.
+/// Context window limit for a model id, stripping one known Bedrock cross-region prefix and
+/// Bedrock's `openai.` provider prefix.
 pub fn get_context_window_limit(model_id: &str) -> Option<u64> {
     if let Some(direct) = lookup(model_id) {
         return Some(direct);
@@ -225,6 +228,13 @@ mod tests {
         assert_eq!(get_context_window_limit("amazon.nova-pro-v1:0"), Some(300_000));
         assert_eq!(get_context_window_limit("amazon.nova-micro-v1:0"), Some(128_000));
         assert_eq!(get_context_window_limit("gpt-6-astra"), Some(1_050_000));
+        assert_eq!(get_context_window_limit("openai.gpt-6-astra"), Some(1_050_000));
+        assert_eq!(get_context_window_limit("us.openai.gpt-6-astra"), Some(1_050_000));
+        assert_eq!(
+            get_context_window_limit("global.openai.gpt-5.6-luna"),
+            Some(1_050_000)
+        );
+        assert_eq!(get_context_window_limit("openai.gpt-oss-120b-1:0"), None);
         assert_eq!(get_context_window_limit("gpt-5.4"), Some(1_050_000));
         assert_eq!(get_context_window_limit("gpt-4o"), Some(128_000));
         assert_eq!(get_context_window_limit("o3"), Some(200_000));
