@@ -179,13 +179,15 @@ pub struct OpenBatch {
 impl OpenBatch {
     /// Whether a `shell` call of the batch had not finished.
     pub fn cut_shell(&self) -> bool {
-        self.message.tool_uses().any(|call| {
-            call.name == "shell"
-                && !self
-                    .results
-                    .iter()
-                    .any(|result| result.tool_use_id == call.tool_use_id)
-        })
+        self.message
+            .tool_uses()
+            .any(|call| call.name == "shell" && self.result(call).is_none())
+    }
+
+    fn result(&self, call: &ToolUseBlock) -> Option<&ToolResultBlock> {
+        self.results
+            .iter()
+            .find(|result| result.tool_use_id == call.tool_use_id)
     }
 }
 
@@ -218,9 +220,7 @@ pub fn restore_batch(messages: &mut Vec<Message>, batch: OpenBatch) -> bool {
         .iter()
         .map(|call| {
             let result = batch
-                .results
-                .iter()
-                .find(|result| result.tool_use_id == call.tool_use_id)
+                .result(call)
                 .cloned()
                 .unwrap_or_else(|| ToolResultBlock::error(&call.tool_use_id, EXECUTION_CANCELLED_MESSAGE));
             ContentBlock::ToolResult(result)
