@@ -318,18 +318,12 @@ impl Swarm {
     }
 
     fn add_totals(&self, node: &Node, counts: crate::cost::Counts, own_call: bool) {
-        let crate::cost::Counts {
-            input,
-            cache_read,
-            cache_write,
-            ..
-        } = counts;
         {
             let mut total = node.usage.lock();
-            total.input += input;
+            total.input += counts.input;
             total.output += counts.output;
-            total.cache_read += cache_read;
-            total.cache_write += cache_write;
+            total.cache_read += counts.cache_read;
+            total.cache_write += counts.cache_write;
         }
         // Relative to the compaction point, so 100% means older turns are summarized before the
         // next call; the window is the one the context manager assumes. A side call's input is
@@ -337,7 +331,7 @@ impl Swarm {
         if let Some(agent) = node.agent().filter(|_| own_call) {
             let window = crate::compaction::window_of(agent.model().as_ref());
             let point = crate::compaction::compaction_point(window, self.inner.config.compact_at);
-            *node.context.lock() = Some(input as f64 / point as f64);
+            *node.context.lock() = Some(counts.input as f64 / point as f64);
         }
         self.emit_usage(node);
     }
@@ -484,7 +478,7 @@ impl Model for SideModel {
 }
 
 /// One model call's tokens from its usage metadata; `input` includes cache reads and writes.
-fn usage_counts(usage: &Usage) -> crate::cost::Counts {
+pub(super) fn usage_counts(usage: &Usage) -> crate::cost::Counts {
     let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
     let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
     crate::cost::Counts {

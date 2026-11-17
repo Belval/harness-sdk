@@ -77,9 +77,7 @@ impl Swarm {
         stop: CancellationToken,
     ) {
         // The whole request was cached by the call it repeats: a refresh reads all of it.
-        let prefix = usage.input_tokens
-            + usage.cache_read_input_tokens.unwrap_or(0)
-            + usage.cache_write_input_tokens.unwrap_or(0);
+        let prefix = super::actor::usage_counts(&usage).input;
         let options = StreamOptions {
             cancel: Some(stop.clone()),
             ..request.options
