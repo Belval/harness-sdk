@@ -271,11 +271,6 @@ pub async fn tidy(land_dir: &Path, target: Option<&Path>) -> crate::gc::Collecte
     out
 }
 
-/// The landed-commit record of the repository at `dir`.
-async fn landed_file(dir: &Path) -> Option<PathBuf> {
-    common_file(dir, LANDED_FILE).await
-}
-
 /// File `name` in the common git dir of the repository at `dir`.
 async fn common_file(dir: &Path, name: &str) -> Option<PathBuf> {
     let common = git(dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await;
@@ -311,7 +306,7 @@ async fn land_lock(repo: &Path) -> Result<Flock<std::fs::File>, String> {
 /// record only means a landed branch keeps looking unmerged.
 async fn record_landed(repo: &Path, source: &str, landed: &str) {
     let (Some(path), Ok(source)) = (
-        landed_file(repo).await,
+        common_file(repo, LANDED_FILE).await,
         git(repo, &["rev-parse", &format!("{source}^{{commit}}")]).await,
     ) else {
         return;
@@ -330,7 +325,7 @@ async fn record_landed(repo: &Path, source: &str, landed: &str) {
 /// The landed sources (see [`LANDED_FILE`]) whose landed commits `base` still has: every commit
 /// reachable from them is on `base` in substance.
 pub async fn landed_sources(dir: &Path, base: &str) -> Vec<String> {
-    let Some(path) = landed_file(dir).await else {
+    let Some(path) = common_file(dir, LANDED_FILE).await else {
         return Vec::new();
     };
     let text = tokio::fs::read_to_string(&path).await.unwrap_or_default();
