@@ -2301,10 +2301,18 @@ async fn the_goal_judge_runs_on_the_side_model_and_counts_toward_the_agents_toke
 
     let seen = usage_until_reply(&mut events, &id).await;
     assert_eq!(judge.call_count(), 1);
+    assert!(
+        judge.calls()[0].1.no_cache,
+        "a verdict's prompt is never resent: no cache write"
+    );
     assert_eq!(
         scripts.lock()["a1"].call_count(),
         1,
         "the judge is not the agent's model"
+    );
+    assert!(
+        !scripts.lock()["a1"].calls()[0].1.no_cache,
+        "the agent's own calls cache"
     );
     // The judge's call adds to the totals without touching the agent's context fill (100 tokens
     // of the 3400-token compaction point: 85% of the 4000-token window).
@@ -2966,6 +2974,10 @@ async fn context_summarization_runs_on_the_side_model_and_counts_toward_the_agen
 
     let seen = usage_until_reply(&mut events, &id).await;
     let summaries = summarizer.call_count() as u64;
+    assert!(
+        summarizer.calls().iter().all(|(_, options)| options.no_cache),
+        "summaries write no cache"
+    );
     assert!(summaries >= 1, "nothing was summarized");
     let (input, output, _) = *seen.last().unwrap();
     assert_eq!((input, output), (140 + 30 * summaries, 14 + 3 * summaries));

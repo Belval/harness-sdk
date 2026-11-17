@@ -459,7 +459,10 @@ impl Model for SideModel {
             let prompt = options.system_prompt.as_ref().map(|prompt| prompt.text());
             let purpose = crate::cost::SidePurpose::of(prompt.as_deref());
             let _permit = self.swarm.admit_model_call(&node.id, &cancel).await?;
-            let mut events = model.stream(messages, options);
+            // A summary or a verdict is asked for once, of a prompt never sent again: a cache
+            // write there costs 25% more than plain input and is never read.
+            let once = StreamOptions { no_cache: purpose != crate::cost::SidePurpose::Other, ..options.clone() };
+            let mut events = model.stream(messages, &once);
             loop {
                 let next = tokio::select! {
                     next = events.next() => next,

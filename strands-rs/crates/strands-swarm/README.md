@@ -61,7 +61,8 @@ error.
   agent back to work until the goal is met. It runs after every turn and sees the goal, the task
   and the latest ~40k characters of the conversation.
 - **Side calls.** The judge and context summarization run on the agent's model or `--side-model ID`.
-  They count toward the agent's tokens and the budget, and queue like its own calls.
+  They count toward the agent's tokens and the budget, and queue like its own calls. They skip
+  the prompt cache: their prompts are never sent twice, so a cache write would cost 25% extra.
 - **Context.**
   - An agent's older turns are summarized once a call's input reaches the compaction point:
     `--compact-at` (default `200k`) or 85% of the model's window, whichever is smaller.
