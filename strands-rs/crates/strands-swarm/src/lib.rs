@@ -28,6 +28,7 @@ pub mod memory;
 pub mod names;
 pub mod pruning;
 pub mod resume;
+pub mod retry;
 pub mod runtime;
 pub mod schedule;
 pub mod selftest;

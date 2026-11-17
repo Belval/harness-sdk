@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use strands_agents::tools::EXECUTION_CANCELLED_MESSAGE;
 use strands_agents::types::{ContentBlock, Message, Role, ToolResultBlock, ToolResultStatus, ToolUseBlock};
+use strands_agents::InvokeInput;
 
 /// How every restart notice starts, so context strategies can tell it from a new task.
 pub const NOTICE_PREFIX: &str = "[The swarm was restarted";
@@ -102,6 +103,22 @@ pub fn append_notice(messages: &mut Vec<Message>, notice: &str) -> bool {
     content.push(notice);
     messages.push(Message::new(Role::User, content));
     true
+}
+
+/// A failed model call leaves the user turn open (the SDK closes it only on cancel): the
+/// conversation ends with the turn's input or tool results and no reply. Fold the next `input`
+/// into that message, as Bedrock rejects two user messages in a row; the agent then continues
+/// from the conversation ([`InvokeInput::None`]).
+pub fn fold_into_open_turn(messages: &mut [Message], input: InvokeInput) -> InvokeInput {
+    let Some(last) = messages.last_mut().filter(|last| last.role == Role::User) else {
+        return input;
+    };
+    match input {
+        InvokeInput::Text(text) => last.content.push(ContentBlock::Text(text)),
+        InvokeInput::Blocks(blocks) => last.content.extend(blocks),
+        other => return other,
+    }
+    InvokeInput::None
 }
 
 #[cfg(test)]
@@ -213,5 +230,19 @@ mod tests {
         let mut ended = vec![Message::user("go"), Message::assistant("done")];
         assert!(!append_notice(&mut ended, "N"));
         assert_eq!(ended.len(), 2);
+    }
+
+    #[test]
+    fn input_after_a_failed_call_joins_the_open_user_turn() {
+        let mut open = vec![Message::user("go"), calls(&["t1"]), results(vec![ok("t1")])];
+        let input = fold_into_open_turn(&mut open, InvokeInput::Text("again".into()));
+        assert!(matches!(input, InvokeInput::None));
+        assert_eq!(open.len(), 3);
+        assert!(matches!(open[2].content.last(), Some(ContentBlock::Text(t)) if t == "again"));
+
+        let mut closed = vec![Message::user("go"), Message::assistant("done")];
+        let input = fold_into_open_turn(&mut closed, InvokeInput::Text("next".into()));
+        assert!(matches!(input, InvokeInput::Text(t) if t == "next"));
+        assert_eq!(closed.len(), 2);
     }
 }

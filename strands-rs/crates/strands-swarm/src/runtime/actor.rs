@@ -175,6 +175,7 @@ impl Swarm {
         self.set_status(node, AgentStatus::Running);
         self.refresh_memory(agent).await;
         let options = InvokeOptions::default().with_cancel(turn.clone());
+        let input = agent.with_messages(|messages| resume::fold_into_open_turn(messages, input));
         let mut stream = agent.stream_with(input, options);
         let mut reply = None;
         let mut failure = None;

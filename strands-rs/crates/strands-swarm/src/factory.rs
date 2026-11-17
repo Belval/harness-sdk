@@ -317,6 +317,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
             spec.on_compacted,
             options.cache_ttl.as_deref(),
         ),
+        retry: Some(crate::retry::policy()),
         id: Some(spec.id),
         name: Some(spec.name),
         ..Default::default()

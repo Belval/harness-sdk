@@ -103,6 +103,14 @@ and exit.
 - **Model calls.** `--max-concurrent-calls N` (8, `0` = unlimited) caps model calls in flight
   across the swarm. Extra calls queue ("queued for a model slot…") instead of tripping provider
   throttling.
+- **Model errors.**
+  - Throttling, server errors (5xx, Bedrock's `InternalServerException` and the like) and dropped
+    connections are retried with backoff, up to 10 attempts (about eight minutes). A rejected
+    request is not retried.
+  - If retrying doesn't help, the turn fails and the parent gets an `error` message. A goal agent
+    tries again (15 s, doubling to 10 min) and reports only the first failure. The judge sees only
+    replies, not failed turns.
+  - The next message picks up where the failed call stopped.
 - **Tokens.** `--budget-tokens N` (e.g. `5M`) caps the swarm's input + output tokens.
   - Once spent, model calls fail with a "budget exhausted" error that travels up to you.
   - `/budget N` raises it and tells every stopped agent to continue. `/budget off` lifts it and
