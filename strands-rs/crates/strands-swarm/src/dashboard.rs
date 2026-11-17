@@ -126,11 +126,12 @@ impl ContextControl {
         }
         for item in biggest {
             let number = match &item.tool_use_id {
-                Some(id) => {
+                // A preview or stub frees next to nothing when offloaded.
+                Some(id) if !item.stashed => {
                     listed.push(id.clone());
                     format!("#{}", listed.len())
                 }
-                None => "  ".to_owned(),
+                _ => "  ".to_owned(),
             };
             out.push_str(&format!(
                 "\n{number} ~{} tokens, {}: {}",
@@ -189,7 +190,11 @@ impl ContextControl {
                     continue;
                 }
                 let before = result_tokens(&result.content);
-                let mut refs = stash_refs(&result.content);
+                let mut refs = stash_refs(&result.tool_use_id, &result.content);
+                if is_stub(&result.content) {
+                    // Rewriting a stub frees nothing and costs the cached prefix after it.
+                    continue;
+                }
                 if refs.is_empty() {
                     // Stashed when the result arrived; stored again only if missing, so the
                     // original is never overwritten.
@@ -205,7 +210,7 @@ impl ContextControl {
                     }
                 }
                 let stub = format!(
-                    "[Offloaded by the agent: ~{} tokens]{}",
+                    "{STUB_PREFIX}~{} tokens]{}",
                     group(before as u64),
                     format_stash_refs(&refs)
                 );
@@ -230,6 +235,14 @@ impl ContextControl {
         }
         note
     }
+}
+
+/// How the stub of an offloaded result starts.
+const STUB_PREFIX: &str = "[Offloaded by the agent: ";
+
+/// Whether `content` is already the stub [`ContextControl::offload`] leaves.
+fn is_stub(content: &[ToolResultContent]) -> bool {
+    matches!(content, [ToolResultContent::Text(text)] if text.starts_with(STUB_PREFIX))
 }
 
 /// Input of the `context` tool.
@@ -292,20 +305,21 @@ fn items(messages: &[Message]) -> Vec<Item> {
         for block in &message.content {
             match block {
                 ContentBlock::ToolResult(result) => {
-                    let refs = stash_refs(&result.content);
+                    let refs = stash_refs(&result.tool_use_id, &result.content);
                     let what = match calls.get(result.tool_use_id.as_str()) {
                         Some((name, input)) => {
                             format!("{name} result `{}`", crate::runtime::summarize_input(input))
                         }
                         None => "tool result".to_owned(),
                     };
+                    let stashed = !refs.is_empty() || is_stub(&result.content);
                     items.push(Item {
                         tokens: result_tokens(&result.content),
                         age: later_calls,
                         // A stub names its stash keys, for `retrieve_context`.
                         what: what + &format_stash_refs(&refs),
                         tool_use_id: Some(result.tool_use_id.clone()),
-                        stashed: !refs.is_empty(),
+                        stashed,
                     });
                 }
                 other => rest += block_tokens(other),
@@ -366,9 +380,13 @@ fn result_tokens(content: &[ToolResultContent]) -> usize {
         .sum()
 }
 
-/// The stash keys a preview or stub names: `[ref: k]` or `[refs: k1, k2]`.
-fn stash_refs(content: &[ToolResultContent]) -> Vec<String> {
-    let mut refs = Vec::new();
+/// The stash keys under which a preview or stub of result `tool_use_id` names its own output
+/// (`[ref: <id>_0]` or `[refs: <id>_0, <id>_1]`), each once. Refs to other results, which a
+/// `context` listing or a `retrieve_context` read quotes, don't count: such a result is not
+/// stashed under them.
+fn stash_refs(tool_use_id: &str, content: &[ToolResultContent]) -> Vec<String> {
+    let own = format!("{tool_use_id}_");
+    let mut refs: Vec<String> = Vec::new();
     for item in content {
         let ToolResultContent::Text(text) = item else {
             continue;
@@ -376,8 +394,14 @@ fn stash_refs(content: &[ToolResultContent]) -> Vec<String> {
         for marker in ["[ref: ", "[refs: "] {
             for (start, _) in text.match_indices(marker) {
                 let rest = &text[start + marker.len()..];
-                if let Some(end) = rest.find(']') {
-                    refs.extend(rest[..end].split(", ").map(str::to_owned));
+                let Some(end) = rest.find(']') else {
+                    continue;
+                };
+                for key in rest[..end].split(", ") {
+                    let index = key.strip_prefix(&own);
+                    if index.is_some_and(|i| i.parse::<usize>().is_ok()) && !refs.iter().any(|r| r == key) {
+                        refs.push(key.to_owned());
+                    }
                 }
             }
         }
@@ -575,12 +599,76 @@ mod tests {
     #[test]
     fn stash_refs_are_read_from_previews_and_stubs() {
         let content = |text: &str| vec![ToolResultContent::Text(text.into())];
-        assert_eq!(stash_refs(&content("head … tail [ref: t1_0]")), ["t1_0"]);
+        assert_eq!(stash_refs("t1", &content("head … tail [ref: t1_0]")), ["t1_0"]);
         assert_eq!(
-            stash_refs(&content("[Offloaded] [refs: a_0, a_1]")),
+            stash_refs("a", &content("[Offloaded] [refs: a_0, a_1, a_0]")),
             ["a_0", "a_1"]
         );
-        assert!(stash_refs(&content("plain output")).is_empty());
+        assert!(stash_refs("t1", &content("plain output")).is_empty());
+        // A listing or a read-back quotes other results' refs; this one is not stashed under them.
+        assert!(stash_refs("c1", &content("#1 shell result `ls` [ref: big_0], [refs: c10_0]")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn offloading_a_listing_or_a_stub_keeps_refs_its_own_and_edits_nothing_twice() {
+        let model = MockMessageModel::shared(vec![
+            call(
+                "shell",
+                "big",
+                serde_json::json!({ "command": "cargo test", "n": 40_000 }),
+            ),
+            call("context", "c1", serde_json::json!({})),
+            call("context", "c2", serde_json::json!({ "offload": [1] })),
+            // c2's listing numbers only c1 (big is a stub now); c3's then only c2.
+            call("context", "c3", serde_json::json!({ "offload": [1] })),
+            call("context", "c4", serde_json::json!({ "offload": [1] })),
+            MockResponse::message(Message::assistant("done")),
+        ]);
+        let control = ContextControl::new(None);
+        let manager = ContextManagerOption::Config(ContextManagerConfig {
+            strategies: Some(vec![control.strategy()]),
+            stash: StashOption::Enabled,
+        });
+        let agent = Agent::builder()
+            .model(model.clone())
+            .tools([dump_tool(), control.tool()])
+            .context_manager(manager)
+            .build()
+            .unwrap();
+        agent.invoke("go").await.unwrap();
+
+        let listing = result_text(&model, 3, "c2");
+        assert!(listing.contains("Offloaded 1 tool results"), "{listing}");
+        assert!(
+            !listing.contains("#1 ~10,001") && listing.contains("shell result `cargo test` [ref: big_0]"),
+            "a stub is listed without a number: {listing}"
+        );
+        let after = result_text(&model, 5, "c4");
+        assert!(after.contains("Offloaded 1 tool results"), "{after}");
+        let stub = |id: &str| result_text(&model, 5, id);
+        assert!(
+            stub("big").contains("[ref: big_0]") && !stub("big").contains("big_0, "),
+            "{}",
+            stub("big")
+        );
+        for listing in ["c1", "c2"] {
+            let text = stub(listing);
+            assert!(text.contains(&format!("[ref: {listing}_0]")), "{text}");
+            assert!(!text.contains("big_0"), "not another result's ref: {text}");
+        }
+        let stash = control.stash.read().clone().unwrap();
+        let kept = stash
+            .retrieve("c2_0")
+            .await
+            .expect("the listing itself is stashed");
+        assert!(kept.to_string().contains("Biggest items"), "{kept}");
+
+        // Offloading stubs again leaves the history (and the cached prefix) as it is.
+        let before = agent.messages();
+        *control.listed.lock() = vec!["big".into(), "c1".into()];
+        let note = control.offload(&agent, &[1, 2]).await;
+        assert!(note.starts_with("Offloaded 0 tool results"), "{note}");
+        assert_eq!(format!("{:?}", agent.messages()), format!("{before:?}"));
     }
 
     #[test]

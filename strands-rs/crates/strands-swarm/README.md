@@ -117,8 +117,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     with `--cache-ttl 1h`), on overflow, or once they would remove 40% of the history. Every other
     call re-sends history byte for byte.
   - The `context` tool lets the agent manage its own context. It lists the biggest items with tool
-    results numbered. `offload: [n, …]` replaces results with a stub whose reference reads them
-    back. `summarize: true` summarizes all but the latest four messages before the next call.
+    results numbered (not previews and stubs, which offloading would not shrink). `offload: [n, …]`
+    replaces results with a stub whose reference reads them back; a stub names only its own
+    result's stash keys. `summarize: true` summarizes all but the latest four messages before the
+    next call.
 - **Tool order.** A batch of tool calls runs at once, except that `read`, `write`, `edit`,
   `shell`, `run_background`, `land`, `spawn_agent`, `cancel_agent`, `send_message`, `wait`,
   `list_agents` and `jobs` run one after another in the model's order: a test run waits for the
