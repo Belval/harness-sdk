@@ -155,27 +155,18 @@ fn reload_when_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({ "type": "string", "enum": ["idle", "now"] })
 }
 
-fn reload_tool(swarm: Swarm) -> ToolRef {
-    let tool = FunctionTool::builder("reload_swarm")
-        .description(RELOAD_DESCRIPTION)
-        .input_schema(lean_schema::<ReloadInput>())
-        .typed_handler(move |input: ReloadInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            async move {
-                swarm
-                    .reload(std::path::Path::new(&input.binary), input.when)
-                    .await?;
-                Result::Ok(match input.when {
-                    ReloadWhen::Now => "Reload scheduled; the swarm is restarting now.".to_owned(),
-                    ReloadWhen::Idle => concat!(
-                        "Installed and self-tested. The swarm restarts once no agent has a tool call ",
-                        "in flight (at most 10 minutes from now); carry on until then."
-                    )
-                    .to_owned(),
-                })
-            }
-        });
-    Arc::new(tool)
+async fn reload_tool(swarm: Swarm, _me: String, input: ReloadInput, _ctx: ToolContext) -> Result<String> {
+    swarm
+        .reload(std::path::Path::new(&input.binary), input.when)
+        .await?;
+    Ok(match input.when {
+        ReloadWhen::Now => "Reload scheduled; the swarm is restarting now.".to_owned(),
+        ReloadWhen::Idle => concat!(
+            "Installed and self-tested. The swarm restarts once no agent has a tool call ",
+            "in flight (at most 10 minutes from now); carry on until then."
+        )
+        .to_owned(),
+    })
 }
 
 const RUN_BACKGROUND_DESCRIPTION: &str = concat!(
@@ -228,66 +219,41 @@ struct LandInput {
     check: Option<Vec<String>>,
 }
 
-fn land_tool(swarm: Swarm, me: String) -> ToolRef {
-    let tool = FunctionTool::builder("land")
-        .description(LAND_DESCRIPTION)
-        .input_schema(lean_schema::<LandInput>())
-        .typed_handler(move |input: LandInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            let me = me.clone();
-            async move {
-                let request = LandRequest {
-                    branch: input.branch,
-                    into: input.into,
-                    check: input.check,
-                };
-                let job = swarm.land(&me, request).await?;
-                Result::Ok(format!(
-                    "Started job {}; output: {}. You will get a message when it ends.",
-                    job.label(),
-                    swarm.job_log(&job.meta.id).display()
-                ))
-            }
-        });
-    Arc::new(tool)
+async fn land_tool(swarm: Swarm, me: String, input: LandInput, _ctx: ToolContext) -> Result<String> {
+    let request = LandRequest {
+        branch: input.branch,
+        into: input.into,
+        check: input.check,
+    };
+    let job = swarm.land(&me, request).await?;
+    Ok(format!(
+        "Started job {}; output: {}. You will get a message when it ends.",
+        job.label(),
+        swarm.job_log(&job.meta.id).display()
+    ))
 }
 
-fn run_background_tool(swarm: Swarm, me: String) -> ToolRef {
-    let tool = FunctionTool::builder("run_background")
-        .description(RUN_BACKGROUND_DESCRIPTION)
-        .input_schema(lean_schema::<RunBackgroundInput>())
-        .typed_handler(move |input: RunBackgroundInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            let me = me.clone();
-            async move {
-                let job = swarm.start_job(&me, &input.command, input.name).await?;
-                Result::Ok(format!(
-                    "Started job {} in {}; output: {}. You will get a message when it ends.",
-                    job.label(),
-                    job.meta.cwd.display(),
-                    swarm.job_log(&job.meta.id).display()
-                ))
-            }
-        });
-    Arc::new(tool)
+async fn run_background_tool(
+    swarm: Swarm,
+    me: String,
+    input: RunBackgroundInput,
+    _ctx: ToolContext,
+) -> Result<String> {
+    let job = swarm.start_job(&me, &input.command, input.name).await?;
+    Ok(format!(
+        "Started job {} in {}; output: {}. You will get a message when it ends.",
+        job.label(),
+        job.meta.cwd.display(),
+        swarm.job_log(&job.meta.id).display()
+    ))
 }
 
-fn jobs_tool(swarm: Swarm, me: String) -> ToolRef {
-    let tool = FunctionTool::builder("jobs")
-        .description(JOBS_DESCRIPTION)
-        .input_schema(lean_schema::<JobsInput>())
-        .typed_handler(move |input: JobsInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            let me = me.clone();
-            async move {
-                if let Some(id) = input.kill {
-                    let job = swarm.kill_job(&id).await?;
-                    return Result::Ok(format!("Job {}: {}.", job.label(), job.status()));
-                }
-                Result::Ok(list_jobs(&swarm, &me, swarm.jobs().await))
-            }
-        });
-    Arc::new(tool)
+async fn jobs_tool(swarm: Swarm, me: String, input: JobsInput, _ctx: ToolContext) -> Result<String> {
+    if let Some(id) = input.kill {
+        let job = swarm.kill_job(&id).await?;
+        return Ok(format!("Job {}: {}.", job.label(), job.status()));
+    }
+    Ok(list_jobs(&swarm, &me, swarm.jobs().await))
 }
 
 /// One line per job, the caller's first, then the newest first within each group.
@@ -340,50 +306,40 @@ const SCHEDULE_DESCRIPTION: &str = concat!(
     "no agent slot. Survives restarts (a missed fire is delivered once)."
 );
 
-fn schedule_tool(swarm: Swarm, me: String) -> ToolRef {
-    let tool = FunctionTool::builder("schedule")
-        .description(SCHEDULE_DESCRIPTION)
-        .input_schema(lean_schema::<ScheduleInput>())
-        .typed_handler(move |input: ScheduleInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            let me = me.clone();
-            async move {
-                if let Some(id) = input.cancel {
-                    let removed = swarm.unschedule(&id)?;
-                    return Result::Ok(format!("Removed {}.", describe_schedule(&swarm, &removed)));
-                }
-                let Some(message) = input.message else {
-                    return Result::Ok(list_schedules(&swarm));
-                };
-                let to = match &input.to {
-                    Some(who) => resolve(&swarm, &me, who)?,
-                    None => me.clone(),
-                };
-                let every = input
-                    .every
-                    .as_deref()
-                    .map(schedule::parse_duration)
-                    .transpose()
-                    .map_err(strands_agents::Error::other)?;
-                let now = swarm.now();
-                let at = input
-                    .at
-                    .as_deref()
-                    .map(|at| schedule::parse_at(at, now))
-                    .transpose()
-                    .map_err(strands_agents::Error::other)?;
-                let request = ScheduleRequest {
-                    id: input.id,
-                    to,
-                    message,
-                    every,
-                    at,
-                };
-                let created = swarm.schedule(&me, request)?;
-                Result::Ok(format!("Scheduled {}.", describe_schedule(&swarm, &created)))
-            }
-        });
-    Arc::new(tool)
+async fn schedule_tool(swarm: Swarm, me: String, input: ScheduleInput, _ctx: ToolContext) -> Result<String> {
+    if let Some(id) = input.cancel {
+        let removed = swarm.unschedule(&id)?;
+        return Ok(format!("Removed {}.", describe_schedule(&swarm, &removed)));
+    }
+    let Some(message) = input.message else {
+        return Ok(list_schedules(&swarm));
+    };
+    let to = match &input.to {
+        Some(who) => resolve(&swarm, &me, who)?,
+        None => me.clone(),
+    };
+    let every = input
+        .every
+        .as_deref()
+        .map(schedule::parse_duration)
+        .transpose()
+        .map_err(strands_agents::Error::other)?;
+    let now = swarm.now();
+    let at = input
+        .at
+        .as_deref()
+        .map(|at| schedule::parse_at(at, now))
+        .transpose()
+        .map_err(strands_agents::Error::other)?;
+    let request = ScheduleRequest {
+        id: input.id,
+        to,
+        message,
+        every,
+        at,
+    };
+    let created = swarm.schedule(&me, request)?;
+    Ok(format!("Scheduled {}.", describe_schedule(&swarm, &created)))
 }
 
 /// `s1 every 30m, next in 12m (…) → monitor (a3): check the queue`.
@@ -424,161 +380,133 @@ const REMEMBER_DESCRIPTION: &str = concat!(
 
 const FORGET_DESCRIPTION: &str = "Remove every memory-file line containing `text` (case-insensitive).";
 
-fn remember_tool(swarm: Swarm) -> ToolRef {
-    let tool = FunctionTool::builder("remember")
-        .description(REMEMBER_DESCRIPTION)
-        .input_schema(lean_schema::<RememberInput>())
-        .typed_handler(move |input: RememberInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            async move {
-                let line = swarm.remember(&input.text).await?;
-                Result::Ok(format!("Remembered: {line}"))
-            }
-        });
-    Arc::new(tool)
+async fn remember_tool(swarm: Swarm, _me: String, input: RememberInput, _ctx: ToolContext) -> Result<String> {
+    let line = swarm.remember(&input.text).await?;
+    Ok(format!("Remembered: {line}"))
 }
 
-fn forget_tool(swarm: Swarm) -> ToolRef {
-    let tool = FunctionTool::builder("forget")
-        .description(FORGET_DESCRIPTION)
-        .input_schema(lean_schema::<ForgetInput>())
-        .typed_handler(move |input: ForgetInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            async move {
-                let removed = swarm.forget(&input.text).await?;
-                Result::Ok(format!("Forgot:\n{}", removed.join("\n")))
-            }
-        });
-    Arc::new(tool)
+async fn forget_tool(swarm: Swarm, _me: String, input: ForgetInput, _ctx: ToolContext) -> Result<String> {
+    let removed = swarm.forget(&input.text).await?;
+    Ok(format!("Forgot:\n{}", removed.join("\n")))
 }
 
 /// The swarm tools bound to agent `id`; `reload_swarm` only in a persistent run, `land` only
 /// when allowed, `remember` and `forget` only when memory is on.
 pub fn swarm_tools(swarm: Swarm, id: &str) -> Vec<ToolRef> {
+    let s = &swarm;
     let mut tools = vec![
-        spawn_tool(swarm.clone(), id.to_owned()),
-        send_tool(swarm.clone(), id.to_owned()),
-        wait_tool(swarm.clone(), id.to_owned()),
-        list_tool(swarm.clone()),
-        cancel_tool(swarm.clone(), id.to_owned()),
-        schedule_tool(swarm.clone(), id.to_owned()),
-        run_background_tool(swarm.clone(), id.to_owned()),
-        jobs_tool(swarm.clone(), id.to_owned()),
+        swarm_tool(s, id, "spawn_agent", SPAWN_DESCRIPTION, spawn_tool),
+        swarm_tool(s, id, "send_message", SEND_DESCRIPTION, send_tool),
+        swarm_tool(s, id, "wait", WAIT_DESCRIPTION, wait_tool),
+        swarm_tool(s, id, "list_agents", LIST_DESCRIPTION, list_tool),
+        swarm_tool(s, id, "cancel_agent", CANCEL_DESCRIPTION, cancel_tool),
+        swarm_tool(s, id, "schedule", SCHEDULE_DESCRIPTION, schedule_tool),
+        swarm_tool(
+            s,
+            id,
+            "run_background",
+            RUN_BACKGROUND_DESCRIPTION,
+            run_background_tool,
+        ),
+        swarm_tool(s, id, "jobs", JOBS_DESCRIPTION, jobs_tool),
     ];
     if swarm.can_reload() {
-        tools.push(reload_tool(swarm.clone()));
+        tools.push(swarm_tool(s, id, "reload_swarm", RELOAD_DESCRIPTION, reload_tool));
     }
     if swarm.allows_land() {
-        tools.push(land_tool(swarm.clone(), id.to_owned()));
+        tools.push(swarm_tool(s, id, "land", LAND_DESCRIPTION, land_tool));
     }
     if swarm.memory().is_some() {
-        tools.push(remember_tool(swarm.clone()));
-        tools.push(forget_tool(swarm));
+        tools.push(swarm_tool(s, id, "remember", REMEMBER_DESCRIPTION, remember_tool));
+        tools.push(swarm_tool(s, id, "forget", FORGET_DESCRIPTION, forget_tool));
     }
     tools
 }
 
-fn spawn_tool(swarm: Swarm, me: String) -> ToolRef {
-    let tool = FunctionTool::builder("spawn_agent")
-        .description(SPAWN_DESCRIPTION)
-        .input_schema(lean_schema::<SpawnInput>())
-        .typed_handler(move |input: SpawnInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            let me = me.clone();
-            async move {
-                let requested = input.name.clone();
-                let request = SpawnRequest {
-                    task: input.task,
-                    name: Some(input.name),
-                    worktree: input.worktree,
-                    model: input.model,
-                    goal: input.goal,
-                };
-                let id = swarm.spawn(&me, request).await?;
-                let Some(info) = swarm.agent(&id) else {
-                    return Result::Ok(format!("Spawned {id}."));
-                };
-                let mut described = describe(&swarm, &info);
-                if let Some(note) = crate::names::renamed(&requested, &info.name) {
-                    described.push_str(&format!(" ({note})"));
-                }
-                if info.status != AgentStatus::Queued {
-                    return Result::Ok(format!(
-                        "Spawned {described}. Its replies will arrive as messages."
-                    ));
-                }
-                Result::Ok(format!(
-                    "Queued {described}: the agent limit is reached, so it starts (and its replies \
-                     arrive as messages) once a slot frees. To free one, cancel an agent you no \
-                     longer need, or cancel this one to drop it. {}",
-                    idle_agents(&swarm)
-                ))
-            }
-        });
+/// Tool `name` taking `I` (as its [`lean_schema`]): each call runs `handler` with the swarm, the
+/// owning agent's id, the input and the call's context.
+fn swarm_tool<I, F, Fut>(swarm: &Swarm, me: &str, name: &str, description: &str, handler: F) -> ToolRef
+where
+    I: serde::de::DeserializeOwned + schemars::JsonSchema + Send + 'static,
+    F: Fn(Swarm, String, I, ToolContext) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+{
+    let (swarm, me) = (swarm.clone(), me.to_owned());
+    let tool = FunctionTool::builder(name)
+        .description(description)
+        .input_schema(lean_schema::<I>())
+        .typed_handler(move |input: I, ctx: ToolContext| handler(swarm.clone(), me.clone(), input, ctx));
     Arc::new(tool)
 }
 
-fn send_tool(swarm: Swarm, me: String) -> ToolRef {
-    let tool = FunctionTool::builder("send_message")
-        .description(SEND_DESCRIPTION)
-        .input_schema(lean_schema::<SendInput>())
-        .typed_handler(move |input: SendInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            let me = me.clone();
-            async move {
-                let to = resolve(&swarm, &me, &input.to)?;
-                swarm.send(&me, &to, input.message)?;
-                Result::Ok(format!("Sent to {}.", swarm.label(&to)))
-            }
-        });
-    Arc::new(tool)
+async fn spawn_tool(swarm: Swarm, me: String, input: SpawnInput, _ctx: ToolContext) -> Result<String> {
+    let requested = input.name.clone();
+    let request = SpawnRequest {
+        task: input.task,
+        name: Some(input.name),
+        worktree: input.worktree,
+        model: input.model,
+        goal: input.goal,
+    };
+    let id = swarm.spawn(&me, request).await?;
+    let Some(info) = swarm.agent(&id) else {
+        return Ok(format!("Spawned {id}."));
+    };
+    let mut described = describe(&swarm, &info);
+    if let Some(note) = crate::names::renamed(&requested, &info.name) {
+        described.push_str(&format!(" ({note})"));
+    }
+    if info.status != AgentStatus::Queued {
+        return Ok(format!(
+            "Spawned {described}. Its replies will arrive as messages."
+        ));
+    }
+    Ok(format!(
+        "Queued {described}: the agent limit is reached, so it starts (and its replies \
+         arrive as messages) once a slot frees. To free one, cancel an agent you no \
+         longer need, or cancel this one to drop it. {}",
+        idle_agents(&swarm)
+    ))
 }
 
-fn wait_tool(swarm: Swarm, me: String) -> ToolRef {
-    let tool = FunctionTool::builder("wait")
-        .description(WAIT_DESCRIPTION)
-        .input_schema(lean_schema::<WaitInput>())
-        .typed_handler(move |input: WaitInput, ctx: ToolContext| {
-            let swarm = swarm.clone();
-            let me = me.clone();
-            async move {
-                let seconds = input
-                    .timeout_seconds
-                    .unwrap_or(DEFAULT_WAIT_SECONDS)
-                    .clamp(1, MAX_WAIT_SECONDS);
-                let from = input
-                    .from
-                    .iter()
-                    .map(|who| match who.as_str() {
-                        JOBS_SENDER => Ok(JOBS_SENDER.to_owned()),
-                        _ => resolve(&swarm, &me, who),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if from == [JOBS_SENDER]
-                    && !swarm.has_mail_from(&me, &from)
-                    && !has_unreported_jobs(&swarm, &me).await
-                {
-                    return Result::Ok(NO_JOBS.to_owned());
-                }
-                if input.all {
-                    if from.is_empty() {
-                        return Err(strands_agents::Error::other(
-                            "`all` needs `from`: the agents to wait for.",
-                        ));
-                    }
-                    return Result::Ok(wait_all(&swarm, &me, from, seconds, &ctx.cancel).await);
-                }
-                let wait = swarm.wait(&me, &from, &ctx.cancel);
-                let text = match tokio::time::timeout(Duration::from_secs(seconds), wait).await {
-                    Ok(WaitOutcome::Mail(mail)) => render_mail(&mail),
-                    Ok(WaitOutcome::Cancelled) => "Wait cancelled.".to_owned(),
-                    Ok(WaitOutcome::Unreachable(notice)) => notice,
-                    Err(_) => timeout_summary(&swarm, &from, seconds),
-                };
-                Result::Ok(text)
-            }
-        });
-    Arc::new(tool)
+async fn send_tool(swarm: Swarm, me: String, input: SendInput, _ctx: ToolContext) -> Result<String> {
+    let to = resolve(&swarm, &me, &input.to)?;
+    swarm.send(&me, &to, input.message)?;
+    Ok(format!("Sent to {}.", swarm.label(&to)))
+}
+
+async fn wait_tool(swarm: Swarm, me: String, input: WaitInput, ctx: ToolContext) -> Result<String> {
+    let seconds = input
+        .timeout_seconds
+        .unwrap_or(DEFAULT_WAIT_SECONDS)
+        .clamp(1, MAX_WAIT_SECONDS);
+    let from = input
+        .from
+        .iter()
+        .map(|who| match who.as_str() {
+            JOBS_SENDER => Ok(JOBS_SENDER.to_owned()),
+            _ => resolve(&swarm, &me, who),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if from == [JOBS_SENDER] && !swarm.has_mail_from(&me, &from) && !has_unreported_jobs(&swarm, &me).await {
+        return Ok(NO_JOBS.to_owned());
+    }
+    if input.all {
+        if from.is_empty() {
+            return Err(strands_agents::Error::other(
+                "`all` needs `from`: the agents to wait for.",
+            ));
+        }
+        return Ok(wait_all(&swarm, &me, from, seconds, &ctx.cancel).await);
+    }
+    let wait = swarm.wait(&me, &from, &ctx.cancel);
+    let text = match tokio::time::timeout(Duration::from_secs(seconds), wait).await {
+        Ok(WaitOutcome::Mail(mail)) => render_mail(&mail),
+        Ok(WaitOutcome::Cancelled) => "Wait cancelled.".to_owned(),
+        Ok(WaitOutcome::Unreachable(notice)) => notice,
+        Err(_) => timeout_summary(&swarm, &from, seconds),
+    };
+    Ok(text)
 }
 
 /// `wait` with `all`: collect mail until each of `from` has sent something, the user writes, or
@@ -650,52 +578,33 @@ async fn has_unreported_jobs(swarm: &Swarm, me: &str) -> bool {
         .any(|job| job.meta.owner == me && (job.state == JobState::Running || !job.reported))
 }
 
-fn list_tool(swarm: Swarm) -> ToolRef {
-    let tool = FunctionTool::builder("list_agents")
-        .description(LIST_DESCRIPTION)
-        .input_schema(lean_schema::<ListInput>())
-        .typed_handler(move |input: ListInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            async move {
-                let jobs = swarm.jobs().await;
-                let branches = swarm.branch_states().await;
-                let left = match input.include_cancelled {
-                    true => cancelled_branches(&swarm, branches.0.as_deref()).await,
-                    false => HashMap::new(),
-                };
-                let text = list_agents(&swarm, input.include_cancelled, &jobs, &branches, &left);
-                Result::Ok(text)
-            }
-        });
-    Arc::new(tool)
+async fn list_tool(swarm: Swarm, _me: String, input: ListInput, _ctx: ToolContext) -> Result<String> {
+    let jobs = swarm.jobs().await;
+    let branches = swarm.branch_states().await;
+    let left = match input.include_cancelled {
+        true => cancelled_branches(&swarm, branches.0.as_deref()).await,
+        false => HashMap::new(),
+    };
+    let text = list_agents(&swarm, input.include_cancelled, &jobs, &branches, &left);
+    Ok(text)
 }
 
-fn cancel_tool(swarm: Swarm, me: String) -> ToolRef {
-    let tool = FunctionTool::builder("cancel_agent")
-        .description(CANCEL_DESCRIPTION)
-        .input_schema(lean_schema::<CancelInput>())
-        .typed_handler(move |input: CancelInput, _ctx: ToolContext| {
-            let swarm = swarm.clone();
-            let me = me.clone();
-            async move {
-                let id = swarm.resolve(&input.id)?;
-                if id == me {
-                    return Result::Ok("You cannot cancel yourself; end your turn instead.".to_owned());
-                }
-                swarm.cancel(&id)?;
-                let mut lines = vec![format!("Cancelled {} and its descendants.", swarm.label(&id))];
-                for (agent, reclaimed) in swarm.reclaimed_after_cancel(&id, CANCEL_RECLAIM_WAIT).await {
-                    match reclaimed {
-                        Some(collected) => lines.extend(collected.lines()),
-                        None => lines.push(format!(
-                            "{agent}: still stopping; its worktree and branch are reclaimed once it stops if safe."
-                        )),
-                    }
-                }
-                Result::Ok(lines.join("\n"))
-            }
-        });
-    Arc::new(tool)
+async fn cancel_tool(swarm: Swarm, me: String, input: CancelInput, _ctx: ToolContext) -> Result<String> {
+    let id = swarm.resolve(&input.id)?;
+    if id == me {
+        return Ok("You cannot cancel yourself; end your turn instead.".to_owned());
+    }
+    swarm.cancel(&id)?;
+    let mut lines = vec![format!("Cancelled {} and its descendants.", swarm.label(&id))];
+    for (agent, reclaimed) in swarm.reclaimed_after_cancel(&id, CANCEL_RECLAIM_WAIT).await {
+        match reclaimed {
+            Some(collected) => lines.extend(collected.lines()),
+            None => lines.push(format!(
+                "{agent}: still stopping; its worktree and branch are reclaimed once it stops if safe."
+            )),
+        }
+    }
+    Ok(lines.join("\n"))
 }
 
 /// The id `who` refers to: `parent`, the user, or an agent id or name.
