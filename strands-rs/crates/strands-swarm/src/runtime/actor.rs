@@ -170,7 +170,13 @@ impl Swarm {
         self.set_status(node, AgentStatus::Running);
         self.refresh_memory(agent).await;
         let options = InvokeOptions::default().with_cancel(turn.clone());
+        let given = matches!(input, InvokeInput::Text(_) | InvokeInput::Blocks(_));
         let input = agent.with_messages(|messages| resume::fold_into_open_turn(messages, input));
+        if given && matches!(input, InvokeInput::None) {
+            // The SDK adds no message for it, so nothing would save the mail it holds, which has
+            // already left the mailbox, before the turn's first message: a crash would lose it.
+            self.save_session(node, agent).await;
+        }
         let mut stream = agent.stream_with(input, options);
         let mut reply = None;
         let mut failure = None;

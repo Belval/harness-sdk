@@ -1346,6 +1346,75 @@ async fn a_hard_crash_mid_batch_keeps_its_calls_and_the_results_that_came_in() {
     resumed.shutdown().await;
 }
 
+/// A model whose first call fails (not retried) and whose later calls never finish.
+struct FailsThenHangs(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Model for FailsThenHangs {
+    fn model_id(&self) -> Option<String> {
+        Some("fails-then-hangs".into())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _options: &'a strands_agents::models::StreamOptions,
+    ) -> strands_agents::models::ModelEventStream<'a> {
+        match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => Box::pin(futures::stream::iter([Err(strands_agents::Error::model(
+                "bad request",
+            ))])),
+            _ => Box::pin(futures::stream::pending()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn mail_folded_into_a_turn_a_failed_call_left_open_survives_a_hard_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sessions = state_dir.join("sessions");
+    let model = Arc::new(FailsThenHangs(calls.clone()));
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let (model, sessions) = (model.clone(), sessions.clone());
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id.clone())
+                .model(model)
+                .system_prompt(spec.instructions)
+                .tools(spec.tools)
+                .session_manager(strands_swarm::agent_session_manager(&sessions, &spec.id)?)
+                .no_sandbox()
+                .build()
+        })
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config);
+    let id = spawn_root(&swarm, "go").await;
+    mail_to(&mut events, USER, "error").await;
+    swarm.send(USER, &id, "remember the milk").unwrap();
+    eventually("the second call is running", || {
+        calls.load(std::sync::atomic::Ordering::SeqCst) == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let crashed = dir.path().join("crashed");
+    crash_copy(&state_dir, &crashed);
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&crashed).await.unwrap().unwrap();
+    assert!(saved.agents[0].mailbox.is_empty(), "the mail left the mailbox");
+    let scripts = scripts_of(vec![("a1", vec![say("milk noted")])]);
+    let mut config = SwarmConfig::new(session_factory(&scripts, crashed.join("sessions")), dir.path());
+    config.state_dir = Some(crashed);
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "milk noted");
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 0);
+    assert!(sent.contains("remember the milk"), "{sent}");
+    resumed.shutdown().await;
+}
+
 /// The system prompt and tool specs an agent sends, serialized: the prompt cache is keyed on these
 /// bytes, so a resumed agent must send exactly what it sent before the restart.
 fn request_prefix(model: &MockMessageModel, call: usize) -> String {
