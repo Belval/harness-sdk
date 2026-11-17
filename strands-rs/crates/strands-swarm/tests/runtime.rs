@@ -866,17 +866,25 @@ async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
             ],
         ),
     ]);
-    // Every agent but a1 takes a while to build, so a2 is still starting when a1 is cancelled.
+    // a2's build waits for the test, so a2 is still starting when a1 is cancelled.
     let inner = mock_factory(&map);
-    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
-        let inner = inner.clone();
-        Box::pin(async move {
-            if spec.id != "a1" {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            inner(spec).await
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let built = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let factory: AgentFactory = {
+        let (gate, built) = (gate.clone(), built.clone());
+        Arc::new(move |spec: AgentSpec| {
+            let (inner, gate, built) = (inner.clone(), gate.clone(), built.clone());
+            Box::pin(async move {
+                if spec.id != "a2" {
+                    return inner(spec).await;
+                }
+                let _ = gate.acquire().await.unwrap();
+                let agent = inner(spec).await;
+                built.store(true, std::sync::atomic::Ordering::SeqCst);
+                agent
+            })
         })
-    });
+    };
     let mut config = SwarmConfig::new(factory, dir.path());
     config.max_agents = 2;
     let (swarm, mut events) = Swarm::new(config);
@@ -896,7 +904,10 @@ async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
     assert!(!listed.contains("(a2)"), "{listed}");
     let all = sent_text(&a3, 2);
     assert!(all.contains("(a2): cancelled"), "{all}");
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // The build a1's cancel overtook finishes now and must not bring a2 back.
+    gate.add_permits(1);
+    eventually("a2 is built", || built.load(std::sync::atomic::Ordering::SeqCst)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         swarm.agent("a2").unwrap().status,
         AgentStatus::Cancelled,
