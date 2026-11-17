@@ -280,6 +280,10 @@ fn dollars(usd: f64) -> String {
 /// One agent's spend, for [`CostReport`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentCost {
+    /// Id.
+    pub id: String,
+    /// Parent id.
+    pub parent: String,
     /// `name (id)`.
     pub label: String,
     /// Totals across restarts (also from before per-model tracking).
@@ -346,6 +350,8 @@ impl CostReport {
             .agents
             .iter()
             .map(|agent| AgentCost {
+                id: agent.id.clone(),
+                parent: agent.parent.clone(),
                 label: match &agent.name {
                     Some(name) => format!("{name} ({})", agent.id),
                     None => agent.id.clone(),
@@ -371,6 +377,30 @@ impl CostReport {
             total.add(agent.estimate(&self.prices));
         }
         total
+    }
+
+    /// What `id` and its subtree (descendants, cancelled ones included) spent; `None` for an
+    /// unknown id.
+    pub fn spend(&self, id: &str) -> Option<Spend> {
+        let own = self.agents.iter().find(|agent| agent.id == id)?;
+        let mut subtree = vec![own];
+        let mut next = 0;
+        while let Some(agent) = subtree.get(next) {
+            let parent = agent.id.clone();
+            subtree.extend(self.agents.iter().filter(|agent| agent.parent == parent));
+            next += 1;
+        }
+        let mut spend = Spend {
+            own: own.estimate(&self.prices),
+            own_tokens: own.totals.input + own.totals.output,
+            descendants: subtree.len() - 1,
+            ..Spend::default()
+        };
+        for agent in subtree {
+            spend.subtree.add(agent.estimate(&self.prices));
+            spend.subtree_tokens += agent.totals.input + agent.totals.output;
+        }
+        Some(spend)
     }
 
     /// The report as a text table.
@@ -441,6 +471,41 @@ impl CostReport {
              prices."
         ));
         lines
+    }
+}
+
+/// One agent's spend and its subtree's, from [`CostReport::spend`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Spend {
+    /// The agent's own estimate.
+    pub own: Estimate,
+    /// Its input + output tokens.
+    pub own_tokens: u64,
+    /// The agent and its descendants.
+    pub subtree: Estimate,
+    /// Their input + output tokens.
+    pub subtree_tokens: u64,
+    /// How many descendants.
+    pub descendants: usize,
+}
+
+impl Spend {
+    /// `est. $4.10 / 12.3M tokens (with 2 descendants $9.80 / 30.1M)`.
+    pub fn describe(&self) -> String {
+        let own = format!(
+            "est. {} / {} tokens",
+            self.own.render(),
+            crate::budget::compact(self.own_tokens)
+        );
+        match self.descendants {
+            0 => own,
+            n => format!(
+                "{own} (with {n} descendant{} {} / {})",
+                if n == 1 { "" } else { "s" },
+                self.subtree.render(),
+                crate::budget::compact(self.subtree_tokens)
+            ),
+        }
     }
 }
 
@@ -534,6 +599,8 @@ mod tests {
         let mut ledger = Ledger::default();
         ledger.record("claude-sonnet-4-5", counts(1_000_000, 0, 0, 0), true);
         let agent = AgentCost {
+            id: "a1".into(),
+            parent: "user".into(),
             label: "a1".into(),
             // 1M more input than the ledger has: saved before per-model tracking.
             totals: counts(2_000_000, 0, 0, 0),
@@ -571,6 +638,8 @@ mod tests {
         );
         let report = CostReport {
             agents: vec![AgentCost {
+                id: "a2".into(),
+                parent: "a1".into(),
                 label: "lazy-mcp (a2)".into(),
                 totals: counts(1_000_000, 100_000, 800_000, 0),
                 ledger,
@@ -588,6 +657,39 @@ mod tests {
         assert!(row.contains("$3.90"), "{row}");
         assert!(row.ends_with("1.0M/call 80%"), "{row}");
         assert!(lines[4].starts_with("total"), "{}", lines[4]);
+    }
+
+    #[test]
+    fn spend_adds_up_an_agent_and_all_its_descendants() {
+        let agent = |id: &str, parent: &str, input: u64| {
+            let mut ledger = Ledger::default();
+            ledger.record("claude-sonnet-4-5", counts(input, 0, 0, 0), true);
+            AgentCost {
+                id: id.into(),
+                parent: parent.into(),
+                label: id.into(),
+                totals: counts(input, 0, 0, 0),
+                ledger,
+                fallback_model: None,
+            }
+        };
+        let report = CostReport {
+            agents: vec![
+                agent("a1", "user", 1_000_000),
+                agent("a2", "a1", 2_000_000),
+                agent("a3", "a2", 1_000_000),
+                agent("a4", "user", 5_000_000),
+            ],
+            prices: Prices::default(),
+        };
+        let root = report.spend("a1").unwrap();
+        assert_eq!((root.descendants, root.subtree_tokens), (2, 4_000_000));
+        assert_eq!(
+            root.describe(),
+            "est. $3.00 / 1.0M tokens (with 2 descendants $12.00 / 4.0M)"
+        );
+        assert_eq!(report.spend("a3").unwrap().describe(), "est. $3.00 / 1.0M tokens");
+        assert_eq!(report.spend("a9"), None);
     }
 
     #[test]

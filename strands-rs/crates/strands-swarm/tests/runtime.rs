@@ -3199,3 +3199,51 @@ async fn land_refuses_other_targets_and_branches_that_are_not_the_callers() {
     assert!(error.contains("--land-into GLOB"), "{error}");
     strict.shutdown().await;
 }
+
+#[tokio::test]
+async fn list_agents_shows_each_agents_estimated_spend_and_its_subtrees() {
+    let dir = tempfile::tempdir().unwrap();
+    // Small enough to stay under the compaction point.
+    let spawn = Message::new(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse(ToolUseBlock::new(
+            "spawn_agent",
+            "s1",
+            json!({"task": "sub", "name": "worker"}),
+        ))],
+    );
+    let scripts = scripts_of(vec![
+        (
+            "a1",
+            vec![
+                MockResponse::with_usage(spawn, usage(50_000, 0, 0)),
+                tool_call("wait", "w1", json!({})),
+                tool_call("list_agents", "l1", json!({})),
+                say("done"),
+            ],
+        ),
+        (
+            "a2",
+            vec![MockResponse::with_usage(
+                Message::assistant("hi"),
+                usage(100_000, 0, 0),
+            )],
+        ),
+    ]);
+    let mut config = persistent_swarm(&scripts, dir.path());
+    let prices = r#"{"test-model": {"input": 100, "output": 500}}"#;
+    config.prices = Arc::new(strands_swarm::cost::Prices::with_overrides(prices).unwrap());
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let listed = sent_text(&scripts.lock()["a1"].clone(), 3);
+    assert!(
+        listed.contains("model test-model, est. $5.00 / 50.0k tokens (with 1 descendant $15.00 / 150.0k)"),
+        "{listed}"
+    );
+    assert!(listed.contains("est. $10.00 / 100.0k tokens"), "{listed}");
+    assert!(
+        listed.contains("Swarm total: est. $15.00 / 150.0k tokens"),
+        "{listed}"
+    );
+}

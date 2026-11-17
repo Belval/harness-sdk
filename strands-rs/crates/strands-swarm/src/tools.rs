@@ -54,8 +54,8 @@ const WAIT_DESCRIPTION: &str = concat!(
 );
 
 const LIST_DESCRIPTION: &str = concat!(
-    "List the agents in the swarm with name, id, parent, status, working directory, branch and running ",
-    "background jobs. ",
+    "List the agents in the swarm with name, id, parent, status, working directory, branch, running ",
+    "background jobs, model and estimated spend (own, and with descendants). ",
     "Cancelled agents are only counted unless include_cancelled is set."
 );
 
@@ -72,7 +72,8 @@ struct SpawnInput {
     /// Give the agent its own git worktree and branch.
     #[serde(default)]
     worktree: bool,
-    /// Model to use instead of the default (`provider/name` or a Bedrock model id).
+    /// Model to use instead of the default (`provider/name` or a Bedrock model id). List-price cost
+    /// relative to opus: sonnet ≈ 0.6×, haiku ≈ 0.2×; cheaper models suit mechanical subtasks.
     #[serde(default)]
     model: Option<String>,
     /// A checkable completion criterion. When set, a judge reviews each finished turn and sends the
@@ -575,8 +576,9 @@ fn resolve(swarm: &Swarm, me: &str, who: &str) -> Result<String> {
     }
 }
 
-/// `parser (a2): running, parent root (a1), cwd /repo, branch swarm/run/a2, jobs j3 (gates)`.
-/// One line per agent; cancelled ones are only counted unless `include_cancelled`.
+/// `parser (a2): running, parent root (a1), cwd /repo, branch swarm/run/a2, jobs j3 (gates), model
+/// claude-sonnet-4-5, est. $1.20 / 3.4M tokens`. One line per agent; cancelled ones are only counted
+/// unless `include_cancelled`; then the swarm's total.
 fn list_agents(swarm: &Swarm, include_cancelled: bool, jobs: &[Job]) -> String {
     let agents = swarm.agents();
     let (shown, hidden): (Vec<_>, Vec<_>) = agents
@@ -594,9 +596,16 @@ fn list_agents(swarm: &Swarm, include_cancelled: bool, jobs: &[Job]) -> String {
         }
     };
     let schedules = swarm.schedules();
+    let cost = swarm.cost();
+    let spend = |info: &AgentInfo| -> String {
+        let model = info.model.as_deref().map(crate::cost::short_model);
+        let model = model.map(|m| format!(", model {m}")).unwrap_or_default();
+        let spend = cost.spend(&info.id).map(|s| format!(", {}", s.describe()));
+        model + &spend.unwrap_or_default()
+    };
     let mut lines = Vec::new();
     for info in &shown {
-        lines.push(describe(swarm, info) + &running(&info.id));
+        lines.push(describe(swarm, info) + &running(&info.id) + &spend(info));
         let upcoming = schedules.iter().filter(|s| s.to == info.id);
         lines.extend(upcoming.map(|s| format!("  scheduled: {}", s.describe(swarm.now()))));
     }
@@ -606,6 +615,12 @@ fn list_agents(swarm: &Swarm, include_cancelled: bool, jobs: &[Job]) -> String {
             hidden.len()
         ));
     }
+    let tokens: u64 = cost.agents.iter().map(|a| a.totals.input + a.totals.output).sum();
+    lines.push(format!(
+        "Swarm total: est. {} / {} tokens (estimates from list prices).",
+        cost.total().render(),
+        crate::budget::compact(tokens)
+    ));
     lines.join("\n")
 }
 

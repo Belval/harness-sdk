@@ -13,6 +13,8 @@ impl Swarm {
             .map(|node| {
                 let usage = *node.usage.lock();
                 crate::cost::AgentCost {
+                    id: node.id.clone(),
+                    parent: node.parent.clone(),
                     label: node.label(),
                     totals: crate::cost::Counts {
                         calls: 0,

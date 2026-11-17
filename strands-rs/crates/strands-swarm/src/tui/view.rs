@@ -773,6 +773,8 @@ mod tests {
         ledger.record("claude-sonnet-4-5", counts, true);
         let report = crate::cost::CostReport {
             agents: vec![crate::cost::AgentCost {
+                id: "a1".into(),
+                parent: crate::runtime::USER.into(),
                 label: "shots (a1)".into(),
                 totals: counts,
                 ledger,

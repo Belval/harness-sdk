@@ -8,7 +8,7 @@ agent with nine extra tools, and decides for itself whether and how to split the
 | `spawn_agent` | Start an agent on a task (optionally in its own git worktree, with a model or a goal). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents). |
-| `list_agents` | The agent tree with statuses, directories, branches and running background jobs. |
+| `list_agents` | The agent tree with statuses, directories, branches, running background jobs, models and estimated spend. |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included. |
 | `reload_swarm` | Restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to an agent's mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
@@ -132,6 +132,11 @@ model-id substring (`{"opus": {"input": 5, "output": 25}}`, optional `cache_read
 these keys win over the built-in ones, the longest match within each). Models without a price
 show as `unknown` (`$3.10+?` when partly priced). These are estimates from reported usage, not a
 bill. Programmatically: `Swarm::cost`.
+Models see the same estimates: `list_agents` gives each agent's model and `est. $4.10 / 12.3M
+tokens`, plus its subtree's total when it has descendants (`with 3 descendants $9.80 / 30.1M`),
+and a swarm total, so a coordinator can spot an expensive worker and cancel it or respawn the work
+on a cheaper model; `spawn_agent`'s `model` notes the relative list prices (sonnet ≈ 0.6× opus,
+haiku ≈ 0.2×). Neither goes into the system prompt, which stays byte-stable.
 `/model <id>` switches the selected agent's model from its next model call on (`/model default`
 returns it to `--model`; `/model` alone shows the current one). The id is resolved like `--model`
 (`provider/name` or a Bedrock id, same effort), an invalid one is rejected without touching the
