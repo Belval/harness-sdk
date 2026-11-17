@@ -104,11 +104,10 @@ impl Swarm {
         let used = self.tokens_used();
         (used >= budget).then(|| {
             format!(
-                "Token budget exhausted: the swarm has used {} of {} tokens, so no further model \
-                 calls run. Report this to whoever is waiting on you; you will be told when the user \
-                 raises the budget (TUI `/budget N`).",
-                crate::text::compact(used),
-                crate::text::compact(budget)
+                "Token budget exhausted ({}), so no further model calls run. Report this to \
+                 whoever is waiting on you; you will be told when the user raises the budget (TUI \
+                 `/budget N`).",
+                crate::text::usage(used, budget)
             )
         })
     }

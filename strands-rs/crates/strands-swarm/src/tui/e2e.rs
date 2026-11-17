@@ -504,3 +504,30 @@ async fn a_long_input_line_wraps_in_a_growing_box() {
     assert_eq!(usize::from(cursor.y), top + 3, "{shown}");
     swarm.shutdown().await;
 }
+
+/// Usage just over the budget reads as over it in `/budget`, not as "1.3M of 1.2M".
+#[tokio::test]
+async fn budget_shows_usage_just_over_it_as_over_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved: crate::state::SwarmState = serde_json::from_value(json!({
+        "run_id": "r",
+        "cwd": dir.path(),
+        "next_id": 2,
+        "agents": [{"id": "a1", "name": null, "parent": "user", "cwd": dir.path(), "branch": null,
+                    "task": "t", "model": null, "goal": null, "status": "cancelled", "mailbox": [],
+                    "input_tokens": 1_200_000, "output_tokens": 60_000}],
+        "budget_tokens": 1_240_000,
+    }))
+    .unwrap();
+    let config = SwarmConfig::new(factory(HashMap::new(), &Sinks::default()), dir.path());
+    let (swarm, _events) = Swarm::resume(config, saved).await.unwrap();
+    let mut app = App::default();
+    let mut screen = Screen::new();
+    screen.type_line(&swarm, &mut app, "/budget").await;
+    let shown = screen.draw(&mut app);
+    assert!(
+        shown.contains("1.3M tokens used, over the 1.2M budget"),
+        "{shown}"
+    );
+    swarm.shutdown().await;
+}

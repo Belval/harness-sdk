@@ -35,10 +35,40 @@ pub fn parse_bytes(text: &str) -> Result<u64, String> {
 
 /// `950`, `12.3k`, `4.5M`.
 pub fn compact(n: u64) -> String {
-    match n {
-        0..=999 => n.to_string(),
-        1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
-        _ => format!("{:.1}M", n as f64 / 1e6),
+    compact_to(n, 1)
+}
+
+/// [`compact`] with `decimals` places; beyond one, trailing zeros are dropped (`1.25M`).
+fn compact_to(n: u64, decimals: usize) -> String {
+    let (scaled, unit) = match n {
+        0..=999 => return n.to_string(),
+        1_000..=999_999 => (n as f64 / 1e3, "k"),
+        _ => (n as f64 / 1e6, "M"),
+    };
+    let mut number = format!("{scaled:.decimals$}");
+    if decimals > 1 {
+        let kept = number
+            .trim_end_matches('0')
+            .len()
+            .max(number.find('.').map_or(0, |dot| dot + 2));
+        number.truncate(kept);
+    }
+    number + unit
+}
+
+/// Token usage against a budget, e.g. `1.1M of 1.2M tokens used`, `all 1.2M tokens used` or
+/// `1.3M tokens used, over the 1.2M budget`. Two different counts are shown with enough places to
+/// tell them apart, so usage just under the budget never reads as equal to it or over it.
+pub fn usage(used: u64, budget: u64) -> String {
+    let shown = |decimals| (compact_to(used, decimals), compact_to(budget, decimals));
+    let (u, b) = (1..=6)
+        .map(shown)
+        .find(|(u, b)| used == budget || u != b)
+        .unwrap_or_else(|| (used.to_string(), budget.to_string()));
+    match used.cmp(&budget) {
+        std::cmp::Ordering::Less => format!("{u} of {b} tokens used"),
+        std::cmp::Ordering::Equal => format!("all {b} tokens used"),
+        std::cmp::Ordering::Greater => format!("{u} tokens used, over the {b} budget"),
     }
 }
 
@@ -148,6 +178,23 @@ mod tests {
         assert_eq!(compact(950), "950");
         assert_eq!(compact(12_345), "12.3k");
         assert_eq!(compact(4_500_000), "4.5M");
+    }
+
+    /// Usage just over or under a budget never rounds to a contradiction like "1.3M of 1.2M".
+    #[test]
+    fn usage_against_a_budget_reads_consistently() {
+        assert_eq!(
+            usage(1_260_000, 1_240_000),
+            "1.3M tokens used, over the 1.2M budget"
+        );
+        assert_eq!(
+            usage(1_240_001, 1_240_000),
+            "1.240001M tokens used, over the 1.24M budget"
+        );
+        assert_eq!(usage(1_249_000, 1_250_000), "1.249M of 1.25M tokens used");
+        assert_eq!(usage(1_250_000, 1_250_000), "all 1.2M tokens used");
+        assert_eq!(usage(300_000, 1_000_000), "300.0k of 1.0M tokens used");
+        assert_eq!(usage(999, 1_000), "999 of 1.0k tokens used");
     }
 
     #[test]

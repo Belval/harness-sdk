@@ -484,10 +484,10 @@ fn max_agents_notice(swarm: &Swarm) -> String {
 }
 
 fn budget_notice(swarm: &Swarm) -> String {
-    let used = crate::text::compact(swarm.tokens_used());
+    let used = swarm.tokens_used();
     match swarm.budget() {
-        Some(budget) => format!("{used} of {} tokens used", crate::text::compact(budget)),
-        None => format!("{used} tokens used, no budget"),
+        Some(budget) => crate::text::usage(used, budget),
+        None => format!("{} tokens used, no budget", crate::text::compact(used)),
     }
 }
 
