@@ -39,10 +39,13 @@ impl Swarm {
         if !interrupted && (node.goal.is_none() || paused) {
             return None;
         }
-        let folded = agent.with_messages(append_restart_notice);
+        let in_flight = agent.with_messages(|messages| resume::in_flight(messages));
+        let status = resume::git_status(&node.cwd).await;
+        let notice = resume::notice(&in_flight, &node.cwd, status.as_deref());
+        let folded = agent.with_messages(|messages| resume::append_notice(messages, &notice));
         Some(match folded {
             true => InvokeInput::None,
-            false => InvokeInput::Text(RESTART_NOTICE.to_owned()),
+            false => InvokeInput::Text(notice),
         })
     }
 
@@ -349,10 +352,6 @@ pub(super) enum Start {
     Resume { interrupted: bool },
 }
 
-pub(super) const RESTART_NOTICE: &str =
-    "[The swarm was restarted. Your conversation was restored; any tool call that was \
-in flight was interrupted. Check the state of your work and continue.]";
-
 /// An agent's auxiliary model (what side calls such as the goal judge and context summarization
 /// run on): gated by the budget and the concurrency cap like the agent's own calls, with its usage
 /// added to the agent's totals. Without a fixed model it follows the agent's current one, model
@@ -402,36 +401,6 @@ impl Model for SideModel {
             }
         })
     }
-}
-
-/// Add the restart notice to the end of a restored conversation without breaking role
-/// alternation: answer dangling tool calls (with errors) and put the notice in the same user
-/// message, or fold it into a trailing user message. Returns `false` when the conversation ends
-/// with a plain assistant message (or is empty), so the notice can be sent as normal input.
-pub(super) fn append_restart_notice(messages: &mut Vec<Message>) -> bool {
-    let Some(last) = messages.last_mut() else {
-        return false;
-    };
-    let notice = ContentBlock::Text(RESTART_NOTICE.to_owned());
-    if last.role == Role::User {
-        last.content.push(notice);
-        return true;
-    }
-    let mut content: Vec<ContentBlock> = last
-        .tool_uses()
-        .map(|call| {
-            ContentBlock::ToolResult(ToolResultBlock::error(
-                call.tool_use_id.clone(),
-                "Interrupted by a swarm restart.",
-            ))
-        })
-        .collect();
-    if content.is_empty() {
-        return false;
-    }
-    content.push(notice);
-    messages.push(Message::new(Role::User, content));
-    true
 }
 
 /// One-line summary of a tool input: the most telling string field, else compact JSON.

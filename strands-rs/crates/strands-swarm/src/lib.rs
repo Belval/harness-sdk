@@ -28,6 +28,7 @@ pub mod mcp;
 pub mod memory;
 pub mod names;
 pub mod pruning;
+pub mod resume;
 pub mod runtime;
 pub mod schedule;
 pub mod selftest;

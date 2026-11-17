@@ -19,10 +19,7 @@ use strands_agents::middleware::{wrap_fn, InvokeModelContext, InvokeModelStage};
 use strands_agents::models::streaming::{ContentBlockDelta, ModelStreamEvent};
 use strands_agents::models::{ModelEventStream, StreamOptions};
 use strands_agents::tools::ToolRef;
-use strands_agents::types::{
-    ContentBlock, ImageBlock, ImageSource, Message, Role, ToolResultBlock, ToolResultContent,
-    ToolResultStatus, Usage,
-};
+use strands_agents::types::{ImageBlock, ImageSource, Message, ToolResultContent, ToolResultStatus, Usage};
 use strands_agents::{Agent, Error, Model, Result};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -34,6 +31,7 @@ use crate::jobs::{self, Job, Jobs};
 use crate::journal::Journal;
 use crate::memory::Memory;
 use crate::names;
+use crate::resume;
 use crate::schedule::{self as schedules, Schedule};
 use crate::selftest;
 use crate::state::{AgentState, MailState, Persister, SwarmState, SESSIONS_DIR};

@@ -222,6 +222,9 @@ The new binary is installed as soon as it passes; `reload_swarm` restarts into i
 or build is not cut short. `wait` calls do not count, and after 10 minutes
 (`SwarmConfig::reload_idle_timeout`) it restarts anyway. Meanwhile the TUI header shows
 `reload pending (waiting for N tool calls)`; a newer reload replaces the pending one.
+An agent that was mid-turn resumes with a short notice instead of re-reading its work: the tool
+calls the restart cut short (name and input) and `git status --short --branch` of its working
+directory. Its todo list is re-surfaced before every call anyway.
 
 Each binary embeds the git commit it was built from (`build.rs`) and saves it with the run. When
 a run resumes under another commit, the TUI shows a notice with the subjects of the commits in

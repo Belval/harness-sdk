@@ -1149,6 +1149,7 @@ async fn a_resumed_run_restores_conversations_and_wakes_interrupted_agents() {
     );
     let a2_call = sent_text(&scripts.lock()["a2"].clone(), 0);
     assert!(a2_call.contains("The swarm was restarted"), "{a2_call}");
+    assert!(a2_call.contains("No tool call was in flight."), "{a2_call}");
     let a1_call = sent_text(&scripts.lock()["a1"].clone(), 0);
     assert!(
         a1_call.contains("spawned") && a1_call.contains("resumed"),
