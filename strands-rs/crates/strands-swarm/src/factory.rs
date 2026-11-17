@@ -26,7 +26,6 @@ use strands_harness::{
 use crate::catalog::ToolCatalog;
 use crate::compaction::{CompactAt, DEFAULT_COMPACT_AT};
 use crate::dashboard::{ContextControl, SUMMARY_KEEPS};
-use crate::pruning::{DropOldReasoning, TrimOldResults};
 use crate::runtime::{AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
 use crate::skills::{skills_prompt, skills_tool};
 
@@ -134,10 +133,9 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// The `auto` pipeline with coding-sized limits: the preset offloads any tool result over 1,500
 /// tokens, which stashes most file reads and command outputs and costs a retrieval call each.
 /// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
-/// summarize old turns at `compact_at` tokens (see [`CompactAt`]). Earlier turns' reasoning is
-/// dropped first (see [`DropOldReasoning`]) and older large `shell`/`read` results are cut to a
-/// preview (see [`TrimOldResults`]). With `stash_dir` the full outputs behind those previews are
-/// kept there, so `retrieve_context` still finds them after a restart.
+/// summarize old turns at `compact_at` tokens (see [`CompactAt`]). With `stash_dir` the full
+/// outputs behind truncated results are kept there, so `retrieve_context` still finds them after
+/// a restart.
 /// `control` (the agent's `context` tool) gets the stash and can request a summary.
 fn context_manager(
     compact_at: u64,
@@ -164,9 +162,10 @@ fn context_manager(
     let summarize = CompactAt::new(Arc::new(summarize), compact_at).on_request(Arc::clone(control));
     ContextManagerOption::Config(ContextManagerConfig {
         strategies: Some(vec![
-            Arc::new(DropOldReasoning),
+            // `DropOldReasoning` and `TrimOldResults` are out of the pipeline until they only edit
+            // history when the prompt cache is lost anyway: run on every turn, each edit forced a
+            // full cache rewrite and raised input cost per call by ~80% (live-run measurement).
             Arc::new(truncate),
-            Arc::new(TrimOldResults::default()),
             Arc::new(summarize),
             control.strategy(),
         ]),
