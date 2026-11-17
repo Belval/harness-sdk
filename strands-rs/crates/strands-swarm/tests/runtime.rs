@@ -114,16 +114,7 @@ async fn a_spawned_agents_reply_reaches_the_parent_through_wait() {
         dir.path(),
     );
 
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "go").await;
 
     assert_eq!(reply_to(&mut events, USER).await, "child said it");
     let root = scripts.lock()["a1"].clone();
@@ -266,16 +257,7 @@ async fn an_idle_agent_wakes_up_for_a_new_message() {
     let (swarm, mut events, scripts) =
         swarm_with(vec![("a1", vec![say("first"), say("second")])], dir.path());
 
-    let id = swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "hello".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let id = spawn_root(&swarm, "hello").await;
     assert_eq!(reply_to(&mut events, USER).await, "first");
 
     swarm.send(USER, &id, "again please").unwrap();
@@ -311,16 +293,7 @@ async fn mail_that_arrives_mid_turn_is_appended_to_the_next_tool_result() {
         dir.path(),
     );
     // Queue the message before the agent's first tool call completes.
-    let id = swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "work".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let id = spawn_root(&swarm, "work").await;
     swarm.send(USER, &id, "priority change").unwrap();
 
     assert_eq!(reply_to(&mut events, USER).await, "noted");
@@ -354,16 +327,7 @@ async fn cancelling_an_agent_cancels_its_descendants() {
         ],
         dir.path(),
     );
-    let root = swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let root = spawn_root(&swarm, "go").await;
     assert_eq!(reply_to(&mut events, USER).await, "spawned");
 
     swarm.cancel(&root).unwrap();
@@ -385,13 +349,9 @@ async fn a_cancelled_agent_that_stopped_is_released_from_memory() {
         vec![("a1", vec![say("first")]), ("a2", vec![say("kept")])],
         dir.path(),
     );
-    let spawn = |task: &str| SpawnRequest {
-        task: task.into(),
-        ..Default::default()
-    };
-    let gone = swarm.spawn(USER, spawn("go")).await.unwrap();
+    let gone = spawn_root(&swarm, "go").await;
     assert_eq!(reply_to(&mut events, USER).await, "first");
-    swarm.spawn(USER, spawn("stay")).await.unwrap();
+    spawn_root(&swarm, "stay").await;
     assert_eq!(reply_to(&mut events, USER).await, "kept");
     // Counted: the scripts map's and the one `model` hands out, plus the agent's while held.
     let model = |id: &str| scripts.lock()[id].clone();
@@ -454,16 +414,7 @@ async fn agents_get_unique_names_and_can_be_addressed_by_them() {
         ],
         dir.path(),
     );
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "Coordinate the workers".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "Coordinate the workers").await;
     assert_eq!(reply_to(&mut events, USER).await, "done");
 
     let names: Vec<(String, String)> = swarm.agents().into_iter().map(|a| (a.id, a.name)).collect();
@@ -641,16 +592,7 @@ async fn spawns_beyond_the_agent_limit_queue_and_start_when_a_slot_frees() {
     config.max_agents = 2;
     let (swarm, mut events) = Swarm::new(config);
 
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "one".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "one").await;
     assert_eq!(reply_to(&mut events, USER).await, "spawned");
     assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Queued);
     assert_eq!(status_saved(&swarm, "a3"), "queued");
@@ -686,21 +628,16 @@ async fn cancelling_a_queued_agent_drops_it() {
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.max_agents = 1;
     let (swarm, mut events) = Swarm::new(config);
-    let task = |task: &str| SpawnRequest {
-        task: task.into(),
-        ..Default::default()
-    };
-
-    swarm.spawn(USER, task("one")).await.unwrap();
+    spawn_root(&swarm, "one").await;
     assert_eq!(reply_to(&mut events, USER).await, "one");
-    swarm.spawn(USER, task("two")).await.unwrap();
+    spawn_root(&swarm, "two").await;
     assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
     swarm.cancel("a2").unwrap();
     assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Cancelled);
 
     // a2 has no script: it is never built, even once a slot frees.
     swarm.cancel("a1").unwrap();
-    swarm.spawn(USER, task("three")).await.unwrap();
+    spawn_root(&swarm, "three").await;
     assert_eq!(reply_to(&mut events, USER).await, "three");
     assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Cancelled);
 }
@@ -821,12 +758,7 @@ async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
     let mut config = SwarmConfig::new(factory, dir.path());
     config.max_agents = 2;
     let (swarm, mut events) = Swarm::new(config);
-    let task = |task: &str| SpawnRequest {
-        task: task.into(),
-        ..Default::default()
-    };
-
-    swarm.spawn(USER, task("one")).await.unwrap();
+    spawn_root(&swarm, "one").await;
     assert_eq!(reply_to(&mut events, USER).await, "spawned");
     assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Starting);
 
@@ -834,7 +766,7 @@ async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
     for id in ["a1", "a2"] {
         assert_eq!(swarm.agent(id).unwrap().status, AgentStatus::Cancelled, "{id}");
     }
-    swarm.spawn(USER, task("three")).await.unwrap();
+    spawn_root(&swarm, "three").await;
     assert_eq!(reply_to(&mut events, USER).await, "three");
     let a3 = map.lock()["a3"].clone();
     let listed = sent_text(&a3, 1);
@@ -872,16 +804,7 @@ async fn wait_returns_at_once_when_the_awaited_agents_are_cancelled() {
         ],
         dir.path(),
     );
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "go").await;
     let a1 = scripts.lock()["a1"].clone();
     eventually("a1 waits", || a1.calls().len() >= 2).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -914,16 +837,7 @@ async fn wait_without_from_returns_once_every_child_is_cancelled() {
         ],
         dir.path(),
     );
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "go").await;
     let a1 = scripts.lock()["a1"].clone();
     eventually("a1 waits", || a1.calls().len() >= 2).await;
     swarm.cancel("a2").unwrap();
@@ -949,16 +863,7 @@ async fn an_agent_cannot_message_itself() {
         )],
         dir.path(),
     );
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "go").await;
     assert_eq!(reply_to(&mut events, USER).await, "done");
     let a1 = scripts.lock()["a1"].clone();
     assert!(sent_text(&a1, 1).contains("You cannot message yourself"));
@@ -991,16 +896,7 @@ async fn a_user_message_ends_a_wait_filtered_to_another_agent() {
         ],
         dir.path(),
     );
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "go").await;
     let a1 = scripts.lock()["a1"].clone();
     eventually("a1 waits on a2", || a1.calls().len() >= 2).await;
     swarm.send(USER, "a1", "stop waiting").unwrap();
@@ -1031,16 +927,7 @@ async fn an_agent_cancelled_in_wait_stops_and_its_child_stays_quiet() {
         ],
         dir.path(),
     );
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "go").await;
     let (a1, a2) = {
         let scripts = scripts.lock();
         (scripts["a1"].clone(), scripts["a2"].clone())
@@ -1155,16 +1042,7 @@ async fn a_failing_goal_agent_backs_off_and_reports_a_streak_once() {
         })
     });
     let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, dir.path()));
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "go").await;
 
     let started = tokio::time::Instant::now();
     let mut errors = 0;
@@ -1353,16 +1231,7 @@ async fn a_resumed_run_restores_conversations_and_wakes_interrupted_agents() {
     config.state_dir = Some(state_dir.clone());
     let (swarm, mut events) = Swarm::new(config.clone());
 
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "go").await;
     assert_eq!(reply_to(&mut events, USER).await, "spawned");
     let a2_waiting = async {
         while scripts.lock()["a2"].call_count() < 1
@@ -1561,12 +1430,12 @@ async fn a_spawn_with_a_tier_alias_gets_the_full_id() {
     let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
     config.default_model = Some("bedrock/global.anthropic.claude-haiku-5-5".into());
     let (swarm, _events) = Swarm::new(config);
-    let spawn = |model: &str| SpawnRequest {
+    let request = SpawnRequest {
         task: "t".into(),
-        model: Some(model.into()),
+        model: Some("sonnet".into()),
         ..Default::default()
     };
-    let id = swarm.spawn(USER, spawn("sonnet")).await.unwrap();
+    let id = swarm.spawn(USER, request).await.unwrap();
     let model = swarm.agent(&id).unwrap().model;
     assert_eq!(
         model.as_deref(),
@@ -1887,16 +1756,7 @@ async fn a_persistent_run_journals_user_traffic_and_lifecycle_events() {
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.state_dir = Some(state_dir.clone());
     let (swarm, mut events) = Swarm::new(config.clone());
-    let id = swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let id = spawn_root(&swarm, "go").await;
     assert_eq!(reply_to(&mut events, USER).await, "hello");
     swarm.send(USER, &id, "again").unwrap();
     assert_eq!(reply_to(&mut events, USER).await, "bye");
@@ -2024,11 +1884,7 @@ async fn model_calls_beyond_the_swarm_cap_queue() {
     config.max_concurrent_calls = 1;
     let (swarm, mut events) = Swarm::new(config);
     for task in ["one", "two", "three"] {
-        let request = SpawnRequest {
-            task: task.into(),
-            ..Default::default()
-        };
-        swarm.spawn(USER, request).await.unwrap();
+        spawn_root(&swarm, task).await;
     }
     let (mut replies, mut queued) = (0, 0);
     let collect = async {
@@ -2067,16 +1923,7 @@ async fn a_spent_token_budget_stops_model_calls_until_it_is_raised() {
         dir.path(),
     );
     swarm.set_budget(Some(10));
-    let id = swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let id = spawn_root(&swarm, "go").await;
     assert_eq!(reply_to(&mut events, USER).await, "hello");
     assert_eq!(swarm.tokens_used(), 20);
 
@@ -2815,11 +2662,7 @@ async fn a_message_with_an_image_reaches_the_model_as_an_image_block() {
     let shot = dir.path().join("shot.png");
     std::fs::write(&shot, b"\x89PNG fake").unwrap();
     let (swarm, mut events, scripts) = swarm_with(vec![("a1", vec![say("first"), say("a cat")])], dir.path());
-    let request = SpawnRequest {
-        task: "hello".into(),
-        ..Default::default()
-    };
-    let id = swarm.spawn(USER, request).await.unwrap();
+    let id = spawn_root(&swarm, "hello").await;
     assert_eq!(reply_to(&mut events, USER).await, "first");
 
     let unsupported = swarm.send_with_images(USER, &id, "this?", vec![dir.path().join("notes.txt")]);
@@ -2873,11 +2716,7 @@ async fn an_image_in_a_tool_result_is_published_for_the_ui() {
         })
     });
     let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, dir.path()));
-    let request = SpawnRequest {
-        task: "take one".into(),
-        ..Default::default()
-    };
-    swarm.spawn(USER, request).await.unwrap();
+    spawn_root(&swarm, "take one").await;
     let image = async {
         while let Some(event) = events.recv().await {
             if let SwarmEvent::Image { id, source, bytes } = event {
@@ -4023,16 +3862,7 @@ async fn compactions_reported_by_the_factorys_pipeline_become_swarm_events() {
         })
     });
     let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, dir.path()));
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "go".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "go").await;
     let compacted = async {
         let mut failed = None;
         loop {
@@ -4165,16 +3995,7 @@ async fn low_disk_space_warns_the_root_once_per_episode() {
     let dir = tempfile::tempdir().unwrap();
     let replies = (0..4).map(|_| say("noted")).collect();
     let (swarm, mut events, _) = swarm_with(vec![("a1", replies)], dir.path());
-    swarm
-        .spawn(
-            USER,
-            SpawnRequest {
-                task: "root".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    spawn_root(&swarm, "root").await;
     reply_to(&mut events, USER).await;
     let free = Arc::new(std::sync::atomic::AtomicU64::new(5 << 30));
     let probe = free.clone();
