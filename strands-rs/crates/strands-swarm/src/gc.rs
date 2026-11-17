@@ -310,7 +310,16 @@ async fn remove_worktree(root: &Path, branch: &str, out: &mut Collected) {
     let root_arg = root.to_string_lossy().into_owned();
     // No `--force`: git refuses a worktree with modified or untracked files.
     match git(&main, &["worktree", "remove", &root_arg]).await {
-        Ok(_) => out.removed.push((root.to_path_buf(), bytes)),
+        Ok(_) => {
+            out.removed.push((root.to_path_buf(), bytes));
+            // `<repo>.swarm/<run>`, then `<repo>.swarm`, once nothing else is in them: a
+            // non-empty directory is not removed.
+            for dir in root.ancestors().skip(1).take(2) {
+                if std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
+            }
+        }
         Err(error) => keep(out, error),
     }
 }
@@ -451,6 +460,10 @@ mod tests {
             "only the agent's own dir goes"
         );
         assert!(
+            !tmp.path().join("repo.swarm").exists(),
+            "the worktree's emptied run dir and .swarm dir go too"
+        );
+        assert!(
             !branch_exists(&repo, "swarm/r1/a2"),
             "nothing on it the base lacks"
         );
@@ -581,6 +594,24 @@ mod tests {
             branch_exists(&_repo, "swarm/r1/a2"),
             "a kept worktree keeps its branch"
         );
+    }
+
+    #[tokio::test]
+    async fn a_run_dir_with_another_worktree_in_it_stays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, worktree) = repo_with_worktree(tmp.path());
+        let sibling = tmp.path().join("repo.swarm/r1/a3");
+        let sibling_arg = sibling.to_str().unwrap();
+        run(
+            &repo,
+            &["worktree", "add", "-q", "-b", "swarm/r1/a3", sibling_arg, "HEAD"],
+        );
+        let target = tmp.path().join("target-worktrees/r1/a2");
+
+        let collected = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &env(&target), None).await;
+
+        assert_eq!(collected.removed.len(), 1, "{collected:?}");
+        assert!(!worktree.exists() && sibling.exists());
     }
 
     #[tokio::test]
