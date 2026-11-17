@@ -26,6 +26,7 @@ use strands_harness::{
 use crate::catalog::ToolCatalog;
 use crate::compaction::{CompactAt, DEFAULT_COMPACT_AT};
 use crate::dashboard::{ContextControl, SUMMARY_KEEPS};
+use crate::pruning::CachePrune;
 use crate::runtime::{AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
 use crate::skills::{skills_prompt, skills_tool};
 
@@ -133,7 +134,9 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// The `auto` pipeline with coding-sized limits: the preset offloads any tool result over 1,500
 /// tokens, which stashes most file reads and command outputs and costs a retrieval call each.
 /// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
-/// summarize old turns at `compact_at` tokens (see [`CompactAt`]). With `stash_dir` the full
+/// summarize old turns at `compact_at` tokens (see [`CompactAt`]). Earlier turns' reasoning and
+/// older large `shell`/`read` results are pruned only when the prompt cache is lost anyway (see
+/// [`CachePrune`]). With `stash_dir` the full
 /// outputs behind truncated results are kept there, so `retrieve_context` still finds them after
 /// a restart.
 /// `control` (the agent's `context` tool) gets the stash and can request a summary.
@@ -160,14 +163,16 @@ fn context_manager(
         ..Default::default()
     });
     let summarize = CompactAt::new(Arc::new(summarize), compact_at).on_request(Arc::clone(control));
+    let summarize = Arc::new(summarize);
+    let prune = CachePrune::new(Some(Arc::clone(&summarize)));
     ContextManagerOption::Config(ContextManagerConfig {
         strategies: Some(vec![
-            // `DropOldReasoning` and `TrimOldResults` are out of the pipeline until they only edit
-            // history when the prompt cache is lost anyway: run on every turn, each edit forced a
-            // full cache rewrite and raised input cost per call by ~80% (live-run measurement).
+            Arc::new(prune.clone()),
             Arc::new(truncate),
-            Arc::new(summarize),
+            summarize,
             control.strategy(),
+            // Last: what the call sends, for the next call's gate.
+            prune.mark(),
         ]),
         stash: match stash_dir {
             // A namespaced view is used as the stash root as is; plain storage would be keyed by
@@ -522,6 +527,57 @@ mod tests {
         let result = calls[1].0.last().unwrap().tool_results().next().unwrap();
         let output = format!("{:?}", result.content);
         assert!(output.contains(&cwd.display().to_string()), "{output}");
+    }
+
+    /// Through the whole harness (every plugin and hook), a call that has no reason to prune
+    /// re-sends the previous call's messages unchanged, so the prompt cache matches all of them.
+    #[tokio::test]
+    async fn the_next_call_resends_history_unchanged() {
+        use strands_agents::testing::MockResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = harness_options(
+            &HarnessFactoryOptions::default(),
+            AgentSpec {
+                cwd: dir.path().to_path_buf(),
+                ..spec()
+            },
+        )
+        .unwrap();
+        let call = ToolUseBlock::new("shell", "s1", serde_json::json!({ "command": "echo hi" }));
+        let model = MockMessageModel::shared(vec![
+            MockResponse::message(Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)])),
+            MockResponse::message(Message::assistant("done")),
+            MockResponse::message(Message::assistant("again")),
+        ]);
+        harness.model = Some(ModelOption::Instance(model.clone()));
+        let agent = create_harness(harness).await.unwrap();
+        agent
+            .invoke(format!("first task {}", "x".repeat(4_000)))
+            .await
+            .unwrap();
+        agent.invoke("second task").await.unwrap();
+
+        let calls = model.calls();
+        // Without the per-call environment block the injector folds into the last user message
+        // (after the cache point, by design).
+        let json = |messages: &[Message]| {
+            let mut messages = messages.to_vec();
+            for message in &mut messages {
+                message.content.retain(
+                    |block| !matches!(block, ContentBlock::Text(text) if text.contains("<system-reminder>")),
+                );
+            }
+            serde_json::to_string(&messages).unwrap()
+        };
+        for pair in calls.windows(2) {
+            let (before, after) = (&pair[0].0, &pair[1].0);
+            assert_eq!(
+                json(&after[..before.len()]),
+                json(before),
+                "the sent prefix changed"
+            );
+        }
+        assert_eq!(calls.len(), 3);
     }
 
     #[test]

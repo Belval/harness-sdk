@@ -115,6 +115,16 @@ input/output tokens and how close its last model call came to the compaction poi
 (the log notes it at 90%). The compaction point is `--compact-at` (default `200k`) or 85% of the
 model's context window, whichever is smaller, so agents on 1M-token models do not carry ~850k
 tokens per call; it follows the window on a `/model` switch.
+Reasoning (thinking text and signatures) from turns before the current one, which models that keep
+prior thinking bill as input on every call, is dropped (the turn in progress keeps it, as Anthropic
+requires within a tool-use loop), and `shell` and `read` results over 2,000 characters are cut to
+their head and tail (~800 characters) once six newer ones exist; `retrieve_context` with the
+reference at the end returns the full output. Both edit history, and the prompt cache only matches
+an unchanged prefix, so they run together and only when the cache is lost anyway: in the pass that
+summarizes, after the context was edited (e.g. by the `context` tool), on the first call after five
+idle minutes (the cache's lifetime), on overflow, or once they would remove 15% of the history.
+Every other call re-sends history byte for byte. (Run on every turn they raised input cost per
+call by ~80%; a replay of that window with the gate saves 29%.)
 Beyond the fixed thresholds an agent manages its own context with the `context` tool: it lists
 the biggest items (tool results numbered), `offload: [n, …]` replaces those results with a
 one-line stub whose reference still reads the full output back, and `summarize: true` has the

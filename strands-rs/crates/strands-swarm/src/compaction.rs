@@ -2,6 +2,7 @@
 //! near the end of the model's window. A 1M-token window would otherwise let every call carry
 //! up to ~850k tokens before anything is compacted.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::dashboard::ContextControl;
@@ -42,6 +43,8 @@ pub struct CompactAt {
     inner: Arc<dyn ContextStrategy>,
     compact_at: u64,
     control: Option<Arc<ContextControl>>,
+    /// Set by [`CompactAt::arm`]: run on this pipeline pass whatever utilization says by then.
+    armed: AtomicBool,
 }
 
 impl CompactAt {
@@ -51,6 +54,7 @@ impl CompactAt {
             inner,
             compact_at,
             control: None,
+            armed: AtomicBool::new(false),
         }
     }
 
@@ -58,6 +62,22 @@ impl CompactAt {
     pub fn on_request(mut self, control: Arc<ContextControl>) -> Self {
         self.control = Some(control);
         self
+    }
+
+    /// Whether this pipeline pass will compact; if so, it will even if an earlier strategy
+    /// brings utilization back under the point. Takes a pending summarize request.
+    pub fn arm(&self, ctx: &ContextState<'_>) -> bool {
+        let due = self.due(ctx);
+        if due {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+        due
+    }
+
+    fn due(&self, ctx: &ContextState<'_>) -> bool {
+        let requested = self.control.as_ref().is_some_and(|c| c.take_summarize_request());
+        let window = window_of(ctx.agent.model().as_ref());
+        requested || ctx.overflow || ctx.utilization >= compaction_utilization(window, self.compact_at)
     }
 }
 
@@ -72,9 +92,7 @@ impl ContextStrategy for CompactAt {
     }
 
     async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
-        let requested = self.control.as_ref().is_some_and(|c| c.take_summarize_request());
-        let window = window_of(ctx.agent.model().as_ref());
-        if !requested && !ctx.overflow && ctx.utilization < compaction_utilization(window, self.compact_at) {
+        if !self.armed.swap(false, Ordering::SeqCst) && !self.due(ctx) {
             return Ok(false);
         }
         self.inner.apply(ctx).await
