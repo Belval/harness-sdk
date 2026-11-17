@@ -147,11 +147,8 @@ impl AgentView {
             _ => return None,
         }
         Some(match self.log.back() {
-            Some(LogEntry::Tool {
-                name,
-                summary,
-                ok: None,
-            }) => format!("running {name}: {summary}…"),
+            // The call is the entry just above, so its summary is not repeated.
+            Some(LogEntry::Tool { name, ok: None, .. }) => format!("running {name}…"),
             Some(LogEntry::Text(_)) => "writing…".to_owned(),
             _ => "thinking…".to_owned(),
         })
@@ -818,7 +815,7 @@ mod tests {
             name: "shell".into(),
             summary: "cargo test".into(),
         });
-        assert_eq!(activity(&app).as_deref(), Some("running shell: cargo test…"));
+        assert_eq!(activity(&app).as_deref(), Some("running shell…"));
         app.apply(SwarmEvent::ToolFinished {
             id: "a1".into(),
             name: "shell".into(),

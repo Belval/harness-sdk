@@ -875,6 +875,33 @@ mod tests {
     }
 
     #[test]
+    fn a_running_tool_call_shows_once_above_its_spinner() {
+        let mut app = App::default();
+        app.apply(crate::runtime::SwarmEvent::Spawned {
+            id: "a1".into(),
+            parent: USER.into(),
+            name: "root".into(),
+            task: "t".into(),
+            cwd: "/w".into(),
+            branch: None,
+        });
+        app.apply(crate::runtime::SwarmEvent::Status {
+            id: "a1".into(),
+            status: AgentStatus::Running,
+        });
+        app.apply(crate::runtime::SwarmEvent::ToolStarted {
+            id: "a1".into(),
+            name: "wait".into(),
+            summary: "{\"from\":[\"parser\"]}".into(),
+        });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        assert_eq!(screen.matches("parser").count(), 1, "{screen}");
+        assert!(screen.contains("running wait…"), "{screen}");
+    }
+
+    #[test]
     fn the_status_popup_wraps_long_lines() {
         let mut app = app_with_an_image(None);
         let subject = "abc1234 feat: thumbnails for every image in the log pane, scaled to fit the cell grid";
