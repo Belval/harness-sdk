@@ -109,6 +109,9 @@ fn assert_cached_prefix_kept(previous: &Call, next: &Call, at: usize) {
     }
 }
 
+/// The journal line of the helper going idle, which follows its reply.
+const HELPER_IDLE: &str = r#""id":"a2","status":"idle""#;
+
 #[tokio::test]
 async fn every_call_resends_the_cached_prefix_unchanged_across_turns_mail_and_a_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -130,8 +133,13 @@ async fn every_call_resends_the_cached_prefix_unchanged_across_turns_mail_and_a_
                 "t3",
                 json!({"command": "head -c 3000 /dev/zero | tr '\\0' x"}),
             ),
-            // The helper's reply arrives while this runs and is appended to its result.
-            call("shell", "t4", json!({"command": "sleep 2"})),
+            // Runs until the helper has replied (its reply comes before the journal shows it
+            // idle; at most 5s), so the reply rides on this result or an earlier one.
+            call(
+                "shell",
+                "t4",
+                json!({"command": format!("for _ in $(seq 500); do grep -qs '{HELPER_IDLE}' run/events.jsonl && break; sleep 0.01; done")}),
+            ),
         ]
         .into_iter()
         .chain((0..6).map(|i| call("shell", &format!("e{i}"), json!({"command": format!("echo {i}")}))))
