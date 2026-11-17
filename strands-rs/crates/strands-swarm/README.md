@@ -22,7 +22,9 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 
 Agents also get the harness's `shell`, `read`, `write`, `edit`, `web_fetch`, `todo_write` and
 `retrieve_context`, but not the SDK's background tasks (`_background_execution` on every tool):
-`run_background` covers slow commands. Tool specs and the swarm's prompt sections are sent on every
+`run_background` covers slow commands. A `shell` result reaches the model as the text a terminal
+would show (stdout, then `[stderr]` and `[exit code N]` when there are any), not the SDK's JSON
+block, whose escaped quotes models copied into `edit`'s `old_str`. Tool specs and the swarm's prompt sections are sent on every
 model call, so a test (`the_fixed_prefix_stays_within_its_budget`) pins their size: 17 kB (about
 5k tokens) with 20 skills, the skills list at 2.5 kB of it.
 

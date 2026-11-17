@@ -271,7 +271,8 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         name: None,
         root: Some(spec.cwd.clone()),
     });
-    let mut plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(environment)];
+    let mut plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(environment), Arc::new(crate::shell_text::ShellText)];
     if let Some(goal) = &spec.goal {
         let judge = JudgeConfig::default().with_max_transcript_chars(JUDGE_TRANSCRIPT_CHARS);
         plugins.push(Arc::new(bounded_goal(
@@ -757,10 +758,12 @@ mod tests {
         agent.invoke("where am I").await.unwrap();
 
         let calls = model.calls();
-        // The shell result is a JSON block (`{"output": ..., "exit_code": ...}`), not text.
+        // The SDK's JSON block reaches the model as plain text (crate::shell_text).
         let result = calls[1].0.last().unwrap().tool_results().next().unwrap();
-        let output = format!("{:?}", result.content);
-        assert!(output.contains(&cwd.display().to_string()), "{output}");
+        match &result.content[..] {
+            [ToolResultContent::Text(text)] => assert_eq!(text, &cwd.display().to_string()),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Through the whole harness (every plugin and hook), a call that has no reason to prune

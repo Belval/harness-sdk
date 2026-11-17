@@ -32,6 +32,7 @@ pub mod retry;
 pub mod runtime;
 pub mod schedule;
 pub mod selftest;
+pub mod shell_text;
 pub mod skills;
 pub mod state;
 pub mod status;
