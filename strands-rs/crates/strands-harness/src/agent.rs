@@ -29,7 +29,9 @@ use crate::builtin_tools::{
 use crate::defaults::{DEFAULT_BUILTIN_PLUGINS, DEFAULT_MODEL, DEFAULT_SESSION_DIR, DEFAULT_SKILLS_DIR};
 use crate::interventions::{resolve_interventions, InterventionsOption, ResolveInterventionsOptions};
 use crate::memory::{resolve_memory, ResolveMemoryOptions};
-use crate::models::{resolve_model, supports_web_search, Effort, ModelOption, ResolveModelOptions};
+use crate::models::{
+    resolve_model, supports_web_search, AwsSettings, Effort, ModelOption, ResolveModelOptions,
+};
 use crate::prompt::build_system_prompt;
 use crate::tools::subagent::{
     make_subagent, AgentBuilderFn, ChildAgentConfig, Choice, ContextAxis, MakeSubagentOptions, Opt, Preset,
@@ -181,6 +183,8 @@ pub struct HarnessAgentOptions {
     /// TTL of the prompt-cache points (`"5m"`, `"1h"`) where caching is on for Bedrock or
     /// Anthropic; `None` leaves the provider default (5 minutes). Rust-only.
     pub cache_ttl: Option<String>,
+    /// AWS settings for Bedrock models in place of the environment's. Rust-only.
+    pub aws: AwsSettings,
     /// How a batch of tool calls runs; `None` is the agent default (all at once, as in TS).
     /// Rust-only.
     pub tool_executor: Option<Arc<dyn ToolExecutor>>,
@@ -238,6 +242,7 @@ pub async fn create_harness(options: HarnessAgentOptions) -> Result<Agent> {
         web_search: web_search == Some(WebSearchMode::Native),
         caching: options.caching,
         cache_ttl: options.cache_ttl.clone(),
+        aws: options.aws.clone(),
     })
     .await?;
 
@@ -637,6 +642,7 @@ async fn resolve_memory_option(
         Some(serde_json::Value::String(id)) => Some(
             resolve_model(ResolveModelOptions {
                 model: Some(ModelOption::Id(id.clone())),
+                aws: options.aws.clone(),
                 ..Default::default()
             })
             .await?,

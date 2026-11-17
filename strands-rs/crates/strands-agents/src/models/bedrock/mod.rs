@@ -4,6 +4,7 @@ mod format;
 mod parse;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -283,6 +284,9 @@ impl BedrockModelConfig {
 pub struct BedrockModelBuilder {
     config: BedrockModelConfig,
     region: Option<String>,
+    profile: Option<String>,
+    config_file: Option<PathBuf>,
+    credentials_file: Option<PathBuf>,
     api_key: Option<String>,
     request_timeout: Option<Duration>,
 }
@@ -306,6 +310,27 @@ impl BedrockModelBuilder {
         self
     }
 
+    /// Take credentials, and the region unless [`region`](Self::region) sets one, from this
+    /// profile instead of `AWS_PROFILE`'s; neither access keys nor `AWS_REGION` in the
+    /// environment override it.
+    pub fn profile(mut self, name: impl Into<String>) -> Self {
+        self.profile = Some(name.into());
+        self
+    }
+
+    /// Read profiles from this file instead of `AWS_CONFIG_FILE` (default `~/.aws/config`).
+    pub fn config_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config_file = Some(path.into());
+        self
+    }
+
+    /// Read credentials from this file instead of `AWS_SHARED_CREDENTIALS_FILE` (default
+    /// `~/.aws/credentials`).
+    pub fn credentials_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.credentials_file = Some(path.into());
+        self
+    }
+
     /// Use a bearer token (`Authorization: Bearer …`) instead of SigV4.
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
@@ -320,8 +345,8 @@ impl BedrockModelBuilder {
 
     /// Resolve the AWS config and build the model.
     pub async fn build(self) -> Result<BedrockModel> {
+        let sdk_config = self.aws_loader().load().await;
         let config = resolve_config(self.config);
-        let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
 
         let region = self
             .region
@@ -359,6 +384,46 @@ impl BedrockModelBuilder {
             config: RwLock::new(config),
             client: Client::from_conf(client_config.build()),
         })
+    }
+
+    /// The AWS chain, with the profile and files set on the builder in place of the environment's.
+    // `ProfileFiles` is deprecated for `aws_runtime`'s `EnvConfigFiles`, which aws-config's own
+    // setters still take under this name.
+    #[allow(deprecated)]
+    fn aws_loader(&self) -> aws_config::ConfigLoader {
+        use aws_config::meta::region::RegionProviderChain;
+        use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
+        use aws_config::profile::{ProfileFileCredentialsProvider, ProfileFileRegionProvider};
+
+        let mut loader = aws_config::defaults(BehaviorVersion::latest());
+        let files = (self.config_file.is_some() || self.credentials_file.is_some()).then(|| {
+            let mut files = ProfileFiles::builder();
+            files = match &self.config_file {
+                Some(path) => files.with_file(ProfileFileKind::Config, path),
+                None => files.include_default_config_file(true),
+            };
+            files = match &self.credentials_file {
+                Some(path) => files.with_file(ProfileFileKind::Credentials, path),
+                None => files.include_default_credentials_file(true),
+            };
+            files.build()
+        });
+        if let Some(files) = &files {
+            loader = loader.profile_files(files.clone());
+        }
+        if let Some(name) = &self.profile {
+            let mut credentials = ProfileFileCredentialsProvider::builder().profile_name(name);
+            let mut region = ProfileFileRegionProvider::builder().profile_name(name);
+            if let Some(files) = &files {
+                credentials = credentials.profile_files(files.clone());
+                region = region.profile_files(files.clone());
+            }
+            loader = loader
+                .profile_name(name)
+                .credentials_provider(credentials.build())
+                .region(RegionProviderChain::first_try(region.build()).or_default_provider());
+        }
+        loader
     }
 }
 
@@ -795,6 +860,29 @@ mod tests {
                 .build(),
         );
         BedrockModel::from_client(client, resolve_config(config))
+    }
+
+    #[tokio::test]
+    async fn a_profile_and_files_set_on_the_builder_beat_the_environment() {
+        use aws_sdk_bedrockruntime::config::ProvideCredentials;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::write(
+            &config,
+            "[profile builder-test]\nregion = eu-north-1\naws_access_key_id = AKIDBUILDERTEST\naws_secret_access_key = test\n",
+        )
+        .unwrap();
+        let builder = BedrockModel::builder()
+            .profile("builder-test")
+            .config_file(&config)
+            .credentials_file("/dev/null");
+        let sdk_config = builder.aws_loader().load().await;
+        let provider = sdk_config.credentials_provider().unwrap();
+        let credentials = provider.provide_credentials().await.unwrap();
+        let model = builder.build().await.unwrap();
+        assert_eq!(model.region().as_deref(), Some("eu-north-1"));
+        assert_eq!(credentials.access_key_id(), "AKIDBUILDERTEST");
     }
 
     #[test]

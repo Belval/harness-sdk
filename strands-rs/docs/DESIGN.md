@@ -103,6 +103,11 @@ installs the exporter).
   that calls to the listed tools run one after another in the model's order, so `edit` then
   `shell` in one batch runs in that order while other calls still overlap. The TS executors are
   unchanged; the harness takes it through `HarnessAgentOptions::tool_executor`.
+- `BedrockModelBuilder::{profile, config_file, credentials_file}` are Rust-only: a host calls
+  Bedrock under its own profile without exporting `AWS_PROFILE`/`AWS_CONFIG_FILE`, which every
+  child process would inherit. A set profile also supplies the region and beats environment access
+  keys. The harness takes them through `AwsSettings` (`ResolveModelOptions::aws`,
+  `HarnessAgentOptions::aws`).
 - `models::routing::ModelRouter` runs its per-invocation selection as **wrap-phase** middleware on
   `InvokeModelStage`, not TS's `InvokeModelStage.Input`: `add_input` is sync while
   `RoutingStrategy::select` is async, and wrap composes innermost so the stage still sees the

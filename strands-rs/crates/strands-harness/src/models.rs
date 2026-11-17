@@ -479,6 +479,33 @@ fn bedrock_region() -> Option<String> {
         .find(|value| !value.is_empty())
 }
 
+/// A Bedrock builder for `config` with `aws` applied; the environment's region only when `aws`
+/// names neither a region nor a profile (whose own region then wins).
+#[cfg(feature = "bedrock")]
+fn bedrock_builder(
+    config: BedrockModelConfig,
+    aws: AwsSettings,
+) -> strands_agents::models::bedrock::BedrockModelBuilder {
+    let mut builder = BedrockModel::builder().config(config);
+    let region = match &aws.profile {
+        Some(_) => aws.region,
+        None => aws.region.or_else(bedrock_region),
+    };
+    if let Some(region) = region {
+        builder = builder.region(region);
+    }
+    if let Some(profile) = aws.profile {
+        builder = builder.profile(profile);
+    }
+    if let Some(path) = aws.config_file {
+        builder = builder.config_file(path);
+    }
+    if let Some(path) = aws.credentials_file {
+        builder = builder.credentials_file(path);
+    }
+    builder
+}
+
 /// The resolved provider, model name, effort level and effective caching flag for a spec.
 struct Resolved<'a> {
     provider: &'a str,
@@ -503,6 +530,22 @@ fn bedrock_config(name: &str, effort: Option<&str>, caching: bool) -> BedrockMod
     }
 }
 
+/// AWS settings for the Bedrock client in place of the process environment's, so a host can
+/// call Bedrock under its own profile while the processes it starts keep the user's `AWS_*`.
+/// Unset fields fall back to the AWS chain. Rust-only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AwsSettings {
+    /// Profile for credentials and, without `region`, the region (`AWS_PROFILE`); access keys
+    /// and `AWS_REGION` in the environment do not override it.
+    pub profile: Option<String>,
+    /// Config file (`AWS_CONFIG_FILE`).
+    pub config_file: Option<std::path::PathBuf>,
+    /// Shared credentials file (`AWS_SHARED_CREDENTIALS_FILE`).
+    pub credentials_file: Option<std::path::PathBuf>,
+    /// Region (`AWS_REGION`).
+    pub region: Option<String>,
+}
+
 /// Options for [`resolve_model`].
 pub struct ResolveModelOptions {
     /// What the caller passed for `model`; unset falls back to `default`.
@@ -519,6 +562,8 @@ pub struct ResolveModelOptions {
     /// TTL of the cache points (`"5m"`, `"1h"`) on Bedrock and Anthropic; `None` sends none,
     /// i.e. the provider default of 5 minutes. Rust-only.
     pub cache_ttl: Option<String>,
+    /// AWS settings for a Bedrock model. Rust-only.
+    pub aws: AwsSettings,
 }
 
 impl Default for ResolveModelOptions {
@@ -530,6 +575,7 @@ impl Default for ResolveModelOptions {
             web_search: false,
             caching: CachingOption::default(),
             cache_ttl: None,
+            aws: AwsSettings::default(),
         }
     }
 }
@@ -547,6 +593,7 @@ pub async fn resolve_model(options: ResolveModelOptions) -> Result<Arc<dyn Model
         web_search,
         caching: caching_option,
         cache_ttl,
+        aws,
     } = options;
     let ttl = cache_ttl.as_deref();
     let caching = !matches!(caching_option, CachingOption::Off);
@@ -569,7 +616,7 @@ pub async fn resolve_model(options: ResolveModelOptions) -> Result<Arc<dyn Model
     };
     let (provider_name, _) = split_provider(&spec);
     match provider_name {
-        "bedrock" => build_bedrock(&spec, effort, web_search, caching, caching_explicit, ttl).await,
+        "bedrock" => build_bedrock(&spec, effort, web_search, caching, caching_explicit, ttl, aws).await,
         "anthropic" => build_anthropic(&spec, effort, web_search, caching, caching_explicit, ttl),
         "openai" | "bedrock-mantle" => build_openai(&spec, effort, web_search, caching, caching_explicit),
         _ => {
@@ -596,19 +643,16 @@ async fn build_bedrock(
     caching: bool,
     caching_explicit: bool,
     cache_ttl: Option<&str>,
+    aws: AwsSettings,
 ) -> Result<Arc<dyn Model>> {
     #[cfg(feature = "bedrock")]
     {
         let config = bedrock_config_for(spec, effort, web_search, caching, caching_explicit, cache_ttl)?;
-        let mut builder = BedrockModel::builder().config(config);
-        if let Some(region) = bedrock_region() {
-            builder = builder.region(region);
-        }
-        Ok(Arc::new(builder.build().await?))
+        Ok(Arc::new(bedrock_builder(config, aws).build().await?))
     }
     #[cfg(not(feature = "bedrock"))]
     {
-        let _ = cache_ttl;
+        let _ = (cache_ttl, aws);
         resolve_spec(spec, effort, web_search, caching, caching_explicit)?;
         Err(missing_feature("bedrock", "bedrock"))
     }
@@ -949,6 +993,47 @@ mod tests {
         }
         if let Some(value) = previous.1 {
             std::env::set_var("AWS_DEFAULT_REGION", value);
+        }
+    }
+
+    #[test]
+    fn aws_settings_reach_the_bedrock_client_over_the_environment() {
+        let _guard = ENV_LOCK.lock().expect("lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        std::fs::write(&config, "[profile host]\nregion = eu-north-1\n").expect("write");
+        let previous = std::env::var("AWS_REGION").ok();
+        std::env::set_var("AWS_REGION", "us-east-1");
+        let region = |aws: AwsSettings| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let model = runtime.block_on(bedrock_builder(BedrockModelConfig::default(), aws).build());
+            model
+                .expect("builds")
+                .client()
+                .config()
+                .region()
+                .map(|region| region.to_string())
+        };
+        let profile = AwsSettings {
+            profile: Some("host".into()),
+            config_file: Some(config),
+            credentials_file: Some("/dev/null".into()),
+            region: None,
+        };
+        // The profile's region beats the environment's; an explicit one beats both.
+        assert_eq!(region(profile.clone()).as_deref(), Some("eu-north-1"));
+        let explicit = AwsSettings {
+            region: Some("ap-south-1".into()),
+            ..profile
+        };
+        assert_eq!(region(explicit).as_deref(), Some("ap-south-1"));
+        assert_eq!(region(AwsSettings::default()).as_deref(), Some("us-east-1"));
+        match previous {
+            Some(value) => std::env::set_var("AWS_REGION", value),
+            None => std::env::remove_var("AWS_REGION"),
         }
     }
 

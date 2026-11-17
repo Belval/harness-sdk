@@ -25,7 +25,7 @@ pub use builtin_tools::{
 };
 pub use interventions::{InterventionValue, InterventionsOption};
 pub use memory::{resolve_memory, ResolveMemoryOptions};
-pub use models::{resolve_model, Effort, ModelOption, ResolveModelOptions};
+pub use models::{resolve_model, AwsSettings, Effort, ModelOption, ResolveModelOptions};
 pub use plugins::{EnvironmentContext, EnvironmentContextConfig, Todos, TodosConfig};
 pub use prompt::{build_system_prompt, HARNESS_CONTRACT};
 pub use telemetry::{reset_telemetry, setup_telemetry, TRACES_EXPORTER_ENV_VAR};
