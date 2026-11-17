@@ -264,8 +264,9 @@ async fn other_unmerged(dir: &Path, base: &str, branch: &str, head: &str) -> Vec
     others
 }
 
-/// Which of the commits on `rev` not on `base` the base already has a copy of, by patch id
-/// (`git cherry`), e.g. after a cherry-pick or rebase.
+/// Which of the commits on `rev` not on `base` the base already has a copy of: by patch id
+/// (`git cherry`), e.g. after a cherry-pick or rebase, or because `land` landed them
+/// ([`crate::land::landed_sources`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Applied {
     /// Commits with a patch-equivalent commit on the base.
@@ -286,11 +287,19 @@ impl Applied {
 
 /// [`Applied`] for `rev` against `base`, in repository `dir`.
 pub async fn applied(dir: &Path, base: &str, rev: &str) -> Result<Applied, String> {
-    let range = format!("{base}..{rev}");
-    let cherry = crate::worktree::git(dir, &["cherry", base, rev]).await;
-    let cherry = cherry.map_err(|error| error.to_string())?;
-    let merges = crate::worktree::git(dir, &["rev-list", "--merges", "--count", &range, "--"]).await;
-    let merges = merges.map_err(|error| error.to_string())?;
+    let git = |args: Vec<String>| async move {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::worktree::git(dir, &args)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let owned = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    // The commits of `base..rev` no landing covered: not reachable from a landed source.
+    let mut uncovered = owned(&[rev, &format!("^{base}"), "--ignore-missing"]);
+    let landed = crate::land::landed_sources(dir, base).await;
+    uncovered.extend(landed.iter().map(|source| format!("^{source}")));
+    let cherry = git(owned(&["cherry", base, rev])).await?;
+    let merges = git([owned(&["rev-list", "--merges", "--count"]), uncovered.clone()].concat()).await?;
     let mut out = Applied {
         merges: merges
             .trim()
@@ -298,9 +307,18 @@ pub async fn applied(dir: &Path, base: &str, rev: &str) -> Result<Applied, Strin
             .map_err(|_| format!("bad count {merges:?}"))?,
         ..Default::default()
     };
+    let landed_too = match landed.is_empty() {
+        true => None,
+        false => Some(git([owned(&["rev-list"]), uncovered].concat()).await?),
+    };
     for line in cherry.lines() {
+        let sha = line.get(2..).unwrap_or_default();
+        let covered = landed_too
+            .as_ref()
+            .is_some_and(|uncovered| !uncovered.lines().any(|line| line == sha));
         match line.chars().next() {
             Some('-') => out.applied += 1,
+            Some('+') if covered => out.applied += 1,
             Some('+') => out.unapplied += 1,
             _ => {}
         }

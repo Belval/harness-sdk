@@ -18,6 +18,14 @@ use crate::worktree::{git, git_in, same_subdir};
 /// Lines of a failing check's output that the report keeps.
 pub const TAIL_LINES: usize = 30;
 
+/// File in the repository's common git dir recording what was landed, one `<source> <landed>`
+/// commit pair per line: the rebase gives the landed commits new ids and, where the lines around
+/// them changed, new patch ids, so `git cherry` alone cannot tell the source's commits are in.
+pub const LANDED_FILE: &str = "swarm-landed";
+
+/// Most landings [`LANDED_FILE`] keeps (the latest).
+const LANDED_KEPT: usize = 500;
+
 /// Everything one landing needs; written to disk for the job that carries it out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandPlan {
@@ -127,6 +135,7 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
         None => git(scratch, &["update-ref", &into_ref, &new, old]).await,
     };
     moved.map_err(|e| format!("Not landed: could not fast-forward {into}: {e}"))?;
+    record_landed(&plan.repo, &plan.source, &new).await;
 
     let checks = match passed.is_empty() {
         true => "No checks ran.".to_owned(),
@@ -139,6 +148,75 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
         short(old),
         short(&new)
     ))
+}
+
+/// The landed-commit record of the repository at `dir`.
+async fn landed_file(dir: &Path) -> Option<PathBuf> {
+    let common = git(dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await;
+    Some(PathBuf::from(common.ok()?).join(LANDED_FILE))
+}
+
+/// Note in [`LANDED_FILE`] that `source`'s commits landed as `landed`. Best effort: a missing
+/// record only means a landed branch keeps looking unmerged.
+async fn record_landed(repo: &Path, source: &str, landed: &str) {
+    let (Some(path), Ok(source)) = (
+        landed_file(repo).await,
+        git(repo, &["rev-parse", &format!("{source}^{{commit}}")]).await,
+    ) else {
+        return;
+    };
+    let old = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    let mut lines: Vec<&str> = old.lines().collect();
+    let line = format!("{source} {landed}");
+    lines.push(&line);
+    let start = lines.len().saturating_sub(LANDED_KEPT);
+    let text = lines[start..].join("\n") + "\n";
+    let tmp = path.with_extension("tmp");
+    let written = match tokio::fs::write(&tmp, text).await {
+        Ok(()) => tokio::fs::rename(&tmp, &path).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = written {
+        tracing::warn!(%error, "could not record the landing");
+    }
+}
+
+/// The landed sources (see [`LANDED_FILE`]) whose landed commits `base` still has: every commit
+/// reachable from them is on `base` in substance.
+pub async fn landed_sources(dir: &Path, base: &str) -> Vec<String> {
+    let Some(path) = landed_file(dir).await else {
+        return Vec::new();
+    };
+    let text = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    let pairs: Vec<(&str, &str)> = text.lines().filter_map(|line| line.split_once(' ')).collect();
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    // One walk for all: the landed commits `base` lacks (e.g. after a reset). It fails if one
+    // is gone altogether (so not on `base` either); then each is asked about on its own.
+    let mut args = vec!["rev-list"];
+    args.extend(pairs.iter().map(|(_, landed)| *landed));
+    let not_base = format!("^{base}");
+    args.extend([not_base.as_str(), "--"]);
+    let lacked = match git(dir, &args).await {
+        Ok(lacked) => lacked,
+        Err(_) => {
+            let mut sources = Vec::new();
+            for (source, landed) in &pairs {
+                let is_in = ["merge-base", "--is-ancestor", landed, base];
+                if git(dir, &is_in).await.is_ok() {
+                    sources.push(source.to_string());
+                }
+            }
+            return sources;
+        }
+    };
+    let lacked: std::collections::HashSet<&str> = lacked.lines().collect();
+    pairs
+        .iter()
+        .filter(|(_, landed)| !lacked.contains(landed))
+        .map(|(source, _)| source.to_string())
+        .collect()
 }
 
 /// Run `check` with `sh` in `dir`; on failure the error carries the tail of its output.
@@ -376,6 +454,56 @@ mod tests {
         assert!(report.contains("Landed 2 commit(s)"), "{report}");
         assert_eq!(head(&fx.main, "main").await, head(&fx.main, "feature").await);
         assert_eq!(head(&fx.main, "HEAD").await, head(&fx.main, "other").await);
+    }
+
+    /// A rebase that changes a landed commit's context gives it a new patch id, so `git cherry`
+    /// sees it as missing from the target; the landing record says it is there. Commits made
+    /// after the landing, or landings the target lost, still count as pending.
+    #[tokio::test]
+    async fn landed_commits_count_as_applied_even_when_their_patch_id_changed() {
+        let fx = fixture().await;
+        sh(
+            &fx.main,
+            "printf 'l1\\nl2\\nl3\\nl4\\n' > c.txt && git add . && git commit -qm c",
+        )
+        .await;
+        sh(&fx.feature, "git rebase -q main").await;
+        sh(&fx.main, "sed -i s/l1/L1/ c.txt && git commit -qam 'main l1'").await;
+        sh(
+            &fx.feature,
+            "sed -i s/l3/L3/ c.txt && git commit -qam 'feature l3'",
+        )
+        .await;
+        let applied = || crate::status::applied(&fx.feature, "main", "feature");
+        assert_eq!(applied().await.unwrap().pending(), 2);
+
+        let report = run(&plan(&fx, &[])).await.unwrap();
+        assert!(report.contains("Landed 2 commit(s)"), "{report}");
+        let cherry = git(&fx.feature, &["cherry", "main", "feature"]).await.unwrap();
+        assert!(cherry.contains('+'), "the patch id changed: {cherry}");
+        let found = applied().await.unwrap();
+        assert_eq!((found.pending(), found.applied), (0, 2), "{found:?}");
+
+        sh(
+            &fx.feature,
+            "echo later > d.txt && git add . && git commit -qm later",
+        )
+        .await;
+        assert_eq!(applied().await.unwrap().pending(), 1, "a later commit is pending");
+        sh(&fx.main, "git reset -q --hard HEAD~2").await;
+        assert_eq!(
+            applied().await.unwrap().pending(),
+            3,
+            "the target lost the landing"
+        );
+        // A landing whose commits are gone altogether (garbage-collected) is ignored too.
+        let record = fx.main.join(".git").join(LANDED_FILE);
+        let gone = format!("{} {}\n", "1".repeat(40), "2".repeat(40));
+        let text = std::fs::read_to_string(&record).unwrap() + &gone;
+        std::fs::write(&record, text).unwrap();
+        sh(&fx.main, "git reset -q --hard ORIG_HEAD").await;
+        let found = applied().await.unwrap();
+        assert_eq!((found.pending(), found.applied), (1, 2), "{found:?}");
     }
 
     #[tokio::test]

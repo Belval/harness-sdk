@@ -275,7 +275,8 @@ Other text messages the selected agent, or starts a root agent when there is non
     `3 not on main, 5 behind, merges cleanly` or `… conflicts in README.md, src/tui/view.rs`.
     The trial merge is `git merge-tree --write-tree` (git ≥ 2.38), which touches no checkout or
     ref, so the integrator sees conflicts before cherry-picking. Commits the base already has a
-    copy of (cherry-picked or rebased, same patch id per `git cherry`) are counted:
+    copy of (cherry-picked or rebased, same patch id per `git cherry`) or that `land` landed
+    (recorded in `<git common dir>/swarm-landed`, since a rebase can change patch ids) are counted:
     `3 not on main (all applied), 4 behind` means nothing is left to integrate. `list_agents`
     shows the same, fresh on every call.
   - The branch compared is the one checked out in the agent's cwd (its given `swarm/<run>/<id>`
@@ -359,7 +360,8 @@ messages you.
     is kept.
   - Its branch `swarm/<run>/<agent>` is deleted once no worktree has it checked out and the base
     `/status` uses has every commit on it: reachable (`merged`) or as a patch-equivalent copy
-    (`all applied`, per `git cherry`; a merge commit never counts as applied). Otherwise it stays,
+    (`all applied`, per `git cherry` or the landing record; a merge commit never counts as
+    applied unless landed). Otherwise it stays,
     e.g. `kept branch swarm/r/a3 (2 commits not on main)`, until a later pass (resume, `/gc`,
     `--gc`) finds it merged. The ref is deleted only if it still points at the commit checked.
   - `cancel_agent` waits up to 10 s for this and its result says what was removed and kept.
