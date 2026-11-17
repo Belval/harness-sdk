@@ -875,6 +875,47 @@ async fn an_agent_cannot_message_itself() {
 }
 
 #[tokio::test]
+async fn a_user_message_ends_a_wait_filtered_to_another_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, _events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
+                    tool_call("wait", "w1", json!({"from": ["a2"], "timeout_seconds": 600})),
+                    say("heard you"),
+                ],
+            ),
+            (
+                "a2",
+                vec![tool_call(
+                    "wait",
+                    "w1",
+                    json!({"from": ["parent"], "timeout_seconds": 600}),
+                )],
+            ),
+        ],
+        dir.path(),
+    );
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "go".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let a1 = scripts.lock()["a1"].clone();
+    eventually("a1 waits on a2", || a1.calls().len() >= 2).await;
+    swarm.send(USER, "a1", "stop waiting").unwrap();
+    eventually("the wait ends", || a1.calls().len() >= 3).await;
+    assert!(sent_text(&a1, 2).contains("stop waiting"));
+}
+
+#[tokio::test]
 async fn an_agent_cancelled_in_wait_stops_and_its_child_stays_quiet() {
     let dir = tempfile::tempdir().unwrap();
     let (swarm, mut events, scripts) = swarm_with(

@@ -215,6 +215,9 @@ pub(super) fn has_matching_mail(node: &Node, filter: &[String]) -> bool {
     let mailbox = node.mailbox.lock();
     match filter.is_empty() {
         true => !mailbox.is_empty(),
-        false => mailbox.iter().any(|mail| filter.contains(&mail.from)),
+        // The user is never filtered out: their message ends any wait.
+        false => mailbox
+            .iter()
+            .any(|mail| mail.from == USER || filter.contains(&mail.from)),
     }
 }

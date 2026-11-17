@@ -110,7 +110,7 @@ struct SendInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct WaitInput {
-    /// Only return for mail from these (agents, or `jobs`); default anyone.
+    /// Only return for mail from these (agents, or `jobs`) or the user; default anyone.
     #[serde(default)]
     from: Vec<String>,
     /// Default 600, max 3600.
