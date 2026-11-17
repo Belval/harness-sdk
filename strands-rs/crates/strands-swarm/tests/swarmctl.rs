@@ -276,6 +276,37 @@ fn a_binary_installed_long_ago_but_never_started_is_on_trial_when_it_first_runs(
 }
 
 #[test]
+fn boot_refuses_a_run_that_does_not_exist() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A fake crontab, so that no test ever edits the real one.
+    let shims = tmp.path().join("shims");
+    std::fs::create_dir_all(&shims).unwrap();
+    let crontab = shims.join("crontab");
+    let body = format!(
+        "#!/bin/sh\necho \"$@\" >> '{}/crontab.calls'\n",
+        tmp.path().display()
+    );
+    std::fs::write(&crontab, body).unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&crontab)
+        .status()
+        .unwrap();
+    let path = format!("{}:{}", shims.display(), std::env::var("PATH").unwrap());
+
+    let output = std::process::Command::new("bash")
+        .args([SCRIPT, "boot", "nosuch"])
+        .env("XDG_STATE_HOME", tmp.path())
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no run nosuch"));
+    assert!(!tmp.path().join("crontab.calls").exists());
+}
+
+#[test]
 fn a_reload_starts_the_new_binary_s_trial_even_if_it_was_installed_long_ago() {
     let run = Run::new();
     let crasher = run.dir().join("crasher");

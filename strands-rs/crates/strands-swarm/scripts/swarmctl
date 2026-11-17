@@ -220,6 +220,7 @@ crontab_without() { { crontab -l 2>/dev/null || true; } | { grep -vF "$1" || tru
 boot_line() { echo "@reboot ${XDG_STATE_HOME:+XDG_STATE_HOME=$XDG_STATE_HOME }$SELF resume $1"; }
 
 boot() {
+  [[ -x "$(run_dir "$1")/bin/current" ]] || die "no run $1 to resume; use swarmctl start"
   local line; line="$(boot_line "$1")"
   { crontab_without "$line"; echo "$line"; } | crontab -
   echo "run $1 will resume after reboot"
