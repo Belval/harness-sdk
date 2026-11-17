@@ -72,13 +72,7 @@ impl Areas {
                 width: self.tree.width.saturating_sub(1),
                 ..self.tree
             },
-            // Top border; one column of left padding.
-            Pane::Log => Rect {
-                x: self.log.x + 1,
-                y: self.log.y + 1,
-                width: self.log.width.saturating_sub(1),
-                height: self.log.height.saturating_sub(1),
-            },
+            Pane::Log => log_inner(self.log),
         }
     }
 
@@ -207,7 +201,7 @@ fn tree_width(app: &App, total: u16) -> u16 {
     let fit = app
         .tree()
         .into_iter()
-        .map(|(depth, view)| agent_item(depth, view, 0).lines[0].width() + if view.unseen { 1 } else { 3 })
+        .map(|(depth, view)| agent_item(depth, view, 0).width() + if view.unseen { 1 } else { 3 })
         .max()
         .unwrap_or(0)
         .max(MIN_TREE);
@@ -223,7 +217,7 @@ fn tree_width(app: &App, total: u16) -> u16 {
 
 /// One line per agent: `⠋ parser opus-5-5 1.2M/34k 34% a2 ⎇ •`. The list clips it at its
 /// width, so the trailing id goes first on narrow terminals.
-fn agent_item(depth: usize, view: &AgentView, tick: usize) -> Text<'static> {
+fn agent_item(depth: usize, view: &AgentView, tick: usize) -> Line<'static> {
     let (glyph, color) = status_glyph(&view.status, tick);
     let mut spans = vec![
         Span::raw("  ".repeat(depth)),
@@ -249,15 +243,14 @@ fn agent_item(depth: usize, view: &AgentView, tick: usize) -> Text<'static> {
     if view.unseen {
         spans.push(Span::styled(" •", Style::new().fg(Color::Yellow)));
     }
-    Text::from(Line::from(spans))
+    Line::from(spans)
 }
 
 /// Clip an agent row to `width` columns, keeping its trailing unseen marker (the last span) in
 /// view: it is what tells the user to look, so it must not fall off a narrow tree.
-fn fit_row(row: Text<'static>, width: usize, unseen: bool) -> Text<'static> {
-    let mut line = row.lines.into_iter().next().unwrap_or_default();
+fn fit_row(mut line: Line<'static>, width: usize, unseen: bool) -> Line<'static> {
     if !unseen || line.width() <= width {
-        return Text::from(line);
+        return line;
     }
     let marker = line.spans.pop().unwrap_or_default();
     let mut room = width.saturating_sub(marker.width());
@@ -273,7 +266,7 @@ fn fit_row(row: Text<'static>, width: usize, unseen: bool) -> Text<'static> {
         spans.push(span);
     }
     spans.push(marker);
-    Text::from(Line::from(spans))
+    Line::from(spans)
 }
 
 /// The share of `input` read from the prompt cache, e.g. `97%`; `None` without input.
@@ -395,10 +388,7 @@ fn draw_thumbnails(
     let mut starts = Vec::with_capacity(lines.len());
     for line in lines {
         starts.push(row);
-        row += Paragraph::new(line.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(inner.width)
-            .max(1);
+        row += wrapped_rows(line, inner.width);
     }
     for (line, id) in thumbnails {
         let Some(protocol) = app.images.get(*id) else {
@@ -481,6 +471,14 @@ fn log_offset(app: &App, rows: usize, height: u16) -> u16 {
     total.saturating_sub(height).saturating_sub(app.scroll)
 }
 
+/// Rows `line` takes when wrapped at `width` (an empty line takes one).
+fn wrapped_rows(line: &Line<'static>, width: u16) -> usize {
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
+}
+
 /// For each row of the log's text area `inner`: whether it continues the row above (a wrapped
 /// line), so a copied selection can rejoin it.
 pub fn log_continuations(app: &App, inner: Rect) -> Vec<bool> {
@@ -488,12 +486,9 @@ pub fn log_continuations(app: &App, inner: Rect) -> Vec<bool> {
         return Vec::new();
     };
     let mut rows = Vec::new();
-    for line in log_lines(view, app, 0).0 {
-        let wrapped = Paragraph::new(line)
-            .wrap(Wrap { trim: false })
-            .line_count(inner.width);
+    for line in &log_lines(view, app, 0).0 {
         rows.push(false);
-        rows.extend(std::iter::repeat_n(true, wrapped.max(1) - 1));
+        rows.extend(std::iter::repeat_n(true, wrapped_rows(line, inner.width) - 1));
     }
     let offset = usize::from(log_offset(app, rows.len(), inner.height));
     rows.into_iter()
@@ -544,12 +539,7 @@ fn draw_keys(frame: &mut Frame, body: Rect) {
     let longest = lines.iter().map(Line::width).max().unwrap_or(0);
     let width = to_u16(longest + 2).min(body.width);
     let height = (KEYS.len() as u16 + 2).min(body.height);
-    let area = Rect::new(
-        body.x + (body.width - width) / 2,
-        body.y + (body.height - height) / 2,
-        width,
-        height,
-    );
+    let area = centered(body, width, height);
     let popup =
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" keys · esc close "));
     frame.render_widget(Clear, area);
@@ -571,10 +561,10 @@ fn popup(app: &App, body: Rect) -> Option<Paragraph<'static>> {
                 None => Line::from(line).bold(),
             })
             .collect();
-        // Prose wraps; the cost table does not, so its columns stay aligned.
         (" status · ↑↓ scroll · any key close ", lines, true)
     } else {
-        // The first and last lines are prose (intro, footnote): those wrap by word.
+        // The first and last lines are prose (intro, footnote): those wrap by word; the table
+        // between does not wrap, so its columns stay aligned.
         let width = usize::from(popup_width(body).saturating_sub(2));
         let lines = app.cost.as_ref()?.lines();
         let last = lines.len().saturating_sub(1);
@@ -603,9 +593,17 @@ fn popup_area(body: Rect, popup: &Paragraph) -> (Rect, u16) {
     // `line_count` takes the inner width and counts both borders.
     let rows = to_u16(popup.line_count(width.saturating_sub(2)));
     let height = rows.min(body.height);
-    let x = body.x + (body.width - width) / 2;
-    let y = body.y + (body.height - height) / 2;
-    (Rect::new(x, y, width, height), rows)
+    (centered(body, width, height), rows)
+}
+
+/// A `width` × `height` rect in the middle of `body` (which it must fit in).
+fn centered(body: Rect, width: u16, height: u16) -> Rect {
+    Rect::new(
+        body.x + (body.width - width) / 2,
+        body.y + (body.height - height) / 2,
+        width,
+        height,
+    )
 }
 
 fn popup_width(body: Rect) -> u16 {
@@ -1302,15 +1300,8 @@ mod tests {
             context: Some(0.34),
         });
         let view = &app.agents["a2"];
-        let item = agent_item(0, view, 0);
-        assert_eq!(item.lines.len(), 1);
-        assert!(
-            item.lines[0]
-                .to_string()
-                .contains("parser opus-5-5 1.2M/34.0k 34% a2"),
-            "{}",
-            item.lines[0]
-        );
+        let item = agent_item(0, view, 0).to_string();
+        assert!(item.contains("parser opus-5-5 1.2M/34.0k 34% a2"), "{item}");
         assert_eq!(
             log_title(view),
             " parser (a2) · starting · opus-5-5 · 1.2M/34.0k tok (97% cached) · 34% · …/a2/repo "
