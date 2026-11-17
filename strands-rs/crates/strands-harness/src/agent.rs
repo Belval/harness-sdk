@@ -12,6 +12,7 @@ use strands_agents::memory::{MemoryManager, MemoryStoreRef};
 use strands_agents::models::Model;
 use strands_agents::plugins::vended::{AgentSkills, SkillSource};
 use strands_agents::plugins::Plugin;
+use strands_agents::retry::{DefaultModelRetryStrategy, DefaultModelRetryStrategyOptions};
 use strands_agents::sandbox::SandboxRef;
 use strands_agents::session::{FileStorage, SaveLatestStrategy, SessionManager, SessionManagerOptions};
 use strands_agents::storage::LocalFileStorage;
@@ -182,6 +183,9 @@ pub struct HarnessAgentOptions {
     pub cache_ttl: Option<String>,
     /// Context management; [`ContextManagerOption::Auto`] by default.
     pub context_manager: ContextManagerOption,
+    /// Model-call retry policy; `None` keeps the SDK default (throttling only, 6 attempts).
+    /// Rust-only.
+    pub retry: Option<DefaultModelRetryStrategyOptions>,
     /// Session persistence; on by default.
     pub session: SessionOption,
     /// Skills; on by default (only when `./.agent/skills` exists).
@@ -296,6 +300,9 @@ pub async fn create_harness(options: HarnessAgentOptions) -> Result<Agent> {
         .plugins(plugins)
         .context_manager(options.context_manager.clone())
         .interventions(interventions);
+    if let Some(retry) = options.retry.clone() {
+        builder = builder.retry_strategy(DefaultModelRetryStrategy::new(retry)?);
+    }
     if let Some(config) = crate::telemetry::setup_telemetry() {
         builder = builder.telemetry(config);
     }
@@ -786,6 +793,36 @@ mod tests {
             names.iter().any(|name| name == "todo_write"),
             "the todos plugin is registered: {names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_retry_policy_replaces_the_default_one() {
+        use strands_agents::retry::{ConstantBackoff, ConstantBackoffOptions};
+        use strands_agents::test_support::MockResponse;
+        use strands_agents::types::Message;
+        let dir = tempfile::tempdir().unwrap();
+        let fail = || MockResponse::Error(strands_agents::Error::other("503"));
+        let model = MockMessageModel::shared(vec![
+            fail(),
+            fail(),
+            MockResponse::message(Message::assistant("ok")),
+        ]);
+        let retry = DefaultModelRetryStrategyOptions {
+            max_attempts: 3,
+            retryable: Arc::new(|_| true),
+            backoff: Arc::new(ConstantBackoff::new(ConstantBackoffOptions { delay_ms: 0.0 })),
+            ..Default::default()
+        };
+        let agent = create_harness(HarnessAgentOptions {
+            model: Some(ModelOption::Instance(model.clone())),
+            retry: Some(retry),
+            ..options(dir.path())
+        })
+        .await
+        .unwrap();
+        let result = agent.invoke("go").await.unwrap();
+        assert_eq!(result.last_message.text(), "ok");
+        assert_eq!(model.call_count(), 3, "both failures were retried");
     }
 
     #[tokio::test]
