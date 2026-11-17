@@ -237,19 +237,9 @@ pub fn human(bytes: u64) -> String {
 }
 
 async fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = crate::worktree::git_in(cwd)
-        .args(args)
-        .output()
+    crate::worktree::git(cwd, args)
         .await
-        .map_err(|error| format!("git: {error}"))?;
-    match output.status.success() {
-        true => Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned()),
-        false => Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-    }
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -257,22 +247,8 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn std_git(dir: &Path) -> std::process::Command {
-        let mut command = std::process::Command::new("git");
-        command.arg("-C").arg(dir);
-        for var in crate::worktree::GIT_LOCATION_VARS {
-            command.env_remove(var);
-        }
-        command
-    }
-
     fn run(dir: &Path, args: &[&str]) {
-        let status = std_git(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?}");
+        crate::worktree::test_git(dir, args);
     }
 
     /// A repo at `<tmp>/repo` with a worktree for agent `a2` of run `r1`, on its own branch.
@@ -305,12 +281,14 @@ mod tests {
     }
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {
-        std_git(repo)
-            .args(["rev-parse", "--verify", "--quiet", branch])
-            .stdout(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+        let mut git = std::process::Command::new("git");
+        git.arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--verify", "--quiet", branch]);
+        for var in crate::worktree::GIT_LOCATION_VARS {
+            git.env_remove(var);
+        }
+        git.output().unwrap().status.success()
     }
 
     #[test]

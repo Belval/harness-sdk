@@ -916,31 +916,43 @@ fn git_in(dir: &Path) -> std::process::Command {
     command
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let status = git_in(dir).args(args).status().unwrap();
-    assert!(status.success(), "git {args:?}");
+/// `git <args>` in `dir` with a throwaway identity: its trimmed stdout; panics when git fails.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let ident = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "commit.gpgsign=false",
+    ];
+    let output = git_in(dir).args(ident).args(args).output().unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// A repo on `main` at `<dir>/repo` with `files` in one commit and a committer identity set
+/// (for the swarm's own git calls).
+fn init_repo(dir: &Path, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for (path, text) in files {
+        let path = repo.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    repo
 }
 
 #[tokio::test]
 async fn a_worktree_agent_gets_its_own_checkout_and_branch() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(repo.join("sub")).unwrap();
-    std::fs::write(repo.join("sub/file.txt"), "x").unwrap();
-    git(&repo, &["init", "-q"]);
-    git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "add", "."]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "init",
-        ],
-    );
+    let repo = init_repo(dir.path(), &[("sub/file.txt", "x")]);
 
     let (swarm, _events, _scripts) = swarm_with(vec![("a1", vec![say("ok")])], &repo.join("sub"));
     let id = swarm
@@ -971,23 +983,7 @@ async fn a_worktree_agent_gets_its_own_checkout_and_branch() {
 #[tokio::test]
 async fn worktree_agents_get_a_private_cargo_target_dir_that_their_children_share() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q"]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "init",
-        ],
-    );
+    let repo = init_repo(dir.path(), &[]);
     let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
     for id in ["a1", "a2"] {
         map.lock()
@@ -1760,28 +1756,6 @@ async fn a_spent_token_budget_stops_model_calls_until_it_is_raised() {
     assert_eq!(swarm.snapshot().budget_tokens, Some(1_000));
 }
 
-/// A repo with one commit at `<dir>/repo`, ignoring `target/`.
-fn init_repo(dir: &Path) -> std::path::PathBuf {
-    let repo = dir.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
-    git(&repo, &["init", "-q"]);
-    git(&repo, &["add", "."]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "init",
-        ],
-    );
-    repo
-}
-
 async fn eventually(what: &str, check: impl Fn() -> bool) {
     for _ in 0..200 {
         if check() {
@@ -1804,7 +1778,7 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 #[tokio::test]
 async fn cancelling_a_worktree_agent_reclaims_its_target_dir_and_clean_worktree() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = init_repo(dir.path());
+    let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);
     let scripts = scripts_of(vec![("a1", vec![say("ok")]), ("a2", vec![say("ok")])]);
     let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
     config.cargo_target_dir = Some(dir.path().join("target"));
@@ -1874,7 +1848,7 @@ async fn cancelling_a_worktree_agent_reclaims_its_target_dir_and_clean_worktree(
 #[tokio::test]
 async fn a_dirty_worktree_is_kept_until_gc_finds_it_clean_and_resume_collects_cancelled_agents() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = init_repo(dir.path());
+    let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);
     let scripts = scripts_of(vec![("a1", vec![say("ok")])]);
     let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
     config.cargo_target_dir = Some(dir.path().join("target"));
@@ -1904,18 +1878,7 @@ async fn a_dirty_worktree_is_kept_until_gc_finds_it_clean_and_resume_collects_ca
 
     // Committed later: resuming the run reclaims the worktree of the already-cancelled agent.
     git(&checkout, &["add", "."]);
-    git(
-        &checkout,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "wip",
-        ],
-    );
+    git(&checkout, &["commit", "-qm", "wip"]);
     let saved = strands_swarm::state::load(&dir.path().join("run"))
         .await
         .unwrap()
@@ -2517,20 +2480,10 @@ async fn a_reload_now_does_not_wait() {
 #[tokio::test]
 async fn resuming_under_another_commit_reports_what_changed() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = init_repo(dir.path());
+    let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);
     let commit = |subject: &str| {
-        let author = ["-c", "user.name=t", "-c", "user.email=t@t"];
-        git(
-            &repo,
-            &[&author[..], &["commit", "-q", "--allow-empty", "-m", subject]].concat(),
-        );
-        let head = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        String::from_utf8(head.stdout).unwrap().trim().to_owned()
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", subject]);
+        git(&repo, &["rev-parse", "HEAD"])
     };
     let old = commit("feat: before");
     let new = commit("fix: after");
@@ -2811,16 +2764,12 @@ async fn agents_schedule_list_and_cancel_through_their_tools() {
 #[tokio::test]
 async fn status_reports_todos_and_branch_commits_without_a_model_call() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
+    let repo = init_repo(dir.path(), &[("init.txt", "init")]);
     let commit = |dir: &Path, message: &str| {
         std::fs::write(dir.join(format!("{message}.txt")), message).unwrap();
         git(dir, &["add", "."]);
-        let who = ["-c", "user.name=t", "-c", "user.email=t@t"];
-        git(dir, &[&who[..], &["commit", "-qm", message]].concat());
+        git(dir, &["commit", "-qm", message]);
     };
-    git(&repo, &["init", "-q", "-b", "main"]);
-    commit(&repo, "init");
 
     let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
     for id in ["a1", "a2"] {
@@ -3030,14 +2979,7 @@ async fn cancelling_an_agent_kills_its_background_jobs() {
 #[tokio::test]
 async fn land_rebases_checks_and_fast_forwards_the_roots_branch_as_a_job() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.name", "t"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    std::fs::write(repo.join("a.txt"), "a").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-qm", "init"]);
+    let repo = init_repo(dir.path(), &[("a.txt", "a")]);
 
     let scripts = scripts_of(vec![
         ("a1", vec![say("lead")]),
@@ -3093,25 +3035,17 @@ async fn land_rebases_checks_and_fast_forwards_the_roots_branch_as_a_job() {
         repo.join("feature.txt").is_file(),
         "the root's checkout was fast-forwarded"
     );
-    let log = git_in(&repo)
-        .args(["log", "--format=%s", "main"])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&log.stdout), "feature\nother\ninit\n");
+    assert_eq!(
+        git(&repo, &["log", "--format=%s", "main"]),
+        "feature\nother\ninit"
+    );
     swarm.shutdown().await;
 }
 
 #[tokio::test]
 async fn land_refuses_other_targets_and_branches_that_are_not_the_callers() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.name", "t"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    std::fs::write(repo.join("a.txt"), "a").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-qm", "init"]);
+    let repo = init_repo(dir.path(), &[("a.txt", "a")]);
     git(&repo, &["branch", "release-1"]);
     git(&repo, &["branch", "precious"]);
 

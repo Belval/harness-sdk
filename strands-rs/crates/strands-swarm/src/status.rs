@@ -145,19 +145,7 @@ pub async fn unmerged(dir: &Path, base: &str, branch: &str) -> Option<Vec<String
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    crate::worktree::git(dir, args).await.ok()
 }
 
 #[cfg(test)]

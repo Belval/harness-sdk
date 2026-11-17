@@ -39,21 +39,11 @@ pub fn in_flight(messages: &[Message]) -> Vec<ToolUseBlock> {
 /// `git status --short --branch` of `cwd`, capped; `None` outside a repository or on failure.
 pub async fn git_status(cwd: &Path) -> Option<String> {
     // No optional locks: a read must not refresh the index of a checkout another process uses.
-    let run = tokio::process::Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(cwd)
-        .args(["status", "--short", "--branch"])
-        .stdin(std::process::Stdio::null())
-        .output();
-    let output = tokio::time::timeout(Duration::from_secs(10), run)
+    let run = crate::worktree::git(cwd, &["--no-optional-locks", "status", "--short", "--branch"]);
+    let text = tokio::time::timeout(Duration::from_secs(10), run)
         .await
         .ok()?
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = text.lines().collect();
     let mut shown = lines[..lines.len().min(STATUS_LINES)].join("\n");
     if lines.len() > STATUS_LINES {
@@ -204,17 +194,7 @@ mod tests {
     async fn git_status_reports_the_branch_and_changes_and_nothing_outside_a_repo() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(git_status(dir.path()).await, None);
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
-                .args(args)
-                .output()
-                .unwrap()
-                .status;
-            assert!(status.success(), "git {args:?}");
-        };
-        git(&["init", "-q", "-b", "main"]);
+        crate::worktree::test_git(dir.path(), &["init", "-q", "-b", "main"]);
         std::fs::write(dir.path().join("new.txt"), "x").unwrap();
         let status = git_status(dir.path()).await.unwrap();
         assert!(status.starts_with("## ") && status.contains("main"), "{status}");

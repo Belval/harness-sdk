@@ -16,20 +16,9 @@ pub const MAX_CHANGES: usize = 30;
 pub async fn changes(repo: &Path, from: &str, to: &str) -> Vec<String> {
     let range = format!("{from}..{to}");
     let max = format!("--max-count={MAX_CHANGES}");
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["log", "--format=%h %s", &max, &range, "--"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await;
-    match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::to_owned)
-            .collect(),
-        _ => Vec::new(),
-    }
+    let log = ["log", "--format=%h %s", &max, &range, "--"];
+    let output = crate::worktree::git(repo, &log).await.unwrap_or_default();
+    output.lines().map(str::to_owned).collect()
 }
 
 /// One line for the TUI: `reloaded 1a2b3c4 → 5d6e7f8: 2 commits: feat: … · fix: …`.
@@ -55,24 +44,7 @@ pub fn notice(from: &str, to: &str, changes: &[String]) -> String {
 mod tests {
     use super::*;
 
-    fn git(repo: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
+    use crate::worktree::test_git as git;
 
     #[tokio::test]
     async fn changes_lists_the_commits_between_two_builds_newest_first() {

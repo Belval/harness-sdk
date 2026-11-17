@@ -64,10 +64,10 @@ pub const GIT_LOCATION_VARS: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
 ];
 
-/// `git -C <dir>`, blind to [`GIT_LOCATION_VARS`].
+/// `git -C <dir>` with no stdin, blind to [`GIT_LOCATION_VARS`].
 pub(crate) fn git_in(dir: &Path) -> Command {
     let mut command = Command::new("git");
-    command.arg("-C").arg(dir);
+    command.arg("-C").arg(dir).stdin(std::process::Stdio::null());
     for var in GIT_LOCATION_VARS {
         command.env_remove(var);
     }
@@ -90,6 +90,28 @@ pub(crate) async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Test fixture: `git <args>` in `dir`, blocking, with a throwaway identity and no signing; its
+/// trimmed stdout. Panics when git fails.
+#[cfg(test)]
+pub(crate) fn test_git(dir: &Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(dir);
+    for var in GIT_LOCATION_VARS {
+        command.env_remove(var);
+    }
+    let ident = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "commit.gpgsign=false",
+    ];
+    let output = command.args(ident).args(args).output().unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 #[cfg(test)]
@@ -127,14 +149,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let ident = ["-c", "user.name=t", "-c", "user.email=t@t"];
-        git(&repo, &["init", "-q"]).await.unwrap();
-        git(
-            &repo,
-            &[&ident[..], &["commit", "-q", "--allow-empty", "-m", "init"]].concat(),
-        )
-        .await
-        .unwrap();
+        test_git(&repo, &["init", "-q"]);
+        test_git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
         let worktree = create(&repo, "run", "a2").await.unwrap();
         let cwd = worktree.cwd.to_string_lossy().into_owned();
         assert!(cwd.ends_with("repo.swarm/run/a2"), "{cwd}");
