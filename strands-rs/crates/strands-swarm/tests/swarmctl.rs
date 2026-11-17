@@ -254,6 +254,28 @@ stty raw -echo; kill -15 $$"#;
 }
 
 #[test]
+fn a_binary_installed_long_ago_but_never_started_is_on_trial_when_it_first_runs() {
+    let run = Run::new();
+    // A stop came between an idle reload's install and the restart; the run resumes a day later.
+    run.binary(
+        &run.bin("current"),
+        r#"echo new >> "$RUN/calls"; exit 3"#,
+        "1 day ago",
+    );
+    std::fs::write(run.bin("started"), "1 1\n").unwrap();
+    run.binary(
+        &run.bin("previous"),
+        r#"echo old >> "$RUN/calls"; touch "$RUN/stop""#,
+        "2 days ago",
+    );
+
+    run.supervise();
+
+    assert_eq!(run.read("calls"), "new\nold\n");
+    assert!(run.read("supervisor.notice").contains("rolled back"));
+}
+
+#[test]
 fn a_reload_starts_the_new_binary_s_trial_even_if_it_was_installed_long_ago() {
     let run = Run::new();
     let crasher = run.dir().join("crasher");

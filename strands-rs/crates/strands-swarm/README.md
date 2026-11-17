@@ -448,8 +448,9 @@ supervisor's notes to `supervisor.log`, each rotated to `<log>.1` at 8 MB (`SWAR
 
 - A swarm that hangs exits instead, so the supervisor sees it: 70 when a deadlock is detected, 71
   when it is not up (first TUI frame drawn, or headless running) within 180 s.
-- A new binary is on trial for 10 minutes (`SWARMCTL_TRIAL_WINDOW`) from its reload (or
-  `swarmctl start`). If it fails (non-zero exit, a signal, 70, 71) on trial, the supervisor puts
+- A new binary is on trial for 10 minutes (`SWARMCTL_TRIAL_WINDOW`) from when it first runs
+  after its reload or `swarmctl start` (`bin/started` names the binary started last), even if a
+  stop came in between. If it fails (non-zero exit, a signal, 70, 71) on trial, the supervisor puts
   the previous binary back and keeps the failed one as `bin/failed`. The previous binary is the
   one that ran: a reload that supersedes a pending one replaces only `bin/current`. A binary that
   ran longer is restarted, never rolled back, and a rolled-back one is not rolled back again.

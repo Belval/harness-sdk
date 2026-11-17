@@ -119,8 +119,17 @@ supervise() {
   # Appended to supervisor.notice, for the swarm to mail its root agent when it next starts.
   notice() { { echo "$(date -Is) $*"; echo "Last lines of $dir/stderr.log:"; tail -n 8 "$dir/stderr.log" 2>/dev/null || true; echo; } >> "$dir/supervisor.notice"; }
   while [[ ! -f "$dir/stop" ]]; do
-    local started installed code ooms
+    local started installed code ooms id
     started=$(date +%s)
+    # A binary's trial starts when it first runs, not when it was installed: an idle reload
+    # waits, and a stop can come in between. bin/started names the binary started last; without
+    # one (an older supervisor's run) the install time stands.
+    id=$(stat -c '%i %Y' "$dir/bin/current" 2>/dev/null || true)
+    if [[ -f "$dir/bin/started" && "$id" != "$(cat "$dir/bin/started")" ]]; then
+      touch "$dir/bin/current" 2>/dev/null || true
+      id=$(stat -c '%i %Y' "$dir/bin/current" 2>/dev/null || true)
+    fi
+    echo "$id" > "$dir/bin/started"
     installed=$(stat -c %Y "$dir/bin/current" 2>/dev/null || echo 0)
     ooms=$(oom_kills)
     # stderr goes through capped_log (fd 3 keeps stdout on the terminal); the pipeline returns
@@ -134,8 +143,6 @@ supervise() {
     local now elapsed why delay
     now=$(date +%s); elapsed=$((now - started))
     if [[ $code -eq $RELOAD_EXIT ]]; then
-      # The new binary's trial starts now, not when it was installed (an idle reload waits).
-      touch "$dir/bin/current" 2>/dev/null || true
       failures=0
       note "reload"
       continue
