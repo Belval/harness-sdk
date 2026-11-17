@@ -471,8 +471,23 @@ async fn spawn_tool(swarm: Swarm, me: String, input: SpawnInput, _ctx: ToolConte
 async fn send_tool(swarm: Swarm, me: String, input: SendInput, _ctx: ToolContext) -> Result<String> {
     let to = resolve(&swarm, &me, &input.to)?;
     swarm.send(&me, &to, input.message)?;
-    Ok(format!("Sent to {}.", swarm.label(&to)))
+    let sent = format!("Sent to {}.", swarm.label(&to));
+    // An agent that reports to its parent mid-turn tends to end the turn by repeating the
+    // report, which costs the parent a turn (and often the user a duplicate notification).
+    let parent = swarm.agent(&me).map(|info| info.parent);
+    Ok(match parent {
+        Some(parent) if parent == to && parent != USER => {
+            format!("{sent} {}", REPLY_ALSO_REACHES_PARENT)
+        }
+        _ => sent,
+    })
 }
+
+/// Appended to a `send_message` result when it went to the sender's (agent) parent.
+const REPLY_ALSO_REACHES_PARENT: &str = concat!(
+    "Your final reply when this turn ends reaches them too: put only what is new since this ",
+    "message in it, or end with just `[silent]` if nothing is."
+);
 
 async fn wait_tool(swarm: Swarm, me: String, input: WaitInput, ctx: ToolContext) -> Result<String> {
     let seconds = input

@@ -64,7 +64,9 @@ points to `--headless` before it starts or resumes anything.
   the swarm prints and a name as the spawner wrote it (`Fix-P12` for `fix-p12`).
 - **Replies.** Each agent's final reply per turn goes to its parent. Mail that arrives mid-turn is
   appended to the next tool result. A reply that is empty or just `[silent]` (e.g. a scheduled poll
-  that found nothing) reaches no agent parent; the user's root always replies.
+  that found nothing) reaches no agent parent; the user's root always replies. A `send_message` to
+  an agent's parent says so in its result, as agents that report mid-turn tend to repeat the report
+  as their final reply, which costs the parent a turn.
 - **Goals.** A `goal` (`spawn_agent`, `/goal`, `--goal`) puts a judge in the loop that sends the
   agent back to work until the goal is met. It runs after every turn and sees the goal, the task
   and the latest ~40k characters of the conversation.

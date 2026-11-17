@@ -126,6 +126,51 @@ async fn a_spawned_agents_reply_reaches_the_parent_through_wait() {
     assert!(sent_text(&child, 0).contains("count to 3"));
 }
 
+#[tokio::test]
+async fn a_message_to_the_parent_says_the_final_reply_reaches_it_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", json!({"task": "report", "name": "reporter"})),
+                    tool_call("send_message", "t2", json!({"to": "user", "message": "started"})),
+                    tool_call("wait", "t3", json!({"from": ["a2"]})),
+                    say("done"),
+                ],
+            ),
+            (
+                "a2",
+                vec![
+                    tool_call(
+                        "send_message",
+                        "t1",
+                        json!({"to": "parent", "message": "CR is up"}),
+                    ),
+                    tool_call("send_message", "t2", json!({"to": "a1", "message": "and tested"})),
+                    say("[silent]"),
+                ],
+            ),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+
+    let child = scripts.lock()["a2"].clone();
+    for call in [1, 2] {
+        let sent = sent_text(&child, call);
+        assert!(
+            sent.contains("Sent to") && sent.contains("final reply when this turn ends reaches them too"),
+            "{sent}"
+        );
+    }
+    // A root's final reply goes to the user anyway, and `[silent]` does not apply to it.
+    let root = sent_text(&scripts.lock()["a1"].clone(), 2);
+    assert!(!root.contains("final reply"), "{root}");
+}
+
 /// Children that reply one after another: a child that waits `seconds` first, then says `text`.
 fn slow_child(seconds: u64, text: &str) -> Vec<MockResponse> {
     match seconds {
