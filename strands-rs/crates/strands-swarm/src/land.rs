@@ -357,7 +357,6 @@ pub async fn landed_sources(dir: &Path, base: &str) -> Vec<String> {
         .collect()
 }
 
-/// Run `check` with `sh` in `dir`; on failure the error carries the tail of its output.
 /// SIGKILLs the process group led by its pid when dropped, unless that was cleared: a check given
 /// up on (its landing stopped) does not run on, cargo and test binaries included.
 struct KillGroupOnDrop(Option<u32>);
@@ -365,10 +364,7 @@ struct KillGroupOnDrop(Option<u32>);
 impl Drop for KillGroupOnDrop {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", "--", &format!("-{pid}")])
-                .stderr(std::process::Stdio::null())
-                .status();
+            crate::jobs::signal_group(pid, nix::sys::signal::Signal::SIGKILL);
         }
     }
 }
@@ -395,6 +391,7 @@ pub fn stop_signal() -> impl std::future::Future<Output = String> {
     }
 }
 
+/// Run `check` with `sh` in `dir`; on failure the error carries the tail of its output.
 async fn check_passes(dir: &Path, check: &str, target_dir: &Path) -> Result<(), String> {
     let mut command = tokio::process::Command::new("sh");
     detach_from_terminal(&mut command)

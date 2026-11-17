@@ -193,7 +193,7 @@ impl Swarm {
                 agents.push(agent.id.clone());
             }
         }
-        let killed = crate::orphans::kill_cut_calls(dir, &agents).await;
+        let killed = crate::orphans::kill_cut_calls(dir, &agents);
         if killed > 0 {
             tracing::info!(
                 killed,

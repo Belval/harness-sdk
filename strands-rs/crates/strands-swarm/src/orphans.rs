@@ -15,6 +15,8 @@
 
 use std::path::Path;
 
+use nix::sys::signal::Signal;
+
 /// Environment variable set on agents' shell commands: `<run dir>#<agent id>`.
 pub const SHELL_MARKER: &str = "STRANDS_SWARM_SHELL";
 /// Left in the run directory by a clean stop; a resume takes it.
@@ -70,24 +72,15 @@ pub fn groups(marker: &str) -> Vec<u32> {
 }
 
 /// Kill the process groups of `agents`' cut shell calls ([`groups`]); returns how many.
-pub async fn kill_cut_calls(run_dir: &Path, agents: &[String]) -> usize {
-    let groups: Vec<String> = agents
+pub fn kill_cut_calls(run_dir: &Path, agents: &[String]) -> usize {
+    let groups: Vec<u32> = agents
         .iter()
         .flat_map(|agent| groups(&marker(run_dir, agent)))
-        .map(|group| format!("-{group}"))
         .collect();
-    if groups.is_empty() {
-        return 0;
+    for group in &groups {
+        // It may have ended since the scan; it is gone either way.
+        crate::jobs::signal_group(*group, Signal::SIGKILL);
     }
-    let mut kill = tokio::process::Command::new("kill");
-    kill.arg("-KILL")
-        .arg("--")
-        .args(&groups)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // Some may have ended since the scan; the rest are gone either way.
-    let _ = kill.status().await;
     groups.len()
 }
 
@@ -163,7 +156,7 @@ mod tests {
         let mut other_run = shell_call(&dir.path().join("other"), "a2", "sleep 30; true");
         assert_eq!(groups(&marker(&run, "a2")), [cut.id().unwrap()]);
 
-        assert_eq!(kill_cut_calls(&run, &["a2".to_owned()]).await, 1);
+        assert_eq!(kill_cut_calls(&run, &["a2".to_owned()]), 1);
         assert!(!cut.wait().await.unwrap().success());
         assert!(alive(left), "a process left on purpose runs on");
         for child in [&mut other_agent, &mut other_run] {
@@ -174,6 +167,6 @@ mod tests {
             child.kill().await.unwrap();
         }
         let _ = std::process::Command::new("kill").arg(left.to_string()).status();
-        assert_eq!(kill_cut_calls(&run, &["a2".to_owned()]).await, 0);
+        assert_eq!(kill_cut_calls(&run, &["a2".to_owned()]), 0);
     }
 }

@@ -9,8 +9,10 @@
 use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use nix::sys::signal::Signal;
+use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use strands_agents::sandbox::detach_from_terminal;
 use strands_agents::{Error, Result};
@@ -307,7 +309,7 @@ impl Jobs {
             }
             if job.state != JobState::Running {
                 ended.push(job);
-            } else if check_alive && !alive(job.meta.pid).await {
+            } else if check_alive && !alive(job.meta.pid) {
                 // The wrapper may have written its exit code just before it went.
                 let exit = self.file(&job.meta.id, "exit");
                 if !tokio::fs::try_exists(&exit).await.unwrap_or(false) {
@@ -345,7 +347,7 @@ impl Jobs {
     /// Whether a job that `matches` still runs (its process alive, whatever its files say).
     pub async fn any_running(&self, matches: impl Fn(&JobMeta) -> bool) -> bool {
         for job in self.list().await {
-            if job.state == JobState::Running && matches(&job.meta) && alive(job.meta.pid).await {
+            if job.state == JobState::Running && matches(&job.meta) && alive(job.meta.pid) {
                 return true;
             }
         }
@@ -359,10 +361,7 @@ impl Jobs {
             return Ok(job);
         }
         self.mark_reported(id).await?;
-        let group = format!("-{}", job.meta.pid);
-        let _ = quiet(tokio::process::Command::new("kill").args(["-TERM", "--", &group]))
-            .status()
-            .await;
+        signal_group(job.meta.pid, Signal::SIGTERM);
         tokio::fs::write(self.file(id, "exit"), "killed").await?;
         self.get(id).await
     }
@@ -440,21 +439,24 @@ async fn modified(path: &Path) -> Option<u64> {
 }
 
 /// Whether process `pid` still exists (`kill -0`).
-async fn alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let probe = quiet(tokio::process::Command::new("kill").args(["-0", &pid.to_string()])).status();
-    match tokio::time::timeout(Duration::from_secs(5), probe).await {
-        Ok(Ok(status)) => status.success(),
-        // Unsure: treat as alive rather than declare a running job lost.
-        _ => true,
-    }
+fn alive(pid: u32) -> bool {
+    positive(pid).is_some_and(|pid| nix::sys::signal::kill(pid, None).is_ok())
+}
+
+/// Send `signal` to the process group led by `leader`; whether it went to any process.
+pub(crate) fn signal_group(leader: u32, signal: Signal) -> bool {
+    positive(leader).is_some_and(|group| nix::sys::signal::killpg(group, signal).is_ok())
+}
+
+/// `pid` as a [`Pid`], if it names one process (`0` and the negative ones name groups).
+fn positive(pid: u32) -> Option<Pid> {
+    i32::try_from(pid).ok().filter(|pid| *pid > 0).map(Pid::from_raw)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     async fn until_ended(jobs: &Jobs, id: &str) -> Job {
         for _ in 0..200 {
