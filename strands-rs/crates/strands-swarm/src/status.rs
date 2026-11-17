@@ -362,9 +362,7 @@ async fn trial_merge(dir: &Path, base: &str, branch: &str) -> Merge {
 
 /// The branch checked out in `dir`; `None` when detached or not a repository.
 pub async fn current_branch(dir: &Path) -> Option<String> {
-    let out = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
-    let branch = out.trim();
-    (!branch.is_empty() && branch != "HEAD").then(|| branch.to_owned())
+    git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await
 }
 
 /// `<short hash> <subject>` of the commits on `branch` not on `base`, newest first, at most

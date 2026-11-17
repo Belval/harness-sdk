@@ -179,9 +179,7 @@ pub async fn collect(
     };
     let base = match base {
         Some(base) => Some(base.to_owned()),
-        None if repo.is_dir() => git(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .await
-            .ok(),
+        None if repo.is_dir() => crate::status::current_branch(&repo).await,
         None => None,
     };
     if root.exists() {
@@ -326,14 +324,14 @@ fn uncommitted(status: &str) -> String {
 /// already has all of (which nothing then tracks); otherwise record why it stays.
 async fn remove_worktree(root: &Path, branch: &str, base: Option<&str>, out: &mut Collected) {
     let keep = |out: &mut Collected, why: String| out.kept.push((root.to_path_buf(), why));
-    match git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await {
-        Ok(head) if head == branch => {}
-        Ok(head) => {
+    match crate::status::current_branch(root).await {
+        Some(head) if head == branch => {}
+        Some(head) => {
             if let Err(why) = integrated(root, base, &head).await {
                 return keep(out, format!("on branch {head}: {why}"));
             }
         }
-        Err(_) => return keep(out, format!("not on branch {branch}")),
+        None => return keep(out, format!("not on branch {branch}")),
     }
     match git(root, &["status", "--porcelain"]).await {
         Ok(status) if status.is_empty() => {}
