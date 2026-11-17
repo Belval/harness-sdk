@@ -132,6 +132,15 @@ struct Cli {
     /// Needs `--run`. A live swarm does this by itself; the TUI's `/gc` retries.
     #[arg(long, requires = "run")]
     gc: bool,
+    /// Print the run's estimated cost per agent (tokens priced from a built-in list-price table,
+    /// see `--prices`) and exit. Needs `--run`.
+    #[arg(long, requires = "run")]
+    cost: bool,
+    /// JSON price table (USD per 1M tokens) over the built-in one, keyed by model-id substring:
+    /// `{"opus": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}}`; cache
+    /// prices default to 0.1x and 1.25x input.
+    #[arg(long, value_name = "FILE")]
+    prices: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -184,6 +193,22 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         }
         journal.flush().await;
         println!("{}", strands_swarm::gc::summary(&collected));
+        return Ok(Exit::Quit);
+    }
+    let prices = match &cli.prices {
+        Some(path) => strands_swarm::cost::Prices::load(path)?,
+        None => strands_swarm::cost::Prices::default(),
+    };
+    let default_model = cli
+        .model
+        .clone()
+        .unwrap_or_else(|| strands_harness::defaults::DEFAULT_MODEL.to_owned());
+    if let (true, Some(name)) = (cli.cost, &cli.run) {
+        let saved = state::load(&state::run_dir(name)?)
+            .await?
+            .ok_or_else(|| format!("no saved run {name}"))?;
+        let report = strands_swarm::cost::CostReport::from_state(&saved, prices, Some(&default_model));
+        report.lines().iter().for_each(|line| println!("{line}"));
         return Ok(Exit::Quit);
     }
     if let (true, Some(name)) = (cli.journal, &cli.run) {
@@ -277,6 +302,8 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.land_into = cli.land_into;
     config.budget_tokens = cli.budget_tokens;
     config.compact_at = cli.compact_at;
+    config.prices = Arc::new(prices);
+    config.default_model = Some(default_model);
     if !cli.no_memory {
         config.memory = cli
             .memory

@@ -205,7 +205,10 @@ impl Swarm {
                 }),
                 ModelStreamEvent::Metadata {
                     usage: Some(usage), ..
-                } => self.add_usage(node, usage, true),
+                } => {
+                    let model = node.agent.get().and_then(|agent| agent.model().model_id());
+                    self.add_usage(node, usage, model, true)
+                }
                 _ => {}
             },
             AgentStreamEvent::BeforeToolCall(call) => {
@@ -249,8 +252,9 @@ impl Swarm {
     }
 
     /// Add one model call's usage (its trailing metadata) to the agent's totals and publish them;
-    /// `own_call` says whether the call carried the agent's context (not a side call's).
-    pub(super) fn add_usage(&self, node: &Node, usage: &Usage, own_call: bool) {
+    /// `own_call` says whether the call carried the agent's context (not a side call's), `model`
+    /// which model answered (for cost estimates).
+    pub(super) fn add_usage(&self, node: &Node, usage: &Usage, model: Option<String>, own_call: bool) {
         let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
         let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
         let input = usage.input_tokens + cache_read + cache_write;
@@ -261,6 +265,15 @@ impl Swarm {
             total.cache_read += cache_read;
             total.cache_write += cache_write;
         }
+        let counts = crate::cost::Counts {
+            calls: 1,
+            input,
+            output: usage.output_tokens,
+            cache_read,
+            cache_write,
+        };
+        let model = model.unwrap_or_else(|| "unknown".to_owned());
+        node.ledger.lock().record(&model, counts, own_call);
         // Relative to the compaction point, so 100% means older turns are summarized before the
         // next call; the window is the one the context manager assumes. A side call's input is
         // not the agent's context.
@@ -383,7 +396,7 @@ impl Model for SideModel {
                 let Some(event) = next else { break };
                 let event = event?;
                 if let ModelStreamEvent::Metadata { usage: Some(usage), .. } = &event {
-                    self.swarm.add_usage(&node, usage, false);
+                    self.swarm.add_usage(&node, usage, model.model_id(), false);
                 }
                 yield event;
             }

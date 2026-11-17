@@ -16,6 +16,7 @@
 pub mod budget;
 pub mod catalog;
 pub mod compaction;
+pub mod cost;
 pub mod dashboard;
 pub mod factory;
 pub mod gc;

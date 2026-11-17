@@ -424,6 +424,7 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            ledger: Default::default(),
             context: None,
             paused: false,
         };

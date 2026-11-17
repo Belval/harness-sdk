@@ -60,7 +60,7 @@ strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--side-model ID]
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
               [--max-agents N] [--max-concurrent-calls N] [--compact-at TOKENS] [--memory FILE | --no-memory]
-              [--notify] [--status-base BRANCH] [--allow-land] [--land-into GLOB]... [--gate CMD]... [--headless] [--journal | --gc] [TASK]
+              [--notify] [--status-base BRANCH] [--allow-land] [--land-into GLOB]... [--gate CMD]... [--headless] [--prices FILE] [--journal | --gc | --cost] [TASK]
 ```
 
 Memory: one Markdown file shared by every agent and every run, for things you ask the swarm to
@@ -94,7 +94,7 @@ while the swarm was down fires once on resume, then keeps its interval. Schedule
 agent (as receiver or creator) are dropped.
 
 TUI: ↑/↓ select an agent, type to message it, `/to <agent> <message>` (by name or id, without selecting it), `/new <task>`, `/goal <goal>`, `/stop`, `/cancel`,
-`/gc`, `/schedules`, `/status`, Ctrl-C quits.
+`/gc`, `/schedules`, `/status`, `/cost`, Ctrl-C quits.
 `/status` answers "what is everyone doing?" without a model call: a popup with each live agent's
 state and current activity, its todo list, its branch's commits not yet on the base
 (`git log <base>..<branch>`; base is the branch checked out where the swarm started, or
@@ -121,7 +121,17 @@ one-line stub whose reference still reads the full output back, and `summarize: 
 pipeline summarize all but the latest four messages before the next model call.
 The header totals the swarm's tokens as `in 84.8M (97% cached) · out 291k`: input counts cache reads
 and writes (the budget does too), and the share read from the prompt cache is shown beside it, as
-in each agent's log title.
+in each agent's log title, then the estimated cost so far, `est. $12.30`.
+`/cost` (or `strands-swarm --run NAME --cost` for a saved run) estimates spend per agent without a
+model call: input, output, cache-read and cache-write tokens, the model, an estimated `$`, and the
+median input per call and cache hit rate over its last 50 calls. Tokens are tracked per model, so
+an agent switched with `/model` is priced per model. Prices are a built-in table of Claude list
+prices per 1M tokens by tier (opus, sonnet, haiku, plus older versions), cache reads at 0.1× and
+writes at 1.25× the input price; `--prices FILE` adds or overrides entries, a JSON object keyed by
+model-id substring (`{"opus": {"input": 5, "output": 25}}`, optional `cache_read`/`cache_write`;
+these keys win over the built-in ones, the longest match within each). Models without a price
+show as `unknown` (`$3.10+?` when partly priced). These are estimates from reported usage, not a
+bill. Programmatically: `Swarm::cost`.
 `/model <id>` switches the selected agent's model from its next model call on (`/model default`
 returns it to `--model`; `/model` alone shows the current one). The id is resolved like `--model`
 (`provider/name` or a Bedrock id, same effort), an invalid one is rejected without touching the

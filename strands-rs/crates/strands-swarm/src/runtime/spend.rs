@@ -1,0 +1,34 @@
+//! Estimated spend behind `/cost` and the header's `$` field.
+
+use super::*;
+
+impl Swarm {
+    /// Every agent's tokens with an estimated cost from [`SwarmConfig::prices`], cancelled
+    /// agents included (their tokens were spent too). No model call.
+    pub fn cost(&self) -> crate::cost::CostReport {
+        let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
+        let default = self.inner.config.default_model.clone();
+        let agents = nodes
+            .iter()
+            .map(|node| {
+                let usage = *node.usage.lock();
+                crate::cost::AgentCost {
+                    label: node.label(),
+                    totals: crate::cost::Counts {
+                        calls: 0,
+                        input: usage.input,
+                        output: usage.output,
+                        cache_read: usage.cache_read,
+                        cache_write: usage.cache_write,
+                    },
+                    ledger: node.ledger.lock().clone(),
+                    fallback_model: node.model_id().or_else(|| default.clone()),
+                }
+            })
+            .collect();
+        crate::cost::CostReport {
+            agents,
+            prices: (*self.inner.config.prices).clone(),
+        }
+    }
+}

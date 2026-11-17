@@ -66,10 +66,19 @@ pub async fn run(
 
     // While the plain log is shown on the main screen the TUI is not drawn; any key returns.
     let mut plain = false;
+    // Token totals the header's cost estimate was last computed for.
+    let mut spent = None;
     let outcome = loop {
         app.mark_seen();
         if app.status.is_some() {
             app.status = Some(swarm.status());
+        }
+        let tokens = app.total_tokens();
+        if app.cost.is_some() || spent != Some(tokens) {
+            let report = swarm.cost();
+            app.spend = Some(report.total());
+            app.cost = app.cost.is_some().then_some(report);
+            spent = Some(tokens);
         }
         if std::mem::take(&mut app.bell) {
             ring_bell();
@@ -246,15 +255,15 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let up_down = |code: KeyCode| if code == KeyCode::Up { -1 } else { 1 };
-    if app.status.is_some() {
-        // The status popup is modal: it scrolls, any other key closes it.
+    if app.status.is_some() || app.cost.is_some() {
+        // The status and cost popups are modal: they scroll, any other key closes them.
         match key.code {
             KeyCode::Up => app.status_scroll = app.status_scroll.saturating_sub(1),
             KeyCode::Down => app.status_scroll = app.status_scroll.saturating_add(1),
             KeyCode::PageUp => app.status_scroll = app.status_scroll.saturating_sub(10),
             KeyCode::PageDown => app.status_scroll = app.status_scroll.saturating_add(10),
             KeyCode::Char('c') if ctrl => app.quit = true,
-            _ => app.status = None,
+            _ => (app.status, app.cost) = (None, None),
         }
         return None;
     }
@@ -406,6 +415,11 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             .await
             .map(|removed| format!("forgot {} line(s): {}", removed.len(), removed.join(" | "))),
         (Command::Schedules, _) => Ok(schedules_notice(swarm)),
+        (Command::Cost, _) => {
+            app.cost = Some(swarm.cost());
+            app.status_scroll = 0;
+            Ok("cost (estimates from list prices): ↑↓ scroll, any other key closes".to_owned())
+        }
         (Command::Status, _) => {
             app.status = Some(swarm.status());
             app.status_scroll = 0;

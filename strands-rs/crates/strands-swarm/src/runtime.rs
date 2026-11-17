@@ -50,6 +50,7 @@ mod persist;
 mod reload;
 mod report;
 mod scheduler;
+mod spend;
 
 pub(crate) use actor::summarize_input;
 use actor::Start;
@@ -253,6 +254,11 @@ pub struct SwarmConfig {
     /// The `strands-swarm` binary that carries out a landing (`--land PLAN`); `None` is this
     /// process's own executable.
     pub exe: Option<PathBuf>,
+    /// Prices for [`Swarm::cost`] estimates (`--prices`).
+    pub prices: Arc<crate::cost::Prices>,
+    /// Model [`Swarm::cost`] prices an agent's tokens as when it has no model of its own and they
+    /// predate per-model tracking.
+    pub default_model: Option<String>,
 }
 
 impl SwarmConfig {
@@ -280,6 +286,8 @@ impl SwarmConfig {
             land_into: Vec::new(),
             gates: Vec::new(),
             exe: None,
+            prices: Arc::default(),
+            default_model: None,
         }
     }
 }
@@ -528,6 +536,8 @@ struct Node {
     env: BTreeMap<String, String>,
     /// Tokens used so far, across restarts.
     usage: Mutex<Tokens>,
+    /// Tokens by model and recent calls, for cost estimates; across restarts.
+    ledger: Mutex<crate::cost::Ledger>,
     /// The actor has exited (or never ran: restored cancelled).
     finished: AtomicBool,
     /// Background disk reclamation has been started for this agent.
@@ -749,6 +759,7 @@ impl Swarm {
                 goal: request.goal.clone(),
                 env,
                 usage: Mutex::new(Tokens::default()),
+                ledger: Mutex::default(),
                 // No actor runs until a queued agent starts.
                 finished: AtomicBool::new(queued),
                 collected: AtomicBool::new(false),

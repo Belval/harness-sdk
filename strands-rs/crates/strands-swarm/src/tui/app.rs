@@ -245,8 +245,12 @@ pub struct App {
     pub show_keys: bool,
     /// The `/status` popup's report while it is open, refreshed by the event loop.
     pub status: Option<crate::status::StatusReport>,
-    /// Lines the `/status` popup is scrolled down.
+    /// Lines the `/status` or `/cost` popup is scrolled down.
     pub status_scroll: u16,
+    /// The `/cost` popup's report while it is open, refreshed by the event loop.
+    pub cost: Option<crate::cost::CostReport>,
+    /// The swarm's estimated spend for the header, refreshed when token totals change.
+    pub spend: Option<crate::cost::Estimate>,
     /// Ring the terminal bell when an agent messages the user (`--notify`).
     pub notify: bool,
     /// A bell is due; the event loop rings it.

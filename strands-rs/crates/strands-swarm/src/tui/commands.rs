@@ -79,6 +79,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "every agent's state, todos, unmerged commits and jobs (no model call)",
     },
     SlashCommand {
+        name: "/cost",
+        args: "",
+        help: "estimated cost per agent: tokens, cache use, $ from list prices (no model call)",
+    },
+    SlashCommand {
         name: "/gc",
         args: "",
         help: "reclaim the disk of cancelled worktree agents",
@@ -135,6 +140,8 @@ pub enum Command {
     Schedules,
     /// Open the status popup.
     Status,
+    /// Open the cost popup.
+    Cost,
     /// Quit.
     Quit,
 }
@@ -195,6 +202,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         "/gc" => return Some(Command::Gc),
         "/schedules" => return Some(Command::Schedules),
         "/status" => return Some(Command::Status),
+        "/cost" => return Some(Command::Cost),
         "/quit" | "/q" => return Some(Command::Quit),
         _ => {}
     }
@@ -277,6 +285,7 @@ mod tests {
         assert_eq!(parse_command("/gc", false), Some(Command::Gc));
         assert_eq!(parse_command("/schedules", false), Some(Command::Schedules));
         assert_eq!(parse_command("/status", false), Some(Command::Status));
+        assert_eq!(parse_command("/cost", false), Some(Command::Cost));
         assert_eq!(
             parse_command("/model  anthropic/claude-x ", true),
             Some(Command::SetModel(Some("anthropic/claude-x".into())))

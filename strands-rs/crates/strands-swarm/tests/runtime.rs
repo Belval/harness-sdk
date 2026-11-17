@@ -1475,6 +1475,17 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
         "mid-turn report: {seen:?}"
     );
     assert_eq!(seen.last(), Some(&(1005, 11, Some(5.0 / 2000.0))), "{seen:?}");
+    // The cost report has the same tokens by model, and per-call stats.
+    let report = swarm.cost();
+    let ledger = &report.agents[0].ledger;
+    let on_model = ledger.by_model["test-model"];
+    assert_eq!(
+        (on_model.calls, on_model.input, on_model.cache_read),
+        (2, 1005, 900)
+    );
+    let stats = ledger.call_stats().unwrap();
+    assert_eq!((stats.calls, stats.median_input), (2, 502));
+    assert_eq!(report.total().render(), "unknown", "the mock model has no price");
     swarm.shutdown().await;
 
     let saved = strands_swarm::state::load(&state_dir)
@@ -1486,6 +1497,7 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
         (1005, 11)
     );
     assert_eq!(saved.agents[0].context, Some(5.0 / 2000.0));
+    assert_eq!(&saved.agents[0].ledger, ledger, "the cost ledger is saved");
     // 900 of the 1005 input tokens came from the prompt cache.
     assert_eq!(
         (
@@ -1494,7 +1506,8 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
         ),
         (900, 0)
     );
-    let (_resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    let (resumed, mut events) = Swarm::resume(config, saved.clone()).await.unwrap();
+    assert_eq!(resumed.cost().agents[0].ledger, saved.agents[0].ledger);
     let restored = async {
         loop {
             if let Some(SwarmEvent::Usage {

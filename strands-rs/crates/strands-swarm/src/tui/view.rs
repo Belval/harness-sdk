@@ -130,6 +130,11 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
     if let Some(report) = &app.status {
         draw_status(frame, areas.body, app, report);
     }
+    if let Some(report) = &app.cost {
+        let lines = report.lines().into_iter().map(Line::from).collect();
+        let title = " estimated cost · ↑↓ scroll · any key close ";
+        draw_popup(frame, areas.body, title, lines, app.status_scroll);
+    }
     let footer_text = app.notice.clone().unwrap_or_else(|| HINT.to_owned());
     frame.render_widget(Paragraph::new(footer_text).dim(), areas.footer);
 }
@@ -148,6 +153,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
         0 => String::new(),
         n => format!(" · {n} cancelled hidden (f3)"),
     };
+    let spend = match app.spend {
+        Some(spend) if spend.any => format!(" · est. {}", spend.render()),
+        _ => String::new(),
+    };
     let budget = app
         .budget
         .map(|budget| format!(" · budget {}", compact(budget)))
@@ -155,7 +164,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
     let mut line = Line::from(vec![
         Span::styled(" strands-swarm ", Style::new().bold().reversed()),
         Span::raw(format!(
-            "  run {run_id} · {} agents · {running} running · in {}{cached} · out {}{budget}{hidden}",
+            "  run {run_id} · {} agents · {running} running · in {}{cached} · out {}{spend}{budget}{hidden}",
             app.agents.len(),
             compact(input),
             compact(output)
@@ -511,6 +520,17 @@ fn draw_status(frame: &mut Frame, body: Rect, app: &App, report: &crate::status:
             None => Line::from(line).bold(),
         })
         .collect();
+    draw_popup(
+        frame,
+        body,
+        " status · ↑↓ scroll · any key close ",
+        lines,
+        app.status_scroll,
+    );
+}
+
+/// A scrollable popup over most of `body`, as tall as `lines` need.
+fn draw_popup(frame: &mut Frame, body: Rect, title: &str, lines: Vec<Line>, scroll: u16) {
     let width = body.width.saturating_sub(4).max(body.width.min(20));
     let height = (lines.len() as u16 + 2).min(body.height);
     let area = Rect::new(
@@ -519,11 +539,9 @@ fn draw_status(frame: &mut Frame, body: Rect, app: &App, report: &crate::status:
         width,
         height,
     );
-    let popup = Paragraph::new(lines).scroll((app.status_scroll, 0)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" status · ↑↓ scroll · any key close "),
-    );
+    let popup = Paragraph::new(lines)
+        .scroll((scroll, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(Clear, area);
     frame.render_widget(popup, area);
 }
@@ -739,6 +757,40 @@ mod tests {
                 assert!(screen.contains("1 not on main"), "{screen}");
             }
         }
+    }
+
+    #[test]
+    fn the_cost_popup_and_header_show_labelled_estimates() {
+        let mut app = app_with_an_image(None);
+        let mut ledger = crate::cost::Ledger::default();
+        let counts = crate::cost::Counts {
+            calls: 1,
+            input: 2_000_000,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+        };
+        ledger.record("claude-sonnet-4-5", counts, true);
+        let report = crate::cost::CostReport {
+            agents: vec![crate::cost::AgentCost {
+                label: "shots (a1)".into(),
+                totals: counts,
+                ledger,
+                fallback_model: None,
+            }],
+            prices: crate::cost::Prices::default(),
+        };
+        app.spend = Some(report.total());
+        app.cost = Some(report);
+        let backend = ratatui::backend::TestBackend::new(120, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        assert!(screen.contains("est. $6.00"), "{screen}");
+        assert!(screen.contains("estimated cost"), "{screen}");
+        assert!(screen.contains("Estimated cost: $6.00"), "{screen}");
+        assert!(screen.contains("shots (a1)"), "{screen}");
+        assert!(screen.contains("claude-sonnet-4-5"), "{screen}");
     }
 
     #[test]

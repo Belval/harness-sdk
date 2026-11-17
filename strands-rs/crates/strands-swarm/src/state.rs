@@ -80,6 +80,9 @@ pub struct AgentState {
     /// The part of `input_tokens` written to the prompt cache.
     #[serde(default)]
     pub cache_write_tokens: u64,
+    /// Tokens by model and recent calls, for cost estimates (empty for runs saved before).
+    #[serde(default, skip_serializing_if = "crate::cost::Ledger::is_empty")]
+    pub ledger: crate::cost::Ledger,
     /// Context window utilization of the last model call (`0..1+`), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<f64>,

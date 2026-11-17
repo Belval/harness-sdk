@@ -81,6 +81,7 @@ impl Swarm {
                 cache_read: saved.cache_read_tokens,
                 cache_write: saved.cache_write_tokens,
             }),
+            ledger: Mutex::new(saved.ledger),
             finished: AtomicBool::new(matches!(status, AgentStatus::Cancelled | AgentStatus::Queued)),
             collected: AtomicBool::new(false),
             context: Mutex::new(saved.context),
@@ -172,6 +173,7 @@ pub(super) fn node_state(node: &Node) -> AgentState {
         output_tokens: usage.output,
         cache_read_tokens: usage.cache_read,
         cache_write_tokens: usage.cache_write,
+        ledger: node.ledger.lock().clone(),
         context: *node.context.lock(),
         paused: node.paused.load(Ordering::SeqCst),
     }
