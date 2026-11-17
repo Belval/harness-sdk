@@ -83,16 +83,22 @@ impl Swarm {
             ..request.options
         };
         for _ in 0..KEEP_WARM_MAX {
+            // Biased: a refresh whose time comes as the agent's next call starts is not sent.
             tokio::select! {
-                _ = tokio::time::sleep(every) => {}
+                biased;
                 _ = stop.cancelled() => return,
+                _ = tokio::time::sleep(every) => {}
             }
             let Ok(_permit) = self.admit_model_call(&node.id, &stop).await else {
                 return;
             };
+            if stop.is_cancelled() {
+                return;
+            }
             let read = tokio::select! {
-                read = reads_prefix(request.model.stream(&request.messages, &options)) => read,
+                biased;
                 _ = stop.cancelled() => return,
+                read = reads_prefix(request.model.stream(&request.messages, &options)) => read,
             };
             if !read {
                 return;
