@@ -1,7 +1,7 @@
 //! A model-free status report of the swarm ([`crate::Swarm::status`], the TUI's `/status`): per
 //! live agent its state, todo list, branch commits not yet on the base (and whether the branch
-//! would merge into it cleanly), background jobs and schedules. The git part runs in the
-//! background and is cached for [`TTL`].
+//! would merge into it cleanly, and which other agents' branches change the same files), background
+//! jobs and schedules. The git part runs in the background and is cached for [`TTL`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,10 @@ pub const MAX_COMMITS: usize = 20;
 /// Most conflicted files named per branch.
 pub const MAX_CONFLICTS: usize = 10;
 
+/// Most trial merges of two agents' branches with each other per refresh (every pair of 10
+/// branches); pairs past it are reported as overlapping without one. Cached pairs are free.
+pub const MAX_PAIRS: usize = 45;
+
 /// Agent-state key of the harness todo list ([`strands_harness::plugins::Todos`] default).
 pub const TODOS_KEY: &str = "todos";
 
@@ -32,6 +36,32 @@ pub struct BranchCache {
     pub base: Option<String>,
     /// Agent id → how its branch stands against the base.
     pub branches: HashMap<String, BranchState>,
+    /// What the next refresh need not ask git again.
+    pub pairs: PairCache,
+}
+
+/// What [`refresh`] keeps for the next one, keyed by commit ids, so only a branch (or base) that
+/// moved is diffed and trial-merged again. Holds only the last refresh's keys.
+#[derive(Debug, Clone, Default)]
+pub struct PairCache {
+    /// (base commit, branch tip) → the files the branch changes since it forked from the base,
+    /// sorted.
+    files: HashMap<(String, String), Vec<String>>,
+    /// (tip, tip), lower first → the trial merge of the two.
+    merges: HashMap<(String, String), Merge>,
+}
+
+/// Another live agent's unmerged branch that changes some of the same files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overlap {
+    /// That agent's id.
+    pub with: String,
+    /// The files both branches change since they forked from the base (at most
+    /// [`MAX_CONFLICTS`]).
+    pub files: Vec<String>,
+    /// A trial merge of the two branches: `Conflicts` names the shared files that conflict,
+    /// `Unknown` when it failed or was past [`MAX_PAIRS`].
+    pub merge: Merge,
 }
 
 /// How an agent's branch stands against the base branch.
@@ -54,6 +84,8 @@ pub struct BranchState {
     pub head: Option<String>,
     /// The agent's other branches (its own and `<its own>-*`) with commits the base lacks.
     pub others: Vec<String>,
+    /// Other live agents' unmerged branches that change the same files, in agent order.
+    pub overlaps: Vec<Overlap>,
 }
 
 /// The outcome of a trial merge (`git merge-tree`) of a branch into the base.
@@ -71,14 +103,27 @@ pub enum Merge {
 }
 
 impl BranchState {
-    /// `3 not on main, 5 behind, conflicts in README.md; also unmerged: swarm/r/a2-old`: the
-    /// summary after the branch name.
+    /// `3 not on main, 5 behind, conflicts in README.md; conflicts with a4 (src/a.rs); overlaps
+    /// with a6 (Cargo.toml); also unmerged: swarm/r/a2-old`: the summary after the branch name.
     pub fn describe(&self, base: &str) -> String {
         let mut text = self.compared(base);
+        for overlap in &self.overlaps {
+            let (how, files) = match &overlap.merge {
+                Merge::Conflicts(files) => ("conflicts", files),
+                _ => ("overlaps", &overlap.files),
+            };
+            text.push_str(&format!("; {how} with {} ({})", overlap.with, files.join(", ")));
+        }
         if !self.others.is_empty() {
             text.push_str(&format!("; also unmerged: {}", self.others.join(", ")));
         }
         text
+    }
+
+    /// Whether the base has everything on the compared branch: nothing beyond it, or a copy of
+    /// every commit (`all applied`).
+    pub fn integrated(&self) -> bool {
+        self.ahead.is_empty() || (self.applied > 0 && self.pending == 0)
     }
 
     /// [`Self::describe`] of the compared branch alone.
@@ -97,7 +142,7 @@ impl BranchState {
         if self.behind > 0 {
             text.push_str(&format!(", {} behind", self.behind));
         }
-        if self.ahead.is_empty() || all_applied {
+        if self.integrated() {
             return text;
         }
         match &self.merge {
@@ -192,11 +237,13 @@ fn todo_line(item: &TodoItem) -> String {
 
 /// Look up the base (`base`, else the branch checked out at `root`) and, for each
 /// `(agent id, cwd, branch)`, how what is checked out in `cwd` stands against it (`branch` when
-/// detached), and which of the agent's other branches the base still lacks.
+/// detached), which of the agent's other branches the base still lacks, and which other agents'
+/// unmerged branches change the same files ([`find_overlaps`], using and updating `cache`).
 pub async fn refresh(
     base: Option<String>,
     root: Option<PathBuf>,
     branches: Vec<(String, PathBuf, String)>,
+    cache: &mut PairCache,
 ) -> (Option<String>, HashMap<String, BranchState>) {
     let base = match (base, root) {
         (Some(base), _) => Some(base),
@@ -205,16 +252,127 @@ pub async fn refresh(
     };
     let mut states = HashMap::new();
     if let Some(base) = &base {
+        let mut work = Vec::new();
         for (id, cwd, branch) in branches {
             let head = current_branch(&cwd).await.unwrap_or_else(|| branch.clone());
             if let Some(mut state) = branch_state(&cwd, base, &head).await {
                 state.others = other_unmerged(&cwd, base, &branch, &head).await;
+                if !state.integrated() {
+                    work.push((id.clone(), cwd, head.clone()));
+                }
                 state.head = (head != branch).then_some(head);
                 states.insert(id, state);
             }
         }
+        find_overlaps(base, &work, &mut states, cache).await;
     }
     (base, states)
+}
+
+/// For each pair of the `work` branches (agent id, cwd, branch) that change a file in common
+/// since they forked from `base`, add an [`Overlap`] to both agents' `states`, with a trial merge
+/// of the two (at most [`MAX_PAIRS`] new ones). Pairs without a shared file cost nothing beyond
+/// one diff per branch, and `cache` saves even that for tips seen last time.
+pub async fn find_overlaps(
+    base: &str,
+    work: &[(String, PathBuf, String)],
+    states: &mut HashMap<String, BranchState>,
+    cache: &mut PairCache,
+) {
+    let mut next = PairCache::default();
+    let base_tip = match work.first() {
+        Some((_, dir, _)) if work.len() > 1 => rev_parse(dir, base).await,
+        _ => None,
+    };
+    let Some(base_tip) = base_tip else {
+        *cache = next;
+        return;
+    };
+    let mut tips = Vec::new();
+    for (id, dir, branch) in work {
+        let Some(tip) = rev_parse(dir, branch).await else {
+            continue;
+        };
+        let key = (base_tip.clone(), tip.clone());
+        let files = match cache.files.remove(&key) {
+            Some(files) => files,
+            None => {
+                let range = format!("{base_tip}...{tip}");
+                let args = ["diff", "--name-only", "--no-renames", &range, "--"];
+                let Some(out) = git(dir, &args).await else {
+                    continue;
+                };
+                let mut files: Vec<String> = out.lines().map(str::to_owned).collect();
+                files.sort();
+                files
+            }
+        };
+        next.files.insert(key, files.clone());
+        tips.push((id, dir, tip, files));
+    }
+    let mut merged = 0;
+    for (i, (a, dir, a_tip, a_files)) in tips.iter().enumerate() {
+        for (b, _, b_tip, b_files) in &tips[i + 1..] {
+            let shared: Vec<String> = a_files
+                .iter()
+                .filter(|file| b_files.binary_search(file).is_ok())
+                .cloned()
+                .collect();
+            if shared.is_empty() || a_tip == b_tip {
+                continue;
+            }
+            let key = match a_tip < b_tip {
+                true => (a_tip.clone(), b_tip.clone()),
+                false => (b_tip.clone(), a_tip.clone()),
+            };
+            let merge = match cache.merges.remove(&key) {
+                Some(merge) => merge,
+                None if merged < MAX_PAIRS => {
+                    merged += 1;
+                    match merge_tree(dir, a_tip, b_tip).await {
+                        Merge::Conflicts(files) => {
+                            let mut files: Vec<String> = files
+                                .into_iter()
+                                .filter(|file| shared.binary_search(file).is_ok())
+                                .collect();
+                            files.truncate(MAX_CONFLICTS);
+                            // A conflict only in files one side changes is with the base.
+                            match files.is_empty() {
+                                true => Merge::Clean,
+                                false => Merge::Conflicts(files),
+                            }
+                        }
+                        merge => merge,
+                    }
+                }
+                None => Merge::Unknown,
+            };
+            if merge != Merge::Unknown {
+                next.merges.insert(key, merge.clone());
+            }
+            let mut files = shared;
+            files.truncate(MAX_CONFLICTS);
+            for (id, with) in [(a, b), (b, a)] {
+                if let Some(state) = states.get_mut(*id) {
+                    state.overlaps.push(Overlap {
+                        with: with.to_string(),
+                        files: files.clone(),
+                        merge: merge.clone(),
+                    });
+                }
+            }
+        }
+    }
+    *cache = next;
+}
+
+/// The commit `rev` names, in repository `dir`.
+async fn rev_parse(dir: &Path, rev: &str) -> Option<String> {
+    git(
+        dir,
+        &["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")],
+    )
+    .await
 }
 
 /// How `branch` stands against `base`, seen from the repository at `dir`; `None` when git fails.
@@ -331,13 +489,24 @@ pub async fn applied(dir: &Path, base: &str, rev: &str) -> Result<Applied, Strin
 
 /// Merge `branch` into `base` without touching any checkout or ref (`git merge-tree`).
 async fn trial_merge(dir: &Path, base: &str, branch: &str) -> Merge {
+    match merge_tree(dir, base, branch).await {
+        Merge::Conflicts(mut files) => {
+            files.truncate(MAX_CONFLICTS);
+            Merge::Conflicts(files)
+        }
+        merge => merge,
+    }
+}
+
+/// `git merge-tree` of `ours` and `theirs`: `Clean`, every conflicted file, or `Unknown`.
+async fn merge_tree(dir: &Path, ours: &str, theirs: &str) -> Merge {
     let args = [
         "merge-tree",
         "--write-tree",
         "--name-only",
         "--no-messages",
-        base,
-        branch,
+        ours,
+        theirs,
     ];
     let Ok(output) = crate::worktree::git_in(dir).args(args).output().await else {
         return Merge::Unknown;
@@ -353,7 +522,6 @@ async fn trial_merge(dir: &Path, base: &str, branch: &str) -> Merge {
                     files.push(file.to_owned());
                 }
             }
-            files.truncate(MAX_CONFLICTS);
             Merge::Conflicts(files)
         }
         _ => Merge::Unknown,
@@ -595,7 +763,13 @@ mod tests {
         commit("fix");
 
         let agents = vec![("a7".to_owned(), repo.to_path_buf(), "swarm/r/a7".to_owned())];
-        let (base, states) = refresh(Some("main".into()), None, agents.clone()).await;
+        let (base, states) = refresh(
+            Some("main".into()),
+            None,
+            agents.clone(),
+            &mut PairCache::default(),
+        )
+        .await;
         assert_eq!(base.as_deref(), Some("main"));
         let state = &states["a7"];
         assert_eq!(state.head.as_deref(), Some("swarm/r/a7-fix"));
@@ -627,10 +801,110 @@ mod tests {
 
         // Back on its own branch, that is what is compared.
         git(repo, &["checkout", "-q", "swarm/r/a7"]);
-        let (_, states) = refresh(Some("main".into()), None, agents).await;
+        let (_, states) = refresh(Some("main".into()), None, agents, &mut PairCache::default()).await;
         let state = &states["a7"];
         assert_eq!(state.head, None);
         assert!(state.ahead[0].ends_with(" given"), "{state:?}");
         assert_eq!(state.others, ["swarm/r/a7-fix"]);
+    }
+
+    #[test]
+    fn a_branch_summary_names_the_branches_it_overlaps() {
+        let overlap = |with: &str, merge| Overlap {
+            with: with.into(),
+            files: vec!["README.md".into(), "src/a.rs".into()],
+            merge,
+        };
+        let state = BranchState {
+            ahead: vec!["c".into()],
+            overlaps: vec![
+                overlap("a4", Merge::Conflicts(vec!["src/a.rs".into()])),
+                overlap("a6", Merge::Clean),
+                overlap("a8", Merge::Unknown),
+            ],
+            others: vec!["swarm/r/a2-old".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            state.describe("main"),
+            "1 not on main, fast-forward; conflicts with a4 (src/a.rs); overlaps with a6 \
+             (README.md, src/a.rs); overlaps with a8 (README.md, src/a.rs); also unmerged: \
+             swarm/r/a2-old"
+        );
+    }
+
+    /// Ten agents in worktrees of one repository: a1 and a2 edit the same line of `shared.txt`,
+    /// a3 and a4 different ends of `both.txt`, a5 has nothing left to merge, the rest only files
+    /// of their own.
+    #[tokio::test]
+    async fn branches_that_change_the_same_files_are_trial_merged_pairwise() {
+        use crate::worktree::test_git as git;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let commit = |dir: &Path, file: &str, text: &str| {
+            std::fs::write(dir.join(file), text).unwrap();
+            git(dir, &["add", "-A"]);
+            git(dir, &["commit", "-q", "-m", file]);
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        commit(&repo, "shared.txt", "one\n");
+        commit(&repo, "both.txt", "top\n\n\n\n\n\nbottom\n");
+        let mut agents = Vec::new();
+        for n in 1..=10 {
+            let (id, branch) = (format!("a{n}"), format!("swarm/r/a{n}"));
+            let cwd = dir.path().join(&id);
+            let worktree = cwd.to_str().unwrap();
+            git(&repo, &["worktree", "add", "-q", "-b", &branch, worktree]);
+            match n {
+                1 | 2 => commit(&cwd, "shared.txt", &format!("{id}\n")),
+                3 => commit(&cwd, "both.txt", "TOP\n\n\n\n\n\nbottom\n"),
+                4 => commit(&cwd, "both.txt", "top\n\n\n\n\n\nBOTTOM\n"),
+                5 => {}
+                _ => commit(&cwd, &format!("{id}.txt"), &id),
+            }
+            if n != 5 {
+                commit(&cwd, &format!("{id}-own.txt"), &id);
+            }
+            agents.push((id, cwd, branch));
+        }
+
+        let mut cache = PairCache::default();
+        let started = std::time::Instant::now();
+        let (_, states) = refresh(Some("main".into()), None, agents.clone(), &mut cache).await;
+        let cold = started.elapsed();
+        let started = std::time::Instant::now();
+        let (_, again) = refresh(Some("main".into()), None, agents.clone(), &mut cache).await;
+        let warm = started.elapsed();
+        eprintln!("10 branches: first refresh {cold:?}, cached {warm:?}");
+        assert_eq!(again, states, "the cache gives the same answer");
+        assert_eq!(cache.merges.len(), 2, "only the overlapping pairs are merged");
+        assert_eq!(cache.files.len(), 9, "the merged branch is not diffed");
+
+        let conflict = |with: &str| Overlap {
+            with: with.into(),
+            files: vec!["shared.txt".into()],
+            merge: Merge::Conflicts(vec!["shared.txt".into()]),
+        };
+        assert_eq!(states["a1"].overlaps, [conflict("a2")]);
+        assert_eq!(states["a2"].overlaps, [conflict("a1")]);
+        assert_eq!(
+            states["a1"].describe("main"),
+            "2 not on main, fast-forward; conflicts with a2 (shared.txt)"
+        );
+        assert_eq!(
+            states["a4"].describe("main"),
+            "2 not on main, fast-forward; overlaps with a3 (both.txt)"
+        );
+        assert_eq!(states["a3"].overlaps[0].merge, Merge::Clean);
+        for id in ["a5", "a6", "a10"] {
+            assert_eq!(states[id].overlaps, [], "{id}");
+        }
+
+        // a2 moves off the shared file: its tip changes, the pair is looked at again.
+        commit(&dir.path().join("a2"), "shared.txt", "one\n");
+        let (_, states) = refresh(Some("main".into()), None, agents, &mut cache).await;
+        assert_eq!(states["a1"].overlaps, []);
+        assert_eq!(cache.merges.len(), 1, "the old pair is dropped");
     }
 }

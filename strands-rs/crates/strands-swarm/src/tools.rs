@@ -74,8 +74,8 @@ const WAIT_DESCRIPTION: &str =
     "Block until a message arrives and return all unread ones; on timeout, a status summary.";
 
 const LIST_DESCRIPTION: &str = concat!(
-    "List agents: status, cwd, branch (ahead/behind the base, clean merge or conflicting files), ",
-    "jobs, model, estimated spend."
+    "List agents: status, cwd, branch (ahead/behind the base, clean merge or conflicting files, ",
+    "overlaps with other agents' branches), jobs, model, estimated spend."
 );
 
 const CANCEL_DESCRIPTION: &str = concat!(

@@ -90,12 +90,14 @@ impl Swarm {
             .filter_map(|node| Some((node.id.clone(), node.cwd.clone(), node.branch.clone()?)))
             .collect();
         let base = self.inner.config.status_base.clone();
-        let (base, branches) = crate::status::refresh(base, root, branches).await;
+        let mut pairs = std::mem::take(&mut self.inner.branches.lock().pairs);
+        let (base, branches) = crate::status::refresh(base, root, branches, &mut pairs).await;
         *self.inner.branches.lock() = crate::status::BranchCache {
             at: Some(tokio::time::Instant::now()),
             refreshing: false,
             base: base.clone(),
             branches: branches.clone(),
+            pairs,
         };
         (base, branches)
     }

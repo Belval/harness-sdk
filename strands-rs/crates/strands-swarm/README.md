@@ -8,7 +8,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `spawn_agent` | Start an agent on a task (optionally in another directory, in its own git worktree, with a model, a goal or its own compaction point). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
 | `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports, which returns at once when none is pending); a user message always ends it. With `all`, until every agent in `from` has sent something; a timeout (default 10 min, at most an hour) returns what came and who is still missing. Mail stays unread (and saved) until it returns, so a restart meanwhile loses none. |
-| `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model (and an agent's own compaction point) and estimated spend. |
+| `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files, other agents' branches changing the same files), running jobs, schedules, model (and an agent's own compaction point) and estimated spend. |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to a mailbox (default: your own) later and/or repeatedly (`every: "30m"`, at least a minute); list or cancel schedules. |
@@ -332,6 +332,15 @@ Other text messages the selected agent, or starts a root agent when there is non
     when detached); `list_agents` names it when it is another (`checked out swarm/r/a7-fix`).
     The agent's other branches (`swarm/<run>/<id>` and `swarm/<run>/<id>-*`) whose commits the
     base lacks are listed after it: `…; also unmerged: swarm/r/a7`.
+  - Two live agents' unmerged branches that change the same files (`git diff --name-only
+    <base>...<branch>`) are trial-merged with each other, so the integrator can sequence work
+    that would otherwise show `merges cleanly` twice and conflict on the second landing:
+    `…; conflicts with a4 (src/a.rs); overlaps with a6 (README.md)`. A conflict only in files one
+    of them changes is with the base and is left to the merge outlook above. Diffs and trial
+    merges are cached by commit, so only a branch that moved is looked at again; pairs without a
+    shared file cost nothing; at most 45 new trial merges run per refresh (later pairs read
+    `overlaps`). Ten branches take about 70 ms cached, 0.3 s new without a shared file, 1 s
+    new when all 45 pairs overlap (on a loaded machine).
   - It refreshes while open; git runs in the background and is cached for 5 s.
   - Programmatically: `Swarm::status`.
 
