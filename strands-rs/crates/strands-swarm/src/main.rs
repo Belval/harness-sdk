@@ -550,6 +550,7 @@ fn print_event(event: &SwarmEvent) {
         | SwarmEvent::MailRead { .. }
         | SwarmEvent::Image { .. }
         | SwarmEvent::ModelQueued { .. }
+        | SwarmEvent::HeldForReload { .. }
         | SwarmEvent::History { .. } => {}
         SwarmEvent::Reloaded { from, to, changes } => {
             eprintln!("{}", strands_swarm::version::notice(from, to, changes));

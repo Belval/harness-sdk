@@ -3285,6 +3285,18 @@ async fn a_pending_reload_holds_the_next_model_call_and_the_resumed_agent_makes_
     assert_eq!(reload_pending(&mut events).await, 1);
 
     gate.notify_one();
+    // Told apart from waiting for a model slot, so the TUI can say what it waits for.
+    let held = async {
+        loop {
+            match events.recv().await {
+                Some(SwarmEvent::HeldForReload { id, held: true }) => return id,
+                Some(SwarmEvent::ModelQueued { queued: true, .. }) => panic!("held, not queued"),
+                _ => {}
+            }
+        }
+    };
+    let held = tokio::time::timeout(Duration::from_secs(5), held).await.unwrap();
+    assert_eq!(held, "a1");
     assert!(
         reloads_within(&swarm, Duration::from_secs(5)).await,
         "idle once the call finished"

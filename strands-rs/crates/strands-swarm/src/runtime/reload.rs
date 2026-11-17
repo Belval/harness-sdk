@@ -72,14 +72,16 @@ impl Swarm {
         if !self.inner.reload_held.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.emit(SwarmEvent::ModelQueued {
+        let held = |held| SwarmEvent::HeldForReload {
             id: id.to_owned(),
-            queued: true,
-        });
+            held,
+        };
+        self.emit(held(true));
         tokio::select! {
             _ = cancel.cancelled() => {}
             _ = self.inner.root_cancel.cancelled() => {}
         }
+        self.emit(held(false));
         Err(Error::Cancelled)
     }
 

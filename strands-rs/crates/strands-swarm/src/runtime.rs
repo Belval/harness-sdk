@@ -500,6 +500,14 @@ pub enum SwarmEvent {
         /// `true` while it waits.
         queued: bool,
     },
+    /// An agent's model call started or stopped being held for a pending reload
+    /// ([`Swarm::reload`] with [`ReloadWhen::Idle`]).
+    HeldForReload {
+        /// Id.
+        id: String,
+        /// `true` while it is held.
+        held: bool,
+    },
     /// A tool result carried an image (e.g. `read` on a png).
     Image {
         /// Id of the agent whose tool returned it.

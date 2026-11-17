@@ -161,6 +161,7 @@ impl Journal {
             | SwarmEvent::MailRead { .. }
             | SwarmEvent::Image { .. }
             | SwarmEvent::ModelQueued { .. }
+            | SwarmEvent::HeldForReload { .. }
             | SwarmEvent::Reclaimed { .. }
             | SwarmEvent::ReloadPending { .. }
             | SwarmEvent::History { .. } => return,

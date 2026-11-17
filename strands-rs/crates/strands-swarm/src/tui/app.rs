@@ -106,6 +106,8 @@ pub struct AgentView {
     pub unseen: bool,
     /// Waiting for a free model-call slot.
     pub queued: bool,
+    /// Its next model call waits for a pending reload.
+    pub held: bool,
 }
 
 impl AgentView {
@@ -143,6 +145,7 @@ impl AgentView {
         match self.status {
             AgentStatus::Queued => return Some("queued until an agent slot frees…".to_owned()),
             AgentStatus::Starting => return Some("starting…".to_owned()),
+            AgentStatus::Running if self.held => return Some("waiting for the reload…".to_owned()),
             AgentStatus::Running if self.queued => return Some("queued for a model slot…".to_owned()),
             AgentStatus::Running => {}
             _ => return None,
@@ -304,6 +307,7 @@ impl App {
                     log: VecDeque::from([LogEntry::Task(task)]),
                     unseen: true,
                     queued: false,
+                    held: false,
                 };
                 self.agents.insert(id, view);
             }
@@ -326,6 +330,7 @@ impl App {
                 self.with(&id, |view| view.push(entry));
             }
             SwarmEvent::ModelQueued { id, queued } => self.with(&id, |view| view.queued = queued),
+            SwarmEvent::HeldForReload { id, held } => self.with(&id, |view| view.held = held),
             SwarmEvent::Budget { tokens } => self.budget = tokens,
             SwarmEvent::ReloadPending { tool_calls } => self.reload_pending = Some(tool_calls),
             SwarmEvent::Reloaded { from, to, changes } => {
@@ -875,6 +880,14 @@ mod tests {
             id: "a1".into(),
             queued: false,
         });
+        assert_eq!(activity(&app).as_deref(), Some("thinking…"));
+        let held = |held| SwarmEvent::HeldForReload {
+            id: "a1".into(),
+            held,
+        };
+        app.apply(held(true));
+        assert_eq!(activity(&app).as_deref(), Some("waiting for the reload…"));
+        app.apply(held(false));
         assert_eq!(activity(&app).as_deref(), Some("thinking…"));
     }
 
