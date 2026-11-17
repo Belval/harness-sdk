@@ -46,7 +46,8 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
 `--run NAME` makes the run persistent under `$XDG_STATE_HOME/strands-swarm/NAME` (default
 `~/.local/state`): the agent tree, unread mail, schedules and every conversation (saved after
 each message; see [Persistence](#persistence)). Starting again with the same name resumes it; a
-TASK given then is sent to the root agent as a message. With `--run`, `--journal`, `--gc` and
+TASK given then is sent to the root agent as a message; `--goal` is not, as it only seeds a new
+root (a supervisor replays it on every restart). With `--run`, `--journal`, `--gc` and
 `--cost` print a report on the saved run and exit.
 
 `--headless` prints events to stderr and messages to you to stdout instead of the TUI, and exits

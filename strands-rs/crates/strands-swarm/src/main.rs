@@ -332,7 +332,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         compact_at: Some(cli.compact_at),
         cache_ttl: cli.cache_ttl.clone(),
     };
-    let root = root_request(cli.task, cli.goal);
+    let (task, goal) = (cli.task, cli.goal);
     let mut config = SwarmConfig::new(harness_factory(options.clone()), cwd);
     let models = harness_model_resolver(options);
     if let Some(id) = cli.side_model {
@@ -388,24 +388,17 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
                 .guard_disk(cli.min_free_disk, strands_swarm::runtime::DISK_CHECK_EVERY, free);
         tokio::spawn(guard);
     }
-    // A resumed run already has its root: a task goes to it as a message (a new root only when
-    // none is left), and the goal only seeds a new one.
-    let live_root = || {
-        swarm
-            .agents()
-            .into_iter()
-            .find(|agent| agent.parent == USER && agent.status.is_live())
-    };
-    let (root, expect_reply) = match (resumed, root, live_root()) {
-        (true, Some(request), Some(agent)) if !request.task.is_empty() => {
-            swarm.send(USER, &agent.id, request.task)?;
+    let live_root = swarm
+        .agents()
+        .into_iter()
+        .find(|agent| agent.parent == USER && agent.status.is_live());
+    let (root, expect_reply) = match (start_plan(task, goal, live_root.is_some()), live_root) {
+        (StartPlan::Message(task), Some(agent)) => {
+            swarm.send(USER, &agent.id, task)?;
             (None, true)
         }
-        (true, _, Some(_)) => (None, false),
-        (_, root, _) => {
-            let new = root.is_some();
-            (root, new)
-        }
+        (StartPlan::Spawn(request), _) => (Some(request), true),
+        _ => (None, false),
     };
 
     if !cli.headless {
@@ -455,13 +448,34 @@ fn print_skills(skills: &Skills) {
     }
 }
 
-fn root_request(task: Option<String>, goal: Option<String>) -> Option<SpawnRequest> {
-    let task = task.or_else(|| goal.clone())?;
-    Some(SpawnRequest {
-        task,
-        goal,
-        ..Default::default()
-    })
+/// What a start does with its TASK and `--goal`.
+#[derive(Debug)]
+enum StartPlan {
+    /// Send the TASK to the live root of the resumed run.
+    Message(String),
+    /// Start a root agent.
+    Spawn(SpawnRequest),
+    Nothing,
+}
+
+/// A resumed run that still has a live root gets only a TASK, as a message: `--goal` seeds a new
+/// root alone, as a supervisor replays it on every restart. Otherwise the TASK (or the goal)
+/// starts a root.
+fn start_plan(task: Option<String>, goal: Option<String>, live_root: bool) -> StartPlan {
+    if live_root {
+        return match task.filter(|task| !task.is_empty()) {
+            Some(task) => StartPlan::Message(task),
+            None => StartPlan::Nothing,
+        };
+    }
+    match task.or_else(|| goal.clone()) {
+        Some(task) => StartPlan::Spawn(SpawnRequest {
+            task,
+            goal,
+            ..Default::default()
+        }),
+        None => StartPlan::Nothing,
+    }
 }
 
 /// Print events until the root has replied (or, with `expect_reply` unset, at once) and no agent
@@ -560,4 +574,36 @@ fn print_event(event: &SwarmEvent) {
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_resume_sends_its_live_root_the_task_but_never_the_goal() {
+        let goal = || Some("all tests pass".to_owned());
+        assert!(matches!(start_plan(None, goal(), true), StartPlan::Nothing));
+        assert!(matches!(
+            start_plan(Some("also fix X".into()), goal(), true),
+            StartPlan::Message(task) if task == "also fix X"
+        ));
+        assert!(matches!(
+            start_plan(Some(String::new()), None, true),
+            StartPlan::Nothing
+        ));
+    }
+
+    #[test]
+    fn without_a_live_root_the_task_or_goal_starts_one() {
+        let StartPlan::Spawn(request) = start_plan(None, Some("g".into()), false) else {
+            panic!("a goal starts a root");
+        };
+        assert_eq!((request.task.as_str(), request.goal.as_deref()), ("g", Some("g")));
+        let StartPlan::Spawn(request) = start_plan(Some("t".into()), None, false) else {
+            panic!("a task starts a root");
+        };
+        assert_eq!((request.task.as_str(), request.goal), ("t", None));
+        assert!(matches!(start_plan(None, None, false), StartPlan::Nothing));
+    }
 }
