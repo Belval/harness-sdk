@@ -268,7 +268,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
             KeyCode::PageUp => app.status_scroll = app.status_scroll.saturating_sub(10),
             KeyCode::PageDown => app.status_scroll = app.status_scroll.saturating_add(10),
             KeyCode::Char('c') if ctrl => app.quit = true,
-            _ => (app.status, app.cost) = (None, None),
+            _ => (app.status, app.cost, app.notice) = (None, None, None),
         }
         return None;
     }

@@ -232,10 +232,9 @@ async fn a_real_swarm_shows_spawns_replies_compaction_and_status_on_screen() {
     }
     let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
     on_terminal_event(&swarm, &mut app, key, &screen.buffer).await;
-    assert!(
-        !screen.draw(&mut app).contains("┌ status"),
-        "any key closes the overlay"
-    );
+    let shown = screen.draw(&mut app);
+    assert!(!shown.contains("┌ status"), "any key closes the overlay");
+    assert!(!shown.contains("any other key closes"), "and its hint\n{shown}");
     swarm.shutdown().await;
 }
 
