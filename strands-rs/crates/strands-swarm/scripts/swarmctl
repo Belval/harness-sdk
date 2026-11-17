@@ -10,6 +10,8 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}/strands-swarm"
 SELF="$(readlink -f "$0")"
 RELOAD_EXIT=75
 CRASH_WINDOW=30
+# stderr.log and supervisor.log are rotated to <log>.1 past this many bytes.
+LOG_MAX="${SWARMCTL_LOG_MAX:-8388608}"
 
 usage() {
   cat <<'EOF'
@@ -28,6 +30,17 @@ die() { echo "swarmctl: $*" >&2; exit 1; }
 run_dir() { echo "$STATE/$1"; }
 session() { echo "swarm-$1"; }
 running() { tmux has-session -t "$(session "$1")" 2>/dev/null; }
+
+# Append stdin to the log $1 line by line, rotating it to $1.1 whenever it passes LOG_MAX bytes.
+capped_log() {
+  local log="$1" line size
+  size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( size > LOG_MAX )); then mv -f "$log" "$log.1"; size=0; fi
+    printf '%s\n' "$line" >> "$log"
+    size=$((size + ${#line} + 1))
+  done
+}
 
 start() {
   local run="$1" binary="$2"; shift 2
@@ -62,17 +75,17 @@ supervise() {
   while [[ ! -f "$dir/stop" ]]; do
     local started code=0
     started=$(date +%s)
-    "$dir/bin/current" --run "$run" "${args[@]}" 2>>"$dir/stderr.log" || code=$?
+    "$dir/bin/current" --run "$run" "${args[@]}" 2> >(capped_log "$dir/stderr.log") || code=$?
     [[ -f "$dir/stop" ]] && break
     if [[ $code -eq $RELOAD_EXIT ]]; then
-      echo "$(date -Is) reload" >> "$dir/supervisor.log"
+      echo "$(date -Is) reload" | capped_log "$dir/supervisor.log"
       continue
     fi
-    echo "$(date -Is) exited code=$code" >> "$dir/supervisor.log"
+    echo "$(date -Is) exited code=$code" | capped_log "$dir/supervisor.log"
     if (( code != 0 && $(date +%s) - started < CRASH_WINDOW )) && [[ -x "$dir/bin/previous" ]]; then
       mv "$dir/bin/current" "$dir/bin/failed"
       mv "$dir/bin/previous" "$dir/bin/current"
-      echo "$(date -Is) rolled back to the previous binary" >> "$dir/supervisor.log"
+      echo "$(date -Is) rolled back to the previous binary" | capped_log "$dir/supervisor.log"
     fi
     sleep 5
   done
@@ -119,6 +132,7 @@ case "$cmd" in
   start) (( $# >= 2 )) || { usage; exit 1; }; start "$@" ;;
   resume) resume "$1" ;;
   supervise) supervise "$1" ;;
+  log) capped_log "$1" ;;
   stop) stop "$1" ;;
   attach) tmux attach -t "$(session "$1")" ;;
   status) status ;;

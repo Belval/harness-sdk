@@ -21,9 +21,19 @@ pub const TAIL_LINES: usize = 40;
 /// Bytes read from the end of a log for its tail.
 const TAIL_BYTES: u64 = 16 * 1024;
 
-/// Runs `$1` with output to `$2`, then writes its exit code to `$3` (renamed into place, so a
-/// reader never sees it half-written).
-const WRAPPER: &str = r#"sh -c "$1" >"$2" 2>&1 </dev/null; echo $? >"$3.tmp"; mv "$3.tmp" "$3""#;
+/// Runs `$1` with output appended to `$2` (append, so [`Jobs::tidy`] can cut the log while it
+/// runs), then writes its exit code to `$3` (renamed into place, so a reader never sees it
+/// half-written).
+const WRAPPER: &str = r#"sh -c "$1" >>"$2" 2>&1 </dev/null; echo $? >"$3.tmp"; mv "$3.tmp" "$3""#;
+
+/// A running job's log is cut to its last [`LOG_KEEP`] bytes once it exceeds this.
+pub const LOG_MAX: u64 = 32 * 1024 * 1024;
+
+/// What is kept of a log that exceeded [`LOG_MAX`].
+pub const LOG_KEEP: u64 = 1024 * 1024;
+
+/// Reported jobs kept on disk; older ones' files are deleted.
+pub const KEEP_JOBS: usize = 200;
 
 /// What `<id>.json` holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +324,28 @@ impl Jobs {
         self.get(id).await
     }
 
+    /// Keep the directory bounded: cut running jobs' logs over `max` bytes to their last `keep`
+    /// bytes, and delete the files of all but the newest `jobs` reported jobs.
+    pub async fn tidy(&self, max: u64, keep: u64, jobs: usize) {
+        let all = self.list().await;
+        let reported = all.iter().filter(|job| job.reported).count();
+        let mut old = reported.saturating_sub(jobs);
+        for job in &all {
+            let id = &job.meta.id;
+            if job.reported && old > 0 {
+                old -= 1;
+                // The `.json` last: a job is listed while it exists.
+                for ext in ["log", "exit", "reported", "json"] {
+                    let _ = tokio::fs::remove_file(self.file(id, ext)).await;
+                }
+            } else if job.state == JobState::Running {
+                if let Err(error) = cut(&self.log_path(id), max, keep).await {
+                    tracing::warn!(job = %id, %error, "could not cut the job's log");
+                }
+            }
+        }
+    }
+
     /// The last `lines` lines of job `id`'s output.
     pub async fn tail(&self, id: &str, lines: usize) -> String {
         let Ok(mut file) = tokio::fs::File::open(self.log_path(id)).await else {
@@ -333,6 +365,28 @@ impl Jobs {
         let keep = all.len().saturating_sub(lines).max(partial);
         all[keep..].join("\n")
     }
+}
+
+/// Cut the log at `path` to its last `keep` bytes, marked, once it exceeds `max`. The job
+/// appends, so its next write lands after the kept tail; output written while cutting is lost.
+async fn cut(path: &Path, max: u64, keep: u64) -> std::io::Result<()> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .await?;
+    let len = file.metadata().await?.len();
+    if len <= max {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(len - keep)).await?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).await?;
+    let mut text = format!("[strands-swarm: log over {max} bytes, earlier output cut]\n").into_bytes();
+    text.extend(tail);
+    file.set_len(0).await?;
+    file.seek(SeekFrom::Start(0)).await?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, &text).await
 }
 
 async fn modified(path: &Path) -> Option<u64> {
@@ -448,6 +502,40 @@ mod tests {
         assert_eq!(lost.len(), 1);
         assert_eq!(lost[0].state, JobState::Lost);
         assert_eq!(lost[0].status(), "ended without an exit code");
+    }
+
+    #[tokio::test]
+    async fn tidying_cuts_a_runaway_log_and_drops_old_reported_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path());
+        let none = BTreeMap::new();
+        for _ in 0..3 {
+            let job = jobs.start("a1", None, "true", dir.path(), &none).await.unwrap();
+            until_ended(&jobs, &job.meta.id).await;
+            jobs.mark_reported(&job.meta.id).await.unwrap();
+        }
+        // Writes 3000 bytes, waits to be cut, then appends a last line.
+        let command = "head -c 3000 /dev/zero | tr '\\0' x; echo; sleep 1; echo last";
+        jobs.start("a1", None, command, dir.path(), &none).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        jobs.tidy(1000, 100, 1).await;
+        let ids: Vec<String> = jobs.list().await.into_iter().map(|job| job.meta.id).collect();
+        assert_eq!(ids, ["j3", "j4"], "only the newest reported job is kept");
+        assert!(!dir.path().join("j1.log").exists() && !dir.path().join("j2.exit").exists());
+        let log = tokio::fs::read_to_string(jobs.log_path("j4")).await.unwrap();
+        assert!(log.starts_with("[strands-swarm: log over 1000 bytes"), "{log}");
+        assert!(log.len() < 200, "{}", log.len());
+
+        until_ended(&jobs, "j4").await;
+        let log = tokio::fs::read_to_string(jobs.log_path("j4")).await.unwrap();
+        assert!(
+            log.ends_with("x\nlast\n"),
+            "appends continue after the cut: {log:?}"
+        );
+        assert_eq!(jobs.tail("j4", 1).await, "last");
+        let next = jobs.start("a1", None, "true", dir.path(), &none).await.unwrap();
+        assert_eq!(next.meta.id, "j5");
     }
 
     #[test]

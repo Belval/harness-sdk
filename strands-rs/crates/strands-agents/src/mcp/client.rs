@@ -80,17 +80,70 @@ impl CompiledFilters {
     }
 }
 
-/// Open `path` for appending (creating it and its directory) as a child's stdio.
-fn open_log(path: &Path) -> std::io::Result<std::process::Stdio> {
+/// Size at which a server's stderr log is rotated to `<log>.1`, so a chatty server cannot fill
+/// the disk: at most about twice this per server.
+pub const STDERR_LOG_MAX: u64 = 4 * 1024 * 1024;
+
+/// Open `path` for appending (creating it and its directory), rotating it first when full.
+fn open_log(path: &Path, max: u64) -> std::io::Result<(std::fs::File, u64)> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
+    }
+    let mut size = std::fs::metadata(path).map_or(0, |meta| meta.len());
+    if size >= max {
+        std::fs::rename(path, rotated(path))?;
+        size = 0;
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
-    Ok(file.into())
+    Ok((file, size))
+}
+
+fn rotated(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// Copy a server's stderr into `file` (already `size` bytes) until it closes, rotating to
+/// `<path>.1` whenever the file reaches `max`. Output that cannot be written is dropped: the
+/// server must never block on a full pipe.
+async fn copy_log(
+    mut from: impl tokio::io::AsyncRead + Unpin,
+    path: PathBuf,
+    file: std::fs::File,
+    mut size: u64,
+    max: u64,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut file = Some(tokio::fs::File::from_std(file));
+    let mut buf = vec![0; 8192];
+    loop {
+        let n = match from.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if size >= max {
+            if let Some(mut full) = file.take() {
+                let _ = full.flush().await;
+            }
+            file = open_log(&path, max).ok().map(|(f, s)| {
+                size = s;
+                tokio::fs::File::from_std(f)
+            });
+        }
+        if let Some(out) = file.as_mut() {
+            if out.write_all(&buf[..n]).await.is_ok() {
+                size += n as u64;
+            }
+        }
+    }
+    if let Some(mut out) = file {
+        let _ = out.flush().await;
+    }
 }
 
 /// Patterns are matched from the start of the name, like TS `new RegExp(p)` + `^`-anchored test.
@@ -404,14 +457,21 @@ impl McpClient {
                 if let Some(cwd) = cwd {
                     cmd.current_dir(cwd);
                 }
-                let stderr = match &self.inner.stderr_log {
-                    Some(path) => open_log(path).map_err(|e| self.connect_error(e))?,
+                let log = match &self.inner.stderr_log {
+                    Some(path) => Some(open_log(path, STDERR_LOG_MAX).map_err(|e| self.connect_error(e))?),
+                    None => None,
+                };
+                let stderr = match log {
+                    Some(_) => std::process::Stdio::piped(),
                     None => std::process::Stdio::inherit(),
                 };
-                let (transport, _) = rmcp::transport::TokioChildProcess::builder(cmd)
+                let (transport, pipe) = rmcp::transport::TokioChildProcess::builder(cmd)
                     .stderr(stderr)
                     .spawn()
                     .map_err(|e| self.connect_error(e))?;
+                if let (Some(pipe), Some((file, size)), Some(path)) = (pipe, log, &self.inner.stderr_log) {
+                    tokio::spawn(copy_log(pipe, path.clone(), file, size, STDERR_LOG_MAX));
+                }
                 handler
                     .serve(transport)
                     .await
@@ -562,6 +622,33 @@ impl From<&rmcp::model::ServerPeerInfo> for McpServerInfo {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_servers_stderr_log_rotates_when_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs/mcp-x.log");
+        let (file, size) = open_log(&path, 100).unwrap();
+        // A pipe that hands out at most 16 bytes per read, like a server writing line by line.
+        let (mut server, pipe) = tokio::io::duplex(16);
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            server.write_all(&[b'e'; 1000]).await.unwrap();
+        });
+        copy_log(pipe, path.clone(), file, size, 100).await;
+        writer.await.unwrap();
+        let current = std::fs::metadata(&path).unwrap().len();
+        let previous = std::fs::metadata(rotated(&path)).unwrap().len();
+        assert!(
+            current <= 116 && (100..=116).contains(&previous),
+            "{current}, {previous}"
+        );
+
+        // A full log is rotated on the next connect as well.
+        std::fs::write(&path, vec![b'x'; 150]).unwrap();
+        let (_, size) = open_log(&path, 100).unwrap();
+        assert_eq!(size, 0);
+        assert_eq!(std::fs::read(rotated(&path)).unwrap(), vec![b'x'; 150]);
+    }
+
     use super::*;
 
     #[test]

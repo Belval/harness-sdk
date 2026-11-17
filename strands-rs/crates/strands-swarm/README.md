@@ -131,6 +131,8 @@ and exit.
   - The swarm polls jobs and mails the owner when one ends, also for jobs started before a restart.
     A job whose process vanished without an exit code (a reboot) is reported as such.
   - A killed job is not reported. Cancelling an agent kills its whole subtree's jobs.
+  - A running job's log over 32 MB is cut to its last 1 MB. Only the newest 200 reported jobs keep
+    their files.
 - **Schedules.**
   - `schedule {message, to?, every?: "30m", at?: "in 2h" | "2026-11-17T09:00Z", id?}` posts
     `[schedule sN] message` (kind `schedule`) at the given times.
@@ -277,8 +279,8 @@ Typing text without a command messages the selected agent.
     catalog and enables tools from the next call on. Enabled tools come back on resume.
   - `--mcp-eager` registers every tool on every agent, `--mcp-deny` hides tools by name, and
     `--list-tools` prints what is allowed and denied.
-  - Under the TUI a server's stderr goes to `<run dir>/logs/mcp-<server>.log`; `--headless` keeps
-    it on the terminal.
+  - Under the TUI a server's stderr goes to `<run dir>/logs/mcp-<server>.log`, rotated to
+    `<log>.1` at 4 MB; `--headless` keeps it on the terminal.
 - **Skills.**
   - Skills are `<name>/SKILL.md` files with `name` and `description` frontmatter, as in Claude Code
     and Codex. They are discovered at startup.
@@ -292,7 +294,9 @@ Typing text without a command messages the selected agent.
 ## Operate 24/7
 
 `scripts/swarmctl` keeps a run alive in tmux. It restarts the run on exit, restarts into the new
-binary on `reload_swarm`, and rolls back if a new binary crashes within 30 s.
+binary on `reload_swarm`, and rolls back if a new binary crashes within 30 s. The swarm's stderr
+goes to `<run dir>/stderr.log` and the supervisor's notes to `supervisor.log`, each rotated to
+`<log>.1` at 8 MB (`SWARMCTL_LOG_MAX`).
 
 ```sh
 swarmctl start NAME ./target/release/strands-swarm --cwd REPO --goal "..."   # start or resume

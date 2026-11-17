@@ -69,6 +69,10 @@ impl Swarm {
                 for job in swarm.inner.jobs.unreported(check_alive).await {
                     swarm.report_job(&job).await;
                 }
+                if check_alive {
+                    let jobs = &swarm.inner.jobs;
+                    jobs.tidy(jobs::LOG_MAX, jobs::LOG_KEEP, jobs::KEEP_JOBS).await;
+                }
                 ticks += 1;
                 tokio::select! {
                     _ = tokio::time::sleep(JOB_POLL) => {}
