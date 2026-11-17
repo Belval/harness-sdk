@@ -313,11 +313,14 @@ Other text messages the selected agent, or starts a root agent when there is non
 
 - Each agent is one line: status, name, model, input/output tokens and how close its last call
   came to the compaction point, e.g. `● parser opus-5-5 1.2M/34.0k 34% a3`.
+- The status spins while the agent works (a model call or a tool call). A still `◌` means it
+  waits for a model-call slot or for a pending reload, a still `⧗` that it is blocked in `wait`.
 - Cancelled agents without a live descendant are hidden (the header counts them); F3 shows them.
 - Alt-←/→ narrows or widens the tree. Narrow it past its minimum to hide it.
 
 **Header.**
 
+- It counts the agents that work as `3 running` and those that wait (`◌`, `⧗`) as `2 waiting`.
 - It totals tokens as `in 84.8M (97% cached) · out 291k · est. $12.30`.
 - Input counts cache reads and writes, as the budget does.
 

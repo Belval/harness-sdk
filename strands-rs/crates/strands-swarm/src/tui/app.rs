@@ -73,6 +73,15 @@ impl LogEntry {
     }
 }
 
+/// What a running agent waits on, from [`AgentView::waiting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    /// A model-call slot, or a pending reload.
+    Slot,
+    /// Mail, in a `wait` tool call.
+    Mail,
+}
+
 /// What the UI knows about one agent.
 #[derive(Debug, Clone)]
 pub struct AgentView {
@@ -150,18 +159,35 @@ impl AgentView {
             AgentStatus::Running => {}
             _ => return None,
         }
-        // Mail lands in the log whenever it arrives, also while a tool call runs.
-        let latest = self
-            .log
-            .iter()
-            .rev()
-            .find(|entry| !matches!(entry, LogEntry::MailIn { .. }));
-        Some(match latest {
+        Some(match self.latest() {
             // The call is the entry above, so its summary is not repeated.
             Some(LogEntry::Tool { name, ok: None, .. }) => format!("running {name}…"),
             Some(LogEntry::Text(_)) => "writing…".to_owned(),
             _ => "thinking…".to_owned(),
         })
+    }
+
+    /// What a running agent waits on instead of working, if anything.
+    pub fn waiting(&self) -> Option<Waiting> {
+        if self.status != AgentStatus::Running {
+            return None;
+        }
+        if self.queued || self.held {
+            return Some(Waiting::Slot);
+        }
+        match self.latest() {
+            Some(LogEntry::Tool { name, ok: None, .. }) if name == "wait" => Some(Waiting::Mail),
+            _ => None,
+        }
+    }
+
+    /// The newest log entry other than mail, which lands whenever it arrives, also while a tool
+    /// call runs.
+    fn latest(&self) -> Option<&LogEntry> {
+        self.log
+            .iter()
+            .rev()
+            .find(|entry| !matches!(entry, LogEntry::MailIn { .. }))
     }
 
     /// Insert a resumed agent's restored conversation before everything logged since the restart
@@ -883,6 +909,7 @@ mod tests {
             queued: true,
         });
         assert_eq!(activity(&app).as_deref(), Some("queued for a model slot…"));
+        assert_eq!(app.agents["a1"].waiting(), Some(Waiting::Slot));
         app.apply(SwarmEvent::ModelQueued {
             id: "a1".into(),
             queued: false,
@@ -894,8 +921,16 @@ mod tests {
         };
         app.apply(held(true));
         assert_eq!(activity(&app).as_deref(), Some("waiting for the reload…"));
+        assert_eq!(app.agents["a1"].waiting(), Some(Waiting::Slot));
         app.apply(held(false));
         assert_eq!(activity(&app).as_deref(), Some("thinking…"));
+        assert_eq!(app.agents["a1"].waiting(), None);
+        app.apply(SwarmEvent::ToolStarted {
+            id: "a1".into(),
+            name: "wait".into(),
+            summary: "from a2".into(),
+        });
+        assert_eq!(app.agents["a1"].waiting(), Some(Waiting::Mail));
     }
 
     #[test]

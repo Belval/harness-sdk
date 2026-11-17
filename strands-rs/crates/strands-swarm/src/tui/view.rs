@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AgentView, App, LogEntry, SlashCommand};
+use super::app::{AgentView, App, LogEntry, SlashCommand, Waiting};
 use super::select::{self, Pane};
 use crate::runtime::{AgentStatus, USER};
 use crate::text::compact;
@@ -132,11 +132,19 @@ pub fn draw(frame: &mut Frame, app: &App, run_id: &str, tick: usize) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
-    let running = app
+    // Running agents that wait (for a model slot or for mail) are not counted as running.
+    let (waiting, running) = app
         .agents
         .values()
         .filter(|v| v.status == AgentStatus::Running)
-        .count();
+        .fold((0, 0), |(waiting, running), v| match v.waiting() {
+            Some(_) => (waiting + 1, running),
+            None => (waiting, running + 1),
+        });
+    let waiting = match waiting {
+        0 => String::new(),
+        n => format!(" · {n} waiting"),
+    };
     let (input, output) = app.total_tokens();
     let cached = cached(app.total_cache_read(), input)
         .map(|percent| format!(" ({percent} cached)"))
@@ -158,7 +166,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
         let mut line = Line::from(vec![
             Span::styled(" strands-swarm ", Style::new().bold().reversed()),
             Span::raw(format!(
-                "  run {run_id} · {} agents · {running} running{tokens}{spend}{budget}{hidden}",
+                "  run {run_id} · {} agents · {running} running{waiting}{tokens}{spend}{budget}{hidden}",
                 app.agents.len(),
             )),
         ]);
@@ -218,7 +226,7 @@ fn tree_width(app: &App, total: u16) -> u16 {
 /// One line per agent: `⠋ parser opus-5-5 1.2M/34k 34% a2 ⎇ •`. The list clips it at its
 /// width, so the trailing id goes first on narrow terminals.
 fn agent_item(depth: usize, view: &AgentView, tick: usize) -> Line<'static> {
-    let (glyph, color) = status_glyph(&view.status, tick);
+    let (glyph, color) = status_glyph(view, tick);
     let mut spans = vec![
         Span::raw("  ".repeat(depth)),
         Span::styled(format!("{glyph} "), Style::new().fg(color)),
@@ -314,11 +322,16 @@ fn short_model(id: &str) -> &str {
     name
 }
 
-fn status_glyph(status: &AgentStatus, tick: usize) -> (&'static str, Color) {
-    match status {
+/// A working agent spins; one waiting for a model slot or for mail shows a still glyph.
+fn status_glyph(view: &AgentView, tick: usize) -> (&'static str, Color) {
+    match &view.status {
         AgentStatus::Queued => ("◌", Color::DarkGray),
         AgentStatus::Starting => ("…", Color::Gray),
-        AgentStatus::Running => (SPINNER[tick % SPINNER.len()], Color::Cyan),
+        AgentStatus::Running => match view.waiting() {
+            Some(Waiting::Slot) => ("◌", Color::Cyan),
+            Some(Waiting::Mail) => ("⧗", Color::Cyan),
+            None => (SPINNER[tick % SPINNER.len()], Color::Cyan),
+        },
         AgentStatus::Idle => ("●", Color::Green),
         AgentStatus::Errored(_) => ("✗", Color::Red),
         AgentStatus::Cancelled => ("⊘", Color::DarkGray),

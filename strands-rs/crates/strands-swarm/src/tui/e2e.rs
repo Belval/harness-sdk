@@ -7,13 +7,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream::BoxStream;
 use parking_lot::Mutex;
 use ratatui::backend::TestBackend;
+use ratatui::style::Color;
 use ratatui::Terminal;
 use serde_json::json;
+use strands_agents::models::{Model, ModelStreamEvent, StreamOptions};
 use strands_agents::testing::{MockMessageModel, MockResponse};
 use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
 use strands_agents::Agent;
+use tokio::sync::Semaphore;
 
 use super::*;
 use crate::compaction::{CompactedSink, Compaction};
@@ -28,9 +32,25 @@ type Sinks = Arc<Mutex<HashMap<String, CompactedSink>>>;
 /// Agents on scripted mock models; each saves its conversation when the swarm has a state dir,
 /// as the harness factory does.
 fn factory(scripts: HashMap<&'static str, Vec<MockResponse>>, sinks: &Sinks) -> AgentFactory {
-    let models: HashMap<String, Arc<MockMessageModel>> = scripts
+    gated_factory(scripts, &[], &Arc::new(Semaphore::new(0)), sinks)
+}
+
+/// [`factory`], where each model call of the `gated` agents first waits for a permit of `gate`.
+fn gated_factory(
+    scripts: HashMap<&'static str, Vec<MockResponse>>,
+    gated: &[&str],
+    gate: &Arc<Semaphore>,
+    sinks: &Sinks,
+) -> AgentFactory {
+    let models: HashMap<String, Arc<Scripted>> = scripts
         .into_iter()
-        .map(|(id, responses)| (id.to_owned(), MockMessageModel::shared(responses)))
+        .map(|(id, responses)| {
+            let model = Scripted {
+                inner: MockMessageModel::new(responses),
+                gate: gated.contains(&id).then(|| gate.clone()),
+            };
+            (id.to_owned(), Arc::new(model))
+        })
         .collect();
     let sinks = sinks.clone();
     Arc::new(move |spec: AgentSpec| {
@@ -51,6 +71,34 @@ fn factory(scripts: HashMap<&'static str, Vec<MockResponse>>, sinks: &Sinks) -> 
             builder.build()
         })
     })
+}
+
+/// A scripted model whose calls each wait for a permit of `gate`, when it has one.
+struct Scripted {
+    inner: MockMessageModel,
+    gate: Option<Arc<Semaphore>>,
+}
+
+impl Model for Scripted {
+    fn model_id(&self) -> Option<String> {
+        self.inner.model_id()
+    }
+
+    fn stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        options: &'a StreamOptions,
+    ) -> BoxStream<'a, strands_agents::Result<ModelStreamEvent>> {
+        let Some(gate) = &self.gate else {
+            return self.inner.stream(messages, options);
+        };
+        let opened = futures::stream::once(async move { gate.acquire().await.expect("open").forget() });
+        Box::pin(
+            opened
+                .filter_map(|()| async { None })
+                .chain(self.inner.stream(messages, options)),
+        )
+    }
 }
 
 fn tool_call(name: &str, id: &str, input: serde_json::Value) -> MockResponse {
@@ -281,5 +329,63 @@ async fn after_a_restart_every_agent_shows_its_past_including_cancelled_ones() {
     assert_eq!(app.selected_id().as_deref(), Some("a2"));
     let shown = screen.until(&mut app, &mut events, "parser: all green").await;
     assert!(shown.contains("restored conversation"), "{shown}");
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_tree_tells_working_agents_from_waiting_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    // The root spawns two children and waits for them; one call runs at a time, so the child
+    // whose call holds the slot works while the other waits for it.
+    let root = Message::new(
+        Role::Assistant,
+        vec![
+            ContentBlock::ToolUse(ToolUseBlock::new(
+                "spawn_agent",
+                "t1",
+                json!({"task": "check the parser", "name": "parser"}),
+            )),
+            ContentBlock::ToolUse(ToolUseBlock::new(
+                "spawn_agent",
+                "t2",
+                json!({"task": "run the linter", "name": "linter"}),
+            )),
+            ContentBlock::ToolUse(ToolUseBlock::new(
+                "wait",
+                "t3",
+                json!({"from": ["parser", "linter"], "all": true, "timeout_seconds": 30}),
+            )),
+        ],
+    );
+    let scripts = HashMap::from([
+        ("a1", vec![MockResponse::message(root), say("root: done")]),
+        ("a2", vec![say("parser: all green")]),
+        ("a3", vec![say("linter: all green")]),
+    ]);
+    let gate = Arc::new(Semaphore::new(0));
+    let factory = gated_factory(scripts, &["a2", "a3"], &gate, &Sinks::default());
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.max_concurrent_calls = 1;
+    let (swarm, mut events) = Swarm::new(config);
+    let mut app = App::default();
+    let mut screen = Screen::new();
+    screen.type_line(&swarm, &mut app, "fix the bug").await;
+
+    let shown = screen
+        .until(&mut app, &mut events, "3 agents · 1 running · 2 waiting")
+        .await;
+    assert!(shown.contains("⧗ fix-bug"), "the root waits for mail\n{shown}");
+    let (working, queued) = match shown.contains("⠋ parser") {
+        true => ("parser", "linter"),
+        false => ("linter", "parser"),
+    };
+    assert!(shown.contains(&format!("⠋ {working}")), "{shown}");
+    assert!(shown.contains(&format!("◌ {queued}")), "{shown}");
+    for glyph in ["⧗", "⠋", "◌"] {
+        let cell = screen.buffer.content().iter().find(|cell| cell.symbol() == glyph);
+        assert_eq!(cell.map(|cell| cell.fg), Some(Color::Cyan), "{glyph}\n{shown}");
+    }
+    gate.add_permits(2);
+    screen.until(&mut app, &mut events, "root: done").await;
     swarm.shutdown().await;
 }
