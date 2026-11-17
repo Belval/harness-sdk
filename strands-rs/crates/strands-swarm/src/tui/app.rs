@@ -147,8 +147,14 @@ impl AgentView {
             AgentStatus::Running => {}
             _ => return None,
         }
-        Some(match self.log.back() {
-            // The call is the entry just above, so its summary is not repeated.
+        // Mail lands in the log whenever it arrives, also while a tool call runs.
+        let latest = self
+            .log
+            .iter()
+            .rev()
+            .find(|entry| !matches!(entry, LogEntry::MailIn { .. }));
+        Some(match latest {
+            // The call is the entry above, so its summary is not repeated.
             Some(LogEntry::Tool { name, ok: None, .. }) => format!("running {name}…"),
             Some(LogEntry::Text(_)) => "writing…".to_owned(),
             _ => "thinking…".to_owned(),
@@ -870,6 +876,23 @@ mod tests {
             queued: false,
         });
         assert_eq!(activity(&app).as_deref(), Some("thinking…"));
+    }
+
+    #[test]
+    fn mail_arriving_during_a_tool_call_leaves_it_shown_as_running() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        app.apply(SwarmEvent::Status {
+            id: "a1".into(),
+            status: AgentStatus::Running,
+        });
+        app.apply(SwarmEvent::ToolStarted {
+            id: "a1".into(),
+            name: "shell".into(),
+            summary: "sleep 58".into(),
+        });
+        app.apply(mail("a1", "a1", "schedule", "[schedule tick] tick"));
+        assert_eq!(app.agents["a1"].activity().as_deref(), Some("running shell…"));
     }
 
     #[test]
