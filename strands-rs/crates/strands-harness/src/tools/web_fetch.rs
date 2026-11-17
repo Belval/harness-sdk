@@ -145,7 +145,9 @@ pub(crate) fn html_to_text(html: &str) -> String {
 }
 
 fn strip_elements(input: &str, tags: &[&str]) -> String {
-    let lower = input.to_lowercase();
+    // ASCII only: tag names are ASCII, and full lowercasing changes the byte length of some
+    // characters (`İ`, the Kelvin sign), so offsets found in it would not slice `input`.
+    let lower = input.to_ascii_lowercase();
     let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
     while i < input.len() {
@@ -424,6 +426,13 @@ fn error_message(err: &Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn elements_after_characters_whose_lowercase_changes_length_are_stripped_without_a_panic() {
+        // `İ` lowercases to 3 bytes from 2, the Kelvin sign to 1 from 3.
+        let html = "İİİ K<script>x()</script>after";
+        assert_eq!(super::strip_elements(html, &["script"]), "İİİ K after");
+    }
+
     use super::*;
     use crate::tools::test_support::{invoke, test_agent, text_of};
     use strands_agents::test_support::{MockMessageModel, MockResponse};
