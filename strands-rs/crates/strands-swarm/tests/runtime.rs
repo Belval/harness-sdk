@@ -57,11 +57,7 @@ fn swarm_with(
     scripts: Vec<(&str, Vec<MockResponse>)>,
     cwd: &Path,
 ) -> (Swarm, UnboundedReceiver<SwarmEvent>, Scripts) {
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    for (id, responses) in scripts {
-        map.lock()
-            .insert(id.to_owned(), MockMessageModel::shared(responses));
-    }
+    let map = scripts_of(scripts);
     let (swarm, events) = Swarm::new(SwarmConfig::new(mock_factory(&map), cwd));
     (swarm, events, map)
 }
@@ -490,10 +486,7 @@ async fn a_supervisor_notice_reaches_the_live_root_once_on_resume() {
         ],
     }))
     .unwrap();
-    let scripts: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    scripts
-        .lock()
-        .insert("a1".into(), MockMessageModel::shared(vec![say("noted")]));
+    let scripts = scripts_of(vec![("a1", vec![say("noted")])]);
     let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
     config.state_dir = Some(state_dir.clone());
     let (swarm, mut events) = Swarm::resume(config, saved).await.unwrap();
@@ -542,7 +535,7 @@ async fn a_saved_run_without_names_resumes_with_derived_ones() {
         ],
     }))
     .unwrap();
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let map = Scripts::default();
     let config = SwarmConfig::new(mock_factory(&map), dir.path());
     let (swarm, _events) = Swarm::resume(config, saved).await.unwrap();
     let names: Vec<String> = swarm.agents().into_iter().map(|a| a.name).collect();
@@ -569,25 +562,21 @@ fn status_saved(swarm: &Swarm, id: &str) -> String {
 #[tokio::test]
 async fn spawns_beyond_the_agent_limit_queue_and_start_when_a_slot_frees() {
     let dir = tempfile::tempdir().unwrap();
-    let scripts: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    let script = |id: &str, responses| {
-        scripts
-            .lock()
-            .insert(id.to_owned(), MockMessageModel::shared(responses))
-    };
-    script(
-        "a1",
-        vec![
-            tool_call("spawn_agent", "t1", json!({"task": "two", "name": "two"})),
-            tool_call("spawn_agent", "t2", json!({"task": "three", "name": "three"})),
-            say("spawned"),
-            say("ok"),
-            say("ok"),
-            say("ok"),
-        ],
-    );
-    script("a2", vec![say("two done")]);
-    script("a3", vec![say("three done"), say("got mail")]);
+    let scripts = scripts_of(vec![
+        (
+            "a1",
+            vec![
+                tool_call("spawn_agent", "t1", json!({"task": "two", "name": "two"})),
+                tool_call("spawn_agent", "t2", json!({"task": "three", "name": "three"})),
+                say("spawned"),
+                say("ok"),
+                say("ok"),
+                say("ok"),
+            ],
+        ),
+        ("a2", vec![say("two done")]),
+        ("a3", vec![say("three done"), say("got mail")]),
+    ]);
     let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
     config.max_agents = 2;
     let (swarm, mut events) = Swarm::new(config);
@@ -620,11 +609,7 @@ async fn spawns_beyond_the_agent_limit_queue_and_start_when_a_slot_frees() {
 #[tokio::test]
 async fn cancelling_a_queued_agent_drops_it() {
     let dir = tempfile::tempdir().unwrap();
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    map.lock()
-        .insert("a1".into(), MockMessageModel::shared(vec![say("one")]));
-    map.lock()
-        .insert("a3".into(), MockMessageModel::shared(vec![say("three")]));
+    let map = scripts_of(vec![("a1", vec![say("one")]), ("a3", vec![say("three")])]);
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.max_agents = 1;
     let (swarm, mut events) = Swarm::new(config);
@@ -659,11 +644,7 @@ async fn a_queued_agent_stays_queued_across_a_resume_until_there_is_room() {
         }))
         .unwrap()
     };
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    map.lock()
-        .insert("a1".into(), MockMessageModel::shared(vec![say("ok")]));
-    map.lock()
-        .insert("a2".into(), MockMessageModel::shared(vec![say("late start")]));
+    let map = scripts_of(vec![("a1", vec![say("ok")]), ("a2", vec![say("late start")])]);
 
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.max_agents = 1;
@@ -694,11 +675,7 @@ async fn raising_the_agent_limit_at_runtime_starts_queued_agents_and_survives_a_
         ],
     }))
     .unwrap();
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    map.lock()
-        .insert("a1".into(), MockMessageModel::shared(vec![say("ok")]));
-    map.lock()
-        .insert("a2".into(), MockMessageModel::shared(vec![say("late start")]));
+    let map = scripts_of(vec![("a1", vec![say("ok")]), ("a2", vec![say("late start")])]);
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.max_agents = 1;
     let (swarm, mut events) = Swarm::resume(config.clone(), saved).await.unwrap();
@@ -723,27 +700,24 @@ async fn raising_the_agent_limit_at_runtime_starts_queued_agents_and_survives_a_
 #[tokio::test]
 async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
     let dir = tempfile::tempdir().unwrap();
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    let script = |id: &str, responses| {
-        map.lock()
-            .insert(id.to_owned(), MockMessageModel::shared(responses))
-    };
-    script(
-        "a1",
-        vec![
-            tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
-            say("spawned"),
-        ],
-    );
-    script("a2", vec![say("never")]);
-    script(
-        "a3",
-        vec![
-            tool_call("list_agents", "l1", json!({})),
-            tool_call("list_agents", "l2", json!({"include_cancelled": true})),
-            say("three"),
-        ],
-    );
+    let map = scripts_of(vec![
+        (
+            "a1",
+            vec![
+                tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "sub"})),
+                say("spawned"),
+            ],
+        ),
+        ("a2", vec![say("never")]),
+        (
+            "a3",
+            vec![
+                tool_call("list_agents", "l1", json!({})),
+                tool_call("list_agents", "l2", json!({"include_cancelled": true})),
+                say("three"),
+            ],
+        ),
+    ]);
     // Every agent but a1 takes a while to build, so a2 is still starting when a1 is cancelled.
     let inner = mock_factory(&map);
     let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
@@ -1142,11 +1116,7 @@ async fn a_worktree_agent_gets_its_own_checkout_and_branch() {
 async fn worktree_agents_get_a_private_cargo_target_dir_that_their_children_share() {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path(), &[]);
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    for id in ["a1", "a2"] {
-        map.lock()
-            .insert(id.to_owned(), MockMessageModel::shared(vec![say("ok")]));
-    }
+    let map = scripts_of(vec![("a1", vec![say("ok")]), ("a2", vec![say("ok")])]);
     let envs: Arc<Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>> = Arc::default();
     let inner = mock_factory(&map);
     let recorded = envs.clone();
@@ -1352,7 +1322,7 @@ async fn a_resumed_agent_sends_the_same_system_prompt_and_tools() {
 #[tokio::test]
 async fn reload_installs_the_binary_keeps_the_previous_one_and_signals_the_host() {
     let dir = tempfile::tempdir().unwrap();
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let map = Scripts::default();
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.state_dir = Some(dir.path().join("run"));
     let (swarm, _events) = Swarm::new(config);
@@ -1407,7 +1377,7 @@ fn mock_resolver(scripts: &Scripts) -> ModelResolver {
 }
 
 fn scripts_of(scripts: Vec<(&str, Vec<MockResponse>)>) -> Scripts {
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let map = Scripts::default();
     for (id, responses) in scripts {
         map.lock()
             .insert(id.to_owned(), MockMessageModel::shared(responses));
@@ -1744,15 +1714,14 @@ async fn token_usage_and_context_are_reported_after_each_model_call_and_survive_
 async fn a_persistent_run_journals_user_traffic_and_lifecycle_events() {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("run");
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
-    map.lock().insert(
-        "a1".into(),
-        MockMessageModel::shared(vec![
+    let map = scripts_of(vec![(
+        "a1",
+        vec![
             tool_call("list_agents", "t1", json!({})),
             say("hello"),
             say("bye"),
-        ]),
-    );
+        ],
+    )]);
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.state_dir = Some(state_dir.clone());
     let (swarm, mut events) = Swarm::new(config.clone());
@@ -3011,7 +2980,7 @@ async fn resuming_under_another_commit_reports_what_changed() {
     };
     let old = commit("feat: before");
     let new = commit("fix: after");
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    let map = Scripts::default();
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.state_dir = Some(dir.path().join("run"));
     config.source = repo.clone();
@@ -3312,7 +3281,6 @@ async fn status_reports_todos_and_branch_commits_without_a_model_call() {
         git(dir, &["commit", "-qm", message]);
     };
 
-    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
     // The root answers its task, then the builder's report, then lists the agents.
     let list = vec![
         say("ok"),
@@ -3320,9 +3288,7 @@ async fn status_reports_todos_and_branch_commits_without_a_model_call() {
         tool_call("list_agents", "l1", json!({})),
         say("listed"),
     ];
-    map.lock().insert("a1".to_owned(), MockMessageModel::shared(list));
-    map.lock()
-        .insert("a2".to_owned(), MockMessageModel::shared(vec![say("ok")]));
+    let map = scripts_of(vec![("a1", list), ("a2", vec![say("ok")])]);
     let inner = mock_factory(&map);
     let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
         let build = inner(spec);
