@@ -176,7 +176,8 @@ const RUN_BACKGROUND_DESCRIPTION: &str = concat!(
     "anything slow: start it here, then `wait` or end your turn; do not sleep-poll its log."
 );
 
-const JOBS_DESCRIPTION: &str = "List background jobs (yours first) with status and log path, or kill one.";
+const JOBS_DESCRIPTION: &str =
+    "List your background jobs and other agents' running ones, with status and log path, or kill one.";
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RunBackgroundInput {
@@ -258,25 +259,47 @@ async fn jobs_tool(swarm: Swarm, me: String, input: JobsInput, _ctx: ToolContext
 }
 
 /// One line per job, the caller's first, then the newest first within each group.
-fn list_jobs(swarm: &Swarm, me: &str, mut jobs: Vec<Job>) -> String {
-    if jobs.is_empty() {
-        return "No background jobs.".to_owned();
-    }
+fn list_jobs(swarm: &Swarm, me: &str, jobs: Vec<Job>) -> String {
+    render_jobs(me, jobs, |id| swarm.label(id), |id| swarm.job_log(id))
+}
+
+/// Longest command shown per job; the job's log and `ps` have the rest.
+const JOB_COMMAND_CHARS: usize = 200;
+
+/// `me`'s jobs (newest first), then other agents' running ones. Other agents' ended jobs are only
+/// counted: the run keeps up to [`crate::jobs::KEEP_JOBS`] of them, which listed in full ran past
+/// 10k tokens for an agent that wanted the state of its own one job.
+fn render_jobs(
+    me: &str,
+    mut jobs: Vec<Job>,
+    label: impl Fn(&str) -> String,
+    log: impl Fn(&str) -> std::path::PathBuf,
+) -> String {
     jobs.reverse();
     jobs.sort_by_key(|job| job.meta.owner != me);
-    jobs.iter()
+    let (shown, others_ended): (Vec<Job>, Vec<Job>) = jobs
+        .into_iter()
+        .partition(|job| job.meta.owner == me || job.state == JobState::Running);
+    let mut lines: Vec<String> = shown
+        .iter()
         .map(|job| {
             format!(
                 "{}: {}, agent {}, `{}`, log {}",
                 job.label(),
                 job.status(),
-                swarm.label(&job.meta.owner),
-                job.meta.command,
-                swarm.job_log(&job.meta.id).display()
+                label(&job.meta.owner),
+                crate::text::clip(&job.meta.command, JOB_COMMAND_CHARS),
+                log(&job.meta.id).display()
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    match (lines.is_empty(), others_ended.len()) {
+        (true, 0) => return "No background jobs.".to_owned(),
+        (true, ended) => return format!("No jobs of yours and none running; other agents' ended: {ended}."),
+        (false, 0) => {}
+        (false, ended) => lines.push(format!("(+{ended} ended jobs of other agents)")),
+    }
+    lines.join("\n")
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -794,6 +817,56 @@ fn timeout_summary(swarm: &Swarm, from: &[String], seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jobs_lists_yours_and_others_running_but_only_counts_others_ended() {
+        let job = |id: &str, owner: &str, state, command: &str| Job {
+            meta: crate::jobs::JobMeta {
+                id: id.into(),
+                owner: owner.into(),
+                name: None,
+                command: command.into(),
+                cwd: "/w".into(),
+                pid: 1,
+                started: 0,
+            },
+            state,
+            reported: true,
+            seconds: 5,
+        };
+        let long = "x".repeat(500);
+        let jobs = vec![
+            job("j1", "a2", JobState::Exited(0), "old"),
+            job("j2", "a1", JobState::Exited(1), &long),
+            job("j3", "a2", JobState::Running, "serve"),
+            job("j4", "a3", JobState::Killed, "old"),
+            job("j5", "a1", JobState::Running, "mine"),
+        ];
+        let render = |me, jobs| {
+            render_jobs(
+                me,
+                jobs,
+                |id| format!("<{id}>"),
+                |id| format!("/jobs/{id}.log").into(),
+            )
+        };
+        let listed = render("a1", jobs.clone());
+        let lines: Vec<&str> = listed.lines().collect();
+        assert_eq!(lines.len(), 4, "{listed}");
+        assert!(
+            lines[0].starts_with("j5: running 5s, agent <a1>, `mine`, log /jobs/j5.log"),
+            "{listed}"
+        );
+        assert!(lines[1].starts_with("j2: exited 1") && lines[1].contains(&format!("`{}…`", &long[..200])));
+        assert!(
+            lines[2].starts_with("j3: running 5s, agent <a2>, `serve`"),
+            "{listed}"
+        );
+        assert_eq!(lines[3], "(+2 ended jobs of other agents)");
+        let none = render("a9", vec![jobs[0].clone()]);
+        assert_eq!(none, "No jobs of yours and none running; other agents' ended: 1.");
+        assert_eq!(render("a1", Vec::new()), "No background jobs.");
+    }
 
     #[test]
     fn spawn_agent_requires_a_name() {

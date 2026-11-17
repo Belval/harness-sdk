@@ -13,7 +13,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to a mailbox (default: your own) later and/or repeatedly (`every: "30m"`, at least a minute); list or cancel schedules. |
 | `run_background` | Run a shell command as a background job; its owner gets the exit code and last 40 output lines when it ends. |
-| `jobs` | List background jobs (status, log path), or kill one with everything it started. |
+| `jobs` | List your background jobs and other agents' running ones (status, log path; other agents' ended jobs only counted), or kill one with everything it started. |
 | `context` | The agent's context dashboard: size against the compaction point, the biggest items, the stash; offload results or summarize now. |
 | `land` | With `--allow-land`: rebase a branch onto the root's branch, run the checks, fast-forward. |
 | `find_tools` | With MCP servers: search the shared MCP tools and enable some for the calling agent. |
