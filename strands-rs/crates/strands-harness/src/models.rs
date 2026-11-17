@@ -421,9 +421,9 @@ fn bedrock_levels(id: &str) -> &'static [&'static str] {
     NO_THINKING_LEVELS
 }
 
-/// A GPT-6 Astra model id, without its cross-region prefix.
+/// A GPT-6 or GPT-6.2 Astra model id, without its cross-region prefix.
 fn is_astra(family: &str) -> bool {
-    family == "openai.gpt-6-astra"
+    matches!(family, "openai.gpt-6-astra" | "openai.gpt-6.2-astra")
 }
 
 fn bedrock_effort(id: &str, effort: Effort) -> Result<Option<String>> {
@@ -957,6 +957,7 @@ fn has_web_search(provider_name: &str, name: &str) -> bool {
     provider_name != "bedrock-mantle"
         || name.starts_with("openai.gpt-5.")
         || name.starts_with("openai.gpt-6-")
+        || name.starts_with("openai.gpt-6.")
 }
 
 /// The AWS environment variables are process-wide, so the tests that set them take this lock.
@@ -1216,6 +1217,9 @@ mod tests {
             "openai.gpt-6-astra",
             "global.openai.gpt-6-astra",
             "us.openai.gpt-6-astra",
+            "openai.gpt-6.2-astra",
+            "global.openai.gpt-6.2-astra",
+            "us.openai.gpt-6.2-astra",
         ] {
             let spec = format!("bedrock/{id}");
             for (effort, level) in [(Effort::Auto, "high"), (Effort::Low, "low"), (Effort::Max, "max")] {
@@ -1651,6 +1655,7 @@ mod tests {
             ("google/gemini-3.5-flash", true),
             ("bedrock-mantle/openai.gpt-5.6-luna", true),
             ("bedrock-mantle/openai.gpt-6-astra", true),
+            ("bedrock-mantle/openai.gpt-6.2-astra", true),
             ("bedrock-mantle/openai.gpt-oss-120b", false),
             ("bedrock-mantle/qwen.qwen3-32b-v1:0", false),
         ] {
@@ -1863,27 +1868,34 @@ mod openai_tests {
     /// Mantle serves Astra with Bedrock's levels, not OpenAI's: `max` works, `none`/`minimal` fail.
     #[test]
     fn resolves_astra_effort_on_bedrock_mantle() {
-        let spec = "bedrock-mantle/openai.gpt-6-astra";
-        for (effort, level) in [
-            (Effort::Auto, "high"),
-            (Effort::Max, "max"),
-            (Effort::Xhigh, "xhigh"),
+        for spec in [
+            "bedrock-mantle/openai.gpt-6-astra",
+            "bedrock-mantle/openai.gpt-6.2-astra",
         ] {
-            let config = resolve(spec, effort, false);
-            assert_eq!(
-                config.params.get("reasoning"),
-                Some(&json!({ "effort": level })),
-                "{effort}"
+            for (effort, level) in [
+                (Effort::Auto, "high"),
+                (Effort::Max, "max"),
+                (Effort::Xhigh, "xhigh"),
+            ] {
+                let config = resolve(spec, effort, false);
+                assert_eq!(
+                    config.params.get("reasoning"),
+                    Some(&json!({ "effort": level })),
+                    "{spec} {effort}"
+                );
+            }
+            assert!(
+                !resolve(spec, Effort::Off, false).params.contains_key("reasoning"),
+                "{spec}"
+            );
+            let error = openai_config_for(spec, Effort::Minimal, false, false, false).expect_err("rejects");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Supported levels: low, medium, high, xhigh, max (or 'auto', 'off')."),
+                "{error}"
             );
         }
-        assert!(!resolve(spec, Effort::Off, false).params.contains_key("reasoning"));
-        let error = openai_config_for(spec, Effort::Minimal, false, false, false).expect_err("rejects");
-        assert!(
-            error
-                .to_string()
-                .contains("Supported levels: low, medium, high, xhigh, max (or 'auto', 'off')."),
-            "{error}"
-        );
     }
 
     #[test]
@@ -1930,7 +1942,11 @@ mod openai_tests {
                 "bedrock-mantle/openai.gpt-5.6-luna",
                 json!({ "reasoning": { "effort": "none" }, "tools": tools }),
             ),
-            ("bedrock-mantle/openai.gpt-6-astra", json!({ "tools": tools })),
+            (
+                "bedrock-mantle/openai.gpt-6-astra",
+                json!({ "tools": tools.clone() }),
+            ),
+            ("bedrock-mantle/openai.gpt-6.2-astra", json!({ "tools": tools })),
         ] {
             let config = resolve(id, Effort::Off, true);
             assert_eq!(JsonValue::Object(config.params), expected, "{id}");
