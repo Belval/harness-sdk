@@ -58,8 +58,9 @@ and exit.
   - A summary brings the input down to half the point: how many of the oldest turns go into it
     follows their token counts. The task message stays verbatim, and so do the latest four
     messages. If the first pass leaves the input above the point, a second pass runs. The log
-    notes `context compacted: 305.0k → 98.1k tokens`. If the summarizer fails, the context is sent
-    as it is, and the log, the footer and `events.jsonl` (`compact_failed`) say why.
+    notes `context compacted: older turns summarized, 305.0k → 98.1k tokens`. If the summarizer
+    fails, the context is sent as it is, and the log, the footer and `events.jsonl`
+    (`compact_failed`) say why.
   - When a compaction changes nothing (the summarizer failed, or nothing could be cut), automatic
     retries wait until the input has grown 10% or ten calls have passed; overflow and `context`
     requests still retry at once.

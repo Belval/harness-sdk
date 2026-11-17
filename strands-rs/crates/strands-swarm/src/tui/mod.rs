@@ -3,6 +3,8 @@
 
 pub mod app;
 pub mod commands;
+#[cfg(test)]
+mod e2e;
 mod edit;
 pub mod images;
 pub mod select;
