@@ -36,8 +36,8 @@ pub use checkpoint::{
 pub use continuation::{is_complete_message_input, ContinuationInput, Continuations};
 pub use delegation::{AgentDelegation, DELEGATION_SINGLE_CALL_CANCEL};
 pub use event_loop::{
-    AgentStream, AgentStreamEvent, InvokeOptions, Limits, CONCURRENT_INVOCATION_MESSAGE, INTERRUPTED_MESSAGE,
-    INTERRUPT_RESPONSES_ONLY_MESSAGE, INTERRUPT_RESUME_REQUIRED_MESSAGE,
+    AgentStream, AgentStreamEvent, InvokeOptions, Limits, CANCELLED_MESSAGE, CONCURRENT_INVOCATION_MESSAGE,
+    INTERRUPTED_MESSAGE, INTERRUPT_RESPONSES_ONLY_MESSAGE, INTERRUPT_RESUME_REQUIRED_MESSAGE,
     STRUCTURED_OUTPUT_FORCED_FAILURE_MESSAGE,
 };
 pub use invocation_state::InvocationState;

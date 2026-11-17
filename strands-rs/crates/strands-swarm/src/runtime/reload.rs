@@ -68,7 +68,7 @@ impl Swarm {
         nodes
             .iter()
             .filter(|node| *node.status.lock() == AgentStatus::Running)
-            .map(|node| *node.tool_calls.lock())
+            .map(|node| node.tool_calls.lock().len())
             .sum()
     }
 

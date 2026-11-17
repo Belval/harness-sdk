@@ -21,6 +21,7 @@ impl Swarm {
         node: &Node,
         agent: &Agent,
         interrupted: bool,
+        ran: &BTreeMap<String, u64>,
     ) -> Option<InvokeInput> {
         if let Err(error) = agent.initialize().await {
             tracing::warn!(agent = %node.id, %error, "session restore failed");
@@ -37,7 +38,7 @@ impl Swarm {
         }
         let in_flight = agent.with_messages(|messages| resume::in_flight(messages));
         let status = resume::git_status(&node.cwd).await;
-        let notice = resume::notice(&in_flight, &node.cwd, status.as_deref());
+        let notice = resume::notice(&in_flight, ran, &node.cwd, status.as_deref());
         let folded = agent.with_messages(|messages| resume::append_notice(messages, &notice));
         Some(match folded {
             true => InvokeInput::None,
@@ -103,7 +104,7 @@ impl Swarm {
 
         let mut input = match start {
             Start::Fresh(task) => Some(InvokeInput::Text(task)),
-            Start::Resume { interrupted } => self.resume_input(&node, &agent, interrupted).await,
+            Start::Resume { interrupted, ran } => self.resume_input(&node, &agent, interrupted, &ran).await,
         };
         let mut backoff = RETRY_INITIAL;
         while let Some(text) = self.next_input(&node, input.take()).await {
@@ -235,7 +236,8 @@ impl Swarm {
             },
             AgentStreamEvent::BeforeToolCall(call) => {
                 if !WAITING_TOOLS.contains(&call.tool_use.name.as_str()) {
-                    *node.tool_calls.lock() += 1;
+                    let id = call.tool_use.tool_use_id.clone();
+                    node.tool_calls.lock().insert(id, Instant::now());
                 }
                 self.emit(SwarmEvent::ToolStarted {
                     id,
@@ -244,10 +246,7 @@ impl Swarm {
                 })
             }
             AgentStreamEvent::AfterToolCall(call) => {
-                if !WAITING_TOOLS.contains(&call.tool_use.name.as_str()) {
-                    let mut calls = node.tool_calls.lock();
-                    *calls = calls.saturating_sub(1);
-                }
+                node.tool_calls.lock().remove(&call.tool_use.tool_use_id);
                 self.emit(SwarmEvent::ToolFinished {
                     id: id.clone(),
                     name: call.tool_use.name.clone(),
@@ -397,8 +396,12 @@ pub(super) const RETRY_MAX: Duration = Duration::from_secs(600);
 pub(super) enum Start {
     /// A new agent: its first turn is the task.
     Fresh(String),
-    /// A restored agent; `interrupted` when it was mid-turn (or starting) when the run stopped.
-    Resume { interrupted: bool },
+    /// A restored agent; `interrupted` when it was mid-turn (or starting) when the run stopped,
+    /// `ran` how long its tool calls in flight had run by then ([`crate::state::AgentState::running_calls`]).
+    Resume {
+        interrupted: bool,
+        ran: BTreeMap<String, u64>,
+    },
 }
 
 /// An agent's auxiliary model (what side calls such as the goal judge and context summarization

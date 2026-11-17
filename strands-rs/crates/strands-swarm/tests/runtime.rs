@@ -2281,14 +2281,19 @@ async fn a_spent_budget_also_stops_the_goal_judge() {
 
 /// Like [`mock_factory`], plus a `slow` tool that runs until it is cancelled.
 fn slow_tool_factory(scripts: &Scripts) -> AgentFactory {
-    let inner = mock_factory(scripts);
+    with_slow_tool(mock_factory(scripts))
+}
+
+/// `inner`, with agents also given a `slow` tool that runs until cancelled.
+fn with_slow_tool(inner: AgentFactory) -> AgentFactory {
     Arc::new(move |mut spec: AgentSpec| {
         let slow = strands_agents::tools::FunctionTool::builder("slow")
             .description("Takes forever.")
             .handler(
                 |_input: serde_json::Value, ctx: strands_agents::tools::ToolContext| async move {
                     ctx.cancel.cancelled().await;
-                    strands_agents::Result::Ok("stopped".to_owned())
+                    // What a real tool (shell) returns when its call is cancelled.
+                    strands_agents::Result::<String>::Err(strands_agents::Error::Cancelled)
                 },
             );
         spec.tools.push(Arc::new(slow));
@@ -2673,6 +2678,43 @@ async fn an_idle_reload_gives_up_waiting_after_its_timeout() {
         "restarted with the call still running"
     );
     swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_call_cut_by_a_restart_is_listed_with_how_long_it_ran() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![tool_call("slow", "t1", json!({})), say("done")],
+    )]);
+    let run = dir.path().join("run");
+    let factory = || with_slow_tool(session_factory(&scripts, run.join("sessions")));
+    let mut config = SwarmConfig::new(factory(), dir.path());
+    config.state_dir = Some(run.clone());
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "work").await;
+    tool_started(&mut events, "slow").await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&run)
+        .await
+        .unwrap()
+        .expect("state saved");
+    assert_eq!(
+        saved.agents[0].running_calls,
+        std::collections::BTreeMap::from([("t1".to_owned(), 1)])
+    );
+    scripts
+        .lock()
+        .insert("a1".into(), MockMessageModel::shared(vec![say("resumed")]));
+    let mut config = SwarmConfig::new(factory(), dir.path());
+    config.state_dir = Some(run.clone());
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "resumed");
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 0);
+    assert!(sent.contains("- slow (cut after 1s) {}"), "{sent}");
+    resumed.shutdown().await;
 }
 
 #[tokio::test]

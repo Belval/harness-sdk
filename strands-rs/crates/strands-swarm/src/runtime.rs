@@ -588,8 +588,9 @@ struct Node {
     turn: Mutex<Option<CancellationToken>>,
     /// Interrupted by the user and not messaged since: a goal agent does not resume on restart.
     paused: AtomicBool,
-    /// Tool calls of the current turn in flight, waiting tools ([`WAITING_TOOLS`]) left out.
-    tool_calls: Mutex<usize>,
+    /// Tool calls of the current turn in flight, by tool use id, with when each started; waiting
+    /// tools ([`WAITING_TOOLS`]) left out.
+    tool_calls: Mutex<BTreeMap<String, Instant>>,
 }
 
 /// Cumulative `(input, output)` tokens.
@@ -823,7 +824,7 @@ impl Swarm {
                 context: Mutex::new(None),
                 turn: Mutex::new(None),
                 paused: AtomicBool::new(false),
-                tool_calls: Mutex::new(0),
+                tool_calls: Mutex::new(BTreeMap::new()),
             });
             agents.insert(id.clone(), node.clone());
             node
@@ -1071,7 +1072,7 @@ impl Swarm {
         }
         // A turn that ended or was cancelled has nothing in flight, finished events or not.
         if status != AgentStatus::Running {
-            *node.tool_calls.lock() = 0;
+            node.tool_calls.lock().clear();
         }
         if status == AgentStatus::Cancelled {
             // Waits on this agent may now be pointless; let them re-check.

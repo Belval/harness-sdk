@@ -98,6 +98,7 @@ impl Swarm {
             _ => AgentStatus::Starting,
         };
         let interrupted = matches!(saved.status.as_str(), "running" | "starting");
+        let ran = saved.running_calls;
         let mailbox = saved.mailbox.into_iter().map(mail_from_state).collect();
         // Runs saved before private target dirs existed get one on resume.
         let env = match saved.branch.is_some() && saved.env.is_empty() {
@@ -135,7 +136,7 @@ impl Swarm {
             context: Mutex::new(saved.context),
             turn: Mutex::new(None),
             paused: AtomicBool::new(saved.paused),
-            tool_calls: Mutex::new(0),
+            tool_calls: Mutex::new(BTreeMap::new()),
         });
         agents.insert(saved.id.clone(), node.clone());
         drop(agents);
@@ -154,7 +155,7 @@ impl Swarm {
         });
         self.emit_usage(&node);
         if status.is_live() && status != AgentStatus::Queued {
-            self.start_actor(node, Start::Resume { interrupted });
+            self.start_actor(node, Start::Resume { interrupted, ran });
         }
     }
 
@@ -227,6 +228,12 @@ pub(super) fn node_state(node: &Node) -> AgentState {
         ledger: node.ledger.lock().clone(),
         context: *node.context.lock(),
         paused: node.paused.load(Ordering::SeqCst),
+        running_calls: node
+            .tool_calls
+            .lock()
+            .iter()
+            .map(|(id, started)| (id.clone(), started.elapsed().as_secs()))
+            .collect(),
     }
 }
 

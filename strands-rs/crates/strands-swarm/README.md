@@ -93,8 +93,9 @@ error.
   - When `CARGO_TARGET_DIR` is set, it builds in its own `$CARGO_TARGET_DIR-worktrees/<run>/<agent>`.
     Builds are not shared, so cargo cannot take another checkout's artifacts as fresh.
 - **Restarts.** An agent that was mid-turn resumes with a short notice instead of re-reading its
-  work. The notice lists the tool calls the restart cut short and `git status --short --branch` of
-  its directory. An agent that had finished its turn rests until its next message; a goal agent
+  work. The notice lists the tool calls the restart cut short, each with how long it had run, and
+  `git status --short --branch` of its directory. When a cut call had run a minute or more, it
+  also says that background jobs survive restarts. An agent that had finished its turn rests until its next message; a goal agent
   whose turn failed retries.
 
 ## Limits

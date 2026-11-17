@@ -3,9 +3,11 @@
 //! checkout. Its todo list needs no copy here, because the harness re-surfaces it before every
 //! model call.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use strands_agents::agent::CANCELLED_MESSAGE;
 use strands_agents::tools::EXECUTION_CANCELLED_MESSAGE;
 use strands_agents::types::{ContentBlock, Message, Role, ToolResultBlock, ToolResultStatus, ToolUseBlock};
 use strands_agents::InvokeInput;
@@ -16,9 +18,21 @@ pub const NOTICE_PREFIX: &str = "[The swarm was restarted";
 const INPUT_CHARS: usize = 300;
 /// Most `git status` lines shown.
 const STATUS_LINES: usize = 30;
+/// A cut call that had run this long gets the hint to run slow commands as background jobs.
+const SLOW_CALL_SECS: u64 = 60;
+/// Said when a slow foreground call was cut: the restart would not have cost a job anything.
+const SLOW_CALL_HINT: &str = "Foreground calls hold up a hot reload, which cuts them after at most 10 \
+    minutes, and die with any restart. Background jobs survive both: for anything slow, use \
+    run_background and wait for its message instead of re-running it in the foreground or polling.";
 
-/// The calls of the last assistant message that never completed: unanswered, or cancelled.
+/// The calls of the last assistant message that never completed: unanswered, or cancelled. The
+/// SDK's closing message of a cancelled turn ([`CANCELLED_MESSAGE`]) does not count as the last.
 pub fn in_flight(messages: &[Message]) -> Vec<ToolUseBlock> {
+    let mut end = messages.len();
+    if messages.last().is_some_and(is_cancel_marker) {
+        end -= 1;
+    }
+    let messages = &messages[..end];
     let Some(at) = messages.iter().rposition(|m| m.role == Role::Assistant) else {
         return Vec::new();
     };
@@ -37,6 +51,12 @@ pub fn in_flight(messages: &[Message]) -> Vec<ToolUseBlock> {
         .collect()
 }
 
+/// The assistant message the SDK closes a cancelled turn with.
+fn is_cancel_marker(message: &Message) -> bool {
+    message.role == Role::Assistant
+        && matches!(message.content.as_slice(), [ContentBlock::Text(text)] if text == CANCELLED_MESSAGE)
+}
+
 /// `git status --short --branch` of `cwd`, capped; `None` outside a repository or on failure.
 pub async fn git_status(cwd: &Path) -> Option<String> {
     // No optional locks: a read must not refresh the index of a checkout another process uses.
@@ -53,16 +73,34 @@ pub async fn git_status(cwd: &Path) -> Option<String> {
     Some(shown)
 }
 
-/// The restart notice: what was cut short and, when `cwd` is a checkout, its status.
-pub fn notice(in_flight: &[ToolUseBlock], cwd: &Path, git_status: Option<&str>) -> String {
+/// The restart notice: what was cut short (with how long it had run, from `ran`: seconds by
+/// tool use id) and, when `cwd` is a checkout, its status.
+pub fn notice(
+    in_flight: &[ToolUseBlock],
+    ran: &BTreeMap<String, u64>,
+    cwd: &Path,
+    git_status: Option<&str>,
+) -> String {
     let mut text = format!("{NOTICE_PREFIX} and your conversation restored.");
     if in_flight.is_empty() {
         text.push_str("\nNo tool call was in flight.");
     } else {
         text.push_str("\nInterrupted before finishing (any effects may be partial):");
+        let mut slow = false;
         for call in in_flight {
             let input = crate::text::clip(&call.input.to_string(), INPUT_CHARS);
-            text.push_str(&format!("\n- {} {input}", call.name));
+            match ran.get(&call.tool_use_id) {
+                Some(&secs) => {
+                    slow |= secs >= SLOW_CALL_SECS;
+                    let after = duration(secs);
+                    text.push_str(&format!("\n- {} (cut after {after}) {input}", call.name));
+                }
+                None => text.push_str(&format!("\n- {} {input}", call.name)),
+            }
+        }
+        if slow {
+            text.push('\n');
+            text.push_str(SLOW_CALL_HINT);
         }
     }
     if let Some(status) = git_status {
@@ -73,6 +111,15 @@ pub fn notice(in_flight: &[ToolUseBlock], cwd: &Path, git_status: Option<&str>) 
     }
     text.push(']');
     text
+}
+
+/// `secs` as `45s`, `9m 12s` or `1h 3m`.
+fn duration(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
+    }
 }
 
 /// Add `notice` to the end of a restored conversation without breaking role alternation:
@@ -171,6 +218,13 @@ mod tests {
             ]),
         ];
         assert_eq!(ids(in_flight(&cancelled)), ["t2"]);
+        let mut closed = cancelled.clone();
+        closed.push(Message::assistant(CANCELLED_MESSAGE));
+        assert_eq!(
+            ids(in_flight(&closed)),
+            ["t2"],
+            "the SDK's cancel marker is skipped"
+        );
 
         let completed = vec![Message::user("go"), calls(&["t1"]), results(vec![ok("t1")])];
         assert!(in_flight(&completed).is_empty(), "cut off during the model call");
@@ -184,10 +238,29 @@ mod tests {
     }
 
     #[test]
+    fn the_notice_says_how_long_each_cut_call_ran_and_points_slow_ones_at_background_jobs() {
+        let cut = calls(&["t1", "t2"]).tool_uses().cloned().collect::<Vec<_>>();
+        let quick = notice(&cut, &BTreeMap::from([("t1".into(), 12)]), Path::new("/w"), None);
+        assert!(
+            quick.contains("\n- shell (cut after 12s) {\"command\":\"run t1\"}"),
+            "{quick}"
+        );
+        assert!(quick.contains("\n- shell {\"command\":\"run t2\"}"), "{quick}");
+        assert!(!quick.contains("run_background"), "{quick}");
+
+        let ran = BTreeMap::from([("t1".into(), 12), ("t2".into(), 552)]);
+        let slow = notice(&cut, &ran, Path::new("/w"), None);
+        assert!(slow.contains("- shell (cut after 9m 12s)"), "{slow}");
+        assert!(slow.contains(&format!("\n{SLOW_CALL_HINT}]")), "{slow}");
+        assert_eq!(duration(3_780), "1h 3m");
+    }
+
+    #[test]
     fn the_notice_lists_cut_short_calls_with_capped_input_and_the_checkout_status() {
         let long = ToolUseBlock::new("write", "t2", json!({"content": "x".repeat(1_000)}));
         let text = notice(
             &[calls(&["t1"]).tool_uses().next().unwrap().clone(), long],
+            &BTreeMap::new(),
             Path::new("/work"),
             Some("## swarm/a1\n M src/lib.rs"),
         );
@@ -197,7 +270,7 @@ mod tests {
         assert!(text.ends_with("in /work:\n## swarm/a1\n M src/lib.rs]"), "{text}");
 
         assert!(text.starts_with(NOTICE_PREFIX));
-        let idle = notice(&[], Path::new("/work"), None);
+        let idle = notice(&[], &BTreeMap::new(), Path::new("/work"), None);
         assert!(
             idle.contains("No tool call was in flight.") && !idle.contains("git"),
             "{idle}"

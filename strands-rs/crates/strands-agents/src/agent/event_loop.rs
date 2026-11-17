@@ -42,7 +42,8 @@ pub const CONCURRENT_INVOCATION_MESSAGE: &str = "Agent is already processing an 
 const INVOCATION_DENIED_MESSAGE: &str = "invocation denied by hook";
 const MODEL_CALL_DENIED_MESSAGE: &str = "model call denied by hook";
 const HOOK_END_TURN_MESSAGE: &str = "Turn ended early by hook after tool execution";
-const CANCELLED_MESSAGE: &str = "Cancelled by user";
+/// The assistant message that closes a turn cancelled while the user turn was open (mid-tools).
+pub const CANCELLED_MESSAGE: &str = "Cancelled by user";
 const NO_TOOL_USE_BLOCKS_MESSAGE: &str = "Model indicated toolUse but no tool use blocks found in message";
 
 /// Error text when a forced structured-output tool call is still not made.

@@ -622,6 +622,7 @@ mod tests {
             ledger: Default::default(),
             context: None,
             paused: false,
+            running_calls: Default::default(),
         };
         fs::create_dir_all(tmp.path().join("target-worktrees/r1/a1")).unwrap();
         fs::create_dir_all(tmp.path().join("target-worktrees/r1/a2")).unwrap();

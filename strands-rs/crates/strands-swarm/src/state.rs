@@ -89,6 +89,10 @@ pub struct AgentState {
     /// Interrupted by the user: a goal agent stays idle until its next message, restarts included.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub paused: bool,
+    /// Tool calls in flight when saved (waiting tools left out): seconds each had run, by tool use
+    /// id, for the restart notice.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub running_calls: BTreeMap<String, u64>,
 }
 
 /// Persisted mail.
