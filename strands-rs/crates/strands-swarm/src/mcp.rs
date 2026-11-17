@@ -221,7 +221,7 @@ struct ToolCache {
     entries: tokio::sync::Mutex<BTreeMap<String, CacheEntry>>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct CacheEntry {
     config: String,
     tools: Vec<ToolSpec>,
@@ -265,7 +265,12 @@ impl ToolCache {
             return;
         };
         let mut entries = self.entries.lock().await;
-        entries.insert(name.to_owned(), CacheEntry { config, tools });
+        let entry = CacheEntry { config, tools };
+        // Each process connects its servers again: most listings repeat the cached one.
+        if entries.get(name) == Some(&entry) {
+            return;
+        }
+        entries.insert(name.to_owned(), entry);
         let text = serde_json::to_vec_pretty(&*entries).unwrap_or_default();
         if let Err(error) = crate::files::replace_async(&self.path, text, false).await {
             tracing::warn!(path = %self.path.display(), %error, "cannot write the MCP tool cache");
@@ -382,4 +387,46 @@ fn add_server(shared: &mut SharedMcp, mut server: McpServer, deny: &[Regex]) {
         }) as ToolRef
     }));
     shared.servers.push(server);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(name: &str) -> ToolSpec {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "description": "d",
+            "inputSchema": {"type": "object"},
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_listing_does_not_rewrite_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-tools.json");
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({"command": "x"})).unwrap();
+        let cache = ToolCache::open(path.clone()).await;
+        cache.store("s", &config, vec![spec("a")]).await;
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"a\""));
+        // A marker the next write would replace.
+        std::fs::write(&path, "marker").unwrap();
+        cache.store("s", &config, vec![spec("a")]).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "marker",
+            "same tools, no write"
+        );
+        cache.store("s", &config, vec![spec("b")]).await;
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("\"b\""),
+            "changed tools are written"
+        );
+        // The next process reads the file and lists the same tools.
+        let reopened = ToolCache::open(path.clone()).await;
+        std::fs::write(&path, "marker").unwrap();
+        reopened.store("s", &config, vec![spec("b")]).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "marker");
+    }
 }

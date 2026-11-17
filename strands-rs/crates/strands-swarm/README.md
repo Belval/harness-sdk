@@ -439,7 +439,7 @@ messages you.
     and start lazily.
   - With `--run`, each server's tool list is cached in `<run dir>/mcp-tools.json` under a hash of
     its config. A start with an unchanged config connects no server (about 6.5 s → 0.03 s for 274
-    tools).
+    tools). The file is rewritten only when a server lists tools that differ from its entry.
   - A server connects when an agent enables one of its tools, or on the first call (60 s timeout),
     and reconnects if it died.
   - Agents start without MCP tools. `find_tools` (whose description lists the servers) searches the
