@@ -241,7 +241,9 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
     moved meanwhile.
   - A conflict (with the files), a failing check (with its last 30 lines) or a refusal changes
     nothing.
-  - The scratch worktree is always removed, and the caller's branch is never modified.
+  - The scratch worktree is always removed, and the caller's branch is never modified. A land job
+    that is stopped (killed with `jobs`, or its agent cancelled) kills the check in flight with its
+    children and removes the scratch worktree too.
 - Programmatically: `Swarm::land`.
 
 ## TUI

@@ -50,6 +50,15 @@ pub struct LandPlan {
 /// `Err` with the reason (conflicted files, a failing check's output tail, a dirty or moved
 /// target) when nothing was changed.
 pub async fn run(plan: &LandPlan) -> Result<String, String> {
+    run_until(plan, std::future::pending()).await
+}
+
+/// [`run`], given up once `stop` resolves (to why): the check in flight is killed with its
+/// children, the scratch worktree is removed, and the report says it was stopped.
+pub async fn run_until(
+    plan: &LandPlan,
+    stop: impl std::future::Future<Output = String>,
+) -> Result<String, String> {
     let repo = &plan.repo;
     let into = &plan.into;
     let into_ref = format!("refs/heads/{into}");
@@ -75,7 +84,20 @@ pub async fn run(plan: &LandPlan) -> Result<String, String> {
     git(repo, &["worktree", "add", "--detach", &scratch, &plan.source])
         .await
         .map_err(|e| format!("Not landed: could not create the scratch worktree: {e}"))?;
-    let outcome = land_in_scratch(plan, &old, checkout.as_deref()).await;
+    let outcome = tokio::select! {
+        outcome = land_in_scratch(plan, &old, checkout.as_deref()) => outcome,
+        why = stop => {
+            let now = git(repo, &["rev-parse", &into_ref]).await.unwrap_or_default();
+            Err(match now == old {
+                true => format!("Not landed: {why}. Nothing was changed."),
+                false => format!(
+                    "Stopped: {why} after {into} moved from {} to {}, which may hold the landing.",
+                    short(&old),
+                    short(&now)
+                ),
+            })
+        }
+    };
     let _ = git(repo, &["worktree", "remove", "--force", &scratch]).await;
     let _ = tokio::fs::remove_dir_all(&plan.scratch).await;
     let _ = git(repo, &["worktree", "prune"]).await;
@@ -220,6 +242,43 @@ pub async fn landed_sources(dir: &Path, base: &str) -> Vec<String> {
 }
 
 /// Run `check` with `sh` in `dir`; on failure the error carries the tail of its output.
+/// SIGKILLs the process group led by its pid when dropped, unless that was cleared: a check given
+/// up on (its landing stopped) does not run on, cargo and test binaries included.
+struct KillGroupOnDrop(Option<u32>);
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// The first SIGTERM, SIGINT or SIGHUP after this call, named: what stops a land job (`jobs`
+/// kill, its agent cancelled) so that it cleans up ([`run_until`]).
+pub fn stop_signal() -> impl std::future::Future<Output = String> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let streams = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::hangup()),
+    );
+    async move {
+        let (Ok(mut term), Ok(mut int), Ok(mut hup)) = streams else {
+            return std::future::pending().await;
+        };
+        let name = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+            _ = hup.recv() => "SIGHUP",
+        };
+        format!("the land job was stopped ({name})")
+    }
+}
+
 async fn check_passes(dir: &Path, check: &str, target_dir: &Path) -> Result<(), String> {
     let mut command = tokio::process::Command::new("sh");
     detach_from_terminal(&mut command)
@@ -231,10 +290,18 @@ async fn check_passes(dir: &Path, check: &str, target_dir: &Path) -> Result<(), 
     for var in crate::worktree::GIT_LOCATION_VARS {
         command.env_remove(var);
     }
-    let output = command
-        .output()
+    let child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Not landed: could not run `{check}`: {e}"))?;
+    // The check leads a session of its own, out of reach of a signal to the land job's group.
+    let mut group = KillGroupOnDrop(child.id());
+    let output = child
+        .wait_with_output()
         .await
         .map_err(|e| format!("Not landed: could not run `{check}`: {e}"))?;
+    group.0 = None;
     if output.status.success() {
         return Ok(());
     }
@@ -576,6 +643,38 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("no branch nope"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_landing_kills_its_check_and_removes_its_scratch_worktree() {
+        let fx = fixture().await;
+        let before = head(&fx.main, "main").await;
+        let started = fx.land.join("started");
+        let late = fx.land.join("late");
+        // A check whose child would outlive it: a test binary under `cargo test`, say.
+        let check = format!(
+            "touch '{}'; (sleep 2; touch '{}') & wait",
+            started.display(),
+            late.display()
+        );
+        let stop = async {
+            while !started.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            "the land job was stopped (SIGTERM)".to_owned()
+        };
+
+        let error = run_until(&plan(&fx, &[check.as_str()]), stop).await.unwrap_err();
+
+        assert_eq!(
+            error,
+            "Not landed: the land job was stopped (SIGTERM). Nothing was changed."
+        );
+        assert_eq!(head(&fx.main, "main").await, before);
+        assert!(!fx.land.join("scratch").exists());
+        assert_eq!(worktrees(&fx.main).await, 2, "main and feature only");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(!late.exists(), "the check's child ran on");
     }
 
     #[test]

@@ -186,7 +186,8 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     if let Some(plan) = &cli.land {
         let plan: strands_swarm::land::LandPlan = serde_json::from_slice(&std::fs::read(plan)?)?;
-        return match strands_swarm::land::run(&plan).await {
+        let stop = strands_swarm::land::stop_signal();
+        return match strands_swarm::land::run_until(&plan, stop).await {
             Ok(report) => {
                 println!("{report}");
                 Ok(Exit::Quit)
