@@ -26,6 +26,7 @@ impl Swarm {
         if let Err(error) = agent.initialize().await {
             tracing::warn!(agent = %node.id, %error, "session restore failed");
         }
+        self.restore_open_batch(node, agent).await;
         if interrupted {
             agent.with_messages(|messages| resume::reword_cancel(messages));
         }
@@ -211,6 +212,7 @@ impl Swarm {
 
     /// Translate one stream event into swarm events; returns the final reply on `AgentResult`.
     fn forward(&self, node: &Node, event: &AgentStreamEvent) -> Option<String> {
+        self.track_batch(node, event);
         let id = node.id.clone();
         match event {
             AgentStreamEvent::ModelStreamUpdate(update) => match &update.event {

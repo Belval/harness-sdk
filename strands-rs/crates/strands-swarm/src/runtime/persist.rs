@@ -166,6 +166,87 @@ impl Swarm {
         }
     }
 
+    /// `<run>/sessions/<id>/open-batch.json`; `None` for a run kept in memory.
+    fn batch_file(&self, id: &str) -> Option<PathBuf> {
+        let dir = self.inner.config.state_dir.as_ref()?;
+        Some(dir.join(SESSIONS_DIR).join(id).join(resume::OPEN_BATCH_FILE))
+    }
+
+    /// Keep `node`'s tool batch on disk as its stream reports it ([`resume::OpenBatch`]): opened
+    /// before the calls run, a result added as each finishes, dropped once the SDK has added the
+    /// batch (or anything else from the user side) to the conversation.
+    pub(super) fn track_batch(&self, node: &Node, event: &AgentStreamEvent) {
+        let mut batch = node.batch.lock();
+        match event {
+            AgentStreamEvent::BeforeTools(tools) => {
+                *batch = Some(resume::OpenBatch {
+                    message: tools.message.clone(),
+                    results: Vec::new(),
+                })
+            }
+            AgentStreamEvent::AfterToolCall(call) => match batch.as_mut() {
+                Some(open) => open.results.push(call.result.clone()),
+                None => return,
+            },
+            AgentStreamEvent::MessageAdded(added)
+                if added.message.role == strands_agents::types::Role::User =>
+            {
+                if batch.take().is_none() {
+                    return;
+                }
+            }
+            _ => return,
+        }
+        let Some(path) = self.batch_file(&node.id) else {
+            return;
+        };
+        let written = match batch.as_ref() {
+            Some(open) => write_atomically(&path, open),
+            None => std::fs::remove_file(&path).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            }),
+        };
+        if let Err(error) = written {
+            tracing::warn!(agent = %node.id, %error, "could not save the tool batch in progress");
+        }
+    }
+
+    /// Put back the tool batch a hard crash cut short ([`resume::restore_batch`]), save the
+    /// conversation with it, then drop the file.
+    pub(super) async fn restore_open_batch(&self, node: &Node, agent: &Agent) {
+        let Some(path) = self.batch_file(&node.id) else {
+            return;
+        };
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            return;
+        };
+        match serde_json::from_slice::<resume::OpenBatch>(&bytes) {
+            Ok(batch) => {
+                if agent.with_messages(|messages| resume::restore_batch(messages, batch)) {
+                    self.save_session(node, agent).await;
+                }
+            }
+            Err(error) => tracing::warn!(agent = %node.id, %error, "unreadable tool batch dropped"),
+        }
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// Save `agent`'s conversation now, after a change the SDK does not save itself (it saves
+    /// when it adds a message).
+    pub(super) async fn save_session(&self, node: &Node, agent: &Agent) {
+        let Some(dir) = self.inner.config.state_dir.as_ref() else {
+            return;
+        };
+        let saved = match crate::agent_session_manager(&dir.join(SESSIONS_DIR), &node.id) {
+            Ok(manager) => manager.save_snapshot(agent, true).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = saved {
+            tracing::warn!(agent = %node.id, %error, "could not save the conversation");
+        }
+    }
+
     pub(super) fn persist(&self) {
         let Some(persister) = self.inner.persister.clone() else {
             return;
@@ -181,6 +262,18 @@ impl Swarm {
             }
         });
     }
+}
+
+/// Write `value` as JSON to `path` through a temporary file and a rename, so a crash leaves the
+/// old file or the new one, never half of one.
+fn write_atomically(path: &Path, value: &impl serde::Serialize) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, serde_json::to_vec(value)?)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// What a restored errored agent shows: the error itself is not persisted.

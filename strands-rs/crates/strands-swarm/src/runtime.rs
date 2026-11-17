@@ -614,6 +614,8 @@ struct Node {
     /// Tool calls of the current turn in flight, by tool use id, with when each started; waiting
     /// tools ([`WAITING_TOOLS`]) left out.
     tool_calls: Mutex<BTreeMap<String, Instant>>,
+    /// The tool batch in progress, also kept on disk ([`resume::OpenBatch`]).
+    batch: Mutex<Option<resume::OpenBatch>>,
 }
 
 /// Cumulative `(input, output)` tokens.

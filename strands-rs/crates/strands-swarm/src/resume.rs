@@ -159,6 +159,62 @@ pub fn append_notice(messages: &mut Vec<Message>, notice: &str) -> bool {
     true
 }
 
+/// File in an agent's session directory that holds its [`OpenBatch`].
+pub const OPEN_BATCH_FILE: &str = "open-batch.json";
+
+/// A batch of tool calls in progress. The SDK adds a batch to the conversation only once every
+/// call in it has finished, so a hard crash (kill -9, OOM kill, power loss) would lose the calls
+/// and the results already in: the agent would not know it had started a job or spawned an
+/// agent. Written ahead while the batch runs, it puts them back on resume ([`restore_batch`]).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OpenBatch {
+    /// The assistant message with the calls.
+    pub message: Message,
+    /// Results of the calls that finished, in the order they did.
+    pub results: Vec<ToolResultBlock>,
+}
+
+/// Put a batch a hard crash cut short back at the end of `messages`: its calls, the results that
+/// came in, and the SDK's cancellation for the rest, so [`in_flight`] lists those. Returns whether
+/// anything changed: nothing does when the conversation already holds the batch's results.
+pub fn restore_batch(messages: &mut Vec<Message>, batch: OpenBatch) -> bool {
+    let calls: Vec<&ToolUseBlock> = batch.message.tool_uses().collect();
+    let Some(first) = calls.first() else {
+        return false;
+    };
+    let answered = messages
+        .iter()
+        .flat_map(|m| m.tool_results())
+        .any(|result| calls.iter().any(|call| call.tool_use_id == result.tool_use_id));
+    if answered {
+        return false;
+    }
+    // The crash may have come between the SDK adding the calls and adding their results.
+    let added = messages.last().is_some_and(|last| {
+        last.role == Role::Assistant && last.tool_uses().any(|call| call.tool_use_id == first.tool_use_id)
+    });
+    if !added {
+        if messages.last().is_some_and(|last| last.role == Role::Assistant) {
+            return false;
+        }
+        messages.push(batch.message.clone());
+    }
+    let content = calls
+        .iter()
+        .map(|call| {
+            let result = batch
+                .results
+                .iter()
+                .find(|result| result.tool_use_id == call.tool_use_id)
+                .cloned()
+                .unwrap_or_else(|| ToolResultBlock::error(&call.tool_use_id, EXECUTION_CANCELLED_MESSAGE));
+            ContentBlock::ToolResult(result)
+        })
+        .collect();
+    messages.push(Message::new(Role::User, content));
+    true
+}
+
 /// A failed model call leaves the user turn open (the SDK closes it only on cancel): the
 /// conversation ends with the turn's input or tool results and no reply. Fold the next `input`
 /// into that message, as Bedrock rejects two user messages in a row; the agent then continues
@@ -329,6 +385,54 @@ mod tests {
         let mut closed = vec![Message::user("go"), Message::assistant("done")];
         let input = fold_into_open_turn(&mut closed, InvokeInput::Text("next".into()));
         assert!(matches!(input, InvokeInput::Text(t) if t == "next"));
+        assert_eq!(closed.len(), 2);
+    }
+
+    #[test]
+    fn a_batch_cut_by_a_hard_crash_comes_back_with_its_finished_results() {
+        let batch = OpenBatch {
+            message: calls(&["t1", "t2"]),
+            results: vec![ok("t1")],
+        };
+        let message = batch.message.clone();
+        // Crashed while t2 ran: the SDK had added nothing of the batch.
+        let mut cut = vec![Message::user("go")];
+        assert!(restore_batch(&mut cut, batch.clone()));
+        assert_eq!(cut.len(), 3);
+        assert_eq!(cut[1], message);
+        let restored: Vec<_> = cut[2]
+            .tool_results()
+            .map(|r| (r.tool_use_id.clone(), r.text()))
+            .collect();
+        assert_eq!(
+            restored,
+            [
+                ("t1".to_owned(), "done".to_owned()),
+                ("t2".to_owned(), EXECUTION_CANCELLED_MESSAGE.to_owned())
+            ]
+        );
+        assert_eq!(ids(in_flight(&cut)), ["t2"], "the notice lists the cut call");
+
+        // Crashed between the SDK adding the calls and adding their results.
+        let mut half = vec![cut[0].clone(), message.clone()];
+        assert!(restore_batch(&mut half, batch.clone()));
+        assert_eq!(half[..2], cut[..2]);
+        assert_eq!(half[2].tool_results().count(), 2);
+
+        // The batch was saved whole (the crash came before the file was removed).
+        let mut done = vec![
+            Message::user("go"),
+            calls(&["t1", "t2"]),
+            results(vec![ok("t1"), ok("t2")]),
+        ];
+        assert!(!restore_batch(&mut done, batch.clone()));
+        assert_eq!(done.len(), 3);
+
+        let mut closed = vec![Message::user("go"), Message::assistant("done")];
+        assert!(
+            !restore_batch(&mut closed, batch),
+            "never two assistant messages in a row"
+        );
         assert_eq!(closed.len(), 2);
     }
 }

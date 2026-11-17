@@ -110,6 +110,10 @@ TASK or `--goal`.
   restarted." rather than the SDK's "Cancelled by user", which a real `/stop` keeps. An agent
   that had finished its turn rests until its next message; a goal agent whose turn failed
   retries.
+- **Hard crashes.** The SDK adds a batch of tool calls to the conversation only once all of them
+  finished, so each agent's batch in progress is also written ahead to
+  `sessions/<agent>/open-batch.json`. After a kill -9, OOM kill or power loss the resumed agent gets
+  the batch back: the calls, the results that came in, and the cut calls in its notice.
 
 ## Limits
 

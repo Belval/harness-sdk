@@ -1285,6 +1285,67 @@ async fn a_resumed_run_restores_conversations_and_wakes_interrupted_agents() {
     assert_eq!(resumed.agents().len(), 2);
 }
 
+/// What a hard crash (kill -9, OOM kill) leaves: the run directory as it is at that moment.
+fn crash_copy(state_dir: &Path, to: &Path) {
+    let copied = std::process::Command::new("cp")
+        .arg("-r")
+        .arg(state_dir)
+        .arg(to)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+}
+
+#[tokio::test]
+async fn a_hard_crash_mid_batch_keeps_its_calls_and_the_results_that_came_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let batch = MockResponse::message(Message::new(
+        Role::Assistant,
+        vec![
+            ContentBlock::ToolUse(ToolUseBlock::new("list_agents", "t1", json!({}))),
+            ContentBlock::ToolUse(ToolUseBlock::new("wait", "t2", json!({"timeout_seconds": 600}))),
+        ],
+    ));
+    let scripts = scripts_of(vec![("a1", vec![batch])]);
+    let mut config = SwarmConfig::new(session_factory(&scripts, state_dir.join("sessions")), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    tool_started(&mut events, "wait").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let crashed = dir.path().join("crashed");
+    crash_copy(&state_dir, &crashed);
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&crashed).await.unwrap().unwrap();
+    assert_eq!(saved.agents[0].status, "running");
+    let scripts = scripts_of(vec![("a1", vec![say("back")])]);
+    let mut config = SwarmConfig::new(session_factory(&scripts, crashed.join("sessions")), dir.path());
+    config.state_dir = Some(crashed.clone());
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "back");
+
+    let (sent, _) = scripts.lock()["a1"].calls()[0].clone();
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(sent[1].tool_uses().count(), 2, "the calls are back");
+    let results: Vec<_> = sent[2].tool_results().collect();
+    assert_eq!(results.len(), 2, "every call is answered: {sent:?}");
+    assert!(
+        results[0].text().contains("(a1)"),
+        "the finished result: {}",
+        results[0].text()
+    );
+    assert_eq!(results[1].tool_use_id, "t2");
+    let notice = sent[2].text();
+    assert!(
+        notice.contains("Interrupted before finishing") && notice.contains("- wait"),
+        "the notice names the cut call: {notice}"
+    );
+    assert!(!crashed.join("sessions/a1").join("open-batch.json").exists());
+    resumed.shutdown().await;
+}
+
 /// The system prompt and tool specs an agent sends, serialized: the prompt cache is keyed on these
 /// bytes, so a resumed agent must send exactly what it sent before the restart.
 fn request_prefix(model: &MockMessageModel, call: usize) -> String {
