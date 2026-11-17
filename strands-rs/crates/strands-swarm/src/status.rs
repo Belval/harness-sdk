@@ -65,8 +65,13 @@ pub struct StatusReport {
 impl StatusReport {
     /// The report as text lines; `doing` adds an agent's current activity after its status.
     pub fn lines(&self, doing: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+        let count = self.agents.len();
+        let mut head = format!("{count} live agent{}", if count == 1 { "" } else { "s" });
+        if let Some(base) = &self.base {
+            head.push_str(&format!(" · base {base}"));
+        }
         let base = self.base.as_deref().unwrap_or("the base");
-        let mut lines = vec![format!("{} live agents · base {base}", self.agents.len())];
+        let mut lines = vec![head];
         for agent in &self.agents {
             let mut head = format!("{} · {}", agent.label, agent.status);
             if agent.unread > 0 {
@@ -231,7 +236,7 @@ mod tests {
             }],
         };
         let lines = report.lines(&|_| None);
-        assert_eq!(lines[0], "1 live agents · base the base");
+        assert_eq!(lines[0], "1 live agent", "no base outside a repository");
         assert_eq!(lines[3], "  branch b · checking…");
     }
 }
