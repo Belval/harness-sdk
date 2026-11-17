@@ -190,10 +190,9 @@ pub async fn collect(
 /// The agent's worktree root `/…/<repo>.swarm/<run_id>/<id>` among `cwd` and its ancestors, and
 /// the main checkout `/…/<repo>` it belongs to. Path shape only: either may be gone.
 fn layout(run_id: &str, id: &str, cwd: &Path) -> Option<(PathBuf, PathBuf)> {
-    let swarm_dir = |owner: &str| owner.len() > ".swarm".len() && owner.ends_with(".swarm");
     let root = cwd
         .ancestors()
-        .find(|dir| owned_path(dir, run_id, id, swarm_dir))?;
+        .find(|dir| owned_path(dir, run_id, id, ".swarm"))?;
     let owner = root.parent()?.parent()?;
     let name = owner.file_name()?.to_str()?.strip_suffix(".swarm")?;
     Some((root.to_path_buf(), owner.parent()?.join(name)))
@@ -254,15 +253,12 @@ async fn delete_merged_branch(repo: &Path, branch: &str, base: Option<&str>, out
 /// `/…/<name>-worktrees/<run_id>/<id>`.
 pub fn private_target_dir(run_id: &str, id: &str, env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let dir = PathBuf::from(env.get("CARGO_TARGET_DIR")?);
-    owned_path(&dir, run_id, id, |owner| {
-        owner.len() > "-worktrees".len() && owner.ends_with("-worktrees")
-    })
-    .then_some(dir)
+    owned_path(&dir, run_id, id, "-worktrees").then_some(dir)
 }
 
-/// Whether `path` is absolute, plain (no `.`/`..`) and ends in `<owner>/<run_id>/<id>` with an
-/// `owner` that `owner_ok` accepts.
-fn owned_path(path: &Path, run_id: &str, id: &str, owner_ok: impl Fn(&str) -> bool) -> bool {
+/// Whether `path` is absolute, plain (no `.`/`..`) and ends in `<name><suffix>/<run_id>/<id>`
+/// with a non-empty `name`.
+fn owned_path(path: &Path, run_id: &str, id: &str, suffix: &str) -> bool {
     let plain = path.is_absolute()
         && path
             .components()
@@ -273,7 +269,11 @@ fn owned_path(path: &Path, run_id: &str, id: &str, owner_ok: impl Fn(&str) -> bo
         .take(3)
         .filter_map(|c| c.as_os_str().to_str())
         .collect();
-    plain && names.len() == 3 && names[0] == id && names[1] == run_id && owner_ok(names[2])
+    plain
+        && names.len() == 3
+        && names[0] == id
+        && names[1] == run_id
+        && names[2].strip_suffix(suffix).is_some_and(|name| !name.is_empty())
 }
 
 async fn remove_dir(dir: &Path, out: &mut Collected) {
@@ -282,10 +282,7 @@ async fn remove_dir(dir: &Path, out: &mut Collected) {
         Ok(meta) if meta.is_dir() => {}
         _ => return,
     }
-    let path = dir.to_path_buf();
-    let bytes = tokio::task::spawn_blocking(move || dir_size(&path))
-        .await
-        .unwrap_or(0);
+    let bytes = size(dir).await;
     match tokio::fs::remove_dir_all(dir).await {
         Ok(()) => out.removed.push((dir.to_path_buf(), bytes)),
         Err(error) => out
@@ -300,10 +297,7 @@ async fn worktree_root(run_id: &str, id: &str, cwd: &Path) -> Option<PathBuf> {
         return None;
     }
     let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"]).await.ok()?);
-    let owned = owned_path(&root, run_id, id, |owner| {
-        owner.len() > ".swarm".len() && owner.ends_with(".swarm")
-    });
-    owned.then_some(root)
+    owned_path(&root, run_id, id, ".swarm").then_some(root)
 }
 
 async fn remove_worktree(root: &Path, branch: &str, out: &mut Collected) {
@@ -317,19 +311,14 @@ async fn remove_worktree(root: &Path, branch: &str, out: &mut Collected) {
         Ok(_) => return keep(out, "uncommitted changes".to_owned()),
         Err(error) => return keep(out, error),
     }
-    let Ok(common) = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await else {
+    let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await;
+    let Some(main) = common.as_deref().ok().and_then(|dir| Path::new(dir).parent()) else {
         return keep(out, "no main checkout".to_owned());
     };
-    let Some(main) = Path::new(&common).parent().map(Path::to_path_buf) else {
-        return keep(out, "no main checkout".to_owned());
-    };
-    let path = root.to_path_buf();
-    let bytes = tokio::task::spawn_blocking(move || dir_size(&path))
-        .await
-        .unwrap_or(0);
+    let bytes = size(root).await;
     let root_arg = root.to_string_lossy().into_owned();
     // No `--force`: git refuses a worktree with modified or untracked files.
-    match git(&main, &["worktree", "remove", &root_arg]).await {
+    match git(main, &["worktree", "remove", &root_arg]).await {
         Ok(_) => {
             out.removed.push((root.to_path_buf(), bytes));
             // `<repo>.swarm/<run>`, then `<repo>.swarm`, once nothing else is in them: a
@@ -342,6 +331,14 @@ async fn remove_worktree(root: &Path, branch: &str, out: &mut Collected) {
         }
         Err(error) => keep(out, error),
     }
+}
+
+/// [`dir_size`] off the async runtime.
+async fn size(dir: &Path) -> u64 {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || dir_size(&dir))
+        .await
+        .unwrap_or(0)
 }
 
 /// Total size of the files under `dir`, without following symlinks.
