@@ -2456,7 +2456,7 @@ async fn a_dirty_worktree_is_kept_until_gc_finds_it_clean_and_resume_collects_ca
     assert!(checkout.join("wip.txt").exists(), "dirty worktrees are kept");
     let collected = swarm.gc().await;
     assert_eq!(collected.len(), 1);
-    assert_eq!(collected[0].kept[0].1, "uncommitted changes");
+    assert_eq!(collected[0].kept[0].1, "uncommitted changes: ?? wip.txt");
     swarm.shutdown().await;
 
     // Committed later: resuming the run reclaims the worktree of the already-cancelled agent.

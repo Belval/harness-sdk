@@ -358,8 +358,10 @@ messages you.
 - **Disk.**
   - Once a cancelled worktree agent and its subtree have stopped (or on resume), its private target
     dir is deleted.
-  - Its worktree is removed with `git worktree remove` unless it has uncommitted changes, and so
-    are `<repo>.swarm/<run>` and `<repo>.swarm` once that leaves them empty. A worktree with
+  - Its worktree is removed with `git worktree remove` unless it has uncommitted changes (the
+    reason names the first three, e.g. `uncommitted changes: ?? tests/__pycache__/`, often only
+    build output to delete), and so are `<repo>.swarm/<run>` and `<repo>.swarm` once that leaves
+    them empty. A worktree with
     another branch checked out goes only once the base has all of that branch (which stays);
     otherwise it is kept, e.g. `on branch swarm/r/a3-fix: 1 commit not on main`. A detached one
     is kept.

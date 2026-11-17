@@ -308,6 +308,18 @@ async fn worktree_root(run_id: &str, id: &str, cwd: &Path) -> Option<PathBuf> {
     owned_path(&root, run_id, id, ".swarm").then_some(root)
 }
 
+/// Why a worktree with `git status --porcelain` output `status` stays, naming the first paths:
+/// often only build output (`?? tests/__pycache__/`) that its owner can delete.
+fn uncommitted(status: &str) -> String {
+    const SHOWN: usize = 3;
+    let lines: Vec<&str> = status.lines().collect();
+    let mut shown = lines.iter().take(SHOWN).copied().collect::<Vec<_>>().join(", ");
+    if lines.len() > SHOWN {
+        shown.push_str(&format!(", {} more", lines.len() - SHOWN));
+    }
+    format!("uncommitted changes: {shown}")
+}
+
 /// Remove the worktree at `root` if it is clean and on `branch`, or on another branch `base`
 /// already has all of (which nothing then tracks); otherwise record why it stays.
 async fn remove_worktree(root: &Path, branch: &str, base: Option<&str>, out: &mut Collected) {
@@ -323,7 +335,7 @@ async fn remove_worktree(root: &Path, branch: &str, base: Option<&str>, out: &mu
     }
     match git(root, &["status", "--porcelain"]).await {
         Ok(status) if status.is_empty() => {}
-        Ok(_) => return keep(out, "uncommitted changes".to_owned()),
+        Ok(status) => return keep(out, uncommitted(&status)),
         Err(error) => return keep(out, error),
     }
     let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await;
@@ -656,7 +668,7 @@ mod tests {
         let collected = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &env(&target), None).await;
         assert_eq!(
             collected.kept,
-            [(worktree.clone(), "uncommitted changes".to_owned())]
+            [(worktree.clone(), "uncommitted changes: ?? new.txt".to_owned())]
         );
         assert!(worktree.join("new.txt").exists());
         assert!(!target.exists(), "the target dir goes regardless");
