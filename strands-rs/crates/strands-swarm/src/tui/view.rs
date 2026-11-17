@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AgentView, App, LogEntry};
+use super::app::{AgentView, App, LogEntry, SlashCommand};
 use super::select::{self, Pane};
 use crate::runtime::{AgentStatus, USER};
 use crate::text::compact;
@@ -675,15 +675,31 @@ fn draw_completions(frame: &mut Frame, input: Rect, app: &App) {
     if completions.is_empty() {
         return;
     }
+    // `name args` padded to one column, so every help text starts at the same place.
+    let args = |command: &SlashCommand| match command.args {
+        "" => String::new(),
+        args => format!(" {args}"),
+    };
+    let column = completions
+        .iter()
+        .map(|command| command.name.len() + args(command).len() + 2)
+        .max()
+        .unwrap_or(0);
+    let help = completions
+        .iter()
+        .map(|command| command.help.len())
+        .max()
+        .unwrap_or(0);
     let height = (completions.len() as u16 + 2).min(input.y);
-    let width = input.width.min(72);
+    let width = input.width.min(to_u16(column + help + 2));
     let area = Rect::new(input.x, input.y - height, width, height);
     let items: Vec<ListItem> = completions
         .iter()
         .map(|command| {
+            let pad = column - command.name.len();
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", command.name), Style::new().bold()),
-                Span::raw(format!("{:<16}", command.args)),
+                Span::styled(command.name, Style::new().bold()),
+                Span::raw(format!("{:<pad$}", args(command))),
                 Span::styled(command.help, Style::new().dim()),
             ]))
         })
@@ -702,6 +718,9 @@ fn draw_completions(frame: &mut Frame, input: Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use super::super::app::SLASH_COMMANDS;
     use super::*;
 
     fn mail(from: &str) -> LogEntry {
@@ -770,6 +789,35 @@ mod tests {
         let row = |y: usize| rows[y].chars().take(tree).collect::<String>();
         assert_eq!(row(3), "  … lazy-mcp-discover •", "{screen}");
         assert!(!row(2).contains('•'), "{screen}");
+    }
+
+    #[test]
+    fn the_slash_popup_aligns_help_in_one_column() {
+        let app = App {
+            input: "/".into(),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app, "run", 0)).unwrap();
+        let screen = screen_text(terminal.backend().buffer());
+        let columns: HashSet<usize> = SLASH_COMMANDS
+            .iter()
+            .map(|command| {
+                let row = screen
+                    .lines()
+                    .find(|row| row.contains(command.help))
+                    .expect(&screen);
+                row.find(command.help).unwrap()
+            })
+            .collect();
+        assert_eq!(columns.len(), 1, "{screen}");
+        let longest = SLASH_COMMANDS
+            .iter()
+            .map(|c| c.help)
+            .max_by_key(|h| h.len())
+            .unwrap();
+        assert!(screen.contains(&format!("{longest}│")), "{screen}");
     }
 
     #[test]
