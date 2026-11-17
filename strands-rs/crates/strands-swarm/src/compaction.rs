@@ -2,6 +2,7 @@
 //! tokens of a 1M window), or at a fixed token count (`--compact-at`, `spawn_agent`'s
 //! `compact_at`) when that is smaller.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -10,7 +11,8 @@ use crate::dashboard::{ContextControl, SUMMARY_KEEPS};
 use async_trait::async_trait;
 use futures::StreamExt;
 use strands_agents::context_manager::strategies::{
-    flatten_messages_to_content, format_summarized, SUMMARIZATION_SYSTEM_PROMPT, SUMMARIZED_PREFIX,
+    flatten_messages_to_content, format_summarized, CHARS_PER_TOKEN, SUMMARIZATION_SYSTEM_PROMPT,
+    SUMMARIZED_PREFIX,
 };
 use strands_agents::context_manager::{ContextState, ContextStrategy, AUTO_SUMMARIZE_UTILIZATION};
 use strands_agents::models::{
@@ -50,6 +52,15 @@ const MAX_PASSES: usize = 2;
 const RETRY_GROWTH: f64 = 0.10;
 /// …or this many model calls have passed. Overflow and `context` requests retry at once.
 const RETRY_CALLS: u32 = 10;
+
+/// Most of the summarizer's window one summarizer call's slice of the transcript may take,
+/// leaving the rest for the prompt, the summary so far and the output. At 850k of a 1M window the
+/// ~425k tokens to summarize go in one call; a 200k-window summarizer gets 100k slices.
+const SLICE_SHARE: f64 = 0.5;
+/// Smallest slice, in estimated tokens.
+const MIN_SLICE: u64 = 1_000;
+/// How often a slice the summarizer rejects as too long is halved before compaction fails.
+const MAX_HALVINGS: u32 = 4;
 
 /// Why automatic compaction is holding off: the input it last failed at, and the calls left.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -312,9 +323,14 @@ async fn summarize_down_to(
     let Some((cut, removed)) = cut else {
         return Ok(None);
     };
-    let mut content = earlier;
-    content.extend(flatten_messages_to_content(&messages[1..cut]));
-    let summary = summarize(model, content).await.inspect_err(|error| {
+    let summary = summarize_in_slices(
+        model,
+        earlier,
+        flatten_messages_to_content(&messages[1..cut]),
+        scale,
+    )
+    .await
+    .inspect_err(|error| {
         if !matches!(error, Error::Cancelled) {
             tracing::warn!("error=<{error}> | summarizing older turns failed");
         }
@@ -342,6 +358,86 @@ fn heuristic(messages: &[Message]) -> u64 {
 
 fn heuristic_blocks(blocks: &[ContentBlock]) -> u64 {
     heuristic(&[Message::new(Role::User, blocks.to_vec())])
+}
+
+/// Summarizes `earlier` (the summary so far, if any) followed by `content` in calls that fit the
+/// summarizer's window: each gets the summary so far and the next slice of `content`, of at most
+/// [`SLICE_SHARE`] of that window, with `scale` real tokens per estimated one. A slice the
+/// summarizer still rejects as too long is halved and sent again, up to [`MAX_HALVINGS`] times.
+async fn summarize_in_slices(
+    model: &Arc<dyn Model>,
+    earlier: Vec<ContentBlock>,
+    content: Vec<ContentBlock>,
+    scale: f64,
+) -> Result<String> {
+    let window = window_of(model.as_ref()) as f64;
+    let mut budget = ((window * SLICE_SHARE / scale.max(f64::EPSILON)) as u64).max(MIN_SLICE);
+    let mut summary = earlier;
+    let mut rest = VecDeque::from(content);
+    let (mut halvings, mut summarized, mut calls) = (0, 0.0, 0);
+    loop {
+        let slice = take_slice(&mut rest, budget);
+        let mut input = summary.clone();
+        input.extend(slice.iter().cloned());
+        match summarize(model, input).await {
+            Ok(text) if rest.is_empty() => {
+                if calls > 0 {
+                    tracing::info!("calls=<{}>, budget=<{budget}> | summarized in slices", calls + 1);
+                }
+                return Ok(text);
+            }
+            Ok(text) => {
+                calls += 1;
+                summarized += heuristic_blocks(&slice) as f64 * scale;
+                let header = format_summarized("the turns before", summarized.round() as u64, Some(&text));
+                summary = vec![ContentBlock::Text(header)];
+            }
+            Err(Error::ContextWindowOverflow(error)) if halvings < MAX_HALVINGS => {
+                tracing::warn!(
+                    "budget=<{budget}>, error=<{error}> | summarizer input too long, halving the slice"
+                );
+                halvings += 1;
+                budget = (budget / 2).max(MIN_SLICE);
+                for block in slice.into_iter().rev() {
+                    rest.push_front(block);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Takes the leading blocks of `rest` that estimate at most `budget` tokens, at least one; a text
+/// block that does not fit is split to fill the slice.
+fn take_slice(rest: &mut VecDeque<ContentBlock>, budget: u64) -> Vec<ContentBlock> {
+    let mut slice = Vec::new();
+    let mut size = 0;
+    while let Some(block) = rest.pop_front() {
+        let weight = heuristic_blocks(std::slice::from_ref(&block));
+        if size + weight <= budget {
+            size += weight;
+            slice.push(block);
+            continue;
+        }
+        let room = (budget - size) as usize * CHARS_PER_TOKEN;
+        match block {
+            // `room` is at least one token's characters, so at least one character fits.
+            ContentBlock::Text(text) if room > 0 => {
+                let mut at = room.min(text.len());
+                while !text.is_char_boundary(at) {
+                    at -= 1;
+                }
+                slice.push(ContentBlock::Text(text[..at].to_owned()));
+                if at < text.len() {
+                    rest.push_front(ContentBlock::Text(text[at..].to_owned()));
+                }
+            }
+            block if slice.is_empty() => slice.push(block),
+            block => rest.push_front(block),
+        }
+        break;
+    }
+    slice
 }
 
 /// One summarizer call over `content`, on the agent's auxiliary model.
@@ -379,12 +475,17 @@ mod tests {
 
     /// A task, then `turns` tool calls with ~300-token results.
     fn tool_loop(turns: usize) -> Vec<Message> {
+        tool_loop_of(turns, 300)
+    }
+
+    /// A task, then `turns` tool calls with results of about `tokens` tokens each.
+    fn tool_loop_of(turns: usize, tokens: usize) -> Vec<Message> {
         let mut messages = vec![Message::user("the task")];
         for i in 0..turns {
             let id = format!("t{i}");
             let call = ToolUseBlock::new("shell", id.clone(), serde_json::json!({ "command": "ls" }));
             messages.push(Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)]));
-            let output = ToolResultContent::Text(format!("output {i} {}", "x".repeat(1_200)));
+            let output = ToolResultContent::Text(format!("output {i} {}", "x".repeat(tokens * 4)));
             messages.push(Message::new(
                 Role::User,
                 vec![ContentBlock::ToolResult(ToolResultBlock::success(
@@ -740,6 +841,204 @@ mod tests {
             }
             Box::pin(futures::stream::iter([Err(Error::Cancelled)]))
         }
+    }
+
+    /// `inner` behind a context window, as a provider enforces it: a call whose input (system
+    /// prompt included) estimates over `rejects_over` tokens fails with an overflow and uses no
+    /// response. It reports `window` as its window, which may be larger than what it accepts.
+    struct Windowed {
+        inner: Arc<MockMessageModel>,
+        window: u64,
+        rejects_over: u64,
+        /// Each call's input, in estimated tokens, rejected or not.
+        inputs: Mutex<Vec<u64>>,
+    }
+
+    impl Windowed {
+        fn new(responses: &[&str], window: u64) -> Arc<Self> {
+            Self::rejecting(responses, window, window)
+        }
+
+        fn rejecting(responses: &[&str], window: u64, rejects_over: u64) -> Arc<Self> {
+            let responses = responses
+                .iter()
+                .map(|text| MockResponse::message(Message::assistant(*text)))
+                .collect();
+            Arc::new(Self {
+                inner: MockMessageModel::shared(responses),
+                window,
+                rejects_over,
+                inputs: Mutex::default(),
+            })
+        }
+
+        fn inputs(&self) -> Vec<u64> {
+            self.inputs.lock().clone()
+        }
+    }
+
+    impl Model for Windowed {
+        fn model_id(&self) -> Option<String> {
+            self.inner.model_id()
+        }
+
+        fn context_window_limit(&self) -> Option<u64> {
+            Some(self.window)
+        }
+
+        fn stream<'a>(&'a self, messages: &'a [Message], options: &'a StreamOptions) -> ModelEventStream<'a> {
+            let count = CountTokensOptions {
+                system_prompt: options.system_prompt.clone(),
+                tool_specs: options.tool_specs.clone(),
+            };
+            let input = estimate_tokens_heuristic(messages, &count);
+            self.inputs.lock().push(input);
+            if input > self.rejects_over {
+                let error = Error::ContextWindowOverflow(format!(
+                    "Input is too long for requested model: {input} > {}",
+                    self.rejects_over
+                ));
+                return Box::pin(futures::stream::iter([Err(error)]));
+            }
+            self.inner.stream(messages, options)
+        }
+    }
+
+    /// An agent on a 1M-window model whose side calls run on `summarizer`.
+    fn agent_with_summarizer(summarizer: &Arc<Windowed>) -> Agent {
+        Agent::builder()
+            .model(Windowed::new(&[], 1_000_000))
+            .aux_model(Arc::clone(summarizer))
+            .build()
+            .unwrap()
+    }
+
+    /// The default point of a 1M window (850k) in ~2k-token tool results.
+    fn at_850k() -> Vec<Message> {
+        let messages = tool_loop_of(425, 2_000);
+        let tokens = heuristic(&messages);
+        assert!((850_000..860_000).contains(&tokens), "{tokens}");
+        messages
+    }
+
+    #[tokio::test]
+    async fn at_850k_a_200k_summarizer_gets_slices_that_fit_its_window() {
+        let summaries: Vec<String> = (1..=8).map(|i| format!("SUMMARY {i}")).collect();
+        let summaries: Vec<&str> = summaries.iter().map(String::as_str).collect();
+        let summarizer = Windowed::new(&summaries, 200_000);
+        let agent = agent_with_summarizer(&summarizer);
+        let (manager, events) = manager(None, None);
+        let mut messages = at_850k();
+        let before = heuristic(&messages);
+
+        assert!(pass(&manager, &agent, &mut messages, before, false).await);
+
+        let inputs = summarizer.inputs();
+        assert!(inputs.len() > 1, "{inputs:?}");
+        assert!(inputs.iter().all(|&input| input <= 200_000), "{inputs:?}");
+        let after = heuristic(&messages);
+        assert!((300_000..=425_000).contains(&after), "{after} tokens left");
+        // Each slice's summary went into the next; the last one is what is kept.
+        let calls = summarizer.inner.calls();
+        assert!(calls[1].0[0].text().contains("SUMMARY 1"));
+        let last = format!("SUMMARY {}", inputs.len());
+        assert!(
+            messages[0].text().contains(&last),
+            "{}",
+            &messages[0].text()[..200]
+        );
+        assert!(!messages[0].text().contains("SUMMARY 1\n"));
+        assert_well_formed(&messages);
+        assert!(matches!(events.lock()[..], [Compaction::Done { after: a, .. }] if a <= 425_000));
+    }
+
+    #[tokio::test]
+    async fn a_summarizer_that_rejects_a_slice_gets_smaller_ones() {
+        // It claims a 1M window but takes no more than 150k.
+        let summaries: Vec<String> = (1..=8).map(|i| format!("SUMMARY {i}")).collect();
+        let summaries: Vec<&str> = summaries.iter().map(String::as_str).collect();
+        let summarizer = Windowed::rejecting(&summaries, 1_000_000, 150_000);
+        let agent = agent_with_summarizer(&summarizer);
+        let (manager, events) = manager(None, None);
+        let mut messages = at_850k();
+        let before = heuristic(&messages);
+
+        assert!(pass(&manager, &agent, &mut messages, before, false).await);
+
+        let inputs = summarizer.inputs();
+        assert!(inputs[0] > 150_000, "the first try was too big: {inputs:?}");
+        let accepted = summarizer.inner.call_count();
+        assert!(accepted >= 3, "{inputs:?}");
+        assert!(heuristic(&messages) <= 425_000);
+        assert!(messages[0].text().contains(&format!("SUMMARY {accepted}")));
+        assert!(matches!(events.lock()[..], [Compaction::Done { .. }]));
+    }
+
+    #[tokio::test]
+    async fn an_agent_over_its_window_with_a_200k_summarizer_finishes_its_turn() {
+        let summaries: Vec<String> = (1..=10).map(|i| format!("SUMMARY {i}")).collect();
+        let summaries: Vec<&str> = summaries.iter().map(String::as_str).collect();
+        let summarizer = Windowed::new(&summaries, 200_000);
+        let model = Windowed::new(&["done"], 1_000_000);
+        let (compact, events) = compact(None, None);
+        let config = ContextManagerConfig {
+            strategies: Some(vec![compact]),
+            ..Default::default()
+        };
+        // Past the 1M window, as after a resume or a burst of big tool results.
+        let mut history = tool_loop_of(520, 2_000);
+        history.push(Message::assistant("next"));
+        let agent = Agent::builder()
+            .model(Arc::clone(&model))
+            .aux_model(Arc::clone(&summarizer))
+            .messages(history)
+            .context_manager(ContextManagerOption::Config(config))
+            .build()
+            .unwrap();
+
+        agent.invoke("go on").await.unwrap();
+
+        // One call, under the window: no overflow, retry or truncation.
+        let inputs = model.inputs();
+        assert_eq!(inputs.len(), 1, "{inputs:?}");
+        assert!(inputs[0] <= 500_000, "{inputs:?}");
+        assert!(summarizer.inputs().iter().all(|&input| input <= 200_000));
+        let messages = agent.messages();
+        assert!(messages[0].text().starts_with("the task"));
+        assert!(messages[0].text().contains("SUMMARY"));
+        assert!(matches!(events.lock()[..], [Compaction::Done { .. }]));
+    }
+
+    #[test]
+    fn a_slice_splits_a_text_too_big_for_it_at_a_character() {
+        let text = |s: &str| ContentBlock::Text(s.to_owned());
+        let big = "é".repeat(30_000); // 60k bytes
+        let mut rest = VecDeque::from([text("small"), text(&big), text("after")]);
+        let budget = 5_000;
+        let mut joined = String::new();
+        let mut slices = 0;
+        while !rest.is_empty() {
+            let slice = take_slice(&mut rest, budget);
+            assert!(!slice.is_empty());
+            assert!(
+                heuristic_blocks(&slice) <= budget + 10,
+                "{}",
+                heuristic_blocks(&slice)
+            );
+            for block in &slice {
+                let ContentBlock::Text(part) = block else { panic!() };
+                joined.push_str(part);
+            }
+            slices += 1;
+        }
+        assert_eq!(joined, format!("small{big}after"), "nothing lost or doubled");
+        assert!((3..=5).contains(&slices), "{slices}");
+        // A block that is not text goes alone when over the budget.
+        let input = serde_json::json!({ "command": "x".repeat(40_000) });
+        let call = ContentBlock::ToolUse(ToolUseBlock::new("shell", "id", input));
+        let mut rest = VecDeque::from([call, text("after")]);
+        assert_eq!(take_slice(&mut rest, 1_000).len(), 1);
+        assert_eq!(rest.len(), 1);
     }
 
     #[tokio::test]
