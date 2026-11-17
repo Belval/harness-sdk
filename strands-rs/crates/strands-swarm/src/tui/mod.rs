@@ -91,7 +91,7 @@ pub async fn run(
                     screen.clone_from(frame.buffer);
                     crate::watchdog::ready();
                 }
-                Err(error) => break Err(strands_agents::Error::other(format!("terminal error: {error}"))),
+                Err(error) => break Err(terminal_error(error)),
             }
         }
         tokio::select! {
@@ -105,7 +105,7 @@ pub async fn run(
                 true if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press) => {
                     plain = false;
                     if let Err(error) = leave_plain(&mut terminal) {
-                        break Err(strands_agents::Error::other(format!("terminal error: {error}")));
+                        break Err(terminal_error(error));
                     }
                 }
                 true => {}
@@ -120,7 +120,7 @@ pub async fn run(
         if std::mem::take(&mut app.show_plain) {
             plain = true;
             if let Err(error) = enter_plain(&app) {
-                break Err(strands_agents::Error::other(format!("terminal error: {error}")));
+                break Err(terminal_error(error));
             }
         }
     };
@@ -129,6 +129,10 @@ pub async fn run(
     ratatui::restore();
     swarm.shutdown().await;
     outcome
+}
+
+fn terminal_error(error: std::io::Error) -> strands_agents::Error {
+    strands_agents::Error::other(format!("terminal error: {error}"))
 }
 
 /// Leave the alternate screen and print the selected agent's log as plain text, so it lands in
@@ -229,17 +233,14 @@ fn on_mouse(app: &mut App, mouse: MouseEvent, screen: &Buffer) -> Option<String>
                 return None;
             };
             let inner = areas.inner(selection.pane);
-            let continues = match selection.pane {
-                select::Pane::Log => view::log_continuations(app, inner),
-                select::Pane::Tree => Vec::new(),
-            };
             // The log is copied from its text alone, without thumbnails.
             let text = match selection.pane {
                 select::Pane::Log => {
                     let log = view::log_text(app, screen.area);
+                    let continues = view::log_continuations(app, inner);
                     select::selected_text(&log, inner, &selection, &continues)
                 }
-                select::Pane::Tree => select::selected_text(screen, inner, &selection, &continues),
+                select::Pane::Tree => select::selected_text(screen, inner, &selection, &[]),
             };
             return (!text.is_empty()).then_some(text);
         }
@@ -337,6 +338,17 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
     None
 }
 
+async fn start_root(swarm: &Swarm, task: String, goal: Option<String>) -> Result<String> {
+    let with_goal = if goal.is_some() { " with a goal" } else { "" };
+    let request = SpawnRequest {
+        task,
+        goal,
+        ..Default::default()
+    };
+    let id = swarm.spawn(USER, request).await?;
+    Ok(format!("started {}{with_goal}", swarm.label(&id)))
+}
+
 async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
     let selected = app.selected_id();
     let outcome = match (command, selected) {
@@ -344,27 +356,8 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             app.quit = true;
             Ok(String::new())
         }
-        (Command::NewRoot(task), _) => {
-            let request = SpawnRequest {
-                task,
-                ..Default::default()
-            };
-            swarm
-                .spawn(USER, request)
-                .await
-                .map(|id| format!("started {}", swarm.label(&id)))
-        }
-        (Command::Goal(goal), _) => {
-            let request = SpawnRequest {
-                task: goal.clone(),
-                goal: Some(goal),
-                ..Default::default()
-            };
-            swarm
-                .spawn(USER, request)
-                .await
-                .map(|id| format!("started {} with a goal", swarm.label(&id)))
-        }
+        (Command::NewRoot(task), _) => start_root(swarm, task, None).await,
+        (Command::Goal(goal), _) => start_root(swarm, goal.clone(), Some(goal)).await,
         (Command::To { text, .. }, _) if text.is_empty() => {
             Err(strands_agents::Error::other("usage: /to <agent> <message>"))
         }
