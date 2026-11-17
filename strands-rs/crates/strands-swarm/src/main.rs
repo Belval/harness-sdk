@@ -616,28 +616,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_resume_sends_its_live_root_the_task_but_never_the_goal() {
+    fn a_resume_sends_its_live_root_a_new_task_but_never_the_goal() {
         let goal = || Some("all tests pass".to_owned());
+        let send = |task: &str, last| start_plan(Some(task.into()), goal(), true, last);
         assert!(matches!(start_plan(None, goal(), true, None), StartPlan::Nothing));
+        assert!(matches!(send("", None), StartPlan::Nothing));
+        assert!(
+            matches!(send("build it", Some("build it")), StartPlan::Nothing),
+            "replayed"
+        );
         assert!(matches!(
-            start_plan(Some("also fix X".into()), goal(), true, None),
-            StartPlan::Message(task) if task == "also fix X"
-        ));
-        assert!(matches!(
-            start_plan(Some(String::new()), None, true, None),
-            StartPlan::Nothing
-        ));
-    }
-
-    #[test]
-    fn a_replayed_task_is_not_sent_again_but_a_new_one_is() {
-        let last = Some("build it");
-        assert!(matches!(
-            start_plan(Some("build it".into()), None, true, last),
-            StartPlan::Nothing
-        ));
-        assert!(matches!(
-            start_plan(Some("also fix X".into()), None, true, last),
+            send("also fix X", Some("build it")),
             StartPlan::Message(task) if task == "also fix X"
         ));
     }
