@@ -139,8 +139,12 @@ struct Screen {
 
 impl Screen {
     fn new() -> Self {
+        Self::sized(WIDTH, HEIGHT)
+    }
+
+    fn sized(width: u16, height: u16) -> Self {
         Self {
-            terminal: Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap(),
+            terminal: Terminal::new(TestBackend::new(width, height)).unwrap(),
             buffer: Buffer::empty(Rect::default()),
         }
     }
@@ -387,5 +391,48 @@ async fn the_tree_tells_working_agents_from_waiting_ones() {
     }
     gate.add_permits(2);
     screen.until(&mut app, &mut events, "root: done").await;
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_tool_line_breaks_a_long_path_live_and_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let sinks = Sinks::default();
+    let path = "/local/home/belvae/workplace/harness-sdk.swarm/self-improve/a64/strands-rs/crates/strands-swarm/src/tui/view.rs";
+    let scripts = HashMap::from([(
+        "a1",
+        vec![
+            tool_call("read", "t1", json!({ "path": path })),
+            say("root: read it"),
+        ],
+    )]);
+    let mut config = SwarmConfig::new(factory(scripts, &sinks), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config.clone());
+    let mut app = App::default();
+    let mut screen = Screen::sized(80, 24);
+    screen.type_line(&swarm, &mut app, "read the view").await;
+    let shown = screen.until(&mut app, &mut events, "root: read it").await;
+    assert!(shown.contains("✗ read /local/home/"), "live\n{shown}");
+    swarm.shutdown().await;
+
+    let saved = crate::state::load(&state_dir)
+        .await
+        .unwrap()
+        .expect("state saved");
+    let config = SwarmConfig {
+        factory: factory(HashMap::from([("a1", vec![])]), &sinks),
+        ..config
+    };
+    let (swarm, mut events) = Swarm::resume(config, saved).await.unwrap();
+    let mut app = App::default();
+    let mut screen = Screen::sized(80, 24);
+    let shown = screen.until(&mut app, &mut events, "restored conversation").await;
+    let shown = match shown.contains("root: read it") {
+        true => shown,
+        false => screen.until(&mut app, &mut events, "root: read it").await,
+    };
+    assert!(shown.contains("✗ read /local/home/"), "restored\n{shown}");
     swarm.shutdown().await;
 }

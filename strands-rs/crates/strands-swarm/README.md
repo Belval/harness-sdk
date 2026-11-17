@@ -343,6 +343,8 @@ Other text messages the selected agent, or starts a root agent when there is non
 
 **Log and copying.**
 
+- A tool line whose summary is one long word (a path) breaks the word at the edge, live and
+  restored, rather than leaving `✗ read` alone above it.
 - F2 prints the selected agent's log as plain text into the terminal's scrollback; any key returns.
 - A resumed run shows the last 100 messages of each agent's restored conversation, cancelled
   agents included (F3 lists them).
