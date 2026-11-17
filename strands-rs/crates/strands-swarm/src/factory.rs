@@ -872,6 +872,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_timed_out_shell_call_shows_its_partial_output_as_plain_text() {
+        let command = "echo 'say \"hi\"'; echo warn >&2; sleep 5";
+        let slow = tool_call(
+            "shell",
+            "s1",
+            serde_json::json!({ "command": command, "timeout": 0.3 }),
+        );
+        let model = run(
+            &HarnessFactoryOptions::default(),
+            spec(),
+            calls_then_done(vec![slow]),
+            "try it",
+        )
+        .await;
+
+        let calls = model.calls();
+        let result = calls[1].0.last().unwrap().tool_results().next().unwrap();
+        match &result.content[..] {
+            [ToolResultContent::Text(text)] => {
+                assert_eq!(text, "say \"hi\"\n[stderr]\nwarn\n[timed out after 0.3s]")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn agents_are_told_to_prefer_the_file_tools_over_shell_edits() {
         let harness = harness_options(&HarnessFactoryOptions::default(), spec()).unwrap();
