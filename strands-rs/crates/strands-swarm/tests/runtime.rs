@@ -3819,8 +3819,12 @@ async fn a_background_job_mails_its_exit_code_and_output_tail_to_the_idle_agent_
     assert_eq!(reply_to(&mut events, USER).await, "saw it");
     let woken = sent_text(&scripts.lock()["a1"].clone(), 2);
     assert!(woken.contains("kind=\\\"job\\\""), "{woken}");
-    let jobs = swarm.jobs().await;
-    assert!(jobs[0].reported, "reported once");
+    // Marked once the report is saved, which may finish after the agent has already read it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !swarm.jobs().await[0].reported {
+        assert!(tokio::time::Instant::now() < deadline, "never marked reported");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
