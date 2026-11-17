@@ -756,16 +756,20 @@ fn describe(swarm: &Swarm, info: &AgentInfo) -> String {
     )
 }
 
+/// Without `from`, only live agents are listed (cancelled ones are counted), as in `list_agents`.
 fn timeout_summary(swarm: &Swarm, from: &[String], seconds: u64) -> String {
-    let agents: Vec<String> = swarm
+    let (shown, hidden): (Vec<_>, Vec<_>) = swarm
         .agents()
-        .iter()
+        .into_iter()
         .filter(|info| from.is_empty() || from.contains(&info.id))
-        .map(|info| describe(swarm, info))
-        .collect();
+        .partition(|info| !from.is_empty() || info.status.is_live());
+    let mut lines: Vec<String> = shown.iter().map(|info| describe(swarm, info)).collect();
+    if !hidden.is_empty() {
+        lines.push(format!("({} cancelled agents not shown)", hidden.len()));
+    }
     format!(
         "No messages within {seconds}s. Current status:\n{}",
-        agents.join("\n")
+        lines.join("\n")
     )
 }
 

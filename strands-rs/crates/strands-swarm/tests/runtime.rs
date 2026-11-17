@@ -178,6 +178,32 @@ async fn wait_all_returns_once_every_named_agent_has_replied() {
 }
 
 #[tokio::test]
+async fn a_wait_timeout_counts_cancelled_agents_instead_of_listing_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = vec![
+        tool_call("spawn_agent", "s", json!({"task": "t", "name": "c1"})),
+        tool_call("spawn_agent", "s2", json!({"task": "t", "name": "c2"})),
+        tool_call("wait", "w1", json!({"timeout_seconds": 30})),
+        tool_call("cancel_agent", "k", json!({"id": "c1"})),
+        tool_call("wait", "w2", json!({"timeout_seconds": 1})),
+        say("done"),
+    ];
+    let agents = vec![
+        ("a1", root),
+        ("a2", vec![say("hi")]),
+        ("a3", slow_child(30, "late")),
+    ];
+    let (swarm, mut events, scripts) = swarm_with(agents, dir.path());
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 5);
+    let result = sent.split("No messages within 1s").nth(1).expect(&sent);
+    assert!(!result.contains("c1 (a2)"), "{result}");
+    assert!(result.contains("c2 (a3): running"), "{result}");
+    assert!(result.contains("(1 cancelled agents not shown)"), "{result}");
+}
+
+#[tokio::test]
 async fn wait_all_on_timeout_returns_what_came_and_who_is_missing() {
     let dir = tempfile::tempdir().unwrap();
     let from = json!({"from": ["c1", "c2", "c3"], "all": true, "timeout_seconds": 1});
