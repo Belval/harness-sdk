@@ -22,7 +22,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 /// Run a swarm of cooperating coding agents. The root agent decides whether and how to spawn
 /// others.
 #[derive(Parser, Debug)]
-#[command(version)]
+#[command(version = env!("STRANDS_SWARM_VERSION"))]
 struct Cli {
     /// Task for the root agent. Optional in the TUI, where you can type it.
     task: Option<String>,
@@ -358,11 +358,11 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     let (swarm, events) = match saved {
         Some(saved) => {
             config.cwd = saved.cwd.clone();
-            eprintln!(
-                "strands-swarm: resuming run {} ({} agents)",
-                saved.run_id,
-                saved.agents.len()
-            );
+            let agents = match saved.agents.len() {
+                1 => "1 agent".to_owned(),
+                n => format!("{n} agents"),
+            };
+            eprintln!("strands-swarm: resuming run {} ({agents})", saved.run_id);
             Swarm::resume(config, saved).await?
         }
         None => Swarm::new(config),

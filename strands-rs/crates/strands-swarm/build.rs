@@ -1,4 +1,5 @@
-//! Embed the git commit the binary is built from as `STRANDS_SWARM_COMMIT` (absent outside git).
+//! Embed the git commit the binary is built from as `STRANDS_SWARM_COMMIT` (absent outside git),
+//! and `STRANDS_SWARM_VERSION` for `--version`: the package version plus that short commit.
 
 use std::path::Path;
 use std::process::Command;
@@ -11,9 +12,13 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let Some(commit) = git(&["rev-parse", "HEAD"]) else {
+        println!("cargo:rustc-env=STRANDS_SWARM_VERSION={version}");
         return;
     };
+    let short = commit.get(..9).unwrap_or(&commit);
+    println!("cargo:rustc-env=STRANDS_SWARM_VERSION={version} ({short})");
     println!("cargo:rustc-env=STRANDS_SWARM_COMMIT={commit}");
     // Rebuild when HEAD moves: its file, the branch it points at, and packed refs.
     let mut refs = vec!["HEAD".to_owned(), "packed-refs".to_owned()];

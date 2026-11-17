@@ -33,8 +33,9 @@ use crate::runtime::{AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
 use crate::skills::{skills_prompt, skills_tool};
 
 /// `subagent` is replaced by the swarm tools; `web_search` fails construction on models without
-/// native search (every Bedrock model), so it is opt-in through MCP instead.
-const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search"];
+/// native search (every Bedrock model), so it is opt-in through MCP instead;
+/// `programmatic_tool_caller` has no runtime in Rust (the harness skips it with a warning).
+const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search", "programmatic_tool_caller"];
 
 /// Preview kept in context when a large tool result is offloaded to the stash.
 /// How to use the file tools: agents otherwise script edits with `python3`/`sed` through `shell`,
