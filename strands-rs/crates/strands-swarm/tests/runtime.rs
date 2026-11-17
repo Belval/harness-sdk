@@ -203,6 +203,44 @@ async fn wait_all_on_timeout_returns_what_came_and_who_is_missing() {
     swarm.shutdown().await;
 }
 
+/// A `wait` with `all` leaves the replies that came in the saved mailbox until it returns: a
+/// kill -9 while it still waits on others would otherwise lose them (an `interrupted` notice was).
+#[tokio::test]
+async fn wait_all_keeps_the_replies_in_the_saved_mailbox_until_it_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = json!({"from": ["c1", "c2"], "all": true, "timeout_seconds": 30});
+    let spawn = |n: u32| {
+        tool_call(
+            "spawn_agent",
+            &format!("s{n}"),
+            json!({"task": "t", "name": format!("c{n}")}),
+        )
+    };
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![spawn(1), spawn(2), tool_call("wait", "w", from), say("done")],
+            ),
+            ("a2", slow_child(0, "first")),
+            ("a3", slow_child(2, "second")),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    let unread = |swarm: &Swarm| {
+        let state = swarm.snapshot();
+        let root = state.agents.iter().find(|a| a.id == "a1").unwrap();
+        root.mailbox.iter().map(|m| m.text.clone()).collect::<Vec<_>>()
+    };
+    eventually("c1's reply is saved for a1", || unread(&swarm) == ["first"]).await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let result = sent_text(&scripts.lock()["a1"], 3);
+    assert!(result.contains("first") && result.contains("second"), "{result}");
+    assert!(unread(&swarm).is_empty());
+    swarm.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_silent_or_empty_final_reply_reaches_no_agent_parent() {
     let dir = tempfile::tempdir().unwrap();

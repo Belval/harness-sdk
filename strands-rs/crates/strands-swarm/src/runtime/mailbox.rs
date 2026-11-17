@@ -53,7 +53,7 @@ impl Swarm {
         filter: &[String],
         cancel: &CancellationToken,
     ) -> Option<Vec<Mail>> {
-        match self.wait_until(id, filter, cancel, |_, _| None).await {
+        match self.wait_until(id, filter, cancel, true, |_, _| None).await {
             WaitOutcome::Mail(mail) => Some(mail),
             _ => None,
         }
@@ -63,12 +63,34 @@ impl Swarm {
     /// can come any more because every agent in `from` (or, without `from`, every agent `id`
     /// spawned) is cancelled, or none can come until the waiter frees a slot for them.
     pub async fn wait(&self, id: &str, from: &[String], cancel: &CancellationToken) -> WaitOutcome {
+        self.wait_or_peek(id, from, cancel, true).await
+    }
+
+    /// Like [`Swarm::wait`], but the mail stays in the mailbox (and so in `swarm.json`):
+    /// `Mail` comes back empty. A `wait` with `all` takes the mail only once it returns, so a
+    /// crash while it still waits on others loses none.
+    pub async fn wait_for_arrival(
+        &self,
+        id: &str,
+        from: &[String],
+        cancel: &CancellationToken,
+    ) -> WaitOutcome {
+        self.wait_or_peek(id, from, cancel, false).await
+    }
+
+    async fn wait_or_peek(
+        &self,
+        id: &str,
+        from: &[String],
+        cancel: &CancellationToken,
+        take: bool,
+    ) -> WaitOutcome {
         let give_up = |swarm: &Self, node: &Node| {
             swarm
                 .unreachable(node, from)
                 .or_else(|| swarm.stalled_on_queue(node, from))
         };
-        self.wait_until(id, from, cancel, give_up).await
+        self.wait_until(id, from, cancel, take, give_up).await
     }
 
     /// Whether `id` has unread mail from one of `from` (from anyone when empty).
@@ -76,11 +98,19 @@ impl Swarm {
         self.node(id).is_some_and(|node| has_matching_mail(&node, from))
     }
 
+    /// The senders of `id`'s unread mail.
+    pub fn unread_senders(&self, id: &str) -> Vec<String> {
+        self.node(id)
+            .map(|node| node.mailbox.lock().iter().map(|mail| mail.from.clone()).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) async fn wait_until(
         &self,
         id: &str,
         filter: &[String],
         cancel: &CancellationToken,
+        take: bool,
         give_up: impl Fn(&Self, &Node) -> Option<String>,
     ) -> WaitOutcome {
         let Some(node) = self.node(id) else {
@@ -89,7 +119,7 @@ impl Swarm {
         loop {
             let notified = node.notify.notified();
             if has_matching_mail(&node, filter) {
-                return WaitOutcome::Mail(self.drain(id));
+                return WaitOutcome::Mail(if take { self.drain(id) } else { Vec::new() });
             }
             if let Some(notice) = give_up(self, &node) {
                 return WaitOutcome::Unreachable(notice);

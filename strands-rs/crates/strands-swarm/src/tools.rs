@@ -512,9 +512,9 @@ async fn wait_tool(swarm: Swarm, me: String, input: WaitInput, ctx: ToolContext)
     Ok(text)
 }
 
-/// `wait` with `all`: collect mail until each of `from` has sent something, the user writes, or
-/// `seconds` pass; every message taken on the way is returned, with a note on who is missing.
-/// `None` when it was cut before taking any.
+/// `wait` with `all`: wait until each of `from` has sent something, the user writes, or
+/// `seconds` pass, then take and return the mail, with a note on who is missing. The mail stays
+/// in the (saved) mailbox until then, so a crash or reload meanwhile loses none. `None` when cut.
 async fn wait_all(
     swarm: &Swarm,
     me: &str,
@@ -523,23 +523,18 @@ async fn wait_all(
     cancel: &CancellationToken,
 ) -> Option<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
-    let mut mail = Vec::new();
     let note = loop {
-        let wait = swarm.wait(me, &remaining, cancel);
+        let senders = swarm.unread_senders(me);
+        remaining.retain(|id| !senders.contains(id));
+        match (remaining.is_empty(), senders.iter().any(|from| from == USER)) {
+            (true, _) => break None,
+            (false, true) => break Some(still_waiting(swarm, &remaining, "The user wrote")),
+            (false, false) => {}
+        }
+        let wait = swarm.wait_for_arrival(me, &remaining, cancel);
         match tokio::time::timeout_at(deadline, wait).await {
-            Ok(WaitOutcome::Mail(batch)) => {
-                remaining.retain(|id| !batch.iter().any(|m| &m.from == id));
-                let from_user = batch.iter().any(|m| m.from == USER);
-                mail.extend(batch);
-                match (remaining.is_empty(), from_user) {
-                    (true, _) => break None,
-                    (false, true) => break Some(still_waiting(swarm, &remaining, "The user wrote")),
-                    (false, false) => {}
-                }
-            }
-            // Mail already taken must still reach the agent.
-            Ok(WaitOutcome::Cancelled) if mail.is_empty() => return None,
-            Ok(WaitOutcome::Cancelled) => break Some("Wait cancelled.".to_owned()),
+            Ok(WaitOutcome::Mail(_)) => {}
+            Ok(WaitOutcome::Cancelled) => return None,
             Ok(WaitOutcome::Unreachable(notice)) => break Some(notice),
             Err(_) => {
                 let why = format!("No messages within {seconds}s");
@@ -547,7 +542,7 @@ async fn wait_all(
             }
         }
     };
-    let mut text = render_mail(&mail);
+    let mut text = render_mail(&swarm.drain(me));
     if let Some(note) = note {
         if !text.is_empty() {
             text.push_str("\n\n");
