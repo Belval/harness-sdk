@@ -58,9 +58,7 @@ impl Swarm {
     /// environment, detached from this process so a restart does not stop it. When it ends, the
     /// owner gets a `job` message with its exit code and the tail of its output.
     pub async fn start_job(&self, owner: &str, command: &str, name: Option<String>) -> Result<Job> {
-        let node = self
-            .node(owner)
-            .ok_or_else(|| Error::other(format!("Unknown agent id {owner}.")))?;
+        let node = self.known(owner)?;
         let job = self
             .inner
             .jobs

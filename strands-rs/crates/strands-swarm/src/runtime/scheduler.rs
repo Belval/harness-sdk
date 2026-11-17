@@ -21,8 +21,8 @@ impl Swarm {
             every,
             at,
         } = request;
-        if owner != USER && self.node(owner).is_none() {
-            return Err(Error::other(format!("Unknown agent id {owner}.")));
+        if owner != USER {
+            self.known(owner)?;
         }
         let live = self.node(&to).is_some_and(|node| node.status.lock().is_live());
         if !live {

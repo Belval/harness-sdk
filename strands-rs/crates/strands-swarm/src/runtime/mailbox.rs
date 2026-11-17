@@ -172,9 +172,7 @@ impl Swarm {
             self.emit(event);
             return Ok(());
         }
-        let node = self
-            .node(to)
-            .ok_or_else(|| Error::other(format!("Unknown agent id {to}.")))?;
+        let node = self.known(to)?;
         if !node.status.lock().is_live() {
             return Err(Error::other(format!("Agent {to} is cancelled.")));
         }

@@ -791,10 +791,11 @@ impl Swarm {
     /// Spawn an agent under `parent` ([`USER`] for a root agent). Returns its id. At the agent
     /// limit the agent is [`AgentStatus::Queued`] instead, and starts once a slot frees.
     pub async fn spawn(&self, parent: &str, mut request: SpawnRequest) -> Result<String> {
-        let parent_node = self.node(parent);
-        if parent != USER && parent_node.is_none() {
-            return Err(Error::other(format!("Unknown agent id {parent}.")));
-        }
+        let parent_node = if parent == USER {
+            None
+        } else {
+            Some(self.known(parent)?)
+        };
         let default = self.inner.config.default_model.as_deref();
         request.model = request.model.map(|model| expand_model(&model, default));
 
@@ -885,9 +886,7 @@ impl Swarm {
     /// parent gets an `interrupted` message, and its children keep running. A goal agent stays
     /// idle until its next message. Errors when the agent is not in a turn.
     pub fn interrupt(&self, id: &str) -> Result<()> {
-        let node = self
-            .node(id)
-            .ok_or_else(|| Error::other(format!("Unknown agent id {id}.")))?;
+        let node = self.known(id)?;
         let turn = node.turn.lock().clone();
         match turn {
             Some(turn) if node.status.lock().is_live() => {
@@ -903,9 +902,7 @@ impl Swarm {
 
     /// Cancel an agent and, through its token, every agent it spawned.
     pub fn cancel(&self, id: &str) -> Result<()> {
-        let node = self
-            .node(id)
-            .ok_or_else(|| Error::other(format!("Unknown agent id {id}.")))?;
+        let node = self.known(id)?;
         node.cancel.cancel();
         // Recorded right away for the whole subtree, so capacity, mail and `list_agents` reflect
         // it even while an actor is still starting or finishing a tool call.
@@ -937,9 +934,7 @@ impl Swarm {
     /// agent keeps its current model. The choice is persisted, so a resumed run keeps it. Returns
     /// the new model id.
     pub async fn set_model(&self, id: &str, model: Option<String>) -> Result<String> {
-        let node = self
-            .node(id)
-            .ok_or_else(|| Error::other(format!("Unknown agent id {id}.")))?;
+        let node = self.known(id)?;
         let resolver = self.inner.config.models.clone().ok_or_else(|| {
             Error::other("Model switching is not available: no model resolver is configured.")
         })?;
@@ -1081,6 +1076,12 @@ impl Swarm {
 
     fn node(&self, id: &str) -> Option<Arc<Node>> {
         self.inner.agents.lock().get(id).cloned()
+    }
+
+    /// [`Swarm::node`], or the error tools report for an unknown id.
+    fn known(&self, id: &str) -> Result<Arc<Node>> {
+        self.node(id)
+            .ok_or_else(|| Error::other(format!("Unknown agent id {id}.")))
     }
 
     /// Every node in spawn order, copied out so per-agent locks are not taken under the agents
