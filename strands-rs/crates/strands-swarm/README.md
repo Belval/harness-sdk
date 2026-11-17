@@ -270,7 +270,8 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   a `/model` switch is priced per model.
 - **Prices.**
   - A built-in table holds Claude list prices per 1M tokens by tier (opus, sonnet, haiku, plus older
-    versions). Cache reads cost 0.1× the input price and cache writes 1.25× (2× with
+    versions) and GPT-6 Astra's, which GPT-6.2 Astra borrows until its own is listed. Cache reads
+    cost 0.1× the input price and cache writes 1.25× (2× with
     `--cache-ttl 1h`).
   - `--prices FILE` adds or overrides entries. It is a JSON object keyed by model-id substring:
     `{"opus": {"input": 5, "output": 25}}`, with optional `cache_read`/`cache_write`.

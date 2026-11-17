@@ -30,6 +30,8 @@ const BUILTIN: &[(&str, f64, f64)] = &[
     ("haiku", 1.0, 5.0),
     ("3-5-haiku", 0.8, 4.0),
     ("3-haiku", 0.25, 1.25),
+    // Bedrock's global GPT-6 Astra price (AWS Price List); GPT-6.2 Astra's is unlisted yet.
+    ("-astra", 10.0, 50.0),
 ];
 
 /// Tokens of one agent on one model. `input` counts all input, cache reads and writes included.
@@ -684,6 +686,13 @@ mod tests {
         assert_eq!(input("us.anthropic.claude-haiku-4-5"), Some(1.0));
         assert_eq!(input("CLAUDE-SONNET-5"), Some(3.0), "case-insensitive");
         assert_eq!(input("openai.gpt-oss-120b"), None);
+        assert_eq!(input("bedrock-mantle/openai.gpt-6-astra"), Some(10.0));
+        assert_eq!(
+            input("bedrock/us.openai.gpt-6.2-astra"),
+            Some(10.0),
+            "falls back to 6"
+        );
+        assert_eq!(prices.price("openai.gpt-6-astra").unwrap().output, 50.0);
     }
 
     #[test]
