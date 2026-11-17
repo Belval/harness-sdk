@@ -130,7 +130,10 @@ pub fn section(text: &str, path: &Path) -> Option<String> {
     }
     let mut kept = text;
     if text.len() > MAX_PROMPT_CHARS {
-        let cut = text.len() - MAX_PROMPT_CHARS;
+        let mut cut = text.len() - MAX_PROMPT_CHARS;
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
         let start = text[cut..].find('\n').map_or(text.len(), |at| cut + at + 1);
         kept = &text[start..];
     }
@@ -250,6 +253,14 @@ mod tests {
         assert!(big.contains("- entry 1999\n(end of memory)"));
         assert!(!big.contains("- entry 0000"));
         assert!(big.len() < MAX_PROMPT_CHARS + 500);
+    }
+
+    #[test]
+    fn a_cut_inside_a_multibyte_character_moves_to_the_next_boundary() {
+        // The trailing `yyy` puts the cut, counted from the end, inside an `é` (2 bytes).
+        let text = format!("{}yyy", "- é\n".repeat(MAX_PROMPT_CHARS));
+        let kept = section(&text, Path::new("/m.md")).unwrap();
+        assert!(kept.contains("older characters left out"));
     }
 
     #[test]
