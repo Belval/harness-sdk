@@ -43,10 +43,12 @@ pub async fn run(
     root: Option<SpawnRequest>,
     notify: bool,
 ) -> Result<Exit> {
-    let mut terminal = ratatui::try_init().map_err(|error| {
-        ratatui::restore();
-        strands_agents::Error::other(format!("Cannot start the TUI: {error}; try --headless"))
-    })?;
+    let mut terminal = ratatui::try_init()
+        .and_then(|mut terminal| take_screen(&mut terminal).map(|()| terminal))
+        .map_err(|error| {
+            ratatui::restore();
+            strands_agents::Error::other(format!("Cannot start the TUI: {error}; try --headless"))
+        })?;
     set_mouse_capture(true);
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -159,6 +161,14 @@ fn ring_bell() {
     use std::io::Write;
     let mut out = std::io::stdout();
     let _ = out.write_all(b"\x07").and_then(|()| out.flush());
+}
+
+/// Clear whatever is on the screen before the first frame. A swarm killed mid-frame (`kill -9`,
+/// the OOM killer) leaves its frame on tmux's alternate screen, the supervisor prints over it,
+/// and re-entering that screen does not clear it; ratatui then draws only the cells that differ
+/// from the blank screen it assumes, so the leftovers would show through every blank cell.
+fn take_screen<B: ratatui::backend::Backend>(terminal: &mut ratatui::Terminal<B>) -> Result<(), B::Error> {
+    terminal.clear()
 }
 
 fn leave_plain(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
@@ -502,6 +512,25 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
         terminal.draw(|frame| view::draw(frame, app, "run1", 0)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn a_tui_started_over_a_killed_one_s_frame_shows_none_of_it() {
+        let mut backend = TestBackend::new(WIDTH, HEIGHT);
+        let cell = ratatui::buffer::Cell::new("#");
+        let leftovers: Vec<_> = (0..HEIGHT)
+            .flat_map(|y| (0..WIDTH).map(move |x| (x, y)))
+            .collect();
+        ratatui::backend::Backend::draw(&mut backend, leftovers.iter().map(|&(x, y)| (x, y, &cell))).unwrap();
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        take_screen(&mut terminal).unwrap();
+        terminal
+            .draw(|frame| view::draw(frame, &App::default(), "run1", 0))
+            .unwrap();
+
+        let shown = format!("{:?}", terminal.backend().buffer());
+        assert!(!shown.contains('#'), "{shown}");
     }
 
     fn mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) -> Option<String> {
