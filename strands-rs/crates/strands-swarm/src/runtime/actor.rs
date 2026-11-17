@@ -278,6 +278,7 @@ impl Swarm {
                     usage: Some(usage), ..
                 } => {
                     let model = node.agent().and_then(|agent| agent.model().model_id());
+                    self.mark_progress(node);
                     self.add_usage(node, usage, model, true)
                 }
                 _ => {}
@@ -295,6 +296,9 @@ impl Swarm {
             }
             AgentStreamEvent::AfterToolCall(call) => {
                 node.tool_calls.lock().remove(&call.tool_use.tool_use_id);
+                if call.result.status == ToolResultStatus::Success {
+                    self.mark_progress(node);
+                }
                 self.emit(SwarmEvent::ToolFinished {
                     id: id.clone(),
                     name: call.tool_use.name.clone(),
@@ -323,6 +327,23 @@ impl Swarm {
     /// Add one model call's usage (its trailing metadata) to the agent's totals and publish them;
     /// `own_call` says whether the call carried the agent's context (not a side call's), `model`
     /// which model answered (for cost estimates).
+    /// Note a sign of progress from `node`: a model reply or a tool call that ended successfully.
+    fn mark_progress(&self, node: &Node) {
+        node.progress.store(self.now().timestamp(), Ordering::Relaxed);
+    }
+
+    /// How long `info`'s agent has shown no sign of progress: since the newest of its last model
+    /// reply, successful tool call and (given its branch's `tip` commit time) commit. `None`
+    /// unless it is running.
+    pub fn quiet_for(&self, info: &AgentInfo, tip: Option<i64>) -> Option<Duration> {
+        if info.status != AgentStatus::Running {
+            return None;
+        }
+        let last = info.progress.max(tip.unwrap_or(0));
+        let quiet = self.now().timestamp().saturating_sub(last);
+        Some(Duration::from_secs(quiet.max(0) as u64))
+    }
+
     pub(super) fn add_usage(&self, node: &Node, usage: &Usage, model: Option<String>, own_call: bool) {
         let counts = usage_counts(usage);
         let model = model.unwrap_or_else(|| "unknown".to_owned());

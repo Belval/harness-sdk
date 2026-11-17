@@ -6,12 +6,14 @@
 //! [`run`] does the work. The swarm runs it as a background job (`strands-swarm --land PLAN`) so
 //! that slow checks survive a restart and the outcome reaches the agent as a job message.
 
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 use strands_agents::sandbox::detach_from_terminal;
 
@@ -149,7 +151,12 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
     let mut passed = Vec::new();
     for check in &plan.checks {
         let started = Instant::now();
-        check_passes(&dir, check, &plan.target_dir).await?;
+        let log = std::io::stdout()
+            .as_fd()
+            .try_clone_to_owned()
+            .ok()
+            .map(std::fs::File::from);
+        check_passes(&dir, check, &plan.target_dir, log.as_ref()).await?;
         passed.push(format!("  ok `{check}` ({}s)", started.elapsed().as_secs()));
     }
 
@@ -394,8 +401,15 @@ pub fn stop_signal() -> impl std::future::Future<Output = String> {
     }
 }
 
-/// Run `check` with `sh` in `dir`; on failure the error carries the tail of its output.
-async fn check_passes(dir: &Path, check: &str, target_dir: &Path) -> Result<(), String> {
+/// Run `check` with `sh` in `dir`; on failure the error carries the tail of its output. The output
+/// is kept out of the job's log, but each chunk of it touches `log`'s modification time, so the
+/// swarm can tell a check that still writes from one that hangs ([`crate::jobs::Jobs::stalled`]).
+async fn check_passes(
+    dir: &Path,
+    check: &str,
+    target_dir: &Path,
+    log: Option<&std::fs::File>,
+) -> Result<(), String> {
     let mut command = tokio::process::Command::new("sh");
     detach_from_terminal(&mut command)
         .arg("-c")
@@ -406,26 +420,33 @@ async fn check_passes(dir: &Path, check: &str, target_dir: &Path) -> Result<(), 
     for var in crate::worktree::GIT_LOCATION_VARS {
         command.env_remove(var);
     }
-    let child = command
+    let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("Not landed: could not run `{check}`: {e}"))?;
     // The check leads a session of its own, out of reach of a signal to the land job's group.
     let mut group = KillGroupOnDrop(child.id());
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("Not landed: could not run `{check}`: {e}"))?;
+    let ran = |e: std::io::Error| format!("Not landed: could not run `{check}`: {e}");
+    let (mut stdout, mut bytes, mut chunk) = (child.stdout.take(), Vec::new(), [0u8; 8192]);
+    while let Some(out) = stdout.as_mut() {
+        match out.read(&mut chunk).await.map_err(ran)? {
+            0 => break,
+            n => bytes.extend_from_slice(&chunk[..n]),
+        }
+        if let Some(log) = log {
+            let _ = log.set_modified(std::time::SystemTime::now());
+        }
+    }
+    let status = child.wait().await.map_err(ran)?;
     group.0 = None;
-    if output.status.success() {
+    if status.success() {
         return Ok(());
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
-    let code = output
-        .status
+    let code = status
         .code()
         .map_or_else(|| "a signal".to_owned(), |code| code.to_string());
     Err(format!(
@@ -543,6 +564,34 @@ mod tests {
         /// Worktree on `feature`, one commit ahead of `main`.
         feature: PathBuf,
         land: PathBuf,
+    }
+
+    #[tokio::test]
+    async fn a_check_that_writes_touches_the_log_and_one_that_is_silent_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::fs::File::create(dir.path().join("log")).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        log.set_modified(old).unwrap();
+        let target = dir.path().join("target");
+        check_passes(dir.path(), "true", &target, Some(&log))
+            .await
+            .unwrap();
+        assert_eq!(
+            log.metadata().unwrap().modified().unwrap(),
+            old,
+            "no output, no touch"
+        );
+        check_passes(dir.path(), "echo hi", &target, Some(&log))
+            .await
+            .unwrap();
+        assert!(
+            log.metadata().unwrap().modified().unwrap() > old,
+            "output touches the log"
+        );
+        let error = check_passes(dir.path(), "echo boom; exit 3", &target, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("exit 3") && error.contains("boom"), "{error}");
     }
 
     async fn sh(dir: &Path, script: &str) {

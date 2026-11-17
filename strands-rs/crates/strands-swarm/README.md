@@ -268,6 +268,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   - A `shell` call that sleeps 30 s or more (`sleep 240; tail job.log`) while its agent has a job
     running gets one line appended to its result: the job is still running, and `wait` with
     `from: ["jobs"]` returns as soon as it ends, whereas a sleep can't be cut short by mail or a reload.
+  - A running job whose log has not grown for 30 minutes (`SwarmConfig::job_quiet`) gets its
+    owner one FYI note (`job j3 (gates) has written nothing for 30m; still running: …`), saved as
+    `<id>.stalled` so a restart does not repeat it. Nothing is killed. A land job's checks count
+    as writing while they print (the land process touches its log's mtime; their output stays out of
+    the log).
   - A running job's log over 32 MB is cut to its last 1 MB. Only the newest 200 reported jobs keep
     their files.
 - **Schedules.**
@@ -346,6 +351,11 @@ Other text messages the selected agent, or starts a root agent when there is non
 - **`/stop`:** an open tool call is closed as cancelled and the agent goes idle with its
   conversation intact. Its parent gets an `interrupted` message and its children keep running. A
   goal agent waits for its next message.
+- **Last progress.** `list_agents` and `/status` add `last progress 3h ago` to a *running* agent
+  once its newest sign of progress is over 15 minutes old: a model reply, a tool call that ended
+  successfully, or a commit at its branch's tip. It is kept in memory and saved with the agent
+  (`progress`), so a restart does not make a stuck agent look fresh. A tool call still in flight
+  is not progress, so a long build shows the note while it runs.
 - **`/status`:**
   - Unmerged commits are `git log <base>..<branch>`. The base is `--status-base`, else the branch
     checked out where the swarm started (a linked worktree's, if it started in one).

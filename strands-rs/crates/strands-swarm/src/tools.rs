@@ -776,10 +776,19 @@ fn list_agents(
         };
         format!(", idle with nothing left to merge: cancel to reclaim {reclaim}")
     };
+    let quiet = |info: &AgentInfo| -> String {
+        let tip = branches.get(&info.id).and_then(|state| state.tip);
+        let note = swarm.quiet_for(info, tip).and_then(crate::status::quiet_note);
+        note.map(|note| format!(", {note}")).unwrap_or_default()
+    };
     let mut lines = Vec::new();
     for info in &shown {
-        let line =
-            describe(swarm, info) + &merge(&info.id) + &reclaim(&info.id) + &running(&info.id) + &spend(info);
+        let line = describe(swarm, info)
+            + &quiet(info)
+            + &merge(&info.id)
+            + &reclaim(&info.id)
+            + &running(&info.id)
+            + &spend(info);
         lines.push(line);
         let upcoming = schedules.iter().filter(|s| s.to == info.id);
         lines.extend(upcoming.map(|s| format!("  scheduled: {}", s.describe(swarm.now()))));

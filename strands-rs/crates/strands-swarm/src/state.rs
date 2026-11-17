@@ -115,6 +115,10 @@ pub struct AgentState {
     /// so a restart that finds the same (a worktree still kept) does not journal it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reclaim_logged: Option<String>,
+    /// When it last showed a sign of progress (a successful tool call or a model reply), unix
+    /// seconds, so a restart does not make a stuck agent look fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<i64>,
 }
 
 /// Persisted mail.

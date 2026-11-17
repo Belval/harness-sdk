@@ -113,6 +113,7 @@ impl Swarm {
                 for job in swarm.inner.jobs.unreported(check_alive).await {
                     swarm.report_job(&job).await;
                 }
+                swarm.note_stalled_jobs().await;
                 if check_alive {
                     let jobs = &swarm.inner.jobs;
                     jobs.tidy(jobs::LOG_MAX, jobs::LOG_KEEP, jobs::KEEP_JOBS).await;
@@ -124,6 +125,23 @@ impl Swarm {
                 }
             }
         });
+    }
+
+    /// Tell the owner, once per job and without waking it ([`FYI`]), that a running job's log has
+    /// not grown for [`SwarmConfig::job_quiet`]. The job is left alone.
+    async fn note_stalled_jobs(&self) {
+        let quiet = self.inner.config.job_quiet;
+        for job in self.inner.jobs.stalled(quiet).await {
+            let text = format!(
+                "Job {} has written nothing for {}; still running: `jobs` to check or kill it.",
+                job.label(),
+                schedules::human(quiet)
+            );
+            let _ = self.post(JOBS_SENDER, &job.meta.owner, FYI, text);
+            if let Err(error) = self.inner.jobs.mark_stalled(&job.meta.id).await {
+                tracing::warn!(job = %job.meta.id, %error, "could not mark the job stalled");
+            }
+        }
     }
 
     pub(super) async fn report_job(&self, job: &Job) {

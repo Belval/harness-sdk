@@ -5651,3 +5651,142 @@ async fn finished_worktree_agents_are_flagged_and_lose_their_target_dir_when_dis
     );
     swarm.shutdown().await;
 }
+
+/// `list_agents` and `/status` say how long a running agent has shown no progress, once that is
+/// over 15 minutes; a fresh one gets no note.
+#[tokio::test(start_paused = true)]
+async fn a_running_agent_quiet_for_over_15_minutes_shows_its_last_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![
+        ("a1", vec![tool_call("hang", "w1", json!({})), say("late")]),
+        ("a2", vec![tool_call("list_agents", "l1", json!({})), say("seen")]),
+    ]);
+    // A tool call that takes a day.
+    let inner = mock_factory(&scripts);
+    let factory: AgentFactory = Arc::new(move |mut spec: AgentSpec| {
+        let hang = strands_agents::tools::FunctionTool::builder("hang")
+            .description("Hangs.")
+            .handler(|_input: serde_json::Value, _ctx| async move {
+                tokio::time::sleep(Duration::from_secs(86_400)).await;
+                strands_agents::Result::<String>::Ok("woke".into())
+            });
+        spec.tools.push(Arc::new(hang));
+        inner(spec)
+    });
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, dir.path()));
+    spawn_root(&swarm, "go").await;
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert_eq!(swarm.status().agents[0].quiet.map(|q| q.as_secs() / 60), Some(10));
+    assert!(!swarm
+        .status()
+        .lines(&|_| None)
+        .join("\n")
+        .contains("last progress"));
+
+    tokio::time::advance(Duration::from_secs(3 * 3600)).await;
+    let status = swarm.status().lines(&|_| None).join("\n");
+    assert!(status.contains("last progress 3h10m ago"), "{status}");
+
+    // A near timer always pending, so the paused clock does not jump a day while git runs.
+    let ticker = tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    swarm
+        .spawn(
+            "a1",
+            SpawnRequest {
+                task: "list".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    while !matches!(events.recv().await, Some(SwarmEvent::ToolFinished { name, .. }) if name == "list_agents")
+    {
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let listed = sent_text(&scripts.lock()["a2"].clone(), 1);
+    let line = |id: &str| {
+        listed
+            .split("\\n")
+            .find(|l| l.contains(&format!("({id})")))
+            .unwrap()
+            .to_owned()
+    };
+    assert!(
+        line("a1").contains(", last progress 3h10m ago, model"),
+        "{listed}"
+    );
+    assert!(!line("a2").contains("last progress"), "{listed}");
+    ticker.abort();
+}
+
+/// A running job whose log stays unchanged for `job_quiet` gets its owner one FYI note, and the
+/// job is left running.
+#[tokio::test]
+async fn a_job_that_writes_nothing_for_job_quiet_mails_its_owner_one_fyi_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call(
+                "run_background",
+                "r1",
+                json!({ "command": UNTIL_GO, "name": "hang" }),
+            ),
+            say("started"),
+        ],
+    )]);
+    let mut config = persistent_swarm(&scripts, dir.path());
+    config.job_quiet = Duration::from_secs(1);
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    let [_, note] = mails_to(&mut events, [(USER, "reply"), ("a1", "fyi")]).await;
+    assert_eq!(
+        note,
+        "Job j1 (hang) has written nothing for 1s; still running: `jobs` to check or kill it."
+    );
+    // Not again, however long it stays quiet.
+    let again = tokio::time::timeout(Duration::from_secs(3), mail_to(&mut events, "a1", "fyi")).await;
+    assert!(again.is_err(), "told once per job");
+    assert_eq!(
+        swarm.jobs().await[0].state,
+        strands_swarm::jobs::JobState::Running
+    );
+    std::fs::write(dir.path().join("go"), "").unwrap();
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_that_keeps_writing_gets_no_quiet_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = "for i in 1 2 3 4 5 6 7 8; do echo tick; sleep 0.4; done";
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("run_background", "r1", json!({ "command": command })),
+            say("started"),
+            say("saw it"),
+        ],
+    )]);
+    let mut config = persistent_swarm(&scripts, dir.path());
+    config.job_quiet = Duration::from_secs(2);
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    let wait = async {
+        while let Some(event) = events.recv().await {
+            if let SwarmEvent::Mail { to, mail } = event {
+                assert_ne!(mail.kind, "fyi", "no note for a job that writes: {}", mail.text);
+                if to == "a1" && mail.kind == "job" {
+                    return;
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), wait)
+        .await
+        .expect("the job never ended");
+    swarm.shutdown().await;
+}

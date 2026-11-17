@@ -293,6 +293,43 @@ impl Jobs {
         Ok(())
     }
 
+    /// Running jobs whose log has not grown (nor been touched, see [`crate::land`]) for `after`
+    /// and that were not noted before ([`Self::mark_stalled`]); a log that does not exist yet
+    /// counts from the job's start.
+    pub async fn stalled(&self, after: std::time::Duration) -> Vec<Job> {
+        let mut stalled = Vec::new();
+        for id in self.unreported_ids().await {
+            if tokio::fs::try_exists(self.file(&id, "stalled"))
+                .await
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(job) = self.get(&id).await else {
+                continue;
+            };
+            if job.state != JobState::Running || job.reported {
+                continue;
+            }
+            let started = UNIX_EPOCH + std::time::Duration::from_secs(job.meta.started);
+            let written = tokio::fs::metadata(self.log_path(&id))
+                .await
+                .and_then(|m| m.modified());
+            let last = written.map_or(started, |written| written.max(started));
+            if last.elapsed().is_ok_and(|quiet| quiet >= after) {
+                stalled.push(job);
+            }
+        }
+        stalled
+    }
+
+    /// Record that job `id`'s owner was told its log stopped growing, so it is not told again
+    /// (not after a restart either).
+    pub async fn mark_stalled(&self, id: &str) -> Result<()> {
+        tokio::fs::write(self.file(id, "stalled"), b"").await?;
+        Ok(())
+    }
+
     /// Ended jobs whose owner has not been told yet. Running jobs whose process has disappeared
     /// are recorded as lost first when `check_alive`.
     ///
@@ -377,7 +414,7 @@ impl Jobs {
             if job.reported && old > 0 {
                 old -= 1;
                 // The `.json` last: a job is listed while it exists.
-                for ext in ["log", "exit", "reported", "json"] {
+                for ext in ["log", "exit", "reported", "stalled", "json"] {
                     let _ = tokio::fs::remove_file(self.file(id, ext)).await;
                 }
             } else if job.state == JobState::Running {

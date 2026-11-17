@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -306,6 +306,9 @@ pub struct SwarmConfig {
     /// Keep the prompt cache warm while a turn waits on a tool call ([`KEEP_WARM_EVERY`] for the
     /// 5-minute cache); `None` is off.
     pub keep_warm: Option<Duration>,
+    /// How long a running background job's log may stay unchanged before its owner gets an FYI
+    /// note that it may be hung.
+    pub job_quiet: Duration,
 }
 
 impl SwarmConfig {
@@ -337,6 +340,7 @@ impl SwarmConfig {
             prices: Arc::default(),
             default_model: None,
             keep_warm: None,
+            job_quiet: Duration::from_secs(30 * 60),
         }
     }
 }
@@ -414,6 +418,9 @@ pub struct AgentInfo {
     pub model: Option<String>,
     /// Its own compaction point from `spawn_agent` (`None`: the swarm default).
     pub compact_at: Option<u64>,
+    /// When it last showed a sign of progress (a successful tool call or a model reply), unix
+    /// seconds.
+    pub progress: i64,
 }
 
 /// Everything observable that happens in the swarm, in order.
@@ -626,6 +633,8 @@ pub enum WaitOutcome {
 #[derive(Default)]
 struct Node {
     id: String,
+    /// When the agent last showed a sign of progress: unix seconds ([`Node::progressed`]).
+    progress: AtomicI64,
     name: String,
     parent: String,
     /// Where it was started: its worktree, if it has one.
@@ -713,6 +722,7 @@ impl Node {
             unread,
             model,
             compact_at: self.compact_at,
+            progress: self.progress.load(Ordering::Relaxed),
         }
     }
 
@@ -948,6 +958,7 @@ impl Swarm {
                 compact_at: request.compact_at,
                 // No actor runs until a queued agent starts.
                 finished: AtomicBool::new(queued),
+                progress: AtomicI64::new(self.now().timestamp()),
                 ..Node::default()
             });
             agents.insert(id.clone(), node.clone());

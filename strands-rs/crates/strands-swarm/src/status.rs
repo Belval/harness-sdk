@@ -22,6 +22,15 @@ pub const MAX_CONFLICTS: usize = 10;
 /// branches); pairs past it are reported as overlapping without one. Cached pairs are free.
 pub const MAX_PAIRS: usize = 45;
 
+/// How long a running agent may show no sign of progress before `list_agents` and `/status` say so.
+pub const QUIET_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// `last progress 3h ago` once `quiet` (time since an agent's newest commit, successful tool call
+/// or model reply) reaches [`QUIET_AFTER`]; nothing before, so healthy lines stay short.
+pub fn quiet_note(quiet: Duration) -> Option<String> {
+    (quiet >= QUIET_AFTER).then(|| format!("last progress {} ago", crate::schedule::human(quiet)))
+}
+
 /// Agent-state key of the harness todo list ([`strands_harness::plugins::Todos`] default).
 pub const TODOS_KEY: &str = "todos";
 
@@ -82,6 +91,8 @@ pub struct BranchState {
     /// The branch checked out in the agent's cwd, which the rest describes, when it is not the one
     /// the agent was given.
     pub head: Option<String>,
+    /// When the compared branch's tip was committed (unix seconds), if known.
+    pub tip: Option<i64>,
     /// The agent's other branches (its own and `<its own>-*`) with commits the base lacks.
     pub others: Vec<String>,
     /// Other live agents' unmerged branches that change the same files, in agent order.
@@ -170,6 +181,9 @@ pub struct AgentReport {
     pub branch: Option<String>,
     /// How `branch` stands against the base; `None` while unknown.
     pub git: Option<BranchState>,
+    /// Time since its last sign of progress, when it is running and that is not recent
+    /// ([`quiet_note`]).
+    pub quiet: Option<Duration>,
     /// Its todo list.
     pub todos: Vec<TodoItem>,
     /// Running background jobs: `tool (age)`.
@@ -232,6 +246,9 @@ impl StatusReport {
             }
             if let Some(doing) = doing(&agent.id).filter(|d| !d.is_empty()) {
                 head.push_str(&format!(" · {doing}"));
+            }
+            if let Some(note) = agent.quiet.and_then(quiet_note) {
+                head.push_str(&format!(" · {note}"));
             }
             lines.push(String::new());
             lines.push(head);
@@ -408,9 +425,11 @@ pub async fn branch_state(dir: &Path, base: &str, branch: &str) -> Option<Branch
     let ahead = unmerged(dir, base, branch).await?;
     let behind = git(dir, &["rev-list", "--count", &format!("{branch}..{base}"), "--"]).await?;
     let behind = behind.trim().parse().ok()?;
+    let tip = git(dir, &["log", "-1", "--format=%ct", branch, "--"]).await;
     let mut state = BranchState {
         ahead,
         behind,
+        tip: tip.and_then(|t| t.trim().parse().ok()),
         ..Default::default()
     };
     if state.ahead.is_empty() || behind == 0 {
@@ -587,6 +606,50 @@ mod tests {
     }
 
     #[test]
+    fn the_progress_note_shows_only_for_a_quiet_agent() {
+        let note = |secs| quiet_note(Duration::from_secs(secs));
+        assert_eq!(note(0), None);
+        assert_eq!(note(14 * 60 + 59), None);
+        assert_eq!(note(15 * 60).as_deref(), Some("last progress 15m ago"));
+        assert_eq!(note(3 * 3600 + 120).as_deref(), Some("last progress 3h2m ago"));
+        assert_eq!(
+            note(2 * 86_400 + 5 * 3600).as_deref(),
+            Some("last progress 2d5h ago")
+        );
+    }
+
+    #[test]
+    fn the_status_line_of_a_quiet_agent_carries_the_note() {
+        let mut agent = AgentReport {
+            label: "a (a1)".into(),
+            id: "a1".into(),
+            status: crate::AgentStatus::Running,
+            unread: 0,
+            branch: None,
+            git: None,
+            quiet: Some(Duration::from_secs(60)),
+            todos: vec![],
+            background: vec![],
+            schedules: vec![],
+        };
+        let lines = |agent: &AgentReport| {
+            let report = StatusReport {
+                base: None,
+                limits: None,
+                agents: vec![agent.clone()],
+            };
+            report.lines(&|_| None).join("\n")
+        };
+        assert!(!lines(&agent).contains("last progress"));
+        agent.quiet = Some(Duration::from_secs(3 * 3600));
+        assert!(
+            lines(&agent).contains("running · last progress 3h ago"),
+            "{}",
+            lines(&agent)
+        );
+    }
+
+    #[test]
     fn the_report_reads_as_one_block_per_agent() {
         let report = StatusReport {
             limits: None,
@@ -604,6 +667,7 @@ mod tests {
                         merge: Merge::Conflicts(vec!["README.md".into(), "src/a.rs".into()]),
                         ..Default::default()
                     }),
+                    quiet: None,
                     todos: vec![
                         todo("Test", TodoStatus::Completed),
                         todo("Commit", TodoStatus::InProgress),
@@ -619,6 +683,7 @@ mod tests {
                     unread: 0,
                     branch: Some("swarm/r/a3".into()),
                     git: Some(BranchState::default()),
+                    quiet: None,
                     todos: vec![],
                     background: vec![],
                     schedules: vec![],
@@ -658,6 +723,7 @@ mod tests {
                 unread: 0,
                 branch: Some("b".into()),
                 git: None,
+                quiet: None,
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],
@@ -727,6 +793,8 @@ mod tests {
         commit("edit a");
         let state = branch_state(repo, "main", "work").await.unwrap();
         assert_eq!((state.ahead.len(), state.behind), (1, 0));
+        let tip = state.tip.expect("the tip's commit time");
+        assert!(tip.abs_diff(chrono::Utc::now().timestamp()) < 60, "{tip}");
         assert!(state.ahead[0].ends_with(" edit a"), "{state:?}");
         assert_eq!(state.merge, Merge::FastForward);
 
@@ -820,6 +888,7 @@ mod tests {
                 unread: 0,
                 branch: Some("swarm/r/a7".into()),
                 git: Some(state.clone()),
+                quiet: None,
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],

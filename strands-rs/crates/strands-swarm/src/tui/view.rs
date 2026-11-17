@@ -1128,6 +1128,7 @@ mod tests {
             unread: 0,
             branch: None,
             git: None,
+            quiet: None,
             todos: vec![],
             background: vec![],
             schedules: vec![],
@@ -1193,6 +1194,7 @@ mod tests {
                     ahead: vec![subject.into()],
                     ..Default::default()
                 }),
+                quiet: None,
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],
