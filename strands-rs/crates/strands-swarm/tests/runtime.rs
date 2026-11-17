@@ -84,6 +84,35 @@ async fn mail_to(events: &mut UnboundedReceiver<SwarmEvent>, to: &str, kind: &st
         .unwrap_or_else(|_| panic!("timed out waiting for {kind} mail to {to}"))
 }
 
+/// Collect events until each `(to, kind)` of `wanted` has had mail, in any order (a job's report
+/// may come before or after a reply); the texts in `wanted`'s order.
+async fn mails_to<const N: usize>(
+    events: &mut UnboundedReceiver<SwarmEvent>,
+    wanted: [(&str, &str); N],
+) -> [String; N] {
+    let mut texts: [Option<String>; N] = std::array::from_fn(|_| None);
+    let wait = async {
+        while texts.iter().any(Option::is_none) {
+            let Some(event) = events.recv().await else {
+                panic!("event stream closed");
+            };
+            if let SwarmEvent::Mail { to, mail } = event {
+                let slot = wanted
+                    .iter()
+                    .position(|(want, kind)| *want == to && *kind == mail.kind)
+                    .filter(|&i| texts[i].is_none());
+                if let Some(i) = slot {
+                    texts[i] = Some(mail.text);
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for mail: {wanted:?}"));
+    texts.map(Option::unwrap)
+}
+
 fn sent_text(model: &MockMessageModel, call: usize) -> String {
     let (messages, _) = &model.calls()[call];
     messages
@@ -4227,6 +4256,10 @@ async fn status_reports_todos_and_branch_commits_without_a_model_call() {
     );
 }
 
+/// A job command that ends once the test creates `go` in its directory, or once the directory is
+/// gone, so a failed test leaves no process behind.
+const UNTIL_GO: &str = "until [ -e go ] || [ ! -e \"$PWD\" ]; do sleep 0.01; done";
+
 fn persistent_swarm(scripts: &Scripts, dir: &Path) -> SwarmConfig {
     let mut config = SwarmConfig::new(mock_factory(scripts), dir);
     config.state_dir = Some(dir.join("run"));
@@ -4250,11 +4283,11 @@ async fn a_background_job_mails_its_exit_code_and_output_tail_to_the_idle_agent_
     )]);
     let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
     spawn_root(&swarm, "build it").await;
-    assert_eq!(reply_to(&mut events, USER).await, "started");
+    let [reply, report] = mails_to(&mut events, [(USER, "reply"), ("a1", "job")]).await;
+    assert_eq!(reply, "started");
     let started = sent_text(&scripts.lock()["a1"].clone(), 1);
     assert!(started.contains("Started job j1 (gates)"), "{started}");
 
-    let report = mail_to(&mut events, "a1", "job").await;
     assert!(report.contains("Job j1 (gates) exited 2 after"), "{report}");
     assert!(report.contains("built"), "{report}");
     assert!(
@@ -4278,12 +4311,8 @@ async fn a_job_is_marked_reported_only_once_its_report_is_saved() {
     let scripts = scripts_of(vec![(
         "a1",
         vec![
-            // Ends once the test sees the wait start.
-            tool_call(
-                "run_background",
-                "r1",
-                json!({ "command": "until [ -e go ]; do sleep 0.01; done" }),
-            ),
+            // Ends once the test has seen the wait start.
+            tool_call("run_background", "r1", json!({ "command": UNTIL_GO })),
             // A wait for someone else (the user, who stays silent): the report stays in the
             // mailbox. An unknown sender would fail the wait and leave the agent errored, to be
             // woken (and its mailbox emptied) by the report it should keep.
@@ -4401,7 +4430,8 @@ async fn a_job_started_before_a_restart_reports_to_the_resumed_agent() {
             tool_call(
                 "run_background",
                 "r1",
-                json!({ "command": "sleep 1; echo finished" }),
+                // Ends once the first swarm is gone.
+                json!({ "command": format!("{UNTIL_GO}; echo finished") }),
             ),
             say("started"),
         ],
@@ -4417,6 +4447,7 @@ async fn a_job_started_before_a_restart_reports_to_the_resumed_agent() {
         strands_swarm::jobs::JobState::Running,
         "outlives the swarm"
     );
+    std::fs::write(dir.path().join("go"), "").unwrap();
 
     let saved = strands_swarm::state::load(&dir.path().join("run"))
         .await
