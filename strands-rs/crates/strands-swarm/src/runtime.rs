@@ -319,6 +319,10 @@ pub struct SwarmConfig {
     pub min_free_mem: u64,
     /// Reads the host's load and memory for those holds ([`host_stats`]).
     pub host_probe: HostProbe,
+    /// `CARGO_BUILD_JOBS` for agents' shell commands and background jobs (land checks included),
+    /// unless this process's environment sets it; `None` sets none. Without it every cargo build
+    /// starts a compiler per CPU, and a few dozen agents building at once swamp the host.
+    pub build_jobs: Option<usize>,
 }
 
 impl SwarmConfig {
@@ -354,8 +358,15 @@ impl SwarmConfig {
             max_load: 0.0,
             min_free_mem: 0,
             host_probe: Arc::new(host_stats),
+            build_jobs: Some(default_build_jobs()),
         }
     }
+}
+
+/// The default [`SwarmConfig::build_jobs`]: a quarter of the CPUs, at least 1 and at most 8.
+pub fn default_build_jobs() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    (cpus / 4).clamp(1, 8)
 }
 
 /// What a `land` call asks for ([`Swarm::land`]).
@@ -1184,6 +1195,18 @@ impl Swarm {
 
     /// Environment for a new worktree agent: a private `CARGO_TARGET_DIR` when the swarm has a
     /// shared one.
+    /// `env` plus `CARGO_BUILD_JOBS` ([`SwarmConfig::build_jobs`]) unless `env` or this
+    /// process's environment sets it already.
+    fn with_build_jobs(&self, mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        const VAR: &str = "CARGO_BUILD_JOBS";
+        if let Some(jobs) = self.inner.config.build_jobs {
+            if !env.contains_key(VAR) && std::env::var_os(VAR).is_none() {
+                env.insert(VAR.to_owned(), jobs.to_string());
+            }
+        }
+        env
+    }
+
     fn worktree_env(&self, id: &str) -> BTreeMap<String, String> {
         let Some(root) = self.private_targets_root() else {
             return BTreeMap::new();

@@ -40,6 +40,7 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
               [--max-agents N] [--max-concurrent-calls N] [--max-load N] [--min-free-mem SIZE]
+              [--build-jobs N]
               [--budget-tokens N] [--compact-at TOKENS]
               [--allow-land] [--land-into GLOB]... [--gate CMD]...
               [--notify] [--status-base BRANCH] [--prices FILE] [--min-free-disk SIZE] [--headless]
@@ -220,6 +221,22 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     second; off Linux nothing is held.
   - `/max-load N` changes the limit for the running process, `/max-load off` lifts it and
     `/max-load default` returns to the flag.
+- **Builds.** Agents' shell commands and background jobs (land checks included) get
+  `CARGO_BUILD_JOBS` set to `--build-jobs N` (default a quarter of the CPUs, 1 to 8; `0` sets
+  none) unless the swarm's own environment sets it. Without it every cargo build starts a
+  compiler per CPU: a few dozen agents building at once put a 64-core host at load 400. It only
+  bounds each build; to bound all of them together, cap compilers host-wide:
+  - cargo runs every compiler through `build.rustc-wrapper` from `~/.cargo/config.toml`
+    (`[build]` / `rustc-wrapper = "/path/to/rustc-slot"`) with the real `rustc` and its
+    arguments as `"$@"`.
+  - A wrapper that takes one of N slots before it execs makes N the host-wide limit, whichever
+    swarm, worktree or terminal the build came from. With `flock` that is a few lines of `sh`:
+    loop over lock files `0..N` under a shared directory, `exec 9>"$dir/$i"`, and once
+    `flock -n 9` succeeds `exec "$@"` (the inherited descriptor holds the slot until that
+    compiler exits); when none is free, sleep a moment and try again.
+  - Pick N below the CPU count: linkers, build scripts and test binaries run outside the
+    wrapper. cargo's quick probes (`rustc -vV`, `--print`) come through it too; a wrapper may
+    exec those at once.
 - **Tokens.** `--budget-tokens N` (e.g. `5M`) caps the swarm's input + output tokens.
   - Once spent, model calls fail with a "budget exhausted" error that travels up to you.
     Each agent reports it once: mail that wakes it again (a schedule firing) is refused without
@@ -289,7 +306,7 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
 
 - **Background jobs.**
   - Jobs run with `sh -c` in the agent's directory and environment, private `CARGO_TARGET_DIR`
-    included. Each runs in a session of its own, so neither a reload nor Ctrl-C stops it.
+    and `CARGO_BUILD_JOBS` ([Limits](#limits)) included. Each runs in a session of its own, so neither a reload nor Ctrl-C stops it.
   - Each job is `<id>.json`, `<id>.log`, `<id>.exit` and, once its owner was told, `<id>.reported`
     in `<run>/jobs` (a temp directory without `--run`).
   - The swarm polls jobs and mails the owner when one ends, also for jobs started before a restart.

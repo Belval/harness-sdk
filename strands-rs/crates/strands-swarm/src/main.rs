@@ -63,6 +63,10 @@ struct Cli {
     /// its memory, at most 8 GB; `0` turns it off).
     #[arg(long, value_name = "SIZE", value_parser = strands_swarm::text::parse_bytes)]
     min_free_mem: Option<u64>,
+    /// `CARGO_BUILD_JOBS` for agents' shell commands, jobs and land checks unless the
+    /// environment sets it (default: a quarter of the CPUs, 1 to 8; `0` sets none).
+    #[arg(long, value_name = "N")]
+    build_jobs: Option<usize>,
     /// Ring the terminal bell when an agent messages you (TUI only; tmux and most terminals turn
     /// it into a window flag or desktop notification).
     #[arg(long)]
@@ -371,6 +375,11 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.max_load = cli
         .max_load
         .unwrap_or_else(strands_swarm::runtime::default_max_load);
+    config.build_jobs = match cli.build_jobs {
+        Some(0) => None,
+        Some(jobs) => Some(jobs),
+        None => Some(strands_swarm::runtime::default_build_jobs()),
+    };
     config.min_free_mem = cli
         .min_free_mem
         .unwrap_or_else(strands_swarm::runtime::default_min_free_mem);

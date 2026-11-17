@@ -1609,6 +1609,39 @@ async fn worktree_agents_get_a_private_cargo_target_dir_that_their_children_shar
     assert_eq!(envs[&child]["CARGO_TARGET_DIR"], private);
 }
 
+#[tokio::test]
+async fn shells_and_jobs_get_capped_cargo_build_jobs_unless_the_environment_sets_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let map = scripts_of(vec![("a1", vec![say("ok"), say("seen")])]);
+    let envs: Arc<Mutex<Vec<std::collections::BTreeMap<String, String>>>> = Arc::default();
+    let inner = mock_factory(&map);
+    let recorded = envs.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        recorded.lock().push(spec.env.clone());
+        inner(spec)
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    assert!((1..=8).contains(&config.build_jobs.unwrap()), "capped by default");
+    config.build_jobs = Some(3);
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "t").await;
+    reply_to(&mut events, USER).await;
+    // The swarm's own environment wins, as it would for any child.
+    let inherited = std::env::var("CARGO_BUILD_JOBS").ok();
+    let expected = inherited.clone().unwrap_or_else(|| "3".to_owned());
+    assert_eq!(
+        envs.lock()[0].get("CARGO_BUILD_JOBS"),
+        inherited.is_none().then_some(&expected)
+    );
+    swarm
+        .start_job("a1", "echo $CARGO_BUILD_JOBS > jobs.txt", None)
+        .await
+        .unwrap();
+    mail_to(&mut events, "a1", "job").await;
+    let written = std::fs::read_to_string(dir.path().join("jobs.txt")).unwrap();
+    assert_eq!(written.trim(), expected);
+}
+
 /// A factory like [`mock_factory`] whose agents persist their conversation under `sessions`.
 fn session_factory(scripts: &Scripts, sessions: std::path::PathBuf) -> AgentFactory {
     let scripts = scripts.clone();

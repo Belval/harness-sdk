@@ -74,10 +74,11 @@ impl Swarm {
         })
     }
 
-    /// The environment of `node`'s shell commands: its own, plus in a persistent run the marker
-    /// a resume finds them by if this process dies hard ([`crate::orphans`]).
+    /// The environment of `node`'s shell commands: its own with `CARGO_BUILD_JOBS`, plus in a
+    /// persistent run the marker a resume finds them by if this process dies hard
+    /// ([`crate::orphans`]).
     fn shell_env(&self, node: &Node) -> BTreeMap<String, String> {
-        let mut env = node.env.clone();
+        let mut env = self.with_build_jobs(node.env.clone());
         if let Some(dir) = &self.inner.config.state_dir {
             env.insert(
                 crate::orphans::SHELL_MARKER.to_owned(),
