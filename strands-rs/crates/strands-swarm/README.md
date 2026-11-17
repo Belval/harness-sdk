@@ -25,7 +25,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 ```sh
 cargo build --release -p strands-swarm
 strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model ID] [--effort E]
-              [--cache-ttl 5m|1h]
+              [--cache-ttl 5m|1h] [--no-keep-warm]
               [--instructions FILE] [--memory FILE | --no-memory]
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
@@ -121,6 +121,13 @@ and exit.
   when calls often follow a 5–60 minute pause: per call, 0.75× the new tokens it writes against
   1.15× the prefix for each pause it bridges. Unavoidable misses (a new agent, a binary that
   changed the tools or prompt) cost the 2× rate too. Off by default.
+- **Keep-warm.** While a turn waits on a tool call (a `wait`, a slow build) after a call that hit
+  the cache, the agent's last request is re-sent every 4.5 minutes and dropped at the first
+  token: the provider reads (0.1×) and so refreshes the cached prefix that would otherwise expire
+  and be rewritten (1.25×) on the next call. It stops at that call, an interrupt or cancel, or
+  after 12 refreshes (under an hour); refreshes pass the model-call gate, count as a full cache
+  read toward the agent's tokens, and are logged as `keep_warm` in `events.jsonl`. On by default
+  with the 5-minute cache; `--no-keep-warm` turns it off.
 - **Where it shows.**
   - `/cost` (or `--run NAME --cost`) shows per agent: input, output, cache-read and cache-write
     tokens, the model, an estimated `$`, and the median input per call and cache hit rate over the

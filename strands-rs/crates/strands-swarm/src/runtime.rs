@@ -48,11 +48,13 @@ mod reload;
 mod report;
 mod scheduler;
 mod spend;
+mod warm;
 
 pub(crate) use actor::summarize_input;
 use actor::Start;
 use background::jobs_dir;
 use capacity::started;
+pub use warm::{KEEP_WARM_EVERY, KEEP_WARM_MAX};
 
 /// Judge rejections in a row after which a goal agent's turn ends anyway, so a goal that cannot
 /// be met does not burn turns forever; its parent hears the last attempt and can step in.
@@ -259,6 +261,9 @@ pub struct SwarmConfig {
     /// Model [`Swarm::cost`] prices an agent's tokens as when it has no model of its own and they
     /// predate per-model tracking.
     pub default_model: Option<String>,
+    /// Keep the prompt cache warm while a turn waits on a tool call ([`KEEP_WARM_EVERY`] for the
+    /// 5-minute cache); `None` is off.
+    pub keep_warm: Option<Duration>,
 }
 
 impl SwarmConfig {
@@ -288,6 +293,7 @@ impl SwarmConfig {
             exe: None,
             prices: Arc::default(),
             default_model: None,
+            keep_warm: None,
         }
     }
 }

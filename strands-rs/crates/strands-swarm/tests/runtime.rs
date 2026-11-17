@@ -3344,3 +3344,96 @@ async fn compactions_reported_by_the_factorys_pipeline_become_swarm_events() {
     let failed = Some(("a1".to_owned(), 300_000, "throttled".to_owned()));
     assert_eq!(compacted, (failed, ("a1".to_owned(), 300_000, 90_000)));
 }
+
+/// Asks for the `pause` tool until it sees a tool result, then says "done"; every response
+/// reports a cache hit on a 1,000-token prompt. Counts calls by whether they repeat the first.
+#[derive(Default)]
+struct CachingModel {
+    calls: std::sync::atomic::AtomicUsize,
+    repeats: std::sync::atomic::AtomicUsize,
+}
+
+impl Model for CachingModel {
+    fn model_id(&self) -> Option<String> {
+        Some("caching".into())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _options: &'a strands_agents::models::StreamOptions,
+    ) -> strands_agents::models::ModelEventStream<'a> {
+        use std::sync::atomic::Ordering;
+        let answered = messages
+            .last()
+            .is_some_and(|m| m.content.iter().any(|b| matches!(b, ContentBlock::ToolResult(_))));
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if !answered && self.calls.load(Ordering::SeqCst) > 1 {
+            self.repeats.fetch_add(1, Ordering::SeqCst);
+        }
+        let (message, stop) = match answered {
+            false => (
+                Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolUse(ToolUseBlock::new("pause", "p1", json!({})))],
+                ),
+                strands_agents::types::StopReason::ToolUse,
+            ),
+            true => (
+                Message::assistant("done"),
+                strands_agents::types::StopReason::EndTurn,
+            ),
+        };
+        let events =
+            strands_agents::testing::events_for_message(&message, Some(stop), Some(usage(10, 990, 5)));
+        Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+    }
+}
+
+#[tokio::test]
+async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_call() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(CachingModel::default());
+    let shared = model.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let model = shared.clone();
+        let pause = strands_agents::tools::FunctionTool::builder("pause")
+            .description("Takes a while.")
+            .handler(|_input: serde_json::Value, _ctx| async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                strands_agents::Result::Ok("back".to_owned())
+            });
+        let mut tools = spec.tools;
+        tools.push(Arc::new(pause));
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(tools)
+                .no_sandbox()
+                .build()
+        })
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.keep_warm = Some(Duration::from_millis(50));
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let refreshes = model.repeats.load(Ordering::SeqCst);
+    assert!(
+        (3..=8).contains(&refreshes),
+        "{refreshes} refreshes in 400ms at 50ms"
+    );
+    // Each refresh counts as a full cache read of the 1,000-token prompt (plus one output token).
+    assert_eq!(swarm.tokens_used(), 2 * 1005 + refreshes as u64 * 1001);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        model.repeats.load(Ordering::SeqCst),
+        refreshes,
+        "the turn is over: no more refreshes"
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2 + refreshes);
+    swarm.shutdown().await;
+}

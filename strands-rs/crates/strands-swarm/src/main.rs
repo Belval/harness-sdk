@@ -41,6 +41,11 @@ struct Cli {
     /// they pay off only when an agent often idles 5-60 minutes between calls.
     #[arg(long, value_parser = ["5m", "1h"])]
     cache_ttl: Option<String>,
+    /// Do not keep the 5-minute prompt cache warm while an agent waits on a tool call (by
+    /// default its last request is re-sent every 4.5 minutes, up to 12 times, and dropped at the
+    /// first token: a cache read at 0.1x input instead of a rewrite at 1.25x). Off with `1h`.
+    #[arg(long)]
+    no_keep_warm: bool,
     /// Working directory of the root agent.
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
@@ -323,6 +328,8 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.models = Some(models);
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
+    config.keep_warm = (!cli.no_keep_warm && cli.cache_ttl.as_deref() != Some("1h"))
+        .then_some(strands_swarm::runtime::KEEP_WARM_EVERY);
     config.status_base = cli.status_base;
     config.allow_land = cli.allow_land;
     config.gates = cli.gates;

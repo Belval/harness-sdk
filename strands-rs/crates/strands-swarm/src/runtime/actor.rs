@@ -97,6 +97,7 @@ impl Swarm {
         };
         self.install_mail_hook(&agent, &node.id);
         self.install_model_gate(&agent, &node);
+        self.install_keep_warm(&agent, &node);
         agent.set_aux_model(Some(Arc::new(SideModel {
             swarm: self.clone(),
             node: Arc::downgrade(&node),
