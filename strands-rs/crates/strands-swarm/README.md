@@ -52,6 +52,10 @@ output) the whole swarm may use: once spent, model calls fail with a "budget exh
 travels up to you, and `/budget N` in the TUI raises it (`/budget off` lifts it, `/budget` shows usage),
 which tells every stopped agent to continue. The budget is saved with the run.
 
+`--max-agents N` caps live agents (spawns beyond it queue). `/max-agents N` changes the cap for the
+running swarm, starts queued agents at once and is kept across restarts ahead of the flag;
+`/max-agents default` returns to the flag's value.
+
 `schedule {message, to?, every?: "30m", at?: "in 2h" | "2026-11-17T09:00Z", id?}` posts
 `[schedule sN] message` (kind `schedule`) to the receiver at the given times; `{cancel: id}` removes
 one and `{}` lists them (`list_agents` shows each agent's, the TUI `/schedules` all). Repeats are at

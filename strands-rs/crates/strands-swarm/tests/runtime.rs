@@ -504,6 +504,47 @@ async fn a_queued_agent_stays_queued_across_a_resume_until_there_is_room() {
 }
 
 #[tokio::test]
+async fn raising_the_agent_limit_at_runtime_starts_queued_agents_and_survives_a_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({
+        "run_id": "old",
+        "cwd": dir.path(),
+        "next_id": 3,
+        "agents": [
+            {"id": "a1", "parent": "user", "cwd": dir.path(), "branch": null, "task": "one",
+             "model": null, "goal": null, "status": "idle", "mailbox": []},
+            {"id": "a2", "parent": "a1", "cwd": dir.path(), "branch": null, "task": "late",
+             "model": null, "goal": null, "status": "queued", "mailbox": []},
+        ],
+    }))
+    .unwrap();
+    let map: Scripts = Arc::new(Mutex::new(HashMap::new()));
+    map.lock()
+        .insert("a1".into(), MockMessageModel::shared(vec![say("ok")]));
+    map.lock()
+        .insert("a2".into(), MockMessageModel::shared(vec![say("late start")]));
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.max_agents = 1;
+    let (swarm, mut events) = Swarm::resume(config.clone(), saved).await.unwrap();
+    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
+    assert!(swarm.set_max_agents(Some(0)).is_err());
+
+    swarm.set_max_agents(Some(2)).unwrap();
+    assert_eq!(swarm.max_agents(), 2);
+    assert_eq!(reply_to(&mut events, "a1").await, "late start");
+    let state = swarm.snapshot();
+    assert_eq!(state.max_agents, Some(2));
+    swarm.shutdown().await;
+
+    // The saved override wins over the configured limit; `None` returns to it.
+    let (swarm, _events) = Swarm::resume(config, state).await.unwrap();
+    assert_eq!(swarm.max_agents(), 2);
+    swarm.set_max_agents(None).unwrap();
+    assert_eq!(swarm.max_agents(), 1);
+    assert_eq!(swarm.snapshot().max_agents, None);
+}
+
+#[tokio::test]
 async fn cancelling_frees_capacity_at_once_for_the_whole_subtree() {
     let dir = tempfile::tempdir().unwrap();
     let map: Scripts = Arc::new(Mutex::new(HashMap::new()));

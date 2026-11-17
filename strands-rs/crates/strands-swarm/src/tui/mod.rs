@@ -348,6 +348,16 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             .set_model(&id, model)
             .await
             .map(|model| format!("{} now uses {model}", swarm.label(&id))),
+        (Command::MaxAgents(None), _) => Ok(max_agents_notice(swarm)),
+        (Command::MaxAgents(Some(limit)), _) => match limit.as_str() {
+            "default" => Ok(None),
+            n => n
+                .parse::<usize>()
+                .map(Some)
+                .map_err(|_| strands_agents::Error::other(format!("Not a number: {n}"))),
+        }
+        .and_then(|limit| swarm.set_max_agents(limit))
+        .map(|()| max_agents_notice(swarm)),
         (Command::Budget(None), _) => Ok(budget_notice(swarm)),
         (Command::Budget(Some(tokens)), _) => match tokens.as_str() {
             "off" | "none" => Ok(None),
@@ -409,6 +419,10 @@ fn schedules_notice(swarm: &Swarm) -> String {
         .map(|s| crate::tools::describe_schedule(swarm, s))
         .collect();
     format!("schedules: {}", all.join(" | "))
+}
+
+fn max_agents_notice(swarm: &Swarm) -> String {
+    format!("up to {} agents at once", swarm.max_agents())
 }
 
 fn budget_notice(swarm: &Swarm) -> String {

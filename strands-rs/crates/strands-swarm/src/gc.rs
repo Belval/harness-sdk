@@ -435,6 +435,7 @@ mod tests {
             next_id: 3,
             agents: vec![agent("a1", "idle"), agent("a2", "cancelled")],
             budget_tokens: None,
+            max_agents: None,
             commit: None,
             schedules: Vec::new(),
         };

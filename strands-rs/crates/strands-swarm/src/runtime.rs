@@ -564,6 +564,8 @@ struct Inner {
     reload_generation: AtomicU64,
     model_calls: Option<Arc<Semaphore>>,
     budget: Mutex<Option<u64>>,
+    /// Live-agent limit set at runtime with [`Swarm::set_max_agents`]; overrides the config.
+    max_agents: Mutex<Option<usize>>,
     /// Agents whose model call was refused for lack of budget, to wake when it is raised.
     over_budget: Mutex<Vec<String>>,
     /// Pending scheduled messages, in creation order.
@@ -653,6 +655,7 @@ impl Swarm {
             model_calls: (config.max_concurrent_calls > 0)
                 .then(|| Arc::new(Semaphore::new(config.max_concurrent_calls))),
             budget: Mutex::new(config.budget_tokens),
+            max_agents: Mutex::new(None),
             over_budget: Mutex::new(Vec::new()),
             schedules: Mutex::new(Vec::new()),
             schedules_changed: Notify::new(),
@@ -730,7 +733,7 @@ impl Swarm {
         let node = {
             let mut agents = self.inner.agents.lock();
             // Decided under the lock, so concurrent spawns cannot overshoot the limit.
-            let queued = started(&agents, &scheduled) >= self.inner.config.max_agents;
+            let queued = started(&agents, &scheduled) >= self.max_agents();
             let taken = agents.values().map(|node| node.name.as_str());
             let node = Arc::new(Node {
                 id: id.clone(),
@@ -794,11 +797,7 @@ impl Swarm {
         let scheduled = self.scheduled_targets();
         let ready: Vec<Arc<Node>> = {
             let agents = self.inner.agents.lock();
-            let free = self
-                .inner
-                .config
-                .max_agents
-                .saturating_sub(started(&agents, &scheduled));
+            let free = self.max_agents().saturating_sub(started(&agents, &scheduled));
             let mut ready = Vec::new();
             for node in agents.values() {
                 if ready.len() == free {
@@ -1422,6 +1421,7 @@ impl Swarm {
     ) -> Result<(Self, mpsc::UnboundedReceiver<SwarmEvent>)> {
         let (swarm, events) = Self::new(config);
         swarm.inner.next_id.store(state.next_id, Ordering::SeqCst);
+        *swarm.inner.max_agents.lock() = state.max_agents;
         if let Some(tokens) = state.budget_tokens {
             *swarm.inner.budget.lock() = Some(tokens);
             swarm.emit(SwarmEvent::Budget { tokens: Some(tokens) });
@@ -1557,6 +1557,7 @@ impl Swarm {
             next_id: self.inner.next_id.load(Ordering::SeqCst),
             agents,
             budget_tokens: *self.inner.budget.lock(),
+            max_agents: *self.inner.max_agents.lock(),
             commit: self.inner.config.commit.clone(),
             schedules: self.inner.schedules.lock().clone(),
         }
@@ -1651,6 +1652,29 @@ impl Swarm {
             let note = format!("[The token budget was {limit}. Continue where you left off.]");
             let _ = self.send(USER, &id, note);
         }
+    }
+
+    /// The live-agent limit in force: the last [`Swarm::set_max_agents`], else the config's.
+    pub fn max_agents(&self) -> usize {
+        self.inner
+            .max_agents
+            .lock()
+            .unwrap_or(self.inner.config.max_agents)
+    }
+
+    /// Change the live-agent limit for this run (kept across restarts, ahead of `--max-agents`);
+    /// `None` returns to the configured one. Raising it starts queued agents at once.
+    pub fn set_max_agents(&self, limit: Option<usize>) -> Result<()> {
+        if limit == Some(0) {
+            return Err(Error::other("The agent limit must be at least 1."));
+        }
+        *self.inner.max_agents.lock() = limit;
+        self.persist();
+        if let Some(journal) = &self.inner.journal {
+            journal.event("max_agents", serde_json::json!({ "limit": self.max_agents() }));
+        }
+        self.start_queued();
+        Ok(())
     }
 
     /// The refusal message when the budget is spent.
