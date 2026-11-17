@@ -345,6 +345,9 @@ impl Swarm {
             *node.context.lock() = Some(counts.input as f64 / point as f64);
         }
         self.emit_usage(node);
+        // Saved now, not at the next status change or mail: a turn can run many calls without
+        // either, and a hard crash would lose their tokens from the cost and the budget.
+        self.persist();
     }
 
     pub(super) fn emit_usage(&self, node: &Node) {

@@ -1356,6 +1356,38 @@ async fn a_hard_crash_mid_batch_keeps_its_calls_and_the_results_that_came_in() {
     resumed.shutdown().await;
 }
 
+/// A model call's tokens are on disk while the turn goes on: a turn can make many calls with no
+/// status change or mail to save them, and a hard crash then lost them from the cost and the
+/// budget (in the soak, three of an agent's compactions' worth).
+#[tokio::test]
+async fn a_calls_tokens_are_saved_before_the_turn_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let wait = Message::new(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse(ToolUseBlock::new(
+            "wait",
+            "t1",
+            json!({"timeout_seconds": 600}),
+        ))],
+    );
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![MockResponse::with_usage(wait, usage(1234, 0, 56))],
+    )]);
+    let mut config = SwarmConfig::new(session_factory(&scripts, state_dir.join("sessions")), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    tool_started(&mut events, "wait").await;
+    let state_file = state_dir.join("swarm.json");
+    eventually("the call's tokens are saved", || {
+        std::fs::read_to_string(&state_file).is_ok_and(|text| text.contains("\"input_tokens\": 1234"))
+    })
+    .await;
+    swarm.shutdown().await;
+}
+
 /// A model whose first call fails (not retried) and whose later calls never finish.
 struct FailsThenHangs(Arc<std::sync::atomic::AtomicUsize>);
 
