@@ -66,7 +66,7 @@ struct Backoff {
 pub enum Compaction {
     /// Older turns were summarized.
     Done {
-        /// Projected input tokens before.
+        /// The call's projected input that set it off, before cache pruning trimmed any of it.
         before: u64,
         /// Estimated input tokens after.
         after: u64,
@@ -105,6 +105,9 @@ pub struct CompactAt {
     /// Set by [`CompactAt::arm`]: real tokens per estimated token of the messages, from the
     /// pass's projection before any strategy edited them. See [`CompactAt::tokens`].
     scale: Mutex<Option<f64>>,
+    /// Set by [`CompactAt::arm`]: the pass's projected input before any strategy edited it, so a
+    /// report says the size that set compaction off, not what was left after pruning.
+    reached: Mutex<Option<u64>>,
 }
 
 impl CompactAt {
@@ -117,6 +120,7 @@ impl CompactAt {
             armed: Mutex::new(None),
             backoff: Mutex::new(None),
             scale: Mutex::new(None),
+            reached: Mutex::new(None),
         }
     }
 
@@ -140,6 +144,7 @@ impl CompactAt {
         *self.scale.lock() = Some(input_tokens(ctx, window) as f64 / estimated as f64);
         let due = self.due(ctx);
         if let Some(requested) = due {
+            *self.reached.lock() = Some(input_tokens(ctx, window));
             let mut armed = self.armed.lock();
             *armed = Some(requested || *armed == Some(true));
         }
@@ -213,6 +218,7 @@ impl CompactAt {
         let window = window_of(ctx.agent.model().as_ref());
         let point = compaction_point(window, self.compact_at);
         let before = self.tokens(ctx, window);
+        let reached = self.reached.lock().take().map_or(before, |r| r.max(before));
         let target = if requested { 0 } else { point / 2 };
         // Armed, but an earlier strategy (pruning) already took it under the target.
         if !requested && !ctx.overflow && before <= target {
@@ -252,7 +258,7 @@ impl CompactAt {
         *self.backoff.lock() = None;
         tracing::info!("before=<{before}>, after=<{tokens}>, passes=<{passes}> | compacted the context");
         self.report(Compaction::Done {
-            before,
+            before: reached,
             after: tokens,
         });
         Ok(true)
@@ -546,6 +552,46 @@ mod tests {
             "after={after}, real={}",
             real(&messages)
         );
+    }
+
+    /// Arms `compact`, then trims the older half of the tool results, as cache pruning does.
+    struct ArmThenPrune(Arc<CompactAt>);
+
+    #[async_trait]
+    impl ContextStrategy for ArmThenPrune {
+        fn name(&self) -> &str {
+            "arm-then-prune"
+        }
+
+        async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
+            self.0.arm(ctx);
+            let half = ctx.messages.len() / 2;
+            for message in &mut ctx.messages[1..half] {
+                for block in &mut message.content {
+                    if let ContentBlock::ToolResult(result) = block {
+                        result.content = vec![ToolResultContent::Text("pruned".into())];
+                    }
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_report_gives_the_size_that_set_it_off_not_what_pruning_left() {
+        let (agent, _) = agent(&["SUMMARY one"]);
+        let (compact, events) = compact(10_000, None);
+        let manager = pipeline(vec![Arc::new(ArmThenPrune(Arc::clone(&compact))), compact]);
+        let mut messages = tool_loop(45);
+        let projected = heuristic(&messages);
+
+        pass(&manager, &agent, &mut messages, projected, false).await;
+
+        let reported = events.lock().clone();
+        let [Compaction::Done { before, .. }] = reported[..] else {
+            panic!("{reported:?}");
+        };
+        assert_eq!(before, projected);
     }
 
     #[tokio::test]
