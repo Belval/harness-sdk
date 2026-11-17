@@ -39,8 +39,19 @@ const EXCLUDED_BUILTINS: &[&str] = &["subagent", "web_search", "programmatic_too
 
 /// Tools whose calls in one batch run one after another in the model's order
 /// ([`OrderedToolExecutor`]): a test run waits for the edits before it, a read or a job for the
-/// command that writes its file. Every other call (messages, MCP, fetches) still starts at once.
-const ORDERED_TOOLS: &[&str] = &["read", "write", "edit", "shell", "run_background", "land"];
+/// command that writes its file, a worktree spawn for the commit it should branch from, a cancel
+/// (which removes the worktree only if it is clean) for the command that cleans it. Every other
+/// call (messages, MCP, fetches) still starts at once.
+const ORDERED_TOOLS: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "shell",
+    "run_background",
+    "land",
+    "spawn_agent",
+    "cancel_agent",
+];
 
 /// Preview kept in context when a large tool result is offloaded to the stash.
 /// How to use the file tools: agents otherwise script edits with `python3`/`sed` through `shell`,
@@ -627,6 +638,67 @@ mod tests {
             .unwrap();
         let text = serde_json::to_string(&read.content).unwrap();
         assert!(text.contains("written"), "{text}");
+    }
+
+    /// A cancel removes a worktree only if it is clean, and a worktree spawn branches from HEAD:
+    /// both wait for the command before them that cleans the checkout or commits.
+    #[tokio::test]
+    async fn spawn_and_cancel_wait_for_the_command_before_them() {
+        use strands_agents::testing::MockResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("committed");
+        let probe = |name: &str| -> ToolRef {
+            let file = file.clone();
+            Arc::new(FunctionTool::builder(name).description("Probe.").handler(
+                move |_input: serde_json::Value, _ctx| {
+                    let seen = file.exists();
+                    async move { Result::Ok(serde_json::json!({ "seen": seen })) }
+                },
+            ))
+        };
+        let call = |name: &str, id: &str, input| ContentBlock::ToolUse(ToolUseBlock::new(name, id, input));
+        let batch = Message::new(
+            Role::Assistant,
+            vec![
+                call(
+                    "shell",
+                    "t1",
+                    serde_json::json!({ "command": "sleep 0.3 && touch committed" }),
+                ),
+                call("spawn_agent", "t2", serde_json::json!({})),
+                call("cancel_agent", "t3", serde_json::json!({})),
+            ],
+        );
+        let spec = AgentSpec {
+            cwd: dir.path().to_owned(),
+            tools: vec![probe("spawn_agent"), probe("cancel_agent")],
+            ..spec()
+        };
+        let options = HarnessFactoryOptions::default();
+        let mut harness = harness_options(&options, spec).unwrap();
+        let model = MockMessageModel::shared(vec![
+            MockResponse::message(batch),
+            MockResponse::message(Message::assistant("done")),
+        ]);
+        harness.model = Some(ModelOption::Instance(model.clone()));
+        build(&options, harness)
+            .await
+            .unwrap()
+            .invoke("go")
+            .await
+            .unwrap();
+
+        let calls = model.calls();
+        let results: Vec<String> = calls[1]
+            .0
+            .last()
+            .unwrap()
+            .tool_results()
+            .filter(|result| result.tool_use_id != "t1")
+            .map(|result| serde_json::to_string(&result.content).unwrap())
+            .collect();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(results.iter().all(|r| r.contains("true")), "{results:?}");
     }
 
     #[tokio::test]
