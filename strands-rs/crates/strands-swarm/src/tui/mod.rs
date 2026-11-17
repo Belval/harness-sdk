@@ -68,7 +68,9 @@ pub async fn run(
         app.notice = outcome.err().map(|error| format!("error: {error}"));
     }
     let mut keys = EventStream::new();
+    // Ticks advance spinners only while something animates; an idle screen is drawn on events.
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick = 0usize;
 
     // While the plain log is shown on the main screen the TUI is not drawn; any key returns.
@@ -116,7 +118,7 @@ pub async fn run(
                 true => {}
                 false => on_terminal_event(&swarm, &mut app, event, &screen).await,
             },
-            _ = ticker.tick() => tick = tick.wrapping_add(1),
+            _ = ticker.tick(), if app.animating() => tick = tick.wrapping_add(1),
             _ = swarm.reload_requested() => break Ok(Exit::Reload),
         }
         if app.quit {

@@ -391,7 +391,12 @@ fn log_window(view: &AgentView, app: &App, tick: usize, inner: Rect) -> LogWindo
     // its placeholder (the lines before the reserved rows).
     let mut groups = Vec::new();
     if let Some(activity) = view.activity() {
-        let glyph = SPINNER[tick % SPINNER.len()];
+        // Only work spins; waiting (for mail, a slot, a reload) holds still, so an idle swarm's
+        // screen does not change between ticks.
+        let glyph = match view.spins() {
+            true => SPINNER[tick % SPINNER.len()],
+            false => status_glyph(view, tick).0,
+        };
         let line = Line::styled(format!("{glyph} {activity}"), Style::new().fg(Color::Cyan));
         let lines = vec![line];
         groups.push((rows_of(&lines), lines, None));
@@ -898,6 +903,75 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, app, "r", 0)).unwrap();
         buffer_text(terminal.backend().buffer())
+    }
+
+    /// The event loop ticks only while [`App::animating`]: otherwise every tick would draw the
+    /// same screen. A swarm whose agents wait (on mail, a model slot) or are idle stays still.
+    #[test]
+    fn the_screen_changes_between_ticks_only_while_the_app_animates() {
+        use crate::runtime::{AgentStatus, SwarmEvent};
+        let frames = |app: &App| -> Vec<String> {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            (0..SPINNER.len())
+                .map(|tick| {
+                    terminal.draw(|frame| draw(frame, app, "r", tick)).unwrap();
+                    buffer_text(terminal.backend().buffer())
+                })
+                .collect()
+        };
+        let mut app = App::default();
+        for (id, parent) in [("a1", USER), ("a2", "a1")] {
+            app.apply(SwarmEvent::Spawned {
+                id: id.into(),
+                parent: parent.into(),
+                name: format!("name-{id}"),
+                task: "t".into(),
+                cwd: "/w".into(),
+                branch: None,
+            });
+            app.apply(SwarmEvent::Status {
+                id: id.into(),
+                status: AgentStatus::Running,
+            });
+        }
+        let tool = |id: &str, name: &str| SwarmEvent::ToolStarted {
+            id: id.into(),
+            name: name.into(),
+            summary: String::new(),
+        };
+        // The selected root waits for mail while its child works, then the child waits too.
+        app.apply(tool("a1", "wait"));
+        assert!(app.animating());
+        let shown = frames(&app);
+        assert!(
+            shown.windows(2).any(|pair| pair[0] != pair[1]),
+            "a working agent spins"
+        );
+        app.apply(SwarmEvent::ModelQueued {
+            id: "a2".into(),
+            queued: true,
+        });
+        let still = |app: &App, case: &str| {
+            assert!(!app.animating(), "{case}");
+            let shown = frames(app);
+            assert!(
+                shown.windows(2).all(|pair| pair[0] == pair[1]),
+                "{case}\n{}",
+                shown.join("\n")
+            );
+        };
+        still(&app, "waiting on mail and a model slot");
+        let idle = |id: &str| SwarmEvent::Status {
+            id: id.into(),
+            status: AgentStatus::Idle,
+        };
+        app.apply(idle("a2"));
+        still(&app, "one idle");
+        app.apply(idle("a1"));
+        app.selected = 1;
+        still(&app, "both idle, the child selected");
+        app.status = Some(Default::default());
+        assert!(app.animating(), "an open /status popup is refreshed");
     }
 
     #[test]

@@ -218,6 +218,15 @@ impl AgentView {
         }
     }
 
+    /// Whether its glyph spins: it is starting, or running without waiting on anything.
+    pub fn spins(&self) -> bool {
+        match self.status {
+            AgentStatus::Starting => true,
+            AgentStatus::Running => self.waiting().is_none(),
+            _ => false,
+        }
+    }
+
     /// The newest log entry other than mail, which lands whenever it arrives, also while a tool
     /// call runs.
     fn latest(&self) -> Option<&LogEntry> {
@@ -587,6 +596,13 @@ impl App {
     /// Cancelled agents left out of the tree.
     pub fn hidden(&self) -> usize {
         self.agents.len().saturating_sub(self.tree().len())
+    }
+
+    /// Whether the screen changes with time alone: an agent's glyph [`spins`](AgentView::spins)
+    /// or a `/status` or `/cost` popup is open (refreshed while open). Otherwise only events
+    /// change it, and the event loop draws on events only.
+    pub fn animating(&self) -> bool {
+        self.status.is_some() || self.cost.is_some() || self.agents.values().any(AgentView::spins)
     }
 
     /// Show or hide cancelled agents, keeping the selected agent selected when it stays visible.
