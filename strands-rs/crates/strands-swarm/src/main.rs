@@ -59,8 +59,9 @@ struct Cli {
     /// it into a window flag or desktop notification).
     #[arg(long)]
     notify: bool,
-    /// Branch the TUI's `/status` compares agent branches against; default: the branch checked
-    /// out where the swarm started.
+    /// Branch the TUI's `/status` compares agent branches against, and that a cancelled agent's
+    /// branch must be merged into to be deleted; default: the branch checked out where the swarm
+    /// started.
     #[arg(long)]
     status_base: Option<String>,
     /// Give agents the `land` tool: rebase their commits onto a branch they do not own in a
@@ -201,7 +202,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         let saved = state::load(&dir)
             .await?
             .ok_or_else(|| format!("no saved run {name}"))?;
-        let collected = strands_swarm::gc::collect_run(&saved).await;
+        let collected = strands_swarm::gc::collect_run(&saved, cli.status_base.as_deref()).await;
         let journal = strands_swarm::journal::Journal::open(&dir);
         for agent in collected.iter().filter(|c| !c.is_empty()) {
             journal.event("gc", agent.journal_fields());

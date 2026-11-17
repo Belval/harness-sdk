@@ -2123,6 +2123,56 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 }
 
 #[tokio::test]
+async fn reclaiming_compares_with_the_root_agents_branch_not_the_main_worktrees() {
+    let dir = tempfile::tempdir().unwrap();
+    // The main worktree stays on `main`; the swarm runs in a linked worktree on `integration`.
+    let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);
+    let root = dir.path().join("integration");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "integration",
+            root.to_str().unwrap(),
+        ],
+    );
+    let scripts = scripts_of(vec![("a1", vec![say("ok")]), ("a2", vec![say("ok")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), &root);
+    config.state_dir = Some(dir.path().join("run"));
+    let (swarm, mut events) = Swarm::new(config);
+    let request = |worktree| SpawnRequest {
+        task: "t".into(),
+        worktree,
+        ..Default::default()
+    };
+    let lead = swarm.spawn(USER, request(false)).await.unwrap();
+    let worker = swarm.spawn(&lead, request(true)).await.unwrap();
+    reply_to(&mut events, USER).await;
+    reply_to(&mut events, &lead).await;
+    let checkout = swarm.agent(&worker).unwrap().cwd;
+    std::fs::write(checkout.join("work.txt"), "done").unwrap();
+    git(&checkout, &["add", "."]);
+    git(&checkout, &["commit", "-qm", "work"]);
+    let branch = format!("swarm/{}/{worker}", swarm.run_id());
+    // Landed on the root's branch, not on the main worktree's.
+    git(&root, &["merge", "-q", "--ff-only", &branch]);
+
+    swarm.cancel(&worker).unwrap();
+    let reclaimed = swarm
+        .reclaimed_after_cancel(&worker, Duration::from_secs(10))
+        .await;
+    let collected = reclaimed[0].1.clone().expect("reclaimed");
+    let deleted = (branch.clone(), "merged".to_owned());
+    assert_eq!(collected.deleted_branch, Some(deleted), "{collected:?}");
+    assert!(!branch_exists(&repo, &branch));
+    let (base, _) = swarm.branch_states().await;
+    assert_eq!(base.as_deref(), Some("integration"), "the base /status uses");
+}
+
+#[tokio::test]
 async fn cancelling_a_worktree_agent_reclaims_its_target_dir_and_clean_worktree() {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);

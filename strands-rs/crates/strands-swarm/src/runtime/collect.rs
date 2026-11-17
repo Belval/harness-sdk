@@ -46,8 +46,8 @@ impl Swarm {
 
     /// Reclaim the disk of every cancelled worktree agent that has stopped: delete its private
     /// `CARGO_TARGET_DIR`, remove its worktree if it is clean, then delete its branch if the base
-    /// ([`SwarmConfig::status_base`], default the main checkout's branch) has all of it, merged or
-    /// cherry-picked.
+    /// (the one `/status` compares against: [`SwarmConfig::status_base`], default the branch at
+    /// the root agent's directory) has all of it, merged or cherry-picked.
     /// Runs on its own whenever an agent stops and on resume; call it to retry (e.g. after
     /// committing in a kept worktree). The outcome is also published as
     /// [`SwarmEvent::Reclaimed`], which the journal records.
@@ -77,9 +77,17 @@ impl Swarm {
             };
         }
         let config = &self.inner.config;
-        let base = config.status_base.as_deref();
+        let base = self.base_branch().await;
         let branch = node.branch.as_deref();
-        let collected = gc::collect(&config.run_id, &node.id, branch, &node.cwd, &node.env, base).await;
+        let collected = gc::collect(
+            &config.run_id,
+            &node.id,
+            branch,
+            &node.cwd,
+            &node.env,
+            base.as_deref(),
+        )
+        .await;
         *node.reclaimed.lock() = Some(collected.clone());
         collected
     }

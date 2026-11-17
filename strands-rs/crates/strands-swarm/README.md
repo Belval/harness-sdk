@@ -327,7 +327,8 @@ Typing text without a command messages the selected agent.
   - Its worktree is removed with `git worktree remove` unless it has uncommitted changes, and so
     are `<repo>.swarm/<run>` and `<repo>.swarm` once that leaves them empty.
   - Its branch `swarm/<run>/<agent>` is deleted once no worktree has it checked out and the base
-    (`--status-base`, default the main checkout's branch) has every commit on it: reachable
+    (the one `/status` uses: `--status-base`, default the branch checked out where the swarm
+    started, which may be a linked worktree's rather than the main checkout's) has every commit on it: reachable
     (`merged`) or as a patch-equivalent copy (`all applied`, per `git cherry`; a merge commit on
     the branch always counts as not applied). Otherwise it stays, e.g. `kept branch swarm/r/a3
     (2 commits not on main)`. The ref is deleted only if it still points at the commit checked.

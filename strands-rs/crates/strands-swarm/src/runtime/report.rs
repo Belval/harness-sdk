@@ -83,13 +83,7 @@ impl Swarm {
         std::collections::HashMap<String, crate::status::BranchState>,
     ) {
         let nodes: Vec<Arc<Node>> = self.inner.agents.lock().values().cloned().collect();
-        // The main checkout: a root without a worktree of its own (a cancelled worktree root's
-        // checkout is gone, a live one has its own branch checked out).
-        let root = nodes
-            .iter()
-            .find(|node| node.parent == USER && node.branch.is_none())
-            .map(|node| node.cwd.clone())
-            .or_else(|| Some(self.inner.config.cwd.clone()));
+        let root = Some(self.base_root());
         let branches = nodes
             .iter()
             .filter(|node| node.status.lock().is_live())
@@ -104,5 +98,25 @@ impl Swarm {
             branches: branches.clone(),
         };
         (base, branches)
+    }
+
+    /// Where the base branch is checked out: a root agent without a worktree of its own (a
+    /// cancelled worktree root's checkout is gone, a live one has its own branch checked out),
+    /// else the swarm's directory. Not necessarily the repository's main worktree.
+    fn base_root(&self) -> PathBuf {
+        let nodes = self.inner.agents.lock();
+        let root = nodes
+            .values()
+            .find(|node| node.parent == USER && node.branch.is_none());
+        root.map_or_else(|| self.inner.config.cwd.clone(), |node| node.cwd.clone())
+    }
+
+    /// The branch `/status` and reclaiming compare agents' branches against:
+    /// [`SwarmConfig::status_base`], else the branch checked out at [`Self::base_root`].
+    pub(super) async fn base_branch(&self) -> Option<String> {
+        match &self.inner.config.status_base {
+            Some(base) => Some(base.clone()),
+            None => crate::status::current_branch(&self.base_root()).await,
+        }
     }
 }

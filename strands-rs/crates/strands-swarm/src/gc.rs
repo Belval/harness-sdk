@@ -121,11 +121,30 @@ pub fn notice(collected: &[Collected]) -> String {
 }
 
 /// Reclaim the directories of every cancelled agent of a saved run (`--gc`, offline).
-pub async fn collect_run(state: &crate::state::SwarmState) -> Vec<Collected> {
+pub async fn collect_run(state: &crate::state::SwarmState, base: Option<&str>) -> Vec<Collected> {
+    // The base as the running swarm has it: the branch at the root agent's own checkout.
+    let base = match base {
+        Some(base) => Some(base.to_owned()),
+        None => {
+            let root = state
+                .agents
+                .iter()
+                .find(|a| a.parent == crate::USER && a.branch.is_none());
+            let root = root.map_or(&state.cwd, |agent| &agent.cwd);
+            crate::status::current_branch(root).await
+        }
+    };
     let mut out = Vec::new();
     for agent in state.agents.iter().filter(|agent| agent.status == "cancelled") {
         let branch = agent.branch.as_deref();
-        let collected = collect(&state.run_id, &agent.id, branch, &agent.cwd, &agent.env, None);
+        let collected = collect(
+            &state.run_id,
+            &agent.id,
+            branch,
+            &agent.cwd,
+            &agent.env,
+            base.as_deref(),
+        );
         out.push(collected.await);
     }
     out
@@ -133,7 +152,8 @@ pub async fn collect_run(state: &crate::state::SwarmState) -> Vec<Collected> {
 
 /// Reclaim the directories and branch cancelled agent `id` of run `run_id` owns. Only worktree
 /// agents (`branch` set) own any; `cwd` is where the agent worked, `env` its command environment.
-/// The branch must be merged into `base` (default: the branch the main checkout has out).
+/// The branch must be merged into `base` (default: the branch the repository's main worktree
+/// has out; the swarm passes the root agent's branch, which may be another worktree's).
 pub async fn collect(
     run_id: &str,
     id: &str,
@@ -667,7 +687,7 @@ mod tests {
             commit: None,
             schedules: Vec::new(),
         };
-        let collected = collect_run(&state).await;
+        let collected = collect_run(&state, None).await;
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].removed.len(), 2, "{collected:?}");
         assert!(
@@ -675,6 +695,68 @@ mod tests {
             "live agents keep theirs"
         );
         assert!(summary(&collected).starts_with("reclaimed "));
+    }
+
+    #[tokio::test]
+    async fn a_saved_run_compares_with_the_root_agents_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, worktree) = repo_with_worktree(tmp.path());
+        fs::write(worktree.join("work.txt"), "done").unwrap();
+        run(&worktree, &["add", "."]);
+        run(&worktree, &["commit", "-qm", "work"]);
+        // The root agent ran in a linked worktree whose branch has the work; the main one has not.
+        let root = tmp.path().join("integration");
+        let root_arg = root.to_str().unwrap();
+        run(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "integration",
+                root_arg,
+                "swarm/r1/a2",
+            ],
+        );
+        let agent = |id: &str, cwd: &Path, branch: Option<&str>, status: &str| crate::state::AgentState {
+            id: id.into(),
+            parent: crate::USER.into(),
+            cwd: cwd.to_path_buf(),
+            branch: branch.map(str::to_owned),
+            status: status.into(),
+            name: None,
+            task: String::new(),
+            model: None,
+            goal: None,
+            mailbox: Vec::new(),
+            env: BTreeMap::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            ledger: Default::default(),
+            context: None,
+            paused: false,
+            running_calls: Default::default(),
+        };
+        let state = crate::state::SwarmState {
+            run_id: "r1".into(),
+            cwd: repo.clone(),
+            next_id: 3,
+            agents: vec![
+                agent("a1", &root, None, "idle"),
+                agent("a2", &worktree, Some("swarm/r1/a2"), "cancelled"),
+            ],
+            budget_tokens: None,
+            max_agents: None,
+            commit: None,
+            schedules: Vec::new(),
+        };
+        let collected = collect_run(&state, None).await;
+        let deleted = ("swarm/r1/a2".to_owned(), "merged".to_owned());
+        assert_eq!(collected[0].deleted_branch, Some(deleted), "{collected:?}");
+        assert!(!branch_exists(&repo, "swarm/r1/a2"));
     }
 
     #[test]
