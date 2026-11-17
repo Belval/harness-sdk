@@ -74,7 +74,13 @@ impl Swarm {
 
     /// Every background job of the run, oldest first.
     pub async fn jobs(&self) -> Vec<Job> {
-        self.inner.jobs.list().await
+        let mut jobs = self.inner.jobs.list().await;
+        // A job whose report is posted counts as reported while the mark waits for the save.
+        let posted = self.inner.reports_posted.lock();
+        for job in &mut jobs {
+            job.reported |= posted.contains(&job.meta.id);
+        }
+        jobs
     }
 
     /// Kill background job `id` (and everything it started); its owner gets no end report.
@@ -134,13 +140,18 @@ impl Swarm {
             job.meta.command,
             self.job_log(id).display()
         );
-        // Posted before it is marked: a crash in between repeats the report rather than lose it.
-        // An owner that is gone (cancelled) cannot be told; the job counts as reported.
+        // Posted and saved before it is marked: a crash in between repeats the report rather than
+        // lose it. An owner that is gone (cancelled) cannot be told; the job counts as reported.
+        self.inner.reports_posted.lock().insert(id.clone());
         let _ = self.post(JOBS_SENDER, &job.meta.owner, "job", text);
         self.journal_event("job_end", serde_json::json!({ "id": id, "status": job.status() }));
+        // `post` saves the mailbox in the background; marked first, a crash before that save
+        // would lose the report.
+        self.persist_now().await;
         if let Err(error) = self.inner.jobs.mark_reported(id).await {
             tracing::warn!(job = %id, %error, "could not mark the job reported");
         }
+        self.inner.reports_posted.lock().remove(id);
     }
 }
 

@@ -714,6 +714,8 @@ struct Inner {
     jobs: Jobs,
     /// The job watcher has been started.
     watching_jobs: AtomicBool,
+    /// Jobs whose end report is posted but not yet marked on disk ([`Swarm::jobs`]).
+    reports_posted: Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// Handle to a running swarm. Cheap to clone.
@@ -751,6 +753,7 @@ impl Swarm {
             branches: Mutex::default(),
             jobs: Jobs::new(jobs_dir(&config)),
             watching_jobs: AtomicBool::new(false),
+            reports_posted: Mutex::default(),
             config,
         };
         let swarm = Self {

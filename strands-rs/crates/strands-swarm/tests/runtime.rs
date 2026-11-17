@@ -3675,6 +3675,42 @@ async fn a_background_job_mails_its_exit_code_and_output_tail_to_the_idle_agent_
 }
 
 #[tokio::test]
+async fn a_job_is_marked_reported_only_once_its_report_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("run_background", "r1", json!({ "command": "sleep 0.3" })),
+            // A wait for someone else: the report stays in the mailbox.
+            tool_call("wait", "w1", json!({ "from": ["nobody"], "timeout_seconds": 30 })),
+        ],
+    )]);
+    let run = dir.path().join("run");
+    let (swarm, _events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    // What a crash right after the mark leaves: swarm.json at that moment.
+    let watcher = std::thread::spawn({
+        let run = run.clone();
+        move || loop {
+            if run.join("jobs/j1.reported").exists() {
+                return std::fs::read_to_string(run.join("swarm.json")).unwrap();
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    });
+    spawn_root(&swarm, "go").await;
+    let saved = tokio::task::spawn_blocking(move || watcher.join().unwrap());
+    let saved = tokio::time::timeout(Duration::from_secs(10), saved)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        saved.contains("Job j1"),
+        "the report is saved before the mark: {saved}"
+    );
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
 async fn wait_from_jobs_returns_the_job_message_and_says_when_none_will_come() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = scripts_of(vec![(
