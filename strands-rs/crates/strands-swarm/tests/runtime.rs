@@ -1313,7 +1313,11 @@ async fn a_hard_crash_mid_batch_keeps_its_calls_and_the_results_that_came_in() {
     let (swarm, mut events) = Swarm::new(config);
     spawn_root(&swarm, "go").await;
     tool_started(&mut events, "wait").await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let batch_file = state_dir.join("sessions/a1/open-batch.json");
+    eventually("list_agents's result is written ahead", || {
+        std::fs::read_to_string(&batch_file).is_ok_and(|text| text.contains("(a1)"))
+    })
+    .await;
     let crashed = dir.path().join("crashed");
     crash_copy(&state_dir, &crashed);
     swarm.shutdown().await;
