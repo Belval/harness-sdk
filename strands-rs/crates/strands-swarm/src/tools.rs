@@ -11,7 +11,8 @@ use strands_agents::Result;
 
 use crate::jobs::{Job, JobState};
 use crate::runtime::{
-    render_mail, AgentInfo, AgentStatus, ReloadWhen, ScheduleRequest, SpawnRequest, Swarm, WaitOutcome, USER,
+    render_mail, AgentInfo, AgentStatus, LandRequest, ReloadWhen, ScheduleRequest, SpawnRequest, Swarm,
+    WaitOutcome, USER,
 };
 use crate::schedule::{self, Schedule};
 
@@ -176,6 +177,55 @@ struct JobsInput {
     /// Id of a job to kill (with everything it started); omit to list jobs.
     #[serde(default)]
     kill: Option<String>,
+}
+
+const LAND_DESCRIPTION: &str = concat!(
+    "Land your commits on the branch your root agent has checked out (others only if the user ",
+    "allowed them), instead of asking someone to merge them. You can land your own branch or ",
+    "that of an agent you spawned. In a scratch worktree the branch is ",
+    "rebased onto it, the checks run there (default: the swarm's gate commands) with a private ",
+    "CARGO_TARGET_DIR, and only if all pass is the target fast-forwarded. Runs as a background ",
+    "job; you get a `job` message with the outcome. On a conflict (with the conflicted files), a ",
+    "failing check (with its output tail) or a target checkout with uncommitted changes, nothing ",
+    "is changed. Your own branch is never modified."
+);
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct LandInput {
+    /// Branch to land: your own (the default) or that of an agent you spawned.
+    #[serde(default)]
+    branch: Option<String>,
+    /// Branch to fast-forward; default (and usually the only one allowed): the branch your
+    /// root agent has checked out.
+    #[serde(default)]
+    into: Option<String>,
+    /// Shell commands that must pass on the rebased commits, run from the same subdirectory as
+    /// your working directory; default: the swarm's gates.
+    #[serde(default)]
+    check: Option<Vec<String>>,
+}
+
+fn land_tool(swarm: Swarm, me: String) -> ToolRef {
+    let tool = FunctionTool::builder("land")
+        .description(LAND_DESCRIPTION)
+        .typed_handler(move |input: LandInput, _ctx: ToolContext| {
+            let swarm = swarm.clone();
+            let me = me.clone();
+            async move {
+                let request = LandRequest {
+                    branch: input.branch,
+                    into: input.into,
+                    check: input.check,
+                };
+                let job = swarm.land(&me, request).await?;
+                Result::Ok(format!(
+                    "Started job {}; output: {}. You will get a message when it ends.",
+                    job.label(),
+                    swarm.job_log(&job.meta.id).display()
+                ))
+            }
+        });
+    Arc::new(tool)
 }
 
 fn run_background_tool(swarm: Swarm, me: String) -> ToolRef {
@@ -394,6 +444,9 @@ pub fn swarm_tools(swarm: Swarm, id: &str) -> Vec<ToolRef> {
         run_background_tool(swarm.clone(), id.to_owned()),
         jobs_tool(swarm.clone(), id.to_owned()),
     ];
+    if swarm.allows_land() {
+        tools.push(land_tool(swarm.clone(), id.to_owned()));
+    }
     if swarm.memory().is_some() {
         tools.push(remember_tool(swarm.clone()));
         tools.push(forget_tool(swarm));

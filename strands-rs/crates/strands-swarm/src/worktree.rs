@@ -47,7 +47,7 @@ pub async fn create(base: &Path, run_id: &str, agent_id: &str) -> Result<Worktre
 
 /// `dir` plus the path of `base` below `toplevel`. Joining an empty subdirectory would append a
 /// trailing `/`, so the root case returns `dir` as is.
-fn same_subdir(dir: &Path, toplevel: &Path, base: &Path) -> PathBuf {
+pub(crate) fn same_subdir(dir: &Path, toplevel: &Path, base: &Path) -> PathBuf {
     match base.strip_prefix(toplevel) {
         Ok(subdir) if !subdir.as_os_str().is_empty() => dir.join(subdir),
         _ => dir.to_path_buf(),
@@ -74,7 +74,8 @@ pub(crate) fn git_in(dir: &Path) -> Command {
     command
 }
 
-async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+/// `git <args>` in `cwd`: its trimmed stdout, or an error carrying its stderr.
+pub(crate) async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = git_in(cwd)
         .args(args)
         .output()

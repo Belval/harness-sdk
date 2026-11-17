@@ -12,8 +12,8 @@ use strands_agents::testing::{MockMessageModel, MockResponse};
 use strands_agents::types::{ContentBlock, Message, Role, ToolUseBlock};
 use strands_agents::{Agent, Model};
 use strands_swarm::{
-    AgentFactory, AgentSpec, AgentStatus, ModelResolver, ReloadWhen, SpawnRequest, Swarm, SwarmConfig,
-    SwarmEvent, GOAL_MAX_ATTEMPTS, USER,
+    AgentFactory, AgentSpec, AgentStatus, LandRequest, ModelResolver, ReloadWhen, SpawnRequest, Swarm,
+    SwarmConfig, SwarmEvent, GOAL_MAX_ATTEMPTS, USER,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -3011,4 +3011,177 @@ async fn cancelling_an_agent_kills_its_background_jobs() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("the job outlived its agent");
+}
+
+#[tokio::test]
+async fn land_rebases_checks_and_fast_forwards_the_roots_branch_as_a_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    std::fs::write(repo.join("a.txt"), "a").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+
+    let scripts = scripts_of(vec![
+        ("a1", vec![say("lead")]),
+        ("a2", vec![say("built"), say("landed, thanks")]),
+    ]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
+    config.state_dir = Some(dir.path().join("run"));
+    config.exe = Some(env!("CARGO_BIN_EXE_strands-swarm").into());
+    config.gates = vec!["test -f feature.txt".into()];
+    let (off, _) = Swarm::new(SwarmConfig::new(mock_factory(&scripts), &repo));
+    assert!(!off.allows_land(), "opt-in");
+    let root = spawn_root(&off, "lead").await;
+    let error = off.land(&root, LandRequest::default()).await.unwrap_err();
+    assert!(error.to_string().contains("--allow-land"), "{error}");
+    off.shutdown().await;
+
+    config.allow_land = true;
+    let (swarm, mut events) = Swarm::new(config);
+    let root = spawn_root(&swarm, "lead").await;
+    let tools: Vec<String> = strands_swarm::tools::swarm_tools(swarm.clone(), &root)
+        .iter()
+        .map(|tool| tool.name().to_owned())
+        .collect();
+    assert!(tools.contains(&"land".to_owned()), "{tools:?}");
+    let child = swarm
+        .spawn(
+            &root,
+            SpawnRequest {
+                task: "build".into(),
+                name: Some("builder".into()),
+                worktree: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    wait_for_status(&swarm, &child, AgentStatus::Idle).await;
+    let cwd = swarm.agent(&child).unwrap().cwd;
+    std::fs::write(cwd.join("feature.txt"), "f").unwrap();
+    git(&cwd, &["add", "."]);
+    git(&cwd, &["commit", "-qm", "feature"]);
+    // `main` moves on meanwhile; landing rebases onto it.
+    std::fs::write(repo.join("other.txt"), "o").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "other"]);
+
+    let job = swarm.land(&child, LandRequest::default()).await.unwrap();
+    assert!(job.label().contains("→ main"), "{}", job.label());
+    let report = mail_to(&mut events, &child, "job").await;
+    assert!(report.contains("Landed 1 commit(s)"), "{report}");
+    assert!(report.contains("ok `test -f feature.txt`"), "{report}");
+    assert!(
+        repo.join("feature.txt").is_file(),
+        "the root's checkout was fast-forwarded"
+    );
+    let log = git_in(&repo)
+        .args(["log", "--format=%s", "main"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&log.stdout), "feature\nother\ninit\n");
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn land_refuses_other_targets_and_branches_that_are_not_the_callers() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    std::fs::write(repo.join("a.txt"), "a").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    git(&repo, &["branch", "release-1"]);
+    git(&repo, &["branch", "precious"]);
+
+    let scripts = scripts_of(vec![
+        ("a1", vec![say("lead")]),
+        ("a2", vec![say("one")]),
+        ("a3", vec![say("two")]),
+        ("a4", vec![say("grandchild")]),
+    ]);
+    let make = |land_into: Vec<String>| {
+        let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
+        config.state_dir = Some(dir.path().join("run"));
+        config.exe = Some(env!("CARGO_BIN_EXE_strands-swarm").into());
+        config.allow_land = true;
+        config.land_into = land_into;
+        config
+    };
+    let (swarm, mut events) = Swarm::new(make(vec!["release-*".into()]));
+    let root = spawn_root(&swarm, "lead").await;
+    let worker = |task: &str| SpawnRequest {
+        task: task.into(),
+        worktree: true,
+        ..Default::default()
+    };
+    let one = swarm.spawn(&root, worker("one")).await.unwrap();
+    let two = swarm.spawn(&root, worker("two")).await.unwrap();
+    let grandchild = swarm.spawn(&one, worker("grandchild")).await.unwrap();
+    for id in [&one, &two, &grandchild] {
+        wait_for_status(&swarm, id, AgentStatus::Idle).await;
+    }
+    let branch_of = |id: &str| swarm.agent(id).unwrap().branch.unwrap();
+    let request = |branch: Option<String>, into: Option<&str>| LandRequest {
+        branch,
+        into: into.map(str::to_owned),
+        check: Some(vec![]),
+    };
+    let refused = |result: strands_agents::Result<_>| result.map(|_| ()).unwrap_err().to_string();
+
+    // Targets: the root's checked-out branch, or one matching --land-into; nothing else.
+    let error = refused(swarm.land(&one, request(None, Some("precious"))).await);
+    assert!(error.contains("landing on precious is not allowed"), "{error}");
+    assert!(error.contains("only main"), "{error}");
+    assert!(error.contains("release-*"), "{error}");
+    // Sources: one's own branch or a descendant's, never a sibling's or an arbitrary one.
+    let error = refused(swarm.land(&two, request(Some(branch_of(&one)), None)).await);
+    assert!(error.contains("is not yours to land"), "{error}");
+    assert!(
+        error.contains(&branch_of(&two)),
+        "lists the caller's own: {error}"
+    );
+    let error = refused(
+        swarm
+            .land(&grandchild, request(Some(branch_of(&one)), None))
+            .await,
+    );
+    assert!(
+        error.contains("is not yours to land"),
+        "not a parent's either: {error}"
+    );
+    let error = refused(swarm.land(&one, request(Some("precious".into()), None)).await);
+    assert!(error.contains("is not yours to land"), "{error}");
+
+    // Allowed: a descendant's branch on an allow-listed target, and the root's own default.
+    let cwd = swarm.agent(&grandchild).unwrap().cwd;
+    std::fs::write(cwd.join("g.txt"), "g").unwrap();
+    git(&cwd, &["add", "."]);
+    git(&cwd, &["commit", "-qm", "grandchild work"]);
+    swarm
+        .land(&one, request(Some(branch_of(&grandchild)), Some("release-1")))
+        .await
+        .unwrap();
+    let report = mail_to(&mut events, &one, "job").await;
+    assert!(report.contains("Landed 1 commit(s)"), "{report}");
+    let error = refused(swarm.land(&root, request(None, None)).await);
+    assert!(
+        error.contains("cannot be landed on itself"),
+        "root's own is main: {error}"
+    );
+    swarm.shutdown().await;
+
+    // Without --land-into only the default target is open.
+    let (strict, _events) = Swarm::new(make(vec![]));
+    let root = spawn_root(&strict, "lead").await;
+    let error = refused(strict.land(&root, request(None, Some("release-1"))).await);
+    assert!(error.contains("--land-into GLOB"), "{error}");
+    strict.shutdown().await;
 }

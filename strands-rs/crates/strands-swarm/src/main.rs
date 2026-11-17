@@ -52,6 +52,21 @@ struct Cli {
     /// out where the swarm started.
     #[arg(long)]
     status_base: Option<String>,
+    /// Give agents the `land` tool: rebase their commits onto a branch they do not own in a
+    /// scratch worktree, run the gates there, and fast-forward it on success.
+    #[arg(long)]
+    allow_land: bool,
+    /// A further branch (glob: `*`, `?`) `land` may fast-forward besides the root agent's
+    /// checked-out branch (repeatable), e.g. `--land-into 'release/*'`.
+    #[arg(long = "land-into", value_name = "GLOB")]
+    land_into: Vec<String>,
+    /// Check command `land` runs when the caller names none (repeatable), e.g.
+    /// `--gate 'cargo test'`.
+    #[arg(long = "gate", value_name = "CMD")]
+    gates: Vec<String>,
+    /// Carry out one landing from a plan file, then exit (how `land` jobs run).
+    #[arg(long, value_name = "PLAN", hide = true)]
+    land: Option<PathBuf>,
     /// Swarm-wide token budget (input + output, e.g. `5M`); once spent, model calls stop until it
     /// is raised (TUI `/budget N`). A resumed run keeps its last budget.
     #[arg(long, value_parser = strands_swarm::budget::parse_tokens)]
@@ -138,6 +153,19 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
+    if let Some(plan) = &cli.land {
+        let plan: strands_swarm::land::LandPlan = serde_json::from_slice(&std::fs::read(plan)?)?;
+        return match strands_swarm::land::run(&plan).await {
+            Ok(report) => {
+                println!("{report}");
+                Ok(Exit::Quit)
+            }
+            Err(report) => {
+                println!("{report}");
+                Err("not landed".into())
+            }
+        };
+    }
     if let Some(dir) = &cli.self_test {
         eprintln!("strands-swarm: {}", strands_swarm::selftest::run(dir).await?);
         return Ok(Exit::Quit);
@@ -244,6 +272,9 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
     config.status_base = cli.status_base;
+    config.allow_land = cli.allow_land;
+    config.gates = cli.gates;
+    config.land_into = cli.land_into;
     config.budget_tokens = cli.budget_tokens;
     config.compact_at = cli.compact_at;
     if !cli.no_memory {

@@ -21,6 +21,7 @@ pub mod gc;
 pub mod images;
 pub mod jobs;
 pub mod journal;
+pub mod land;
 pub mod mcp;
 pub mod memory;
 pub mod names;
@@ -44,7 +45,8 @@ pub use factory::{
 pub use mcp::{load_shared_mcp, McpOptions, SharedMcp};
 pub use memory::Memory;
 pub use runtime::{
-    AgentFactory, AgentInfo, AgentSpec, AgentStatus, Mail, ModelResolver, ReloadWhen, ScheduleRequest,
-    SpawnRequest, Swarm, SwarmConfig, SwarmEvent, WaitOutcome, GOAL_MAX_ATTEMPTS, RELOAD_EXIT_CODE, USER,
+    AgentFactory, AgentInfo, AgentSpec, AgentStatus, LandRequest, Mail, ModelResolver, ReloadWhen,
+    ScheduleRequest, SpawnRequest, Swarm, SwarmConfig, SwarmEvent, WaitOutcome, GOAL_MAX_ATTEMPTS,
+    RELOAD_EXIT_CODE, USER,
 };
 pub use skills::{discover_skills, Skills};

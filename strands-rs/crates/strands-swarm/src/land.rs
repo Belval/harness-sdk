@@ -1,0 +1,469 @@
+//! Landing an agent's commits on a branch it does not own ([`crate::Swarm::land`], the `land`
+//! tool): rebase them onto the target in a scratch worktree, run the checks there, and
+//! fast-forward the target only if everything passed. A conflict or a failing check leaves the
+//! target, its checkout and the agent's own branch exactly as they were.
+//!
+//! [`run`] does the work. The swarm runs it as a background job (`strands-swarm --land PLAN`) so
+//! that slow checks survive a restart and the outcome reaches the agent as a job message.
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+use crate::worktree::{git, git_in, same_subdir};
+
+/// Lines of a failing check's output that the report keeps.
+pub const TAIL_LINES: usize = 30;
+
+/// Everything one landing needs; written to disk for the job that carries it out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandPlan {
+    /// The agent's working directory: a checkout of the repository; checks run in the same
+    /// subdirectory of the scratch worktree.
+    pub repo: PathBuf,
+    /// Commit to land (the tip of the agent's branch when it asked).
+    pub source: String,
+    /// What `source` was called, for the report.
+    pub label: String,
+    /// Branch to fast-forward.
+    pub into: String,
+    /// Shell commands that must all succeed; none means no checks.
+    pub checks: Vec<String>,
+    /// Scratch worktree to create (and remove afterwards).
+    pub scratch: PathBuf,
+    /// `CARGO_TARGET_DIR` for the checks.
+    pub target_dir: PathBuf,
+}
+
+/// Land `plan`: `Ok` with a report when `into` was fast-forwarded (or had nothing to take),
+/// `Err` with the reason (conflicted files, a failing check's output tail, a dirty or moved
+/// target) when nothing was changed.
+pub async fn run(plan: &LandPlan) -> Result<String, String> {
+    let repo = &plan.repo;
+    let into = &plan.into;
+    let into_ref = format!("refs/heads/{into}");
+    let old = git(
+        repo,
+        &["rev-parse", "--verify", &format!("{into_ref}^{{commit}}")],
+    )
+    .await
+    .map_err(|_| format!("Not landed: there is no branch {into}."))?;
+    let checkout = checked_out(repo, &into_ref).await;
+    if let Some(dir) = &checkout {
+        ensure_clean(dir, into).await?;
+    }
+    let pending = log(repo, &old, &plan.source).await?;
+    if pending.is_empty() {
+        return Ok(format!(
+            "Nothing to land: {} has no commits that are not on {into}.",
+            plan.label
+        ));
+    }
+    let _ = tokio::fs::remove_dir_all(&plan.scratch).await;
+    let scratch = plan.scratch.to_string_lossy().into_owned();
+    git(repo, &["worktree", "add", "--detach", &scratch, &plan.source])
+        .await
+        .map_err(|e| format!("Not landed: could not create the scratch worktree: {e}"))?;
+    let outcome = land_in_scratch(plan, &old, checkout.as_deref()).await;
+    let _ = git(repo, &["worktree", "remove", "--force", &scratch]).await;
+    let _ = tokio::fs::remove_dir_all(&plan.scratch).await;
+    let _ = git(repo, &["worktree", "prune"]).await;
+    outcome
+}
+
+async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) -> Result<String, String> {
+    let (scratch, into, label) = (&plan.scratch, &plan.into, &plan.label);
+    if let Err(error) = git(scratch, &["rebase", "--quiet", old]).await {
+        let conflicted = git(scratch, &["diff", "--name-only", "--diff-filter=U"])
+            .await
+            .unwrap_or_default();
+        let _ = git(scratch, &["rebase", "--abort"]).await;
+        if conflicted.is_empty() {
+            return Err(format!(
+                "Not landed: rebasing {label} onto {into} failed: {error}"
+            ));
+        }
+        return Err(format!(
+            "Not landed: {label} conflicts with {into} ({}) in:\n{conflicted}\nRebase onto {into}, \
+             resolve, commit, and land again. Nothing was changed.",
+            short(old)
+        ));
+    }
+    let new = git(scratch, &["rev-parse", "HEAD"])
+        .await
+        .map_err(|e| format!("Not landed: {e}"))?;
+    let commits = log(scratch, old, &new).await?;
+    if commits.is_empty() {
+        return Ok(format!("Nothing to land: {into} already has {label}'s changes."));
+    }
+    let toplevel = git(&plan.repo, &["rev-parse", "--show-toplevel"])
+        .await
+        .map_err(|e| format!("Not landed: {e}"))?;
+    let dir = same_subdir(scratch, Path::new(&toplevel), &plan.repo);
+    let mut passed = Vec::new();
+    for check in &plan.checks {
+        let started = Instant::now();
+        check_passes(&dir, check, &plan.target_dir).await?;
+        passed.push(format!("  ok `{check}` ({}s)", started.elapsed().as_secs()));
+    }
+
+    let into_ref = format!("refs/heads/{into}");
+    let now = git(scratch, &["rev-parse", &into_ref]).await.unwrap_or_default();
+    if now != old {
+        return Err(format!(
+            "Not landed: {into} moved from {} to {} meanwhile. Land again.",
+            short(old),
+            short(&now)
+        ));
+    }
+    let moved = match checkout {
+        Some(dir) => {
+            ensure_clean(dir, into).await?;
+            git(dir, &["merge", "--ff-only", "--quiet", &new]).await
+        }
+        None => git(scratch, &["update-ref", &into_ref, &new, old]).await,
+    };
+    moved.map_err(|e| format!("Not landed: could not fast-forward {into}: {e}"))?;
+
+    let checks = match passed.is_empty() {
+        true => "No checks ran.".to_owned(),
+        false => format!("Checks passed:\n{}", passed.join("\n")),
+    };
+    Ok(format!(
+        "Landed {} commit(s) of {label} on {into} ({}..{}):\n{commits}\n{checks}\n{label} itself \
+         is unchanged; `git rebase {into}` drops the landed commits from it.",
+        commits.lines().count(),
+        short(old),
+        short(&new)
+    ))
+}
+
+/// Run `check` with `sh` in `dir`; on failure the error carries the tail of its output.
+async fn check_passes(dir: &Path, check: &str, target_dir: &Path) -> Result<(), String> {
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!("exec 2>&1\n{check}"))
+        .current_dir(dir)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .stdin(std::process::Stdio::null());
+    for var in crate::worktree::GIT_LOCATION_VARS {
+        command.env_remove(var);
+    }
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("Not landed: could not run `{check}`: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
+    let code = output
+        .status
+        .code()
+        .map_or_else(|| "a signal".to_owned(), |code| code.to_string());
+    Err(format!(
+        "Not landed: `{check}` failed (exit {code}) on the rebased commits. Nothing was changed. \
+         Last lines:\n{tail}"
+    ))
+}
+
+/// The worktree that has `branch_ref` checked out, if any.
+async fn checked_out(repo: &Path, branch_ref: &str) -> Option<PathBuf> {
+    let list = git(repo, &["worktree", "list", "--porcelain"]).await.ok()?;
+    let mut path = None;
+    for line in list.lines() {
+        if let Some(dir) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(dir));
+        } else if line.strip_prefix("branch ") == Some(branch_ref) {
+            return path;
+        }
+    }
+    None
+}
+
+/// Refuse when `dir` (where `into` is checked out) has uncommitted changes to tracked files.
+async fn ensure_clean(dir: &Path, into: &str) -> Result<(), String> {
+    let output = git_in(dir)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .await
+        .map_err(|e| format!("Not landed: git status failed: {e}"))?;
+    let status = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || !status.trim().is_empty() {
+        return Err(format!(
+            "Not landed: {into} is checked out at {} with uncommitted changes; they must be \
+             committed or stashed first. Nothing was changed.\n{}",
+            dir.display(),
+            status.trim_end()
+        ));
+    }
+    Ok(())
+}
+
+/// `<short hash> <subject>` of the commits in `from..to`, newest first.
+async fn log(dir: &Path, from: &str, to: &str) -> Result<String, String> {
+    git(dir, &["log", "--format=%h %s", &format!("{from}..{to}"), "--"])
+        .await
+        .map_err(|e| format!("Not landed: {e}"))
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(9)]
+}
+
+/// Whether `text` matches `pattern`, where `*` stands for any run of characters (`/` included)
+/// and `?` for one character.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let (pattern, text): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((star_p, star_t)) = star {
+            p = star_p + 1;
+            t = star_t + 1;
+            star = Some((star_p, star_t + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
+}
+
+/// `s` as one `sh` word.
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        /// Main checkout, on `main`.
+        main: PathBuf,
+        /// Worktree on `feature`, one commit ahead of `main`.
+        feature: PathBuf,
+        land: PathBuf,
+    }
+
+    async fn sh(dir: &Path, script: &str) {
+        let output = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{script}: {output:?}");
+    }
+
+    async fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("repo");
+        let feature = dir.path().join("feature");
+        std::fs::create_dir_all(main.join("sub")).unwrap();
+        sh(
+            &main,
+            "git init -q -b main && git config user.name t && git config user.email t@t && \
+             echo base > a.txt && git add . && git commit -qm init",
+        )
+        .await;
+        sh(
+            &main,
+            &format!("git worktree add -q -b feature {}", feature.display()),
+        )
+        .await;
+        sh(
+            &feature,
+            "echo new > b.txt && git add . && git commit -qm 'add b'",
+        )
+        .await;
+        let land = dir.path().join("land");
+        Fixture {
+            main,
+            feature,
+            land,
+            _dir: dir,
+        }
+    }
+
+    fn plan(fx: &Fixture, checks: &[&str]) -> LandPlan {
+        LandPlan {
+            repo: fx.feature.clone(),
+            source: "feature".into(),
+            label: "feature".into(),
+            into: "main".into(),
+            checks: checks.iter().map(|c| c.to_string()).collect(),
+            scratch: fx.land.join("scratch"),
+            target_dir: fx.land.join("target"),
+        }
+    }
+
+    async fn head(dir: &Path, rev: &str) -> String {
+        git(dir, &["rev-parse", rev]).await.unwrap()
+    }
+
+    async fn worktrees(dir: &Path) -> usize {
+        let list = git(dir, &["worktree", "list", "--porcelain"]).await.unwrap();
+        list.lines().filter(|l| l.starts_with("worktree ")).count()
+    }
+
+    #[tokio::test]
+    async fn a_clean_branch_with_passing_checks_fast_forwards_the_checked_out_target() {
+        let fx = fixture().await;
+        // `main` moves on independently: landing rebases `feature` onto it.
+        sh(
+            &fx.main,
+            "echo more > c.txt && git add . && git commit -qm 'add c'",
+        )
+        .await;
+        let feature_before = head(&fx.main, "feature").await;
+        let checks = [
+            "test -f b.txt && test -f c.txt",
+            r#"test "$CARGO_TARGET_DIR" = "$EXPECTED""#,
+        ];
+        let mut plan = plan(&fx, &checks);
+        plan.checks[1] = plan.checks[1].replace("$EXPECTED", &plan.target_dir.display().to_string());
+        let report = run(&plan).await.unwrap();
+        assert!(
+            report.starts_with("Landed 1 commit(s) of feature on main"),
+            "{report}"
+        );
+        assert!(report.contains("add b"), "{report}");
+        assert!(report.contains("ok `test -f b.txt"), "{report}");
+        assert!(fx.main.join("b.txt").is_file(), "the main checkout follows");
+        assert_eq!(
+            git(&fx.main, &["status", "--porcelain"]).await.unwrap(),
+            "",
+            "and is clean"
+        );
+        let log = git(&fx.main, &["log", "--format=%s", "main"]).await.unwrap();
+        assert_eq!(log, "add b\nadd c\ninit", "linear, no merge commit");
+        assert_eq!(
+            head(&fx.main, "feature").await,
+            feature_before,
+            "own branch untouched"
+        );
+        assert_eq!(worktrees(&fx.main).await, 2, "scratch worktree removed");
+        assert!(!plan.scratch.exists());
+    }
+
+    #[tokio::test]
+    async fn checks_run_in_the_same_subdirectory_and_an_unchecked_out_target_moves_by_ref() {
+        let fx = fixture().await;
+        sh(&fx.main, "git checkout -q -b other").await;
+        sh(
+            &fx.feature,
+            "mkdir -p sub && echo x > sub/x.txt && git add . && git commit -qm sub",
+        )
+        .await;
+        let mut plan = plan(&fx, &["test -f x.txt"]);
+        plan.repo = fx.feature.join("sub");
+        let report = run(&plan).await.unwrap();
+        assert!(report.contains("Landed 2 commit(s)"), "{report}");
+        assert_eq!(head(&fx.main, "main").await, head(&fx.main, "feature").await);
+        assert_eq!(head(&fx.main, "HEAD").await, head(&fx.main, "other").await);
+    }
+
+    #[tokio::test]
+    async fn a_conflict_names_the_files_and_changes_nothing() {
+        let fx = fixture().await;
+        sh(
+            &fx.main,
+            "echo mine > b.txt && git add . && git commit -qm 'main b'",
+        )
+        .await;
+        let main_before = head(&fx.main, "main").await;
+        let error = run(&plan(&fx, &["true"])).await.unwrap_err();
+        assert!(error.contains("conflicts with main"), "{error}");
+        assert!(error.contains("\nb.txt\n"), "{error}");
+        assert_eq!(head(&fx.main, "main").await, main_before);
+        assert_eq!(worktrees(&fx.main).await, 2, "scratch worktree removed");
+        assert_eq!(git(&fx.feature, &["status", "--porcelain"]).await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn a_failing_check_reports_its_output_tail_and_changes_nothing() {
+        let fx = fixture().await;
+        let main_before = head(&fx.main, "main").await;
+        let error = run(&plan(
+            &fx,
+            &["true", "echo boom; echo detail >&2; exit 3", "touch never"],
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("`echo boom; echo detail >&2; exit 3` failed (exit 3)"),
+            "{error}"
+        );
+        assert!(error.ends_with("boom\ndetail"), "{error}");
+        assert_eq!(head(&fx.main, "main").await, main_before);
+        assert!(!fx.main.join("b.txt").exists());
+        assert_eq!(worktrees(&fx.main).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_dirty_target_checkout_is_refused() {
+        let fx = fixture().await;
+        sh(&fx.main, "echo edited > a.txt").await;
+        let main_before = head(&fx.main, "main").await;
+        let error = run(&plan(&fx, &[])).await.unwrap_err();
+        assert!(error.contains("uncommitted changes"), "{error}");
+        assert!(error.contains("a.txt"), "{error}");
+        assert_eq!(head(&fx.main, "main").await, main_before);
+        assert_eq!(
+            std::fs::read_to_string(fx.main.join("a.txt")).unwrap(),
+            "edited\n"
+        );
+        assert!(
+            !plan(&fx, &[]).scratch.exists(),
+            "refused before any scratch work"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_to_land_is_a_success_without_changes() {
+        let fx = fixture().await;
+        let mut plan = plan(&fx, &["false"]);
+        plan.source = "main".into();
+        let report = run(&plan).await.unwrap();
+        assert!(report.starts_with("Nothing to land"), "{report}");
+        let error = run(&LandPlan {
+            into: "nope".into(),
+            ..plan
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("no branch nope"), "{error}");
+    }
+
+    #[test]
+    fn globs_match_whole_branch_names() {
+        assert!(glob_match("swarm-self", "swarm-self"));
+        assert!(!glob_match("swarm-self", "swarm-self2"));
+        assert!(!glob_match("swarm-self", "main"));
+        assert!(glob_match("swarm/*", "swarm/run/a2"));
+        assert!(glob_match("*-self", "swarm-self"));
+        assert!(glob_match("release-?", "release-1"));
+        assert!(!glob_match("release-?", "release-10"));
+        assert!(glob_match("a*b*c", "aXbYbZc"));
+        assert!(!glob_match("a*b*c", "aXbYbZ"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn quoting_survives_single_quotes() {
+        assert_eq!(sh_quote("/a b/it's"), r"'/a b/it'\''s'");
+    }
+}

@@ -14,6 +14,7 @@ agent with nine extra tools, and decides for itself whether and how to split the
 | `schedule` | Post a message to an agent's mailbox (default: your own) later and/or every N minutes; list or cancel schedules. |
 | `run_background` | Start a shell command as a background job and return its id at once; the agent gets a message with the exit code and the output's last 40 lines when it ends. |
 | `jobs` | List background jobs (status, log path), or kill one with everything it started. |
+| `land` | Only with `--allow-land`: rebase the caller's (or a descendant's) branch onto the root's checked-out branch, run the checks, and fast-forward it (see below). |
 | `find_tools` | Only with MCP servers: search the shared MCP tools by keyword and enable some for the calling agent. |
 | `skills` | Only with skills: load a skill's full `SKILL.md` instructions, its location and its bundled files. |
 | `remember` / `forget` | Only with memory: add a dated entry to the user's memory file, or drop the lines matching a text. |
@@ -25,6 +26,22 @@ the output in `<id>.log` and, from a small `sh` wrapper, the exit code in `<id>.
 polls them and mails the owner when one ends, also for jobs started before a restart; a job
 whose process vanished without an exit code (a reboot) is reported as such. A killed job is not
 reported, and cancelling an agent kills the jobs of its whole subtree.
+
+`land` (opt-in with `--allow-land`) lets a worker merge its own work instead of handing it to an
+integrator: `{branch?, into?, check?: [commands]}` lands `branch` on `into`. `branch` defaults to
+the caller's own and may only be that or the branch of an agent below it, so nobody lands another
+agent's unfinished work. `into` defaults to the branch the caller's root agent has checked out;
+any other target must match a `--land-into GLOB` the user gave (repeatable, `*` and `?`), else it
+is refused, so `main` or someone else's branch stays out of reach. As a background job it
+creates a scratch worktree at the branch's tip, rebases it onto `into`, runs each check with `sh`
+from the same subdirectory as the caller's working directory (default checks: the `--gate CMD`
+commands, repeatable) with a private `CARGO_TARGET_DIR` (`<shared>-land/<run>`, or under the jobs
+directory), and only then fast-forwards `into`: `git merge --ff-only` in the worktree that has it
+checked out, else a compare-and-swap `update-ref`. It refuses when that worktree has uncommitted
+changes to tracked files, and gives up if `into` moved meanwhile. A conflict (with the conflicted
+files), a failing check (with its last 30 lines) or a refusal changes nothing; the scratch worktree
+is always removed, and the caller's own branch is never modified (`git rebase <into>` afterwards
+drops the landed commits from it). Programmatically: `Swarm::land`.
 
 Every agent has a short, unique name (`lazy-mcp (a2)`): the one its spawner gave, else one derived
 from its task; ids and names work interchangeably. Each agent's final reply per turn goes to its parent. A `goal` (TUI `/goal`, CLI `--goal`, or on
@@ -42,7 +59,7 @@ strands-swarm [--run NAME] [--goal GOAL] [--model ID] [--side-model ID]
               [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
               [--max-agents N] [--max-concurrent-calls N] [--compact-at TOKENS] [--memory FILE | --no-memory]
-              [--notify] [--status-base BRANCH] [--headless] [--journal | --gc] [TASK]
+              [--notify] [--status-base BRANCH] [--allow-land] [--land-into GLOB]... [--gate CMD]... [--headless] [--journal | --gc] [TASK]
 ```
 
 Memory: one Markdown file shared by every agent and every run, for things you ask the swarm to

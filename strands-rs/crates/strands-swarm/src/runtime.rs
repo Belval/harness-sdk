@@ -44,6 +44,7 @@ mod actor;
 mod background;
 mod capacity;
 mod collect;
+mod landing;
 mod mailbox;
 mod persist;
 mod reload;
@@ -242,6 +243,16 @@ pub struct SwarmConfig {
     /// Branch [`Swarm::status`] compares agents' branches against; `None` uses the branch checked
     /// out at the root agent's working directory.
     pub status_base: Option<String>,
+    /// Offer the `land` tool ([`Swarm::land`]); off by default.
+    pub allow_land: bool,
+    /// Globs (`*`, `?`) of further branches [`Swarm::land`] may fast-forward besides the root
+    /// agent's checked-out branch (`--land-into`).
+    pub land_into: Vec<String>,
+    /// Commands [`Swarm::land`] runs when the caller names no checks (`--gate`).
+    pub gates: Vec<String>,
+    /// The `strands-swarm` binary that carries out a landing (`--land PLAN`); `None` is this
+    /// process's own executable.
+    pub exe: Option<PathBuf>,
 }
 
 impl SwarmConfig {
@@ -265,8 +276,25 @@ impl SwarmConfig {
             commit: crate::version::COMMIT.map(str::to_owned),
             source: PathBuf::from(crate::version::SOURCE),
             status_base: None,
+            allow_land: false,
+            land_into: Vec::new(),
+            gates: Vec::new(),
+            exe: None,
         }
     }
+}
+
+/// What a `land` call asks for ([`Swarm::land`]).
+#[derive(Debug, Clone, Default)]
+pub struct LandRequest {
+    /// Branch to land: the caller's own (the default) or that of an agent below it.
+    pub branch: Option<String>,
+    /// Branch to fast-forward; default: the branch the caller's root agent has checked out. Any
+    /// other must match [`SwarmConfig::land_into`].
+    pub into: Option<String>,
+    /// Shell commands that must pass on the rebased commits; `None` uses
+    /// [`SwarmConfig::gates`].
+    pub check: Option<Vec<String>>,
 }
 
 /// What a `spawn_agent` call (or the user) asks for.
