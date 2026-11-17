@@ -122,11 +122,12 @@ impl AgentView {
 
     fn push_text(&mut self, delta: &str) {
         match self.log.back_mut() {
-            Some(LogEntry::Text(text)) => text.push_str(delta),
-            _ => self.log.push_back(LogEntry::Text(delta.to_owned())),
+            Some(LogEntry::Text(text)) => {
+                text.push_str(delta);
+                self.unseen = true;
+            }
+            _ => self.push(LogEntry::Text(delta.to_owned())),
         }
-        self.trim();
-        self.unseen = true;
     }
 
     fn mark_read(&mut self) {
@@ -661,6 +662,20 @@ mod tests {
         }
     }
 
+    /// Mail from `from` (also its label) to `to`.
+    fn mail(to: &str, from: &str, kind: &'static str, text: &str) -> SwarmEvent {
+        SwarmEvent::Mail {
+            to: to.into(),
+            mail: Mail {
+                from: from.into(),
+                from_label: from.into(),
+                kind,
+                text: text.into(),
+                images: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn a_message_with_an_image_logs_the_image_after_the_text() {
         let dir = tempfile::tempdir().unwrap();
@@ -758,40 +773,17 @@ mod tests {
     fn shows_agent_to_user_messages_on_the_sender_and_skips_replies() {
         let mut app = App::default();
         app.apply(spawned("a1", USER));
-        let mail = |kind: &'static str| Mail {
-            from: "a1".into(),
-            from_label: "a1".into(),
-            kind,
-            text: "hi".into(),
-            images: Vec::new(),
-        };
-        app.apply(SwarmEvent::Mail {
-            to: USER.into(),
-            mail: mail("reply"),
-        });
-        app.apply(SwarmEvent::Mail {
-            to: USER.into(),
-            mail: mail("message"),
-        });
+        app.apply(mail(USER, "a1", "reply", "hi"));
+        app.apply(mail(USER, "a1", "message", "hi"));
         assert_eq!(app.agents["a1"].log.len(), 2);
         assert!(matches!(&app.agents["a1"].log[1], LogEntry::MailIn { from, .. } if from == "a1 → user"));
     }
 
     #[test]
     fn notify_rings_the_bell_for_messages_to_the_user_only() {
-        let mail = |from: &str| Mail {
-            from: from.into(),
-            from_label: from.into(),
-            kind: "reply",
-            text: "done".into(),
-            images: Vec::new(),
-        };
         let mut quiet = App::default();
         quiet.apply(spawned("a1", USER));
-        quiet.apply(SwarmEvent::Mail {
-            to: USER.into(),
-            mail: mail("a1"),
-        });
+        quiet.apply(mail(USER, "a1", "reply", "done"));
         assert!(!quiet.bell);
 
         let mut app = App {
@@ -799,15 +791,9 @@ mod tests {
             ..App::default()
         };
         app.apply(spawned("a1", USER));
-        app.apply(SwarmEvent::Mail {
-            to: "a1".into(),
-            mail: mail(USER),
-        });
+        app.apply(mail("a1", USER, "reply", "done"));
         assert!(!app.bell, "mail from the user does not ring");
-        app.apply(SwarmEvent::Mail {
-            to: USER.into(),
-            mail: mail("a1"),
-        });
+        app.apply(mail(USER, "a1", "reply", "done"));
         assert!(app.bell);
     }
 
@@ -815,28 +801,15 @@ mod tests {
     fn marks_mail_read_once_the_agent_takes_it() {
         let mut app = App::default();
         app.apply(spawned("a1", USER));
-        let mail = Mail {
-            from: USER.into(),
-            from_label: USER.into(),
-            kind: "message",
-            text: "hi".into(),
-            images: Vec::new(),
-        };
         let read = |app: &App| match app.agents["a1"].log.back() {
             Some(LogEntry::MailIn { read, .. }) => *read,
             other => panic!("{other:?}"),
         };
-        app.apply(SwarmEvent::Mail {
-            to: "a1".into(),
-            mail: mail.clone(),
-        });
+        app.apply(mail("a1", USER, "message", "hi"));
         assert_eq!(read(&app), Some(false));
         app.apply(SwarmEvent::MailRead { id: "a1".into() });
         assert_eq!(read(&app), Some(true));
-        app.apply(SwarmEvent::Mail {
-            to: "a1".into(),
-            mail,
-        });
+        app.apply(mail("a1", USER, "message", "hi"));
         assert_eq!(read(&app), Some(false));
     }
 
@@ -844,21 +817,10 @@ mod tests {
     fn a_disk_warning_shows_in_the_footer() {
         let mut app = App::default();
         app.apply(spawned("a1", USER));
-        app.apply(SwarmEvent::Mail {
-            to: "a1".into(),
-            mail: Mail {
-                from: crate::runtime::DISK_SENDER.into(),
-                from_label: crate::runtime::DISK_SENDER.into(),
-                kind: "disk",
-                text: "disk space low: 3.0 GB free on the filesystem of /w (warning below 20 GB)\nmore"
-                    .into(),
-                images: vec![],
-            },
-        });
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("disk space low: 3.0 GB free on the filesystem of /w (warning below 20 GB)")
-        );
+        let warning = "disk space low: 3.0 GB free on the filesystem of /w (warning below 20 GB)";
+        let sender = crate::runtime::DISK_SENDER;
+        app.apply(mail("a1", sender, "disk", &format!("{warning}\nmore")));
+        assert_eq!(app.notice.as_deref(), Some(warning));
     }
 
     #[test]
@@ -1105,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn a_compaction_is_noted_in_the_agents_log() {
+    fn compactions_are_noted_in_the_log_and_failed_ones_in_the_footer() {
         let mut app = App::default();
         app.apply(spawned("a1", USER));
         app.apply(SwarmEvent::Compacted {
@@ -1113,28 +1075,21 @@ mod tests {
             before: 305_000,
             after: 98_100,
         });
-        assert!(app.agents["a1"]
-            .log
-            .iter()
-            .any(|entry| matches!(entry, LogEntry::Status(note)
-            if note == "context compacted: older turns summarized, 305.0k → 98.1k tokens")));
-    }
-
-    #[test]
-    fn a_failed_compaction_is_noted_in_the_log_and_the_footer() {
-        let mut app = App::default();
-        app.apply(spawned("a1", USER));
         app.apply(SwarmEvent::CompactFailed {
             id: "a1".into(),
             tokens: 305_000,
             error: "throttled".into(),
         });
-        let note = "context not compacted: summarizing older turns failed (throttled); 305.0k tokens sent as they are";
-        assert!(app.agents["a1"]
-            .log
-            .iter()
-            .any(|entry| matches!(entry, LogEntry::Status(n) if n == note)));
-        assert_eq!(app.notice, Some(format!("a1: {note}")));
+        let failed = "context not compacted: summarizing older turns failed (throttled); 305.0k tokens sent as they are";
+        let log = &app.agents["a1"].log;
+        assert_eq!(
+            log.range(log.len() - 2..).collect::<Vec<_>>(),
+            [
+                &LogEntry::Status("context compacted: older turns summarized, 305.0k → 98.1k tokens".into()),
+                &LogEntry::Status(failed.into()),
+            ]
+        );
+        assert_eq!(app.notice, Some(format!("a1: {failed}")));
     }
 
     #[test]
