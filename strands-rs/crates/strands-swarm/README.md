@@ -7,7 +7,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | --- | --- |
 | `spawn_agent` | Start an agent on a task (optionally in its own git worktree, with a model or a goal). Non-blocking. |
 | `send_message` | Message any agent (by id or name), or `parent`. Busy agents see it after their current tool call; idle ones wake up. |
-| `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports); a user message always ends it. With `all`, until every agent in `from` has sent something: one call collects a fan-out's replies, and a timeout returns what came with who is still missing. |
+| `wait` | Block until messages arrive (optionally from specific agents, or `jobs` for job-end reports); a user message always ends it. With `all`, until every agent in `from` has sent something; a timeout returns what came and who is still missing. |
 | `list_agents` | The agent tree: status, directory, branch (ahead/behind the base, clean merge or conflicting files), running jobs, schedules, model and estimated spend. |
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
@@ -24,9 +24,9 @@ Agents also get the harness's `shell`, `read`, `write`, `edit`, `web_fetch`, `to
 `retrieve_context`, but not the SDK's background tasks (`_background_execution` on every tool):
 `run_background` covers slow commands. A `shell` result reaches the model as the text a terminal
 would show (stdout, then `[stderr]` and `[exit code N]` when there are any), not the SDK's JSON
-block, whose escaped quotes models copied into `edit`'s `old_str`. Tool specs and the swarm's prompt sections are sent on every
-model call, so a test (`the_fixed_prefix_stays_within_its_budget`) pins their size: 17 kB (about
-5k tokens) with 20 skills, the skills list at 2.5 kB of it.
+block, whose escaped quotes models copied into `edit`'s `old_str`. Tool specs and the swarm's
+prompt sections are sent on every model call, so `the_fixed_prefix_stays_within_its_budget` pins
+their size: 17 kB (about 5k tokens) with 20 skills, the skills list at 2.5 kB of it.
 
 ## Run
 
@@ -85,10 +85,9 @@ error.
     end returns the full output.
   - Both edit history, and the prompt cache only matches an unchanged prefix, so they run only when
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
-    the `context` tool), on the first call after the cache's lifetime (five idle minutes, an hour with `--cache-ttl 1h`), on
-    overflow, or once they would remove 40% of the history. Every other call re-sends history byte
-    for byte. (Run on every turn they raised input cost per call by ~80%; a replay with the gate
-    saves 29%.)
+    the `context` tool), on the first call after the cache's lifetime (five idle minutes, an hour
+    with `--cache-ttl 1h`), on overflow, or once they would remove 40% of the history. Every other
+    call re-sends history byte for byte.
   - The `context` tool lets the agent manage its own context. It lists the biggest items with tool
     results numbered. `offload: [n, …]` replaces results with a stub whose reference reads them
     back. `summarize: true` summarizes all but the latest four messages before the next call.
@@ -97,7 +96,7 @@ error.
   `list_agents` and `jobs` run one after another in the model's order: a test run waits for the
   edits before it, a read for the command that writes the file, a worktree spawn for the commit
   it should branch from, a cancel for the command that cleans the worktree it reclaims, a `wait`
-  for the spawns and jobs before it (it used to find none and return at once).
+  for the spawns and jobs before it.
 - **Worktrees.**
   - A worktree agent works in `<repo>.swarm/<run>/<agent>` on branch `swarm/<run>/<agent>`.
   - When `CARGO_TARGET_DIR` is set, it builds in its own `$CARGO_TARGET_DIR-worktrees/<run>/<agent>`.
@@ -255,8 +254,8 @@ Typing text without a command messages the selected agent.
   conversation intact. Its parent gets an `interrupted` message and its children keep running. A
   goal agent waits for its next message.
 - **`/status`:**
-  - Unmerged commits are `git log <base>..<branch>`. The base is the branch checked out at start,
-    or `--status-base`.
+  - Unmerged commits are `git log <base>..<branch>`. The base is `--status-base`, else the branch
+    checked out where the swarm started (a linked worktree's, if it started in one).
   - Each branch also says how many base commits it lacks and how it would merge:
     `3 not on main, 5 behind, merges cleanly` or `… conflicts in README.md, src/tui/view.rs`.
     The trial merge is `git merge-tree --write-tree` (git ≥ 2.38), which touches no checkout or
@@ -330,12 +329,10 @@ Typing text without a command messages the selected agent.
   - Its worktree is removed with `git worktree remove` unless it has uncommitted changes, and so
     are `<repo>.swarm/<run>` and `<repo>.swarm` once that leaves them empty.
   - Its branch `swarm/<run>/<agent>` is deleted once no worktree has it checked out and the base
-    (the one `/status` uses: `--status-base`, default the branch checked out where the swarm
-    started, which may be a linked worktree's rather than the main checkout's) has every commit on it: reachable
-    (`merged`) or as a patch-equivalent copy (`all applied`, per `git cherry`; a merge commit on
-    the branch always counts as not applied). Otherwise it stays, e.g. `kept branch swarm/r/a3
-    (2 commits not on main)`. The ref is deleted only if it still points at the commit checked.
-    A later pass (resume, `/gc`, `--gc`) deletes it once merged.
+    `/status` uses has every commit on it: reachable (`merged`) or as a patch-equivalent copy
+    (`all applied`, per `git cherry`; a merge commit never counts as applied). Otherwise it stays,
+    e.g. `kept branch swarm/r/a3 (2 commits not on main)`, until a later pass (resume, `/gc`,
+    `--gc`) finds it merged. The ref is deleted only if it still points at the commit checked.
   - `cancel_agent` waits up to 10 s for this and its result says what was removed and kept.
     `list_agents` with `include_cancelled` shows it later: `cwd … (removed)`, `branch … (deleted)`
     or `branch … (kept: 2 not on main, merges cleanly)`.
