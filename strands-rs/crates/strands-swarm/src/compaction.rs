@@ -580,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn a_report_gives_the_size_that_set_it_off_not_what_pruning_left() {
         let (agent, _) = agent(&["SUMMARY one"]);
-        let (compact, events) = compact(10_000, None);
+        let (compact, events) = compact(Some(10_000), None);
         let manager = pipeline(vec![Arc::new(ArmThenPrune(Arc::clone(&compact))), compact]);
         let mut messages = tool_loop(45);
         let projected = heuristic(&messages);
