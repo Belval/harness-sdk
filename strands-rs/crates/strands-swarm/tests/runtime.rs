@@ -1328,8 +1328,7 @@ async fn a_resumed_agent_sends_the_same_system_prompt_and_tools() {
 async fn reload_installs_the_binary_keeps_the_previous_one_and_signals_the_host() {
     let dir = tempfile::tempdir().unwrap();
     let map = Scripts::default();
-    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
-    config.state_dir = Some(dir.path().join("run"));
+    let config = persistent_swarm(&map, dir.path());
     let (swarm, _events) = Swarm::new(config);
     let bin = dir.path().join("run/bin");
 
@@ -2973,8 +2972,7 @@ async fn resuming_under_another_commit_reports_what_changed() {
     let old = commit("feat: before");
     let new = commit("fix: after");
     let map = Scripts::default();
-    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
-    config.state_dir = Some(dir.path().join("run"));
+    let mut config = persistent_swarm(&map, dir.path());
     config.source = repo.clone();
     config.commit = Some(old.clone());
     let (swarm, _events) = Swarm::new(config.clone());
@@ -3171,8 +3169,7 @@ async fn an_idle_agent_waiting_on_a_schedule_holds_no_agent_slot() {
 async fn schedules_persist_and_missed_fires_fire_once_on_resume() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = scripts_of(vec![("a1", vec![say("started")])]);
-    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
-    config.state_dir = Some(dir.path().join("run"));
+    let config = persistent_swarm(&scripts, dir.path());
     let (swarm, mut events) = Swarm::new(config.clone());
     let root = spawn_root(&swarm, "monitor").await;
     reply_to(&mut events, USER).await;
