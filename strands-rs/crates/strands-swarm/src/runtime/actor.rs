@@ -25,16 +25,8 @@ impl Swarm {
         if let Err(error) = agent.initialize().await {
             tracing::warn!(agent = %node.id, %error, "session restore failed");
         }
-        let (messages, omitted) = agent.with_messages(|messages| {
-            let omitted = messages.len().saturating_sub(HISTORY_MESSAGES);
-            (messages[omitted..].to_vec(), omitted)
-        });
-        if !messages.is_empty() {
-            self.emit(SwarmEvent::History {
-                id: node.id.clone(),
-                messages,
-                omitted,
-            });
+        if let Some(history) = agent.with_messages(|messages| history_event(&node.id, messages)) {
+            self.emit(history);
         }
         let paused = node.paused.load(Ordering::SeqCst);
         if !interrupted && (node.goal.is_none() || paused) {

@@ -28,6 +28,7 @@ impl Swarm {
         for agent in state.agents {
             swarm.restore_agent(agent);
         }
+        swarm.publish_cancelled_history();
         // Fires missed while the run was down are due now: each fires once.
         if !state.schedules.is_empty() {
             *swarm.inner.schedules.lock() = state.schedules;
@@ -38,6 +39,46 @@ impl Swarm {
         swarm.collect_in_background();
         swarm.watch_jobs();
         Ok((swarm, events))
+    }
+
+    /// Cancelled agents get no actor on resume, so nothing restores their session. Read each
+    /// one's saved conversation in the background and publish its tail ([`SwarmEvent::History`]),
+    /// so a viewer still shows what they did.
+    fn publish_cancelled_history(&self) {
+        let Some(dir) = self
+            .inner
+            .config
+            .state_dir
+            .as_ref()
+            .map(|dir| dir.join(SESSIONS_DIR))
+        else {
+            return;
+        };
+        let cancelled: Vec<String> = self
+            .inner
+            .agents
+            .lock()
+            .values()
+            .filter(|node| *node.status.lock() == AgentStatus::Cancelled)
+            .map(|node| node.id.clone())
+            .collect();
+        if cancelled.is_empty() {
+            return;
+        }
+        let swarm = self.clone();
+        self.track(tokio::spawn(async move {
+            let storage = strands_agents::FileStorage::new(dir);
+            for id in cancelled {
+                match saved_messages(&storage, &id).await {
+                    Ok(messages) => {
+                        if let Some(history) = history_event(&id, &messages) {
+                            swarm.emit(history);
+                        }
+                    }
+                    Err(error) => tracing::warn!(agent = %id, %error, "saved conversation unreadable"),
+                }
+            }
+        }));
     }
 
     pub(super) fn restore_agent(&self, saved: AgentState) {
@@ -205,4 +246,27 @@ pub(super) fn mail_from_state(mail: MailState) -> Mail {
         text: mail.text,
         images: mail.images,
     }
+}
+
+/// The messages of agent `id`'s latest saved snapshot, as [`crate::agent_session_manager`] keeps
+/// it; empty when it has none.
+async fn saved_messages(storage: &strands_agents::FileStorage, id: &str) -> Result<Vec<Message>> {
+    use strands_agents::session::{SnapshotLocation, SnapshotStorage};
+    let snapshot = storage
+        .load_snapshot(&SnapshotLocation::agent(id, id), None)
+        .await?;
+    match snapshot.and_then(|mut snapshot| snapshot.data.remove("messages")) {
+        Some(messages) => Ok(serde_json::from_value(messages)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// [`SwarmEvent::History`] with the last [`HISTORY_MESSAGES`] of `messages`, or `None` for none.
+pub(super) fn history_event(id: &str, messages: &[Message]) -> Option<SwarmEvent> {
+    let omitted = messages.len().saturating_sub(HISTORY_MESSAGES);
+    (!messages.is_empty()).then(|| SwarmEvent::History {
+        id: id.to_owned(),
+        messages: messages[omitted..].to_vec(),
+        omitted,
+    })
 }

@@ -25,6 +25,8 @@ const HEIGHT: u16 = 30;
 /// Each agent's compaction sink, as the factory was handed it.
 type Sinks = Arc<Mutex<HashMap<String, CompactedSink>>>;
 
+/// Agents on scripted mock models; each saves its conversation when the swarm has a state dir,
+/// as the harness factory does.
 fn factory(scripts: HashMap<&'static str, Vec<MockResponse>>, sinks: &Sinks) -> AgentFactory {
     let models: HashMap<String, Arc<MockMessageModel>> = scripts
         .into_iter()
@@ -37,13 +39,16 @@ fn factory(scripts: HashMap<&'static str, Vec<MockResponse>>, sinks: &Sinks) -> 
             sinks.lock().insert(spec.id.clone(), sink);
         }
         Box::pin(async move {
-            Agent::builder()
-                .id(spec.id)
+            let mut builder = Agent::builder()
+                .id(&spec.id)
                 .model(model)
                 .system_prompt(spec.instructions)
                 .tools(spec.tools)
-                .no_sandbox()
-                .build()
+                .no_sandbox();
+            if let Some(dir) = &spec.session_dir {
+                builder = builder.session_manager(crate::agent_session_manager(dir, &spec.id)?);
+            }
+            builder.build()
         })
     })
 }
@@ -88,6 +93,13 @@ impl Screen {
                     + "\n"
             })
             .collect()
+    }
+
+    /// Press `code`, through the TUI's terminal-event handler.
+    async fn press(&mut self, swarm: &Swarm, app: &mut App, code: KeyCode) -> String {
+        let key = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        on_terminal_event(swarm, app, key, &self.buffer).await;
+        self.draw(app)
     }
 
     /// Type `line` and press enter, each key going through the TUI's terminal-event handler.
@@ -224,5 +236,69 @@ async fn a_real_swarm_shows_spawns_replies_compaction_and_status_on_screen() {
         !screen.draw(&mut app).contains("┌ status"),
         "any key closes the overlay"
     );
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn after_a_restart_every_agent_shows_its_past_including_cancelled_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("run");
+    let sinks = Sinks::default();
+    let scripts = HashMap::from([
+        (
+            "a1",
+            vec![
+                tool_call(
+                    "spawn_agent",
+                    "t1",
+                    json!({"task": "check the parser", "name": "parser"}),
+                ),
+                tool_call("wait", "t2", json!({"from": ["parser"], "timeout_seconds": 10})),
+                say("root: the parser is fine"),
+            ],
+        ),
+        ("a2", vec![say("parser: all green")]),
+    ]);
+    let mut config = SwarmConfig::new(factory(scripts, &sinks), dir.path());
+    config.state_dir = Some(state_dir.clone());
+    let (swarm, mut events) = Swarm::new(config.clone());
+    let mut app = App::default();
+    let mut screen = Screen::new();
+    screen.type_line(&swarm, &mut app, "fix the bug").await;
+    screen
+        .until(&mut app, &mut events, "root: the parser is fine")
+        .await;
+    swarm.cancel("a2").unwrap();
+    screen.until(&mut app, &mut events, "1 cancelled hidden").await;
+    swarm.shutdown().await;
+
+    // A new process: a fresh screen, the same run.
+    let saved = crate::state::load(&state_dir)
+        .await
+        .unwrap()
+        .expect("state saved");
+    let resumed_factory = factory(HashMap::from([("a1", vec![]), ("a2", vec![])]), &sinks);
+    let config = SwarmConfig {
+        factory: resumed_factory,
+        ..config
+    };
+    let (swarm, mut events) = Swarm::resume(config, saved).await.unwrap();
+    let mut app = App::default();
+    let mut screen = Screen::new();
+    let shown = screen
+        .until(&mut app, &mut events, "root: the parser is fine")
+        .await;
+    assert!(shown.contains("restored conversation"), "{shown}");
+    assert!(
+        shown.contains("spawn_agent"),
+        "past tool calls are listed\n{shown}"
+    );
+
+    // The cancelled child has no actor, yet its log shows what it did once it is listed.
+    screen.press(&swarm, &mut app, KeyCode::F(3)).await;
+    screen.press(&swarm, &mut app, KeyCode::Down).await;
+    assert_eq!(app.selected_id().as_deref(), Some("a2"));
+    let shown = screen.until(&mut app, &mut events, "parser: all green").await;
+    assert!(shown.contains("restored conversation"), "{shown}");
     swarm.shutdown().await;
 }

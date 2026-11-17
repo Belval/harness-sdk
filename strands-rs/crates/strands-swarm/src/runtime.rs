@@ -54,6 +54,7 @@ pub(crate) use actor::summarize_input;
 use actor::Start;
 use background::jobs_dir;
 use capacity::started;
+use persist::history_event;
 pub use warm::{KEEP_WARM_EVERY, KEEP_WARM_MAX};
 
 /// Judge rejections in a row after which a goal agent's turn ends anyway, so a goal that cannot

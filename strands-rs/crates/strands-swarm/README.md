@@ -254,7 +254,8 @@ Typing text without a command messages the selected agent.
 **Log and copying.**
 
 - F2 prints the selected agent's log as plain text into the terminal's scrollback; any key returns.
-- A resumed run shows each agent's restored conversation.
+- A resumed run shows the last 100 messages of each agent's restored conversation, cancelled
+  agents included (F3 lists them).
 - Drag to select text in the log or tree. Releasing copies it with OSC 52, which works over ssh;
   tmux needs `set -g set-clipboard on`.
 - The wheel scrolls the log and Esc clears the highlight. Hold Shift (Option/Alt in iTerm2) for
