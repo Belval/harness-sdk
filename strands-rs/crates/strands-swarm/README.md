@@ -108,9 +108,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     requests still retry at once.
   - **Pruning.** Reasoning from earlier turns (thinking text and signatures, which some models bill
     as input on every call) is dropped; the turn in progress keeps it, as Anthropic requires within
-    a tool-use loop. `shell` and `read` results over 2,000 characters are cut to their head and
-    tail (~800 characters) once six newer ones exist; `retrieve_context` with the reference at the
-    end returns the full output.
+    a tool-use loop. Tool results over 2,000 characters (`shell`, `read`, MCP listings and the
+    rest, but not `skills`, `wait` or `retrieve_context`) are cut to their head and tail (~800
+    characters) once six newer ones exist; `retrieve_context` with the reference at the end returns
+    the full output.
   - Both edit history, and the prompt cache only matches an unchanged prefix, so they run only when
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
     the `context` tool), on the first call after the cache's lifetime (five idle minutes, an hour

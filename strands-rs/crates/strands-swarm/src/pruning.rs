@@ -5,7 +5,7 @@
 //! requires thinking blocks within the turn in progress (a tool-use loop is one turn) and allows
 //! omitting earlier turns' thinking, as long as no dropped block sits between two kept ones.
 //!
-//! Old tool output: a `shell` or `read` result is mostly read once, then re-sent on every call.
+//! Old tool output: a `shell`, `read` or MCP result is mostly read once, then re-sent on every call.
 //! Older ones are cut to their head and tail; the full text stays in the stash under the
 //! `retrieve_context` reference the preview ends with.
 //!
@@ -70,20 +70,28 @@ fn drop_old_reasoning(messages: &mut [Message]) -> bool {
     acted
 }
 
-/// Tools whose older results are trimmed.
-const TRIMMED_TOOLS: [&str; 2] = ["shell", "read"];
-/// The latest this many [`TRIMMED_TOOLS`] results stay whole.
+/// Tools whose older results stay whole: a loaded skill is the procedure the agent follows, and
+/// mail (a child's report) arrives in `wait` results. `retrieve_context` reads the stash back,
+/// and the SDK never trims what it returned.
+const UNTRIMMED_TOOLS: [&str; 3] = ["skills", "wait", "retrieve_context"];
+/// The latest this many trimmable results stay whole.
 const KEEP_RECENT_RESULTS: usize = 6;
 /// Older results longer than this (in characters) are trimmed.
 const TRIM_ABOVE_CHARS: usize = 2_000;
 /// What a trimmed result keeps, in tokens (about 800 characters, head and tail).
 const TRIM_PREVIEW_TOKENS: usize = 200;
 
-/// Trims [`TRIMMED_TOOLS`] results longer than [`TRIM_ABOVE_CHARS`] once
-/// [`KEEP_RECENT_RESULTS`] newer ones exist, whenever it runs: gated by [`CachePrune`].
+/// Whether `tool`'s older results are trimmed: any tool's but [`UNTRIMMED_TOOLS`]'. An MCP
+/// listing (a code review's JSON, a search's hits) is read once like a `shell` result.
+fn trimmed(tool: &str) -> bool {
+    !UNTRIMMED_TOOLS.contains(&tool)
+}
+
+/// Trims results longer than [`TRIM_ABOVE_CHARS`] once [`KEEP_RECENT_RESULTS`] newer ones exist,
+/// whenever it runs: gated by [`CachePrune`]. See [`trimmed`] for which.
 fn trim_old_results() -> OffloadStrategy {
     let truncate = Offload::truncate(
-        OffloadTarget::tools(TRIMMED_TOOLS),
+        OffloadTarget::tools(UNTRIMMED_TOOLS.map(|tool| format!("!{tool}"))),
         TruncateConfig {
             preview_tokens: Some(TRIM_PREVIEW_TOKENS),
             preview: None,
@@ -278,26 +286,26 @@ fn json_len<T: serde::Serialize>(value: &T) -> usize {
     serde_json::to_string(value).map_or(0, |json| json.len())
 }
 
-/// [`TRIMMED_TOOLS`] results with at least `keep` newer ones.
+/// Trimmable results (see [`trimmed`]) with at least `keep` newer ones.
 fn old_trimmed_results(messages: &[Message], keep: usize) -> impl Iterator<Item = &ToolResultBlock> {
     let names: HashMap<&str, &str> = messages
         .iter()
         .flat_map(|m| m.tool_uses())
         .map(|u| (u.tool_use_id.as_str(), u.name.as_str()))
         .collect();
-    let trimmed = |r: &&ToolResultBlock| {
+    let is_trimmed = |r: &&ToolResultBlock| {
         names
             .get(r.tool_use_id.as_str())
-            .is_some_and(|name| TRIMMED_TOOLS.contains(name))
+            .is_some_and(|name| trimmed(name))
     };
     let matching: Vec<&Message> = messages
         .iter()
-        .filter(|m| m.role == Role::User && m.tool_results().any(|r| trimmed(&r)))
+        .filter(|m| m.role == Role::User && m.tool_results().any(|r| is_trimmed(&r)))
         .collect();
     let old = matching.len().saturating_sub(keep);
     let results: Vec<&ToolResultBlock> = matching[..old]
         .iter()
-        .flat_map(|m| m.tool_results().filter(trimmed))
+        .flat_map(|m| m.tool_results().filter(is_trimmed))
         .collect();
     results.into_iter()
 }
@@ -476,8 +484,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trims_older_large_shell_and_read_results_to_a_preview_with_a_reference() {
-        let mut results = vec![("read", 5_000), ("write", 5_000), ("shell", 100)];
+    async fn trims_older_large_tool_results_to_a_preview_with_a_reference() {
+        let mcp = "builder-mcp_CodeReviewReadActions";
+        let mut results = vec![
+            ("read", 5_000),
+            ("skills", 5_000),
+            ("shell", 100),
+            (mcp, 5_000),
+            ("wait", 5_000),
+        ];
         results.extend([("shell", 5_000); 2 * KEEP_RECENT_RESULTS]);
         let mut messages = history(&results);
 
@@ -490,8 +505,10 @@ mod tests {
             "{}",
             text(0)
         );
-        assert_eq!(text(1).len(), 5_000, "other tools are left alone");
+        assert_eq!(text(1).len(), 5_000, "a loaded skill is left alone");
         assert_eq!(text(2).len(), 100, "small results are left alone");
+        assert!(text(3).len() < TRIM_ABOVE_CHARS, "an MCP result: {}", text(3));
+        assert_eq!(text(4).len(), 5_000, "mail in a wait result is left alone");
         let last_trimmed = results.len() - KEEP_RECENT_RESULTS - 1;
         assert!(text(last_trimmed).len() < TRIM_ABOVE_CHARS);
         for i in last_trimmed + 1..results.len() {
