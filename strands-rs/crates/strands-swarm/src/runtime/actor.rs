@@ -359,7 +359,8 @@ impl Swarm {
     pub(super) fn add_usage(&self, node: &Node, usage: &Usage, model: Option<String>, own_call: bool) {
         let counts = usage_counts(usage);
         let model = model.unwrap_or_else(|| "unknown".to_owned());
-        node.ledger.lock().record(&model, counts, own_call);
+        let own = own_call.then(|| self.now().timestamp());
+        node.ledger.lock().record(&model, counts, own);
         self.add_totals(node, counts, own_call);
     }
 

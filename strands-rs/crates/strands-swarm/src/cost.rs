@@ -81,7 +81,18 @@ pub struct Call {
     pub input: u64,
     /// Of which read from the cache.
     pub cache_read: u64,
+    /// When it ended (Unix seconds); 0 for calls saved before this was kept.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at: i64,
 }
+
+fn is_zero(at: &i64) -> bool {
+    *at == 0
+}
+
+/// How far back [`CostReport::cache_hit_since`] looks for the header and `/cost`: the swarm's
+/// cache hit rate now, not one weighed down by every call since the run started.
+pub const RECENT_HIT_SECS: i64 = 3600;
 
 /// An agent's tokens by model plus its most recent calls; persisted with the agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,18 +160,20 @@ impl Ledger {
 
     /// Count one side call for `purpose` on `model` (in `by_model` too).
     pub fn record_side(&mut self, purpose: SidePurpose, model: &str, counts: Counts) {
-        self.record(model, counts, false);
+        self.record(model, counts, None);
         let by_model = self.side.entry(purpose.name().to_owned()).or_default();
         by_model.entry(model.to_owned()).or_default().add(&counts);
     }
 
-    /// Count one model call on `model`; `own` calls also feed [`Ledger::call_stats`].
-    pub fn record(&mut self, model: &str, counts: Counts, own: bool) {
+    /// Count one model call on `model`. `own` is when one of the agent's own calls ended (Unix
+    /// seconds); those also feed [`Ledger::call_stats`] and [`CostReport::cache_hit_since`].
+    pub fn record(&mut self, model: &str, counts: Counts, own: Option<i64>) {
         self.by_model.entry(model.to_owned()).or_default().add(&counts);
-        if own {
+        if let Some(at) = own {
             self.recent.push_back(Call {
                 input: counts.input,
                 cache_read: counts.cache_read,
+                at,
             });
             while self.recent.len() > RECENT_CALLS {
                 self.recent.pop_front();
@@ -434,6 +447,38 @@ impl CostReport {
         total
     }
 
+    /// Share of input read from the prompt cache over own calls that ended at or after `since`
+    /// (Unix seconds), across agents; `None` without any. Each agent keeps only its last
+    /// [`RECENT_CALLS`], so a busier one counts with fewer of its calls.
+    pub fn cache_hit_since(&self, since: i64) -> Option<f64> {
+        let (input, read) = self
+            .agents
+            .iter()
+            .flat_map(|agent| &agent.ledger.recent)
+            .filter(|call| call.at >= since)
+            .fold((0, 0), |(input, read), call| {
+                (input + call.input, read + call.cache_read)
+            });
+        (input > 0).then(|| read as f64 / input as f64)
+    }
+
+    /// Recent and run-long cache hit rates at `now` (Unix seconds), e.g. `Cache reads: 97% of
+    /// input over the last hour, 91% since the run started.`
+    pub fn cache_line(&self, now: i64) -> Option<String> {
+        let (input, read) = self.agents.iter().fold((0, 0), |(input, read), agent| {
+            (input + agent.totals.input, read + agent.totals.cache_read)
+        });
+        let percent = |share: f64| format!("{:.0}%", share * 100.0);
+        let total = (input > 0).then(|| percent(read as f64 / input as f64))?;
+        Some(match self.cache_hit_since(now - RECENT_HIT_SECS) {
+            Some(recent) => format!(
+                "Cache reads: {} of input over the last hour, {total} since the run started.",
+                percent(recent)
+            ),
+            None => format!("Cache reads: {total} of input since the run started."),
+        })
+    }
+
     /// What `id` and its subtree (descendants, cancelled ones included) spent; `None` for an
     /// unknown id.
     pub fn spend(&self, id: &str) -> Option<Spend> {
@@ -536,6 +581,9 @@ impl CostReport {
             ));
         }
         lines.push(counted("total", "", self.total(), &sum, ""));
+        if let Some(line) = self.cache_line(chrono::Utc::now().timestamp()) {
+            lines.push(line);
+        }
         let side = self.side_calls();
         if !side.is_empty() {
             lines.push(String::new());
@@ -678,9 +726,9 @@ mod tests {
     fn call_stats_cover_the_last_own_calls_only() {
         let mut ledger = Ledger::default();
         for input in 1..=60u64 {
-            ledger.record("m", counts(input * 1000, 10, input * 500, 0), true);
+            ledger.record("m", counts(input * 1000, 10, input * 500, 0), Some(0));
         }
-        ledger.record("judge", counts(1_000_000, 10, 0, 0), false);
+        ledger.record("judge", counts(1_000_000, 10, 0, 0), None);
         let stats = ledger.call_stats().unwrap();
         assert_eq!(stats.calls, RECENT_CALLS);
         // Calls 11..=60: median of 50 values is (35k + 36k) / 2.
@@ -695,7 +743,7 @@ mod tests {
     fn untracked_tokens_use_the_fallback_model_and_unpriced_ones_are_unknown() {
         let prices = Prices::default();
         let mut ledger = Ledger::default();
-        ledger.record("claude-sonnet-4-5", counts(1_000_000, 0, 0, 0), true);
+        ledger.record("claude-sonnet-4-5", counts(1_000_000, 0, 0, 0), Some(0));
         let old = AgentCost {
             // 1M more input than the ledger has: saved before per-model tracking.
             fallback_model: Some("claude-opus-5".into()),
@@ -704,7 +752,7 @@ mod tests {
         assert_eq!(old.estimate(&prices).render(), "$8.00");
         assert_eq!(old.main_model(), Some("claude-sonnet-4-5"));
 
-        ledger.record("mystery-model", counts(1_000_000, 0, 0, 0), true);
+        ledger.record("mystery-model", counts(1_000_000, 0, 0, 0), Some(0));
         let partly = agent("a1", "user", counts(2_000_000, 0, 0, 0), ledger);
         assert_eq!(partly.estimate(&prices).render(), "$3.00+?");
         let none = agent("a1", "user", counts(5, 5, 0, 0), Ledger::default());
@@ -718,7 +766,7 @@ mod tests {
         ledger.record(
             "global.anthropic.claude-opus-5",
             counts(1_000_000, 100_000, 800_000, 0),
-            true,
+            Some(0),
         );
         let report = CostReport {
             agents: vec![AgentCost {
@@ -737,6 +785,42 @@ mod tests {
         assert!(row.contains("$3.90"), "{row}");
         assert!(row.ends_with("1.0M/call 80%"), "{row}");
         assert!(lines[4].starts_with("total"), "{}", lines[4]);
+        // The one call is dated 0, long before the last hour.
+        assert_eq!(lines[5], "Cache reads: 80% of input since the run started.");
+    }
+
+    #[test]
+    fn the_recent_cache_hit_rate_counts_only_calls_of_the_last_hour() {
+        let now = 1_000_000;
+        let mut old = Ledger::default();
+        // Hours ago, before caching worked: drags the run-long rate down.
+        old.record("m", counts(900, 0, 0, 0), Some(now - 7200));
+        old.record("m", counts(100, 0, 90, 0), Some(now - 60));
+        let mut busy = Ledger::default();
+        busy.record("m", counts(100, 0, 100, 0), Some(now - 3600));
+        // A call saved before calls were dated counts in no window.
+        busy.recent.push_back(Call {
+            input: 100,
+            cache_read: 0,
+            at: 0,
+        });
+        let report = CostReport {
+            agents: vec![
+                agent("a1", "user", counts(1000, 0, 90, 0), old),
+                agent("a2", "a1", counts(200, 0, 100, 0), busy),
+            ],
+            prices: Prices::default(),
+        };
+        assert_eq!(report.cache_hit_since(now - RECENT_HIT_SECS), Some(0.95));
+        assert_eq!(report.cache_hit_since(now + 1), None);
+        assert_eq!(
+            report.cache_line(now).unwrap(),
+            "Cache reads: 95% of input over the last hour, 16% since the run started."
+        );
+        let saved = serde_json::to_string(&report.agents[1].ledger).unwrap();
+        assert!(saved.contains(r#"{"input":100,"cache_read":0}"#), "{saved}");
+        let back: Ledger = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back, report.agents[1].ledger);
     }
 
     #[test]
@@ -757,7 +841,7 @@ mod tests {
     fn side_calls_count_in_the_totals_and_get_their_own_rows() {
         let opus = "global.anthropic.claude-opus-5";
         let mut ledger = Ledger::default();
-        ledger.record(opus, counts(1_000_000, 0, 0, 0), true);
+        ledger.record(opus, counts(1_000_000, 0, 0, 0), Some(0));
         ledger.record_side(SidePurpose::Judge, opus, counts(200_000, 0, 0, 0));
         ledger.record_side(SidePurpose::Judge, opus, counts(200_000, 0, 0, 0));
         ledger.record_side(SidePurpose::Summarizer, opus, counts(600_000, 0, 0, 0));
@@ -800,7 +884,7 @@ mod tests {
     fn spend_adds_up_an_agent_and_all_its_descendants() {
         let sonnet = |id: &str, parent: &str, input: u64| {
             let mut ledger = Ledger::default();
-            ledger.record("claude-sonnet-4-5", counts(input, 0, 0, 0), true);
+            ledger.record("claude-sonnet-4-5", counts(input, 0, 0, 0), Some(0));
             agent(id, parent, counts(input, 0, 0, 0), ledger)
         };
         let report = CostReport {

@@ -374,6 +374,9 @@ pub struct App {
     pub cost: Option<crate::cost::CostReport>,
     /// The swarm's estimated spend for the header, refreshed when token totals change.
     pub spend: Option<crate::cost::Estimate>,
+    /// The swarm's cache hit rate over the last hour's calls for the header, refreshed with
+    /// `spend`; `None` shows the run-long rate.
+    pub recent_cache_hit: Option<f64>,
     /// Ring the terminal bell when an agent messages the user (`--notify`).
     pub notify: bool,
     /// A bell is due; the event loop rings it.

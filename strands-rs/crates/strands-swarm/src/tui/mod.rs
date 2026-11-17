@@ -86,6 +86,8 @@ pub async fn run(
         if app.cost.is_some() || spent != Some(tokens) {
             let report = swarm.cost();
             app.spend = Some(report.total());
+            let since = chrono::Utc::now().timestamp() - crate::cost::RECENT_HIT_SECS;
+            app.recent_cache_hit = report.cache_hit_since(since);
             app.cost = app.cost.is_some().then_some(report);
             spent = Some(tokens);
         }

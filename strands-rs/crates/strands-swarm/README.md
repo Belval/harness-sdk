@@ -292,7 +292,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
 - **Where it shows.**
   - `/cost` (or `--run NAME --cost`) shows per agent: input, output, cache-read and cache-write
     tokens, the model, an estimated `$`, and the median input per call and cache hit rate over the
-    last 50 calls. Below the table, side calls get their own rows by purpose: the goal `judge`,
+    last 50 calls. Below the total, one line gives the swarm's cache hit rate over the last hour's
+    calls and since the run started: the run-long rate keeps every early miss (a night before
+    caching worked held a live run at 88-91% while it ran at 96-97%). Below the table, side calls
+    get their own rows by purpose: the goal `judge`,
     the context `summarizer` and `other` calls on the auxiliary model (told apart by the system
     prompt they send, so a custom judge or summarizer prompt counts as `other`). They are already
     part of each agent's totals.
@@ -446,7 +449,9 @@ Other text messages the selected agent, or starts a root agent when there is non
 **Header.**
 
 - It counts the agents that work as `3 running` and those that wait (`◌`, `⧗`) as `2 waiting`.
-- It totals tokens as `in 84.8M (97% cached) · out 291k · est. $12.30`.
+- It totals tokens as `in 84.8M (97% cached last hour) · out 291k · est. $12.30`: the cached
+  share is over the last hour's calls (up to each agent's last 50), or since the run started when
+  there were none.
 - Input counts cache reads and writes, as the budget does.
 
 **Input.**

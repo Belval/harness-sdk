@@ -147,9 +147,12 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
         n => format!(" · {n} waiting"),
     };
     let (input, output) = app.total_tokens();
-    let cached = cached(app.total_cache_read(), input)
-        .map(|percent| format!(" ({percent} cached)"))
-        .unwrap_or_default();
+    // The last hour's rate when known: the run-long one carries every earlier miss along.
+    let cached = match app.recent_cache_hit {
+        Some(share) => Some(format!(" ({:.0}% cached last hour)", share * 100.0)),
+        None => cached(app.total_cache_read(), input).map(|percent| format!(" ({percent} cached)")),
+    }
+    .unwrap_or_default();
     let hidden = match app.hidden() {
         0 => String::new(),
         n => format!(" · {n} cancelled hidden (f3)"),
@@ -1071,6 +1074,12 @@ mod tests {
             wide.contains("· in 14.1M (0% cached) · out 0 · budget 50.0M · 1 cancelled hidden (f3)"),
             "{wide}"
         );
+        app.recent_cache_hit = Some(0.966);
+        let wide = render(&app, 160, 10);
+        assert!(
+            wide.contains("· in 14.1M (97% cached last hour) · out 0"),
+            "{wide}"
+        );
     }
 
     #[test]
@@ -1228,7 +1237,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
         };
-        ledger.record("claude-sonnet-4-5", counts, true);
+        ledger.record("claude-sonnet-4-5", counts, Some(0));
         let report = crate::cost::CostReport {
             agents: vec![crate::cost::AgentCost {
                 id: "a1".into(),
