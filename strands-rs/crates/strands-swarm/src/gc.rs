@@ -735,6 +735,7 @@ mod tests {
             context: None,
             paused: false,
             running_calls: Default::default(),
+            reclaim_logged: None,
         }
     }
 

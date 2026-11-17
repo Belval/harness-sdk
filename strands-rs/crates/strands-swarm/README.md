@@ -383,7 +383,8 @@ messages you.
   - A run without `--run` cannot be resumed, so on exit every worktree agent is treated as
     cancelled.
   - Nothing outside those exact paths and that branch is touched, and each removal is logged as a
-    `gc` event.
+    `gc` event. A pass on its own (after a cancel, on resume) logs an agent only when its outcome
+    changed: a worktree still kept for the same reason is not logged again on every restart.
   - Only the swarm's own `$CARGO_TARGET_DIR-worktrees/<run>/<agent>` dirs are reclaimed. An agent
     that points `CARGO_TARGET_DIR` somewhere else owns that dir and must clean it itself.
   - Every minute the swarm checks free space on the filesystems of the run dir, the agents'

@@ -617,6 +617,8 @@ struct Node {
     collected: AtomicBool,
     /// What the last reclamation of this agent did.
     reclaimed: Mutex<Option<Collected>>,
+    /// The last reclamation outcome published, across restarts ([`AgentState::reclaim_logged`]).
+    reclaim_logged: Mutex<Option<String>>,
     /// Context window utilization of the last model call, across restarts.
     context: Mutex<Option<f64>>,
     /// Cancels the turn in progress only ([`Swarm::interrupt`]); a child of `cancel`.

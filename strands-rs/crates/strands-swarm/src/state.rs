@@ -103,6 +103,10 @@ pub struct AgentState {
     /// id, for the restart notice.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub running_calls: BTreeMap<String, u64>,
+    /// What reclaiming this agent's disk last did, as journaled ([`crate::gc::Collected::lines`]),
+    /// so a restart that finds the same (a worktree still kept) does not journal it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_logged: Option<String>,
 }
 
 /// Persisted mail.

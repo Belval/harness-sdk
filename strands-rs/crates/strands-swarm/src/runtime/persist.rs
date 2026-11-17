@@ -132,6 +132,7 @@ impl Swarm {
             finished: AtomicBool::new(matches!(status, AgentStatus::Cancelled | AgentStatus::Queued)),
             context: Mutex::new(saved.context),
             paused: AtomicBool::new(saved.paused),
+            reclaim_logged: Mutex::new(saved.reclaim_logged),
             ..Node::default()
         });
         agents.insert(saved.id.clone(), node.clone());
@@ -384,6 +385,7 @@ pub(super) fn node_state(node: &Node) -> AgentState {
         context,
         paused: node.paused.load(Ordering::SeqCst),
         running_calls,
+        reclaim_logged: node.reclaim_logged.lock().clone(),
     }
 }
 

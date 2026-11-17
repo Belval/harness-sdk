@@ -2519,6 +2519,54 @@ async fn a_dirty_worktree_is_kept_until_gc_finds_it_clean_and_resume_collects_ca
 }
 
 #[tokio::test]
+async fn a_worktree_still_kept_on_resume_is_not_journaled_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);
+    let scripts = scripts_of(vec![("a1", vec![say("ok")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), &repo);
+    config.state_dir = Some(dir.path().join("run"));
+    let (swarm, mut events) = Swarm::new(config.clone());
+    let worktree = SpawnRequest {
+        task: "t".into(),
+        worktree: true,
+        ..Default::default()
+    };
+    let owner = swarm.spawn(USER, worktree).await.unwrap();
+    reply_to(&mut events, USER).await;
+    let checkout = swarm.agent(&owner).unwrap().cwd;
+    std::fs::write(checkout.join("wip.txt"), "unsaved work").unwrap();
+    let journaled = || {
+        let events = std::fs::read_to_string(dir.path().join("run/events.jsonl")).unwrap_or_default();
+        events.lines().filter(|l| l.contains("\"event\":\"gc\"")).count()
+    };
+    swarm.cancel(&owner).unwrap();
+    eventually("the background pass has run", || journaled() == 1).await;
+    swarm.shutdown().await;
+
+    for _ in 0..2 {
+        let saved = strands_swarm::state::load(&dir.path().join("run"))
+            .await
+            .unwrap()
+            .unwrap();
+        let (resumed, _events) = Swarm::resume(config.clone(), saved).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        resumed.shutdown().await;
+        assert!(checkout.join("wip.txt").exists());
+        assert_eq!(journaled(), 1, "the same kept worktree was journaled again");
+    }
+
+    // Something changed: journaled again.
+    std::fs::remove_file(checkout.join("wip.txt")).unwrap();
+    let saved = strands_swarm::state::load(&dir.path().join("run"))
+        .await
+        .unwrap()
+        .unwrap();
+    let (resumed, _events) = Swarm::resume(config, saved).await.unwrap();
+    eventually("the clean worktree is removed and journaled", || journaled() == 2).await;
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
 async fn cancelling_says_what_it_kept_and_a_run_without_state_cleans_up_on_exit() {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);

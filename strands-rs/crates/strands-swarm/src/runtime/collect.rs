@@ -34,7 +34,7 @@ impl Swarm {
             let swarm = self.clone();
             tokio::spawn(async move {
                 let collected = swarm.collect_node(&node).await;
-                if !collected.is_empty() {
+                if swarm.newly_reclaimed(&node, &collected) {
                     swarm.emit(SwarmEvent::Reclaimed {
                         collected: vec![collected],
                         requested: false,
@@ -92,6 +92,21 @@ impl Swarm {
         collected
     }
 
+    /// Whether `collected` is worth publishing on its own: something was done or kept, and not
+    /// the same as last time (a resume retrying a worktree that is still kept).
+    fn newly_reclaimed(&self, node: &Node, collected: &Collected) -> bool {
+        if collected.is_empty() {
+            return false;
+        }
+        let lines = Some(collected.lines().join("\n"));
+        if *node.reclaim_logged.lock() == lines {
+            return false;
+        }
+        *node.reclaim_logged.lock() = lines;
+        self.persist();
+        true
+    }
+
     /// After [`Swarm::cancel`]: what reclaiming the cancelled worktree agents of `id`'s subtree
     /// did, once all of them are done or `timeout` passes (`None` for those still stopping).
     pub async fn reclaimed_after_cancel(
@@ -130,7 +145,7 @@ impl Swarm {
                 continue;
             }
             let done = self.collect_node(node).await;
-            if !done.is_empty() {
+            if self.newly_reclaimed(node, &done) {
                 collected.push(done);
             }
         }
