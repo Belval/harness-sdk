@@ -43,8 +43,12 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
 
 `--run NAME` makes the run persistent under `~/.local/state/strands-swarm/NAME`: the agent tree,
 unread mail, schedules and every conversation (saved after each message). Starting again with the
-same name resumes it. With `--run`, `--journal`, `--gc` and `--cost` print a report on the saved run
-and exit.
+same name resumes it; a TASK given then is sent to the root agent as a message. With `--run`,
+`--journal`, `--gc` and `--cost` print a report on the saved run and exit.
+
+`--headless` prints events instead of the TUI and exits once the root has replied and no agent is
+busy (a resume without a task: once no agent is busy), with a non-zero status when that reply is an
+error.
 
 ## Agents
 
@@ -90,7 +94,8 @@ and exit.
     Builds are not shared, so cargo cannot take another checkout's artifacts as fresh.
 - **Restarts.** An agent that was mid-turn resumes with a short notice instead of re-reading its
   work. The notice lists the tool calls the restart cut short and `git status --short --branch` of
-  its directory.
+  its directory. An agent that had finished its turn rests until its next message; a goal agent
+  whose turn failed retries.
 
 ## Limits
 
