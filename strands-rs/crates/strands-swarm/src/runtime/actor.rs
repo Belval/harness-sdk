@@ -493,12 +493,55 @@ fn usage_counts(usage: &Usage) -> crate::cost::Counts {
     }
 }
 
-/// One-line summary of a tool input: the most telling string field, else compact JSON.
+/// One-line summary of a tool input: the most telling string field, else every field as
+/// `key value` (`from a2, jobs · timeout_seconds 300`).
 pub(crate) fn summarize_input(input: &serde_json::Value) -> String {
     const KEYS: &[&str] = &["command", "path", "task", "to", "url", "query"];
     let text = KEYS
         .iter()
         .find_map(|key| input.get(*key).and_then(|v| v.as_str()).map(str::to_owned))
-        .unwrap_or_else(|| input.to_string());
+        .unwrap_or_else(|| match input {
+            serde_json::Value::Object(fields) => fields
+                .iter()
+                .map(|(key, value)| format!("{key} {}", scalar_list(value)))
+                .collect::<Vec<_>>()
+                .join(" · "),
+            other => other.to_string(),
+        });
     crate::text::clip(text.lines().next().unwrap_or_default(), 120)
+}
+
+/// A string bare, a list of strings or numbers comma-separated, anything else as JSON.
+fn scalar_list(value: &serde_json::Value) -> String {
+    let scalar = |value: &serde_json::Value| match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => Some(value.to_string()),
+        _ => None,
+    };
+    let list = || {
+        let items = value.as_array()?.iter().map(scalar).collect::<Option<Vec<_>>>()?;
+        Some(items.join(", "))
+    };
+    scalar(value).or_else(list).unwrap_or_else(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::summarize_input;
+
+    #[test]
+    fn summarizes_a_tool_input_in_words() {
+        assert_eq!(summarize_input(&json!({"command": "ls -la\npwd"})), "ls -la");
+        assert_eq!(
+            summarize_input(&json!({"from": ["a2", "jobs"], "timeout_seconds": 300})),
+            "from a2, jobs · timeout_seconds 300"
+        );
+        assert_eq!(summarize_input(&json!({})), "");
+        assert_eq!(
+            summarize_input(&json!({"todos": [{"content": "x"}]})),
+            r#"todos [{"content":"x"}]"#
+        );
+    }
 }
