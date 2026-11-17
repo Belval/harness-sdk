@@ -86,7 +86,7 @@ error.
   - Both edit history, and the prompt cache only matches an unchanged prefix, so they run only when
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
     the `context` tool), on the first call after the cache's lifetime (five idle minutes, an hour with `--cache-ttl 1h`), on
-    overflow, or once they would remove 15% of the history. Every other call re-sends history byte
+    overflow, or once they would remove 40% of the history. Every other call re-sends history byte
     for byte. (Run on every turn they raised input cost per call by ~80%; a replay with the gate
     saves 29%.)
   - The `context` tool lets the agent manage its own context. It lists the biggest items with tool

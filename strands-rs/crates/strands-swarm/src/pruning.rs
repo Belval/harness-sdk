@@ -138,7 +138,11 @@ pub const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// The cache lifetime with `--cache-ttl 1h`.
 pub const CACHE_TTL_1H: Duration = Duration::from_secs(60 * 60);
 /// Prune for its own sake once that would remove this share of the history (in characters).
-pub const PRUNE_SHARE: f64 = 0.15;
+/// Each prune rewrites the cached conversation (1.25× instead of 0.1× per token) to save 0.1×
+/// of what it removes on every later call. At 15% small agents with chatty shell output pruned
+/// every 4-6 calls, which came to 15-40% of their cost; a simulation over result sizes and
+/// rates puts the cheapest share at 0.4-0.5.
+pub const PRUNE_SHARE: f64 = 0.4;
 /// Agent state key: when the agent last called its model (Unix milliseconds). Kept in the
 /// session, so [`PruneReason::Idle`] holds across a restart.
 pub const LAST_CALL_KEY: &str = "swarm_last_model_call_ms";
