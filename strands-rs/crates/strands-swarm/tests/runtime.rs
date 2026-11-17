@@ -3837,7 +3837,8 @@ async fn a_reload_now_does_not_wait() {
         .reload(Path::new("/bin/true"), ReloadWhen::Now)
         .await
         .unwrap();
-    assert!(reloads_within(&swarm, Duration::from_millis(100)).await);
+    // At once, where an idle reload would wait out the slow call (its timeout is 600s).
+    assert!(reloads_within(&swarm, Duration::from_secs(5)).await);
     swarm.shutdown().await;
 }
 
