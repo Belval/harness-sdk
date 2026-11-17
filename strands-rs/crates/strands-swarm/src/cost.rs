@@ -315,17 +315,11 @@ impl Estimate {
         if counts.is_empty() {
             return Self::default();
         }
-        match model.and_then(|model| prices.price(model)) {
-            Some(price) => Self {
-                usd: price.cost(counts),
-                unknown: false,
-                any: true,
-            },
-            None => Self {
-                usd: 0.0,
-                unknown: true,
-                any: true,
-            },
+        let price = model.and_then(|model| prices.price(model));
+        Self {
+            usd: price.map_or(0.0, |price| price.cost(counts)),
+            unknown: price.is_none(),
+            any: true,
         }
     }
 
@@ -480,15 +474,27 @@ impl CostReport {
 
     /// The report as a text table.
     pub fn lines(&self) -> Vec<String> {
-        // The estimate (cell 6) is shown right after the model, so it stays in view when a narrow
-        // terminal clips the table.
-        let row = |cells: [&str; 8]| {
-            format!(
-                "{:<24} {:<22} {:>9} {:>7} {:>7} {:>8} {:>8} {:>14}",
-                cells[0], cells[1], cells[6], cells[2], cells[3], cells[4], cells[5], cells[7]
-            )
-            .trim_end()
-            .to_owned()
+        // The estimate follows the model, so it stays in view when a narrow terminal clips the
+        // table.
+        let row = |[name, model, estimate, input, output, read, write, stats]: [&str; 8]| {
+            format!("{name:<24} {model:<22} {estimate:>9} {input:>7} {output:>7} {read:>8} {write:>8} {stats:>14}")
+                .trim_end()
+                .to_owned()
+        };
+        let counted = |name: &str, model: &str, estimate: Estimate, counts: &Counts, stats: &str| {
+            let [input, output, read, write] =
+                [counts.input, counts.output, counts.cache_read, counts.cache_write]
+                    .map(crate::text::compact);
+            row([
+                name,
+                model,
+                &estimate.render(),
+                &input,
+                &output,
+                &read,
+                &write,
+                stats,
+            ])
         };
         let mut lines = vec![
             format!(
@@ -501,18 +507,17 @@ impl CostReport {
             row([
                 "agent",
                 "model",
+                "est. $",
                 "in",
                 "out",
                 "cache rd",
                 "cache wr",
-                "est. $",
                 &format!("last {RECENT_CALLS} calls"),
             ]),
         ];
         let mut sum = Counts::default();
         for agent in &self.agents {
-            let t = &agent.totals;
-            sum.add(t);
+            sum.add(&agent.totals);
             let stats = agent.ledger.call_stats().map_or_else(String::new, |stats| {
                 format!(
                     "{}/call {:.0}%",
@@ -521,42 +526,22 @@ impl CostReport {
                 )
             });
             let model = agent.main_model().map(short_model).unwrap_or("-");
-            lines.push(row([
+            lines.push(counted(
                 &crate::text::clip(&agent.label, 23),
                 &crate::text::clip(model, 21),
-                &crate::text::compact(t.input),
-                &crate::text::compact(t.output),
-                &crate::text::compact(t.cache_read),
-                &crate::text::compact(t.cache_write),
-                &agent.estimate(&self.prices).render(),
+                agent.estimate(&self.prices),
+                &agent.totals,
                 &stats,
-            ]));
+            ));
         }
-        lines.push(row([
-            "total",
-            "",
-            &crate::text::compact(sum.input),
-            &crate::text::compact(sum.output),
-            &crate::text::compact(sum.cache_read),
-            &crate::text::compact(sum.cache_write),
-            &self.total().render(),
-            "",
-        ]));
+        lines.push(counted("total", "", self.total(), &sum, ""));
         let side = self.side_calls();
         if !side.is_empty() {
             lines.push(String::new());
             lines.push("side calls, part of the totals above:".to_owned());
             for (purpose, (counts, estimate)) in &side {
-                lines.push(row([
-                    &format!("  {purpose}"),
-                    &format!("{} calls", counts.calls),
-                    &crate::text::compact(counts.input),
-                    &crate::text::compact(counts.output),
-                    &crate::text::compact(counts.cache_read),
-                    &crate::text::compact(counts.cache_write),
-                    &estimate.render(),
-                    "",
-                ]));
+                let calls = format!("{} calls", counts.calls);
+                lines.push(counted(&format!("  {purpose}"), &calls, *estimate, counts, ""));
             }
         }
         lines.push(String::new());
@@ -621,6 +606,18 @@ mod tests {
             output,
             cache_read,
             cache_write,
+        }
+    }
+
+    /// Agent `id` (also its label) under `parent`, without a fallback model.
+    fn agent(id: &str, parent: &str, totals: Counts, ledger: Ledger) -> AgentCost {
+        AgentCost {
+            id: id.into(),
+            parent: parent.into(),
+            label: id.into(),
+            totals,
+            ledger,
+            fallback_model: None,
         }
     }
 
@@ -698,32 +695,18 @@ mod tests {
         let prices = Prices::default();
         let mut ledger = Ledger::default();
         ledger.record("claude-sonnet-4-5", counts(1_000_000, 0, 0, 0), true);
-        let agent = AgentCost {
-            id: "a1".into(),
-            parent: "user".into(),
-            label: "a1".into(),
+        let old = AgentCost {
             // 1M more input than the ledger has: saved before per-model tracking.
-            totals: counts(2_000_000, 0, 0, 0),
-            ledger: ledger.clone(),
             fallback_model: Some("claude-opus-5".into()),
+            ..agent("a1", "user", counts(2_000_000, 0, 0, 0), ledger.clone())
         };
-        assert_eq!(agent.estimate(&prices).render(), "$8.00");
-        assert_eq!(agent.main_model(), Some("claude-sonnet-4-5"));
+        assert_eq!(old.estimate(&prices).render(), "$8.00");
+        assert_eq!(old.main_model(), Some("claude-sonnet-4-5"));
 
         ledger.record("mystery-model", counts(1_000_000, 0, 0, 0), true);
-        let partly = AgentCost {
-            totals: counts(2_000_000, 0, 0, 0),
-            ledger,
-            fallback_model: None,
-            ..agent.clone()
-        };
+        let partly = agent("a1", "user", counts(2_000_000, 0, 0, 0), ledger);
         assert_eq!(partly.estimate(&prices).render(), "$3.00+?");
-        let none = AgentCost {
-            totals: counts(5, 5, 0, 0),
-            ledger: Ledger::default(),
-            fallback_model: None,
-            ..agent
-        };
+        let none = agent("a1", "user", counts(5, 5, 0, 0), Ledger::default());
         assert_eq!(none.estimate(&prices).render(), "unknown");
         assert_eq!(Estimate::default().render(), "$0.00");
     }
@@ -738,12 +721,8 @@ mod tests {
         );
         let report = CostReport {
             agents: vec![AgentCost {
-                id: "a2".into(),
-                parent: "a1".into(),
                 label: "lazy-mcp (a2)".into(),
-                totals: counts(1_000_000, 100_000, 800_000, 0),
-                ledger,
-                fallback_model: None,
+                ..agent("a2", "a1", counts(1_000_000, 100_000, 800_000, 0), ledger)
             }],
             prices: Prices::default(),
         };
@@ -791,14 +770,7 @@ mod tests {
             "but not in the own-call stats"
         );
         let report = CostReport {
-            agents: vec![AgentCost {
-                id: "a1".into(),
-                parent: "user".into(),
-                label: "a1".into(),
-                totals: counts(2_000_000, 0, 0, 0),
-                ledger: ledger.clone(),
-                fallback_model: None,
-            }],
+            agents: vec![agent("a1", "user", counts(2_000_000, 0, 0, 0), ledger.clone())],
             prices: Prices::default(),
         };
         let side = report.side_calls();
@@ -825,24 +797,17 @@ mod tests {
 
     #[test]
     fn spend_adds_up_an_agent_and_all_its_descendants() {
-        let agent = |id: &str, parent: &str, input: u64| {
+        let sonnet = |id: &str, parent: &str, input: u64| {
             let mut ledger = Ledger::default();
             ledger.record("claude-sonnet-4-5", counts(input, 0, 0, 0), true);
-            AgentCost {
-                id: id.into(),
-                parent: parent.into(),
-                label: id.into(),
-                totals: counts(input, 0, 0, 0),
-                ledger,
-                fallback_model: None,
-            }
+            agent(id, parent, counts(input, 0, 0, 0), ledger)
         };
         let report = CostReport {
             agents: vec![
-                agent("a1", "user", 1_000_000),
-                agent("a2", "a1", 2_000_000),
-                agent("a3", "a2", 1_000_000),
-                agent("a4", "user", 5_000_000),
+                sonnet("a1", "user", 1_000_000),
+                sonnet("a2", "a1", 2_000_000),
+                sonnet("a3", "a2", 1_000_000),
+                sonnet("a4", "user", 5_000_000),
             ],
             prices: Prices::default(),
         };
