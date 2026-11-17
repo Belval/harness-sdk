@@ -182,15 +182,10 @@ impl Swarm {
         }
         let mut agents = Vec::new();
         for agent in &state.agents {
-            let Some(path) = self.batch_file(&agent.id) else {
-                continue;
-            };
-            let Ok(bytes) = tokio::fs::read(&path).await else {
-                continue;
-            };
-            let batch = serde_json::from_slice::<resume::OpenBatch>(&bytes);
-            if batch.is_ok_and(|batch| batch.cut_shell()) {
-                agents.push(agent.id.clone());
+            if let Some((_, Ok(batch))) = self.saved_batch(&agent.id).await {
+                if batch.cut_shell() {
+                    agents.push(agent.id.clone());
+                }
             }
         }
         let killed = crate::orphans::kill_cut_calls(dir, &agents);
@@ -207,6 +202,13 @@ impl Swarm {
     fn batch_file(&self, id: &str) -> Option<PathBuf> {
         let dir = self.inner.config.state_dir.as_ref()?;
         Some(dir.join(SESSIONS_DIR).join(id).join(resume::OPEN_BATCH_FILE))
+    }
+
+    /// `id`'s [`Swarm::batch_file`] and what it holds, if there is one.
+    async fn saved_batch(&self, id: &str) -> Option<(PathBuf, serde_json::Result<resume::OpenBatch>)> {
+        let path = self.batch_file(id)?;
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        Some((path, serde_json::from_slice(&bytes)))
     }
 
     /// Keep `node`'s tool batch on disk as its stream reports it ([`resume::OpenBatch`]): opened
@@ -254,13 +256,10 @@ impl Swarm {
     /// Put back the tool batch a hard crash cut short ([`resume::restore_batch`]), save the
     /// conversation with it, then drop the file.
     pub(super) async fn restore_open_batch(&self, node: &Node, agent: &Agent) {
-        let Some(path) = self.batch_file(&node.id) else {
+        let Some((path, batch)) = self.saved_batch(&node.id).await else {
             return;
         };
-        let Ok(bytes) = tokio::fs::read(&path).await else {
-            return;
-        };
-        match serde_json::from_slice::<resume::OpenBatch>(&bytes) {
+        match batch {
             Ok(batch) => {
                 if agent.with_messages(|messages| resume::restore_batch(messages, batch)) {
                     self.save_session(node, agent).await;
