@@ -3220,3 +3220,42 @@ async fn list_agents_shows_each_agents_estimated_spend_and_its_subtrees() {
         "{listed}"
     );
 }
+
+#[tokio::test]
+async fn a_compaction_reported_by_the_factorys_pipeline_becomes_a_swarm_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let factory: AgentFactory = Arc::new(|spec: AgentSpec| {
+        // Stands in for the context pipeline summarizing before a model call.
+        (spec.on_compacted.as_ref().expect("a compaction sink"))(300_000, 90_000);
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(MockMessageModel::shared(vec![say("done")]))
+                .tools(spec.tools)
+                .no_sandbox()
+                .build()
+        })
+    });
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, dir.path()));
+    swarm
+        .spawn(
+            USER,
+            SpawnRequest {
+                task: "go".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let compacted = async {
+        loop {
+            if let Some(SwarmEvent::Compacted { id, before, after }) = events.recv().await {
+                return (id, before, after);
+            }
+        }
+    };
+    let compacted = tokio::time::timeout(Duration::from_secs(10), compacted)
+        .await
+        .expect("timed out waiting for the compaction");
+    assert_eq!(compacted, ("a1".to_owned(), 300_000, 90_000));
+}

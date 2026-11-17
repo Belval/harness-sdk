@@ -428,6 +428,9 @@ fn print_event(event: &SwarmEvent) {
             )
         }
         SwarmEvent::Status { id, status } => eprintln!("[{id}] {status}"),
+        SwarmEvent::Compacted { id, before, after } => {
+            eprintln!("[{id}] context compacted: {before} -> {after} tokens")
+        }
         SwarmEvent::Text { .. }
         | SwarmEvent::Usage { .. }
         | SwarmEvent::MailRead { .. }

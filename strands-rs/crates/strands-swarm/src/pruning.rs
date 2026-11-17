@@ -503,8 +503,7 @@ mod tests {
         assert!(!trim(&mut messages).await, "nothing left to trim");
     }
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use strands_agents::testing::MockMessageModel;
+    use strands_agents::testing::{MockMessageModel, MockResponse};
     use strands_agents::InMemoryStorage;
 
     use crate::compaction::CompactAt;
@@ -584,26 +583,19 @@ mod tests {
         assert!(!pruned(&messages));
     }
 
-    /// Counts the summarize passes [`CompactAt`] lets through.
-    struct CountingSummary(AtomicUsize);
-
-    #[async_trait]
-    impl ContextStrategy for CountingSummary {
-        fn name(&self) -> &str {
-            "count"
-        }
-
-        async fn apply(&self, _ctx: &mut ContextState<'_>) -> Result<bool> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(false)
-        }
-    }
-
     #[tokio::test]
     async fn prunes_in_the_same_pass_as_a_compaction_and_keeps_it_armed() {
-        let summary = Arc::new(CountingSummary(AtomicUsize::new(0)));
-        let compact = Arc::new(CompactAt::new(summary.clone(), 1_000));
-        let (prune, agent) = (CachePrune::new(Some(compact.clone())), agent());
+        let model = MockMessageModel::shared(vec![
+            MockResponse::message(Message::assistant("summary")),
+            MockResponse::message(Message::assistant("unused")),
+        ]);
+        let agent = Agent::builder()
+            .model(model.clone())
+            .no_sandbox()
+            .build()
+            .unwrap();
+        let compact = Arc::new(CompactAt::new(1_000));
+        let prune = CachePrune::new(Some(compact.clone()));
         let mut messages = prunable();
         let mut ctx = ContextState {
             messages: &mut messages,
@@ -619,12 +611,16 @@ mod tests {
         };
         assert_eq!(prune.reason(&ctx), Some(PruneReason::Compaction));
         assert!(prune.apply(&mut ctx).await.unwrap());
-        // Pruning lowered the count below the point; the armed compaction still runs, once.
-        ctx.utilization = 0.0;
-        compact.apply(&mut ctx).await.unwrap();
-        compact.apply(&mut ctx).await.unwrap();
-        assert_eq!(summary.0.load(Ordering::SeqCst), 1);
-        assert!(pruned(&messages));
+        // Pruning lowered the count below the point (1k of the mock's assumed 200k window), though
+        // not below the target; the armed compaction still runs, once.
+        ctx.utilization = 800.0 / 200_000.0;
+        assert!(compact.apply(&mut ctx).await.unwrap());
+        assert!(!compact.apply(&mut ctx).await.unwrap());
+        assert_eq!(model.call_count(), 1);
+        assert!(
+            messages[0].text().contains("summary"),
+            "the summary follows the task"
+        );
     }
 
     #[tokio::test]

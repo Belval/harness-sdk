@@ -49,6 +49,22 @@ impl Swarm {
         })
     }
 
+    /// Where agent `id`'s context pipeline reports a summary: a [`SwarmEvent::Compacted`]. It
+    /// holds the swarm weakly, as the agent it is handed to is owned by the swarm.
+    fn compaction_sink(&self, id: &str) -> crate::compaction::CompactedSink {
+        let inner = Arc::downgrade(&self.inner);
+        let id = id.to_owned();
+        Arc::new(move |before, after| {
+            if let Some(inner) = inner.upgrade() {
+                Swarm { inner }.emit(SwarmEvent::Compacted {
+                    id: id.clone(),
+                    before,
+                    after,
+                });
+            }
+        })
+    }
+
     pub(super) async fn run_actor(self, node: Arc<Node>, start: Start) {
         // Read under its own statement: `instructions` takes the agents lock, and `snapshot` takes
         // the agents lock before per-agent locks.
@@ -68,6 +84,7 @@ impl Swarm {
                 .as_ref()
                 .map(|dir| dir.join(SESSIONS_DIR)),
             env: node.env.clone(),
+            on_compacted: Some(self.compaction_sink(&node.id)),
         };
         let agent = match (self.inner.config.factory)(spec).await {
             Ok(agent) => agent,

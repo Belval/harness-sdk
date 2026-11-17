@@ -145,6 +145,9 @@ impl Journal {
             }
             SwarmEvent::Model { id, model } => ("model", json!({"id": id, "model": model})),
             SwarmEvent::Budget { tokens } => ("budget", json!({"tokens": tokens})),
+            SwarmEvent::Compacted { id, before, after } => {
+                ("compacted", json!({"id": id, "before": before, "after": after}))
+            }
             SwarmEvent::Reloaded { from, to, changes } => {
                 ("changes", json!({"from": from, "to": to, "commits": changes}))
             }
@@ -311,6 +314,11 @@ mod tests {
             id: "a1".into(),
             delta: "skipped".into(),
         });
+        journal.record(&SwarmEvent::Compacted {
+            id: "a1".into(),
+            before: 300,
+            after: 100,
+        });
         journal.flush().await;
 
         let entries = read(dir.path()).unwrap();
@@ -322,10 +330,19 @@ mod tests {
 
         let events = fs::read_to_string(dir.path().join(EVENTS_FILE)).unwrap();
         let lines: Vec<Value> = events.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["event"], "status");
         assert_eq!(lines[0]["status"], "running");
         assert!(lines[0]["ts"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(lines[1]["event"], "compacted");
+        assert_eq!(
+            (
+                lines[1]["id"].as_str(),
+                lines[1]["before"].as_u64(),
+                lines[1]["after"].as_u64()
+            ),
+            (Some("a1"), Some(300), Some(100))
+        );
     }
 
     #[tokio::test]

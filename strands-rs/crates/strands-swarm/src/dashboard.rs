@@ -22,7 +22,7 @@ use crate::compaction::{compaction_point, window_of};
 const TOP_ITEMS: usize = 10;
 /// Tokens counted for an image, video, audio or document block.
 const MEDIA_TOKENS: usize = 1_600;
-/// Messages the summary keeps verbatim (the summarizing strategy's `preserve_recent`).
+/// Messages a summary always keeps verbatim (see [`crate::compaction::CompactAt`]).
 pub const SUMMARY_KEEPS: usize = 4;
 
 const DESCRIPTION: &str = concat!(

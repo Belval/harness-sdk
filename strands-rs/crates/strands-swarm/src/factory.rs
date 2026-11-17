@@ -24,8 +24,8 @@ use strands_harness::{
 };
 
 use crate::catalog::ToolCatalog;
-use crate::compaction::{CompactAt, DEFAULT_COMPACT_AT};
-use crate::dashboard::{ContextControl, SUMMARY_KEEPS};
+use crate::compaction::{CompactAt, CompactedSink, DEFAULT_COMPACT_AT};
+use crate::dashboard::ContextControl;
 use crate::pruning::CachePrune;
 use crate::runtime::{AgentFactory, AgentSpec, ModelResolver, GOAL_MAX_ATTEMPTS};
 use crate::skills::{skills_prompt, skills_tool};
@@ -141,11 +141,13 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// [`CachePrune`]). With `stash_dir` the full
 /// outputs behind truncated results are kept there, so `retrieve_context` still finds them after
 /// a restart.
-/// `control` (the agent's `context` tool) gets the stash and can request a summary.
+/// `control` (the agent's `context` tool) gets the stash and can request a summary; each
+/// summary is reported to `on_compacted`.
 fn context_manager(
     compact_at: u64,
     stash_dir: Option<&std::path::Path>,
     control: &Arc<ContextControl>,
+    on_compacted: Option<CompactedSink>,
 ) -> ContextManagerOption {
     let truncate = Offload::truncate(
         OffloadTarget::ToolResults,
@@ -158,14 +160,11 @@ fn context_manager(
         threshold: Some(AGENTIC_TRUNCATE_THRESHOLD),
         ..Default::default()
     });
-    // Ungated (utilization 0) and message-level; `CompactAt` decides when it runs.
-    let summarize = Offload::summarize(OffloadTarget::All).when(OffloadConditions {
-        utilization: Some(0.0),
-        preserve_recent: Some(SUMMARY_KEEPS as f64),
-        ..Default::default()
-    });
-    let summarize = CompactAt::new(Arc::new(summarize), compact_at).on_request(Arc::clone(control));
-    let summarize = Arc::new(summarize);
+    let summarize = Arc::new(
+        CompactAt::new(compact_at)
+            .on_request(Arc::clone(control))
+            .on_compacted(on_compacted),
+    );
     let prune = CachePrune::new(Some(Arc::clone(&summarize)));
     ContextManagerOption::Config(ContextManagerConfig {
         strategies: Some(vec![
@@ -251,7 +250,7 @@ fn harness_options(options: &HarnessFactoryOptions, spec: AgentSpec) -> Result<H
         // Discovery happens once at startup (crate::skills); the harness's own `./.agent/skills`
         // lookup, relative to the process rather than the agent, stays off.
         skills: SkillsOption::Off,
-        context_manager: context_manager(compact_at, stash_dir.as_deref(), &control),
+        context_manager: context_manager(compact_at, stash_dir.as_deref(), &control, spec.on_compacted),
         id: Some(spec.id),
         name: Some(spec.name),
         ..Default::default()
@@ -295,6 +294,7 @@ mod tests {
             DEFAULT_COMPACT_AT,
             None,
             &ContextControl::new(DEFAULT_COMPACT_AT),
+            None,
         ))
         .unwrap();
         let mut messages = vec![Message::user("start")];
@@ -331,7 +331,7 @@ mod tests {
         // The mock has no known window, so the context manager assumes 200k: 5k tokens is 2.5%,
         // far below the 85% mark, but past `compact_at`.
         let manager =
-            ContextManager::from(context_manager(4_000, None, &ContextControl::new(4_000))).unwrap();
+            ContextManager::from(context_manager(4_000, None, &ContextControl::new(4_000), None)).unwrap();
 
         let mut below = chat(6);
         let changed = manager
@@ -367,7 +367,8 @@ mod tests {
         ))]);
         let agent = Agent::builder().model(model.clone()).build().unwrap();
         let control = ContextControl::new(DEFAULT_COMPACT_AT);
-        let manager = ContextManager::from(context_manager(DEFAULT_COMPACT_AT, None, &control)).unwrap();
+        let manager =
+            ContextManager::from(context_manager(DEFAULT_COMPACT_AT, None, &control, None)).unwrap();
         control.request_summary();
 
         let mut messages = chat(6);
@@ -398,6 +399,7 @@ mod tests {
                     DEFAULT_COMPACT_AT,
                     Some(&dir),
                     &ContextControl::new(DEFAULT_COMPACT_AT),
+                    None,
                 ))
                 .unwrap();
                 manager.init_agent(&agent).await.unwrap();
@@ -438,6 +440,7 @@ mod tests {
             goal: None,
             session_dir: None,
             env: Default::default(),
+            on_compacted: None,
         }
     }
 

@@ -182,6 +182,9 @@ pub struct AgentSpec {
     pub session_dir: Option<PathBuf>,
     /// Environment variables for the agent's commands, on top of the swarm's own.
     pub env: BTreeMap<String, String>,
+    /// Where the agent's context pipeline reports each summary of older turns
+    /// ([`SwarmEvent::Compacted`]); a factory without summarization may ignore it.
+    pub on_compacted: Option<crate::compaction::CompactedSink>,
 }
 
 /// Builds the [`Agent`] for an [`AgentSpec`].
@@ -432,6 +435,15 @@ pub enum SwarmEvent {
         /// The last model call's input as a share of the compaction point (`0..1+`; at 1.0 older
         /// turns are summarized before the next call); `None` before the first model call.
         context: Option<f64>,
+    },
+    /// An agent's older turns were summarized before a model call.
+    Compacted {
+        /// Id.
+        id: String,
+        /// Projected input tokens before.
+        before: u64,
+        /// Estimated input tokens after.
+        after: u64,
     },
     /// The token budget was set or lifted (`None`).
     Budget {

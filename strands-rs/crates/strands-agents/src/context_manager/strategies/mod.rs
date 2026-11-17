@@ -5,7 +5,9 @@ mod emergency;
 mod offload;
 
 pub use emergency::EmergencyTruncateStrategy;
-pub use offload::{Offload, OffloadConditions, OffloadStrategy, OffloadTarget, TruncateConfig};
+pub use offload::{
+    Offload, OffloadConditions, OffloadStrategy, OffloadTarget, TruncateConfig, SUMMARIZATION_SYSTEM_PROMPT,
+};
 
 use std::collections::{HashMap, HashSet};
 

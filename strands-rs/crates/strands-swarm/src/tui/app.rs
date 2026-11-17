@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use strands_agents::types::{ContentBlock, Message, Role, ToolResultStatus};
 
 use crate::runtime::{summarize_input, AgentStatus, SwarmEvent, USER};
+use crate::text::compact;
 
 pub use super::commands::{parse_command, Command, SlashCommand, SLASH_COMMANDS};
 
@@ -356,6 +357,13 @@ impl App {
                     )));
                 }
                 view.context = context.or(view.context);
+            }),
+            SwarmEvent::Compacted { id, before, after } => self.with(&id, |view| {
+                view.push(LogEntry::Status(format!(
+                    "context compacted: older turns summarized, {} → {} tokens",
+                    compact(before),
+                    compact(after)
+                )))
             }),
         }
     }
@@ -1017,6 +1025,22 @@ mod tests {
         });
         assert_eq!(app.notice.as_deref(), Some("gc: nothing to reclaim"));
         assert!(SLASH_COMMANDS.iter().any(|command| command.name == "/gc"));
+    }
+
+    #[test]
+    fn a_compaction_is_noted_in_the_agents_log() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        app.apply(SwarmEvent::Compacted {
+            id: "a1".into(),
+            before: 305_000,
+            after: 98_100,
+        });
+        assert!(app.agents["a1"]
+            .log
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::Status(note)
+            if note == "context compacted: older turns summarized, 305.0k → 98.1k tokens")));
     }
 
     #[test]

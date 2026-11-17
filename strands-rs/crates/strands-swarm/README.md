@@ -54,6 +54,10 @@ and exit.
   - An agent's older turns are summarized once a call's input reaches the compaction point:
     `--compact-at` (default `200k`) or 85% of the model's window, whichever is smaller.
   - The point follows the window on a `/model` switch. The log notes 90%.
+  - A summary brings the input down to half the point: how many of the oldest turns go into it
+    follows their token counts. The task message stays verbatim, and so do the latest four
+    messages. If the first pass leaves the input above the point, a second pass runs. The log
+    notes `context compacted: 305.0k → 98.1k tokens`.
   - **Pruning.** Reasoning from earlier turns (thinking text and signatures, which some models bill
     as input on every call) is dropped; the turn in progress keeps it, as Anthropic requires within
     a tool-use loop. `shell` and `read` results over 2,000 characters are cut to their head and
@@ -238,7 +242,8 @@ Typing text without a command messages the selected agent.
 - **Journal.**
   - A persistent run keeps `journal.jsonl` with every message to and from the user, and
     `events.jsonl` with compact lifecycle events: spawns, status changes, tool calls, model
-    switches, resumes, reloads, shutdowns and disk reclaimed.
+    switches, compactions (`before`/`after` tokens), resumes, reloads, shutdowns and disk
+    reclaimed.
   - Both are JSON lines with a UTC `ts`, written by a background thread and rotated to `<file>.1`
     at 8 MB.
 - **Log.** Warnings and errors (or whatever `RUST_LOG` selects) go to `<run dir>/swarm.log` under
