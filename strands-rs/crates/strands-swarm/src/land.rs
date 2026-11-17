@@ -909,12 +909,15 @@ mod tests {
         let fx = fixture().await;
         let before = head(&fx.main, "main").await;
         let started = fx.land.join("started");
-        let late = fx.land.join("late");
-        // A check whose child would outlive it: a test binary under `cargo test`, say.
+        let (go, late) = (fx.land.join("go"), fx.land.join("late"));
+        // A check whose child would outlive it (a test binary under `cargo test`, say): it
+        // touches `late` once the test, after the stop, creates `go` (or its directory is gone).
         let check = format!(
-            "touch '{}'; (sleep 2; touch '{}') & wait",
+            "touch '{}'; (until [ -e '{go}' ] || [ ! -e '{dir}' ]; do sleep 0.01; done; touch '{}') & wait",
             started.display(),
-            late.display()
+            late.display(),
+            go = go.display(),
+            dir = fx.land.display(),
         );
         let stop = async {
             while !started.exists() {
@@ -932,7 +935,9 @@ mod tests {
         assert_eq!(head(&fx.main, "main").await, before);
         assert!(!fx.land.join("scratch").exists());
         assert_eq!(worktrees(&fx.main).await, 2, "main and feature only");
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        std::fs::write(&go, "").unwrap();
+        // A child that survived would touch `late` within its next 10ms poll.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!late.exists(), "the check's child ran on");
     }
 

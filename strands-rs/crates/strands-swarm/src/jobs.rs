@@ -555,15 +555,21 @@ mod tests {
     async fn killing_a_job_stops_its_whole_process_group() {
         let dir = tempfile::tempdir().unwrap();
         let jobs = Jobs::new(dir.path());
-        let marker = dir.path().join("late");
-        let command = format!("sleep 2 && touch {}", marker.display());
+        let (go, marker) = (dir.path().join("go"), dir.path().join("late"));
+        // Its child touches `late` once the test, after the kill, creates `go`.
+        let command = format!(
+            "(until [ -e go ] || [ ! -e \"$PWD\" ]; do sleep 0.01; done; touch {}) & wait",
+            marker.display()
+        );
         jobs.start("a1", None, &command, dir.path(), &BTreeMap::new())
             .await
             .unwrap();
         let killed = jobs.kill("j1").await.unwrap();
         assert_eq!(killed.state, JobState::Killed);
         assert!(killed.reported, "the killer already knows");
-        tokio::time::sleep(Duration::from_millis(2500)).await;
+        std::fs::write(&go, "").unwrap();
+        // A child that survived would touch `late` within its next 10ms poll.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!marker.exists(), "the command's children were killed too");
         assert!(jobs.unreported(true).await.is_empty());
     }
