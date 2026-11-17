@@ -112,6 +112,19 @@ fn duration(seconds: u64) -> String {
     }
 }
 
+/// The number of job id `j<n>`.
+fn number(id: &str) -> Option<u64> {
+    id.strip_prefix('j')?.parse().ok()
+}
+
+/// `command` with no stdin and its output discarded.
+fn quiet(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -142,7 +155,7 @@ impl Jobs {
 
     /// Where job `id` writes its output.
     pub fn log_path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.log"))
+        self.file(id, "log")
     }
 
     fn file(&self, id: &str, ext: &str) -> PathBuf {
@@ -163,7 +176,7 @@ impl Jobs {
         let _guard = self.start.lock().await;
         tokio::fs::create_dir_all(&self.dir).await?;
         let id = self.next_id().await?;
-        let mut child = detach_from_terminal(&mut tokio::process::Command::new("sh"))
+        let mut child = quiet(detach_from_terminal(&mut tokio::process::Command::new("sh")))
             .arg("-c")
             .arg(WRAPPER)
             .arg("job")
@@ -172,9 +185,6 @@ impl Jobs {
             .arg(self.file(&id, "exit"))
             .current_dir(cwd)
             .envs(env)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| Error::other(format!("Could not start the job: {e}")))?;
         let meta = JobMeta {
@@ -203,7 +213,7 @@ impl Jobs {
             .metas()
             .await
             .iter()
-            .filter_map(|meta| meta.id.strip_prefix('j')?.parse::<u64>().ok())
+            .filter_map(|meta| number(&meta.id))
             .max()
             .unwrap_or(0);
         Ok(format!("j{}", highest + 1))
@@ -224,10 +234,7 @@ impl Jobs {
                 metas.extend(parsed);
             }
         }
-        metas.sort_by_key(|meta| {
-            let number = meta.id.strip_prefix('j').and_then(|n| n.parse::<u64>().ok());
-            (number, meta.id.clone())
-        });
+        metas.sort_by_key(|meta| (number(&meta.id), meta.id.clone()));
         metas
     }
 
@@ -313,11 +320,7 @@ impl Jobs {
         }
         self.mark_reported(id).await?;
         let group = format!("-{}", job.meta.pid);
-        let _ = tokio::process::Command::new("kill")
-            .args(["-TERM", "--", &group])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+        let _ = quiet(tokio::process::Command::new("kill").args(["-TERM", "--", &group]))
             .status()
             .await;
         tokio::fs::write(self.file(id, "exit"), "killed").await?;
@@ -399,12 +402,7 @@ async fn alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    let probe = tokio::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let probe = quiet(tokio::process::Command::new("kill").args(["-0", &pid.to_string()])).status();
     match tokio::time::timeout(Duration::from_secs(5), probe).await {
         Ok(Ok(status)) => status.success(),
         // Unsure: treat as alive rather than declare a running job lost.
