@@ -231,6 +231,10 @@ impl Swarm {
         let options = InvokeOptions::default().with_cancel(turn.clone());
         let given = matches!(input, InvokeInput::Text(_) | InvokeInput::Blocks(_));
         self.pair_tool_calls(node, agent);
+        let closed = agent.with_messages(resume::close_open_calls);
+        if closed > 0 {
+            tracing::warn!(agent = %node.id, closed, "answered calls a failed turn left without results");
+        }
         let input = agent.with_messages(|messages| resume::fold_into_open_turn(messages, input));
         if given && matches!(input, InvokeInput::None) {
             // The SDK adds no message for it, so nothing would save the mail it holds, which has

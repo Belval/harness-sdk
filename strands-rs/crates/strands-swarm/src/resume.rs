@@ -237,6 +237,28 @@ pub fn pair_tool_calls(messages: &mut Vec<Message>) -> usize {
     changed
 }
 
+/// Answer the calls of a conversation's last message with [`UNRECORDED`] errors, in a new user
+/// message, so a turn can start after it: a turn that failed after its calls were added (a failed
+/// save, a provider error mid-batch) leaves an idle agent's conversation ending in them, and mail
+/// appended after it would make the provider refuse every later call. A restart answers them first
+/// ([`append_notice`]), so by a turn's start this is the only way left. Returns how many.
+pub fn close_open_calls(messages: &mut Vec<Message>) -> usize {
+    let results: Vec<ContentBlock> = match messages.last() {
+        Some(last) if last.role == Role::Assistant => last
+            .tool_uses()
+            .map(|call| {
+                ContentBlock::ToolResult(ToolResultBlock::error(call.tool_use_id.clone(), UNRECORDED))
+            })
+            .collect(),
+        _ => return 0,
+    };
+    let count = results.len();
+    if count > 0 {
+        messages.push(Message::new(Role::User, results));
+    }
+    count
+}
+
 /// File in an agent's session directory that holds its [`OpenBatch`].
 pub const OPEN_BATCH_FILE: &str = "open-batch.json";
 
@@ -368,6 +390,23 @@ mod tests {
 
     fn ids(calls: Vec<ToolUseBlock>) -> Vec<String> {
         calls.into_iter().map(|c| c.tool_use_id).collect()
+    }
+
+    #[test]
+    fn a_conversation_ending_in_calls_gets_their_results_before_a_turn() {
+        let mut open = vec![Message::user("go"), calls(&["t1", "t2"])];
+        assert_eq!(close_open_calls(&mut open), 2);
+        assert_eq!(open.len(), 3);
+        assert_eq!(open[2].role, Role::User);
+        assert!(open[2].tool_results().all(|r| r.text() == UNRECORDED));
+        // Mail now folds into that user message, so the conversation stays well formed.
+        let input = fold_into_open_turn(&mut open, InvokeInput::Text("mail".into()));
+        assert!(matches!(input, InvokeInput::None));
+        assert_eq!(open[2].content.last(), Some(&ContentBlock::text("mail")));
+
+        let mut closed = vec![Message::user("go"), Message::assistant("done")];
+        assert_eq!(close_open_calls(&mut closed), 0);
+        assert_eq!(closed.len(), 2);
     }
 
     #[test]
