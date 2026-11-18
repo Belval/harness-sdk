@@ -29,6 +29,8 @@ enum Step {
     Drop(String),
     /// Bedrock's `ValidationException`: the request itself is wrong.
     Rejected,
+    /// Anthropic's refusal of an image over its limits, with this message.
+    Limit(String),
 }
 
 fn say(text: &str) -> Step {
@@ -89,6 +91,7 @@ impl Model for Flaky {
             Some(Step::Rejected) => vec![Err(Error::model(
                 "A conversation must alternate between user and assistant roles.",
             ))],
+            Some(Step::Limit(message)) => vec![Err(Error::model(message))],
             Some(Step::Drop(text)) => {
                 let mut events: Vec<Result<ModelStreamEvent>> =
                     events_for_message(&Message::assistant(text), None, None)
@@ -283,6 +286,39 @@ async fn a_goal_agent_retries_failed_turns_without_paying_for_a_judge_call() {
     );
     assert_eq!(model.calls().len(), 3);
     assert_eq!(judged.load(Ordering::SeqCst), 1, "only the reply was judged");
+    assert_alternating(&model);
+    swarm.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_image_over_the_model_limit_is_removed_from_history_and_the_call_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.png");
+    image::RgbImage::new(2100, 10).save(&path).unwrap();
+    let limit = "The model returned the following errors: messages.1.content.1.image.source.base64.data: \
+                 At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels";
+    let model = Flaky::new(vec![say("ready"), Step::Limit(limit.into()), say("seen")]);
+    let (swarm, mut events) = start(&model, dir.path()).await;
+    assert_eq!(mail(&mut events).await, ("reply".into(), "ready".into()));
+    swarm.send_with_images(USER, "a1", "look", vec![path]).unwrap();
+    assert_eq!(mail(&mut events).await, ("reply".into(), "seen".into()));
+    let calls = model.calls();
+    assert_eq!(calls.len(), 3, "one retry");
+    let has_image = |messages: &[Message]| {
+        messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .any(|block| matches!(block, ContentBlock::Image(_)))
+    };
+    assert!(has_image(&calls[1]));
+    assert!(!has_image(&calls[2]));
+    assert!(
+        texts(&calls[2])
+            .iter()
+            .any(|t| t == strands_swarm::images::REMOVED_NOTE),
+        "{:?}",
+        calls[2]
+    );
     assert_alternating(&model);
     swarm.shutdown().await;
 }

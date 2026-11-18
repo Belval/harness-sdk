@@ -360,8 +360,11 @@ pub(crate) fn harness_options(
         .copied()
         .filter(|name| !EXCLUDED_BUILTINS.contains(name));
     let environment = crate::workdir::Environment::new(spec.workdir.clone()).injector();
-    let mut plugins: Vec<Arc<dyn Plugin>> =
-        vec![Arc::new(environment), Arc::new(crate::shell_text::ShellText)];
+    let mut plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(environment),
+        Arc::new(crate::shell_text::ShellText),
+        Arc::new(crate::images::FitImages),
+    ];
     if let Some(goal) = &spec.goal {
         let judge = JudgeConfig::default().with_max_transcript_chars(JUDGE_TRANSCRIPT_CHARS);
         plugins.push(Arc::new(bounded_goal(

@@ -232,16 +232,20 @@ impl Swarm {
             // already left the mailbox, before the turn's first message: a crash would lose it.
             self.save_session(node, agent).await;
         }
-        let mut stream = agent.stream_with(input, options);
-        let mut reply = None;
-        let mut failure = None;
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(event) => reply = self.forward(node, &event).or(reply),
-                Err(error) => failure = Some(error),
+        let stream = agent.stream_with(input, options.clone());
+        let (mut reply, mut failure) = self.drain_turn(node, stream).await;
+        if let Some(error) = failure.as_ref().map(Error::to_string) {
+            // One image over the provider's limits fails every call that resends it, so this
+            // agent would never recover: replace it by a note and try once more.
+            if !turn.is_cancelled() && images::names_image_limit(&error) {
+                let removed = agent.with_messages(|messages| images::drop_oversized(messages, &error));
+                tracing::warn!(agent = %node.id, removed, %error, "removed images over the model's limit");
+                if removed > 0 {
+                    let stream = agent.stream_with(InvokeInput::None, options);
+                    (reply, failure) = self.drain_turn(node, stream).await;
+                }
             }
         }
-        drop(stream);
         node.turn.lock().take();
         if node.cancel.is_cancelled() || self.inner.shutting_down.load(Ordering::SeqCst) {
             return None;
@@ -272,6 +276,18 @@ impl Swarm {
         }
         self.set_status(node, AgentStatus::Idle);
         None
+    }
+
+    /// Forward a turn's stream to the end; returns its final reply and its error, if any.
+    async fn drain_turn(&self, node: &Node, mut stream: AgentStream) -> (Option<String>, Option<Error>) {
+        let (mut reply, mut failure) = (None, None);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(event) => reply = self.forward(node, &event).or(reply),
+                Err(error) => failure = Some(error),
+            }
+        }
+        (reply, failure)
     }
 
     /// Translate one stream event into swarm events; returns the final reply on `AgentResult`.

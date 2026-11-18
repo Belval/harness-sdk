@@ -484,6 +484,11 @@ Other text messages the selected agent, or starts a root agent when there is non
   sixel graphics. Inside tmux (so under `swarmctl`), and on terminals without graphics, there is
   no thumbnail: unicode halfblocks would blur it beyond reading. Open the path to see the image.
 - Only the newest 4 stay decoded. The mailbox and journal keep only the path.
+- Before an image reaches a model (a tool result from `read` or MCP, or an `/image`
+  attachment), it is downscaled to at most 2576 px on the long edge and 3.75 MB, the limits of
+  Claude and Bedrock. A model error that names an image limit replaces the images over it in the
+  agent's history with `[image removed: over the model's size limit]`, and the call is retried
+  once. Otherwise every later call would resend the image and fail.
 
 **Log and copying.**
 

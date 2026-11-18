@@ -13,7 +13,7 @@ use futures::future::BoxFuture;
 use futures::StreamExt;
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use strands_agents::agent::{AgentStreamEvent, InvokeInput, InvokeOptions};
+use strands_agents::agent::{AgentStream, AgentStreamEvent, InvokeInput, InvokeOptions};
 use strands_agents::hooks::AfterToolCallEvent;
 use strands_agents::middleware::{wrap_fn, InvokeModelContext, InvokeModelStage};
 use strands_agents::models::streaming::{ContentBlockDelta, ModelStreamEvent};

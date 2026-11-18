@@ -4290,7 +4290,7 @@ async fn an_interrupt_also_stops_the_goal_judge() {
 async fn a_message_with_an_image_reaches_the_model_as_an_image_block() {
     let dir = tempfile::tempdir().unwrap();
     let shot = dir.path().join("shot.png");
-    std::fs::write(&shot, b"\x89PNG fake").unwrap();
+    image::RgbImage::new(4, 3).save(&shot).unwrap();
     let (swarm, mut events, scripts) = swarm_with(vec![("a1", vec![say("first"), say("a cat")])], dir.path());
     let id = spawn_root(&swarm, "hello").await;
     assert_eq!(reply_to(&mut events, USER).await, "first");
@@ -4311,7 +4311,8 @@ async fn a_message_with_an_image_reaches_the_model_as_an_image_block() {
         _ => None,
     });
     let image = image.expect("no image block sent to the model");
-    assert!(matches!(&image.source, strands_agents::types::ImageSource::Bytes(b) if b == b"\x89PNG fake"));
+    let sent = std::fs::read(&shot).unwrap();
+    assert!(matches!(&image.source, strands_agents::types::ImageSource::Bytes(b) if *b == sent));
 }
 
 #[tokio::test]
