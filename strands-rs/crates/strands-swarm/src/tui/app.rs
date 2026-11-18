@@ -194,15 +194,11 @@ impl AgentView {
             AgentStatus::Queued => return Some("queued until an agent slot frees…".to_owned()),
             AgentStatus::Starting => return Some("starting…".to_owned()),
             AgentStatus::Running if self.held => return Some("waiting for the reload…".to_owned()),
-            AgentStatus::Running if self.host_held.is_some() => {
-                return self.host_held.as_ref().map(|why| format!("waiting: {why}"));
-            }
-            AgentStatus::Running if self.queued.is_some() => {
-                let (calls, limit) = self.queued.unwrap_or_default();
-                return Some(crate::text::queued_for_call(calls, limit));
-            }
             AgentStatus::Running => {}
             _ => return None,
+        }
+        if let Some(why) = self.held_for() {
+            return Some(why);
         }
         Some(match self.latest() {
             // The call is the entry above, so its summary is not repeated.
@@ -210,6 +206,18 @@ impl AgentView {
             Some(LogEntry::Text(_)) => "writing…".to_owned(),
             _ => "thinking…".to_owned(),
         })
+    }
+
+    /// Why a running agent's next model call waits for the host or a model-call slot, if it does.
+    pub fn held_for(&self) -> Option<String> {
+        if self.status != AgentStatus::Running {
+            return None;
+        }
+        if let Some(why) = &self.host_held {
+            return Some(format!("waiting: {why}"));
+        }
+        let (calls, limit) = self.queued?;
+        Some(crate::text::queued_for_call(calls, limit))
     }
 
     /// What a running agent waits on instead of working, if anything.
