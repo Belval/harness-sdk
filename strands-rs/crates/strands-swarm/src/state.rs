@@ -171,6 +171,10 @@ const ALIVE_FILES: [&str; 4] = [
 /// follow by minutes; each is extended to the run's last sign of life: the newest write among
 /// [`ALIVE_FILES`] (swarmctl notes the exit in `supervisor.log` the moment it happens).
 pub async fn load(dir: &Path) -> Result<Option<SwarmState>> {
+    let stale = crate::files::remove_stale_temps(dir);
+    if stale > 0 {
+        tracing::info!(stale, "removed temporary copies left by writes a crash cut short");
+    }
     let mut state = match load_saved(dir).await? {
         Some(state) => state,
         None => return Ok(None),

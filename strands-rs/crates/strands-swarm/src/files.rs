@@ -19,20 +19,54 @@ pub fn replace(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> 
     }
     // Per process: two swarms may share a file (the memory file).
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".tmp-{}", std::process::id()));
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(bytes)?;
-    if durable {
-        file.sync_all()?;
-        #[cfg(test)]
-        SYNCED.with(|synced| synced.set(synced.get() + 1));
+    tmp.push(format!("{TMP_INFIX}{}", std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        if durable {
+            file.sync_all()?;
+            #[cfg(test)]
+            SYNCED.with(|synced| synced.set(synced.get() + 1));
+        }
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        // A full disk would otherwise keep the half-written copy, and fill up the more for it.
+        let _ = std::fs::remove_file(&tmp);
     }
-    drop(file);
-    std::fs::rename(&tmp, path)?;
+    written?;
     if let (true, Some(dir)) = (durable, dir) {
         let _ = std::fs::File::open(dir).and_then(|dir| dir.sync_all());
     }
     Ok(())
+}
+
+/// What [`replace`] puts between a file's name and its process id to name the temporary copy.
+const TMP_INFIX: &str = ".tmp-";
+
+/// Delete the temporary copies in `dir` that [`replace`] left in processes no longer running
+/// (killed mid-write); returns how many. A live process's copy may be mid-write and is kept.
+pub fn remove_stale_temps(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.rsplit_once(TMP_INFIX))
+            .and_then(|(_, pid)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let alive = pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists();
+        if !alive && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// [`replace`] on a blocking thread. `bytes` may be shared (an `Arc<Vec<u8>>`), so that a retry
@@ -51,6 +85,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copies_left_by_dead_processes_are_removed_and_a_live_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pids above the kernel's limit (4194304) are never alive.
+        let dead = dir.path().join("swarm.json.tmp-4194399");
+        let mine = dir.path().join(format!("swarm.json.tmp-{}", std::process::id()));
+        let other = dir.path().join("notes.tmp-old");
+        for path in [&dead, &mine, &other] {
+            std::fs::write(path, "x").unwrap();
+        }
+        assert_eq!(remove_stale_temps(dir.path()), 1);
+        assert!(!dead.exists() && mine.exists() && other.exists());
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_temporary_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        // Renaming a file over a non-empty directory fails after the copy is written.
+        let path = dir.path().join("state");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("inside"), "x").unwrap();
+        assert!(replace(&path, b"one", false).is_err());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, ["state"]);
+    }
 
     #[tokio::test]
     async fn a_file_is_replaced_whole_and_no_temporary_file_stays() {
