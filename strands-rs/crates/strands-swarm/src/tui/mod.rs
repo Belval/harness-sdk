@@ -401,54 +401,30 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             .await
             .map(|model| format!("{} now uses {model}", swarm.label(&id))),
         (Command::MaxAgents(None), _) => Ok(max_agents_notice(swarm)),
-        (Command::MaxAgents(Some(limit)), _) => match limit.as_str() {
-            "default" => Ok(None),
-            n => n
-                .parse::<usize>()
-                .map(Some)
-                .map_err(|_| strands_agents::Error::other(format!("Not a number: {n}"))),
-        }
-        .and_then(|limit| swarm.set_max_agents(limit))
-        .map(|()| max_agents_notice(swarm)),
+        (Command::MaxAgents(Some(arg)), _) => limit_arg(&arg, None, number)
+            .and_then(|limit| swarm.set_max_agents(limit))
+            .map(|()| max_agents_notice(swarm)),
         (Command::MaxCalls(None), _) => Ok(max_calls_notice(swarm)),
-        (Command::MaxCalls(Some(limit)), _) => match limit.as_str() {
-            "default" => Ok(None),
-            n => n
-                .parse::<usize>()
-                .map(Some)
-                .map_err(|_| strands_agents::Error::other(format!("Not a number: {n}"))),
-        }
-        .map(|limit| {
+        (Command::MaxCalls(Some(arg)), _) => limit_arg(&arg, None, number).map(|limit| {
             swarm.set_max_calls(limit);
             max_calls_notice(swarm)
         }),
         (Command::MaxLoad(None), _) => Ok(max_load_notice(swarm)),
-        (Command::MaxLoad(Some(limit)), _) => match limit.as_str() {
-            "default" => Ok(None),
-            "off" => Ok(Some(0.0)),
-            n => n
-                .parse::<f64>()
-                .ok()
-                .filter(|n| *n >= 0.0)
-                .map(Some)
-                .ok_or_else(|| strands_agents::Error::other(format!("Not a load: {n}"))),
-        }
+        (Command::MaxLoad(Some(arg)), _) => limit_arg(&arg, Some(0.0), |n| {
+            let load = n.parse().ok().filter(|load: &f64| *load >= 0.0);
+            load.ok_or_else(|| format!("Not a load: {n}"))
+        })
         .map(|limit| {
             swarm.set_max_load(limit);
             max_load_notice(swarm)
         }),
         (Command::MinFreeMem(None), _) => Ok(min_free_mem_notice(swarm)),
-        (Command::MinFreeMem(Some(floor)), _) => match floor.as_str() {
-            "default" => Ok(None),
-            "off" => Ok(Some(0)),
-            n => crate::text::parse_bytes(n)
-                .map(Some)
-                .map_err(strands_agents::Error::other),
+        (Command::MinFreeMem(Some(arg)), _) => {
+            limit_arg(&arg, Some(0), crate::text::parse_bytes).map(|floor| {
+                swarm.set_min_free_mem(floor);
+                min_free_mem_notice(swarm)
+            })
         }
-        .map(|floor| {
-            swarm.set_min_free_mem(floor);
-            min_free_mem_notice(swarm)
-        }),
         (Command::Budget(None), _) => Ok(budget_notice(swarm)),
         (Command::Budget(Some(tokens)), _) => match tokens.as_str() {
             "off" | "none" => Ok(None),
@@ -520,6 +496,24 @@ fn schedules_notice(swarm: &Swarm) -> String {
         .map(|s| crate::tools::describe_schedule(swarm, s))
         .collect();
     format!("schedules: {}", all.join(" | "))
+}
+
+/// A runtime limit's argument: `default` returns to the flag (`None`), `off` sets `off` where
+/// the limit has one, anything else is `parse`d.
+fn limit_arg<T>(
+    arg: &str,
+    off: Option<T>,
+    parse: impl FnOnce(&str) -> Result<T, String>,
+) -> strands_agents::Result<Option<T>> {
+    match (arg, off) {
+        ("default", _) => Ok(None),
+        ("off", Some(off)) => Ok(Some(off)),
+        (arg, _) => parse(arg).map(Some).map_err(strands_agents::Error::other),
+    }
+}
+
+fn number(arg: &str) -> Result<usize, String> {
+    arg.parse().map_err(|_| format!("Not a number: {arg}"))
 }
 
 fn max_agents_notice(swarm: &Swarm) -> String {
