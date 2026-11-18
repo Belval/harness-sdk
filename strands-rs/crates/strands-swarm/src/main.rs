@@ -1,6 +1,6 @@
 //! `strands-swarm`: run a model-driven agent swarm in the terminal.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,6 +232,10 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         };
     }
     if let Some(dir) = &cli.self_test {
+        let source = Path::new(strands_swarm::version::SOURCE);
+        if let Some(stale) = strands_swarm::version::stale(strands_swarm::version::COMMIT, source).await {
+            return Err(stale.into());
+        }
         eprintln!("strands-swarm: {}", strands_swarm::selftest::run(dir).await?);
         return Ok(Exit::Quit);
     }

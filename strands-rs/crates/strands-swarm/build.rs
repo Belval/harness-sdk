@@ -20,6 +20,11 @@ fn main() {
     let short = commit.get(..9).unwrap_or(&commit);
     println!("cargo:rustc-env=STRANDS_SWARM_VERSION={version} ({short})");
     println!("cargo:rustc-env=STRANDS_SWARM_COMMIT={commit}");
+    // Cargo reruns this script only when one of these files is newer than the script's last start,
+    // judged from the fingerprint of the last run, which worktrees sharing a target dir also
+    // share (their package hashes alike): a build in one can leave another embedding a stale
+    // commit, and the reload self-test refuses such a binary (`version::stale`). Rerunning on
+    // every build would recompile the crate every time, so the check lives there instead.
     // Rebuild when HEAD moves: its file, the branch it points at, packed refs, and HEAD's reflog,
     // which every commit, merge and checkout appends to (a branch ref packed when this ran has no
     // file to watch, and the loose one written by the next commit would go unnoticed).

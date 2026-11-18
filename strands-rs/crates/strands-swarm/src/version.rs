@@ -11,6 +11,24 @@ pub const SOURCE: &str = env!("CARGO_MANIFEST_DIR");
 /// Most commits [`changes`] lists.
 pub const MAX_CHANGES: usize = 30;
 
+/// Why this binary is stale, if it is: it embeds `commit` but the checkout at `source` it was
+/// built from is at another one. Cargo reuses a build script's output while the files it watched
+/// look unchanged, and a target dir shared by worktrees shares that verdict (the package hashes
+/// the same in each), so a build can embed an older commit than the checkout's HEAD. `None` when
+/// the binary is current, has no commit, or `source` is gone or no git checkout.
+pub async fn stale(commit: Option<&str>, source: &Path) -> Option<String> {
+    let commit = commit?;
+    let head = crate::worktree::git(source, &["rev-parse", "HEAD"]).await.ok()?;
+    (head != commit).then(|| {
+        format!(
+            "this binary embeds commit {commit} but its checkout {} is at {head}: the build script \
+             did not rerun (cargo reused its output). Run `cargo build --release -p strands-swarm` \
+             again, or touch crates/strands-swarm/build.rs to force it, then retry.",
+            source.display()
+        )
+    })
+}
+
 /// `<short hash> <subject>` of the commits in `to` but not in `from`, newest first, at most
 /// [`MAX_CHANGES`]; empty when `repo` is gone or does not know either commit.
 pub async fn changes(repo: &Path, from: &str, to: &str) -> Vec<String> {
@@ -77,6 +95,26 @@ mod tests {
             notice("abcdef0123", "0123456789", &[]),
             "reloaded abcdef0 → 0123456"
         );
+    }
+
+    #[tokio::test]
+    async fn a_binary_older_than_its_checkout_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let old = git(dir.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(stale(Some(&old), dir.path()).await, None);
+        git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let new = git(dir.path(), &["rev-parse", "HEAD"]);
+
+        let message = stale(Some(&old), dir.path()).await.unwrap();
+        assert!(message.contains(&old) && message.contains(&new), "{message}");
+        assert_eq!(stale(Some(&new), dir.path()).await, None);
+        // Nothing to compare: built outside git, or the checkout is gone or not a repository.
+        assert_eq!(stale(None, dir.path()).await, None);
+        assert_eq!(stale(Some(&old), &dir.path().join("gone")).await, None);
+        let plain = tempfile::tempdir_in("/tmp").unwrap();
+        assert_eq!(stale(Some(&old), plain.path()).await, None);
     }
 
     #[test]
