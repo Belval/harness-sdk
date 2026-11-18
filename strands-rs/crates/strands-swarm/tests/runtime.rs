@@ -2509,9 +2509,10 @@ async fn first_context(events: &mut UnboundedReceiver<SwarmEvent>, id: &str) -> 
 }
 
 #[tokio::test]
-async fn without_compact_at_the_point_is_85_percent_of_the_model_window() {
-    // 1M (Opus 5.5) compacts at 850k, no longer at 200k: 170k is 20% of the point, not 85%.
-    for (window, share) in [(1_000_000, 0.2), (200_000, 1.0)] {
+async fn without_compact_at_the_point_is_the_cap_or_85_percent_of_a_smaller_window() {
+    // 1M (Opus 5.5) compacts at the 300k cap: 170k is 170/300 of the point; a 200k window at its
+    // 85%, which 170k reaches.
+    for (window, share) in [(1_000_000, 170.0 / 300.0), (200_000, 1.0)] {
         let dir = tempfile::tempdir().unwrap();
         let scripts = scripts_of(vec![(
             "a1",

@@ -107,9 +107,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   the prompt cache: their prompts are never sent twice, so a cache write would cost 25% extra.
 - **Context.**
   - An agent's older turns are summarized once a call's input reaches the compaction point:
-    85% of the model's window (850k tokens for a 1M window), or `--compact-at TOKENS` if that
-    is smaller. `spawn_agent`'s `compact_at` sets one agent's point instead, saved with the agent
-    across restarts; an agent spawned without one follows `--compact-at` as the run is started.
+    300k tokens (every call re-reads the whole context, and over a run's calls above 300k the
+    reads were a third of its spend), or 85% of the model's window if that is smaller;
+    `--compact-at TOKENS` replaces the 300k (up to the 85%). `spawn_agent`'s `compact_at` sets one
+    agent's point instead, saved with the agent across restarts; an agent spawned without one
+    follows `--compact-at` as the run is started.
   - The point follows the window on a `/model` switch. The log notes 90%.
   - A summary brings the input down to half the point: how many of the oldest turns go into it
     follows their token counts. The task message stays verbatim, and so do the latest four

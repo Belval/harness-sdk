@@ -101,8 +101,9 @@ struct Cli {
     #[arg(long, value_parser = strands_swarm::text::parse_bytes, default_value = "20G")]
     min_free_disk: u64,
     /// Summarize an agent's older turns once a call's input reaches this many tokens (e.g. `300k`,
-    /// `1.5M`), or 85% of the model's window if that is smaller. Without it, 85% of the window
-    /// (850k tokens for a 1M window). `spawn_agent`'s `compact_at` overrides it for one agent.
+    /// `1.5M`), or 85% of the model's window if that is smaller. Without it, 300k tokens (the
+    /// cap, see `compaction::DEFAULT_CAP`) or 85% of the window, whichever is smaller.
+    /// `spawn_agent`'s `compact_at` overrides it for one agent.
     #[arg(long, value_parser = strands_swarm::text::parse_tokens)]
     compact_at: Option<u64>,
     /// File with extra instructions given to every agent.

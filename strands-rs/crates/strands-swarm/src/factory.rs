@@ -92,7 +92,7 @@ pub struct HarnessFactoryOptions {
     /// `skills` tool. Neither when empty.
     pub skills: Arc<Vec<Skill>>,
     /// Summarize older turns once a call's input reaches this many tokens (or 85% of the
-    /// model's window, if smaller); `None` uses the 85% alone. An agent's
+    /// model's window, if smaller); `None` uses 300k (or the 85% if smaller). An agent's
     /// [`AgentSpec::compact_at`] takes precedence.
     pub compact_at: Option<u64>,
     /// TTL of the prompt-cache points (`"5m"`, `"1h"`); the provider default (5m) when `None`.
@@ -284,7 +284,7 @@ fn agent_session(dir: &std::path::Path, agent_id: &str) -> Result<SessionOption>
 /// The `auto` pipeline with coding-sized limits: the preset offloads any tool result over 1,500
 /// tokens, which stashes most file reads and command outputs and costs a retrieval call each.
 /// Coding agents keep results up to the `agentic` threshold inline, with a larger preview, and
-/// summarize old turns at 85% of the window or `compact_at` tokens (see [`CompactAt`]). Earlier turns' reasoning and
+/// summarize old turns at `compact_at` tokens, by default 300k (see [`CompactAt`]). Earlier turns' reasoning and
 /// older large `shell`/`read` results are pruned only when the prompt cache is lost anyway (see
 /// [`CachePrune`]). With `stash_dir` the full outputs behind truncated results are kept there,
 /// so `retrieve_context` still finds them after a restart. `control` (the agent's `context`
