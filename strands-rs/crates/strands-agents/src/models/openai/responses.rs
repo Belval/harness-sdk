@@ -49,6 +49,7 @@ pub(super) fn format_request(
         body.insert("reasoning".into(), json!({ "effort": effort }));
     }
 
+    config.apply_cache_key(&mut body, options);
     if !options.tool_specs.is_empty() {
         let strict = config.strict_tools.map(Value::from).unwrap_or(Value::Null);
         let mut tools: Vec<Value> = match body.remove("tools") {

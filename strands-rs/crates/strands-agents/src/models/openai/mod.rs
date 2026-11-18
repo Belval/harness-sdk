@@ -61,6 +61,40 @@ pub struct OpenAIModelConfig {
     pub params: Map<String, Value>,
     /// Bedrock Mantle (OpenAI-compatible Bedrock endpoint) configuration.
     pub mantle: Option<BedrockMantleConfig>,
+    /// Prompt caching: OpenAI caches prefixes itself and routes reads on `prompt_cache_key`.
+    /// `None` sends no key (caching off).
+    pub cache_config: Option<OpenAICacheConfig>,
+}
+
+/// Prompt-cache settings for [`OpenAIModel`] (`CacheConfig.cacheKey` in TS; the placement fields
+/// do not apply to OpenAI's implicit caching).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpenAICacheConfig {
+    /// Sent as `prompt_cache_key`; unset, `strands-<session id>` when the agent has a session;
+    /// empty, none. A `prompt_cache_key` in `params` wins.
+    pub cache_key: Option<String>,
+}
+
+impl OpenAIModelConfig {
+    /// Inserts `prompt_cache_key` into `body` when caching is on: the configured key, else
+    /// `strands-<session id>` (TS `resolveCacheKey`); a key already in `body` (from `params`) wins.
+    fn apply_cache_key(&self, body: &mut Map<String, Value>, options: &StreamOptions) {
+        let Some(cache) = &self.cache_config else {
+            return;
+        };
+        let session = options
+            .agent_metadata
+            .as_ref()
+            .and_then(|meta| meta.session_id.as_deref());
+        let key = match (&cache.cache_key, session) {
+            (Some(key), _) => key.clone(),
+            (None, Some(session)) => format!("strands-{session}"),
+            (None, None) => return,
+        };
+        if !key.is_empty() {
+            body.entry("prompt_cache_key").or_insert(Value::String(key));
+        }
+    }
 }
 
 /// Managed request fields that a user's `params` may not override (Responses API).

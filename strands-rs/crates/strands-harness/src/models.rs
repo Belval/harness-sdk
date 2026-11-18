@@ -29,7 +29,7 @@ use strands_agents::models::{
     AnthropicCacheConfig, AnthropicCacheStrategy, AnthropicModel, AnthropicModelConfig,
 };
 #[cfg(feature = "openai")]
-use strands_agents::models::{BedrockMantleConfig, OpenAIModel, OpenAIModelConfig};
+use strands_agents::models::{BedrockMantleConfig, OpenAICacheConfig, OpenAIModel, OpenAIModelConfig};
 #[cfg(feature = "bedrock")]
 use strands_agents::models::{BedrockModel, BedrockModelConfig, CacheConfig, CacheStrategy};
 
@@ -812,6 +812,7 @@ pub(crate) fn openai_config_for(
         model_id: Some(resolved.name.to_string()),
         mantle,
         params,
+        cache_config: resolved.caching.then(OpenAICacheConfig::default),
         ..OpenAIModelConfig::default()
     })
 }
@@ -1837,6 +1838,15 @@ mod openai_tests {
         assert_eq!(config.model_id.as_deref(), Some("gpt-5.6-sol"));
         assert!(config.mantle.is_none());
         assert_eq!(config.params.get("reasoning"), Some(&json!({ "effort": "high" })));
+    }
+
+    #[test]
+    fn caching_on_sends_openai_models_a_prompt_cache_key() {
+        for spec in ["openai/gpt-5.6-sol", "bedrock-mantle/openai.gpt-6-astra"] {
+            let cached = openai_config_for(spec, Effort::Auto, false, true, true).expect("resolves");
+            assert_eq!(cached.cache_config, Some(OpenAICacheConfig::default()), "{spec}");
+            assert_eq!(resolve(spec, Effort::Auto, false).cache_config, None, "{spec}");
+        }
     }
 
     #[test]

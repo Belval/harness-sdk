@@ -36,8 +36,8 @@ pub use model::{
 };
 #[cfg(feature = "openai")]
 pub use openai::{
-    classify_openai_error, BedrockMantleConfig, OpenAIApi, OpenAIModel, OpenAIModelConfig, OpenAIRequest,
-    OpenAITransport, ReqwestTransport as OpenAIReqwestTransport,
+    classify_openai_error, BedrockMantleConfig, OpenAIApi, OpenAICacheConfig, OpenAIModel, OpenAIModelConfig,
+    OpenAIRequest, OpenAITransport, ReqwestTransport as OpenAIReqwestTransport,
 };
 pub use sse::{SseEvent, SseParser};
 pub use streaming::{

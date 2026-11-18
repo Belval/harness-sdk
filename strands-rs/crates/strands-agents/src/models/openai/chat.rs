@@ -42,6 +42,7 @@ pub(super) fn format_request(
     if let Some(top_p) = config.top_p {
         body.insert("top_p".into(), json!(top_p));
     }
+    config.apply_cache_key(&mut body, options);
     if let Some(value) = config.frequency_penalty {
         body.insert("frequency_penalty".into(), json!(value));
     }

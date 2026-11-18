@@ -649,3 +649,57 @@ async fn connect_without_credentials_fails_at_once() {
         "{err}"
     );
 }
+
+fn cache_body(
+    api: OpenAIApi,
+    cache: Option<OpenAICacheConfig>,
+    params: Value,
+    session: Option<&str>,
+) -> Value {
+    let config = OpenAIModelConfig {
+        api,
+        api_key: Some("k".into()),
+        model_id: Some("openai.gpt-6-astra".into()),
+        mantle: Some(BedrockMantleConfig {
+            region: Some("us-east-1".into()),
+            ..Default::default()
+        }),
+        params: serde_json::from_value(params).unwrap(),
+        cache_config: cache,
+        ..Default::default()
+    };
+    let model =
+        OpenAIModel::with_transport(config, Arc::new(StaticTransport { body: String::new() })).unwrap();
+    let options = StreamOptions {
+        agent_metadata: Some(crate::models::AgentMetadata {
+            session_id: session.map(Into::into),
+        }),
+        ..Default::default()
+    };
+    model.format_request(&[user("hi")], &options).unwrap().body
+}
+
+#[test]
+fn caching_sends_the_configured_key_else_one_derived_from_the_session() {
+    for api in [OpenAIApi::Responses, OpenAIApi::Chat] {
+        let on = Some(OpenAICacheConfig::default());
+        let keyed =
+            |cache, params, session| cache_body(api, cache, params, session)["prompt_cache_key"].clone();
+        // Derived from the session, as the Bedrock Converse path and the TS adapters do.
+        assert_eq!(keyed(on.clone(), json!({}), Some("a7")), json!("strands-a7"));
+        // A configured key wins over the session; an explicit one in params over both.
+        let configured = Some(OpenAICacheConfig {
+            cache_key: Some("run/1".into()),
+        });
+        assert_eq!(keyed(configured.clone(), json!({}), Some("a7")), json!("run/1"));
+        let params = json!({"prompt_cache_key": "explicit"});
+        assert_eq!(keyed(configured, params, Some("a7")), json!("explicit"));
+        // No session and no key, an empty key, or caching off: none.
+        assert_eq!(keyed(on.clone(), json!({}), None), Value::Null);
+        let empty = Some(OpenAICacheConfig {
+            cache_key: Some(String::new()),
+        });
+        assert_eq!(keyed(empty, json!({}), Some("a7")), Value::Null);
+        assert_eq!(keyed(None, json!({}), Some("a7")), Value::Null);
+    }
+}
