@@ -70,13 +70,19 @@ impl Swarm {
         };
         let limit = self.max_calls();
         for id in waiting {
-            self.emit(SwarmEvent::ModelQueued {
-                id,
-                queued: true,
-                calls,
-                limit,
-            });
+            self.emit_queued(&id, true, calls, limit);
         }
+    }
+
+    /// Publish that `id` started (`queued`) or stopped waiting for a model-call slot.
+    fn emit_queued(&self, id: &str, queued: bool, calls: usize, limit: usize) {
+        let id = id.to_owned();
+        self.emit(SwarmEvent::ModelQueued {
+            id,
+            queued,
+            calls,
+            limit,
+        });
     }
 
     /// Model calls in flight now.
@@ -135,12 +141,7 @@ impl Swarm {
                     let calls = slots.in_flight;
                     drop(slots);
                     if ticket.is_some() {
-                        self.emit(SwarmEvent::ModelQueued {
-                            id: id.to_owned(),
-                            queued: false,
-                            calls,
-                            limit,
-                        });
+                        self.emit_queued(id, false, calls, limit);
                     }
                     return Ok(CallPermit(self.inner.calls.clone()));
                 }
@@ -154,12 +155,7 @@ impl Swarm {
             };
             if shown != Some((calls, limit)) {
                 shown = Some((calls, limit));
-                self.emit(SwarmEvent::ModelQueued {
-                    id: id.to_owned(),
-                    queued: true,
-                    calls,
-                    limit,
-                });
+                self.emit_queued(id, true, calls, limit);
             }
             let cancelled = tokio::select! {
                 _ = changes.changed() => false,
@@ -168,13 +164,7 @@ impl Swarm {
             if cancelled {
                 gate.slots.lock().waiting.retain(|(t, _)| Some(*t) != ticket);
                 gate.wake();
-                let (calls, limit) = (self.calls_in_flight(), self.max_calls());
-                self.emit(SwarmEvent::ModelQueued {
-                    id: id.to_owned(),
-                    queued: false,
-                    calls,
-                    limit,
-                });
+                self.emit_queued(id, false, self.calls_in_flight(), self.max_calls());
                 return Err(Error::Cancelled);
             }
         }
