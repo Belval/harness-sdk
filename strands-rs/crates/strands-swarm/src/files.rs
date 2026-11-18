@@ -61,12 +61,27 @@ pub fn remove_stale_temps(dir: &Path) -> usize {
         else {
             continue;
         };
-        let alive = pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists();
+        let alive = pid == std::process::id() || process_exists(pid);
         if !alive && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
     }
     removed
+}
+
+/// Whether a process `pid` exists: signal 0 reaches it, or it belongs to another user (EPERM).
+/// Only "no such process" counts as gone, so a copy is never deleted from under its writer.
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    !matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 /// [`replace`] on a blocking thread. `bytes` may be shared (an `Arc<Vec<u8>>`), so that a retry
@@ -96,8 +111,11 @@ mod tests {
         for path in [&dead, &mine, &other] {
             std::fs::write(path, "x").unwrap();
         }
+        // pid 1 is alive and another user's: EPERM must not count as gone.
+        let foreign = dir.path().join("swarm.json.tmp-1");
+        std::fs::write(&foreign, "x").unwrap();
         assert_eq!(remove_stale_temps(dir.path()), 1);
-        assert!(!dead.exists() && mine.exists() && other.exists());
+        assert!(!dead.exists() && mine.exists() && other.exists() && foreign.exists());
     }
 
     #[test]
