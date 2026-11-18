@@ -7,6 +7,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use strands_agents::background_tasks::BackgroundTasksConfig;
 use strands_agents::context_manager::ContextManagerOption;
+#[cfg(feature = "mcp")]
 use strands_agents::mcp::{ListOptions, LoadOptions, McpClient, McpServerConfig};
 use strands_agents::memory::{MemoryManager, MemoryStoreRef};
 use strands_agents::models::Model;
@@ -68,6 +69,7 @@ pub enum BackgroundTasksOption {
 }
 
 /// The `mcp_servers` option: a path to an `mcp.json`-shaped config, or an inline server map.
+#[cfg(feature = "mcp")]
 #[derive(Debug, Clone)]
 pub enum McpServersOption {
     /// Path to a JSON config file.
@@ -170,6 +172,7 @@ pub struct HarnessAgentOptions {
     /// harness-added one.
     pub plugins: Vec<Arc<dyn Plugin>>,
     /// MCP servers: a config path or an inline map, loaded via [`McpClient::load_servers`].
+    #[cfg(feature = "mcp")]
     pub mcp_servers: Option<McpServersOption>,
     /// Which built-ins to enable, and their config. Defaults to [`crate::defaults::DEFAULT_BUILTIN_TOOLS`].
     pub builtin_tools: Option<BuiltinToolsConfig>,
@@ -251,7 +254,9 @@ pub async fn create_harness(options: HarnessAgentOptions) -> Result<Agent> {
         None => build_system_prompt(options.instructions.as_deref(), &[]),
     };
 
+    #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
     let mut consumer_tools = options.tools.clone();
+    #[cfg(feature = "mcp")]
     consumer_tools.extend(load_mcp_tools(options.mcp_servers.as_ref()).await?);
     let builtin = build_builtin_tools(&options, &resolved_builtins, web_search, &model, &consumer_tools)?;
 
@@ -370,6 +375,7 @@ pub async fn create_harness(options: HarnessAgentOptions) -> Result<Agent> {
 /// Connect the configured MCP servers and return their (server-prefixed) tools.
 ///
 /// Per-server failures are tolerated (`continue_on_error`), matching TS.
+#[cfg(feature = "mcp")]
 async fn load_mcp_tools(option: Option<&McpServersOption>) -> Result<Vec<ToolRef>> {
     let Some(option) = option else {
         return Ok(Vec::new());
@@ -795,9 +801,14 @@ mod tests {
         );
 
         let names = tool_names(&agent);
+        let mut builtins = vec!["shell", "read", "write", "edit"];
+        if cfg!(feature = "http") {
+            builtins.push("web_fetch");
+        }
+        builtins.push("subagent");
         assert_eq!(
-            names[..6],
-            ["shell", "read", "write", "edit", "web_fetch", "subagent"].map(String::from),
+            names[..builtins.len()],
+            builtins,
             "built-ins in registration order, minus programmatic_tool_caller: {names:?}"
         );
 
@@ -927,6 +938,7 @@ mod tests {
         assert!(names.contains(&"read".to_string()), "{names:?}");
     }
 
+    #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn loads_no_tools_when_mcp_servers_is_unset_or_empty() {
         assert!(load_mcp_tools(None).await.unwrap().is_empty());
@@ -934,12 +946,14 @@ mod tests {
         assert!(load_mcp_tools(Some(&empty)).await.unwrap().is_empty());
     }
 
+    #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn fails_on_a_missing_mcp_config_path() {
         let option = McpServersOption::Path("./does-not-exist-mcp.json".into());
         assert!(load_mcp_tools(Some(&option)).await.is_err());
     }
 
+    #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn skips_a_disabled_mcp_server() {
         let mut servers = indexmap::IndexMap::new();

@@ -15,9 +15,11 @@ pub mod prompt;
 pub mod telemetry;
 pub mod tools;
 
+#[cfg(feature = "mcp")]
+pub use agent::McpServersOption;
 pub use agent::{
-    create_harness, BackgroundTasksOption, CachingOption, HarnessAgentOptions, McpServersOption,
-    MemoryConfig, MemoryOption, SandboxOption, SessionConfig, SessionOption, SkillsOption,
+    create_harness, BackgroundTasksOption, CachingOption, HarnessAgentOptions, MemoryConfig, MemoryOption,
+    SandboxOption, SessionConfig, SessionOption, SkillsOption,
 };
 pub use builtin_tools::{
     BuiltinPluginName, BuiltinToolName, BuiltinToolSetting, BuiltinToolsConfig, WebSearchMode,
@@ -34,9 +36,11 @@ pub use telemetry::{reset_telemetry, setup_telemetry, TRACES_EXPORTER_ENV_VAR};
 ///
 /// Resolvers and the individual tools stay in their modules ([`builtin_tools`], [`tools`]).
 pub mod prelude {
+    #[cfg(feature = "mcp")]
+    pub use crate::agent::McpServersOption;
     pub use crate::agent::{
-        create_harness, BackgroundTasksOption, CachingOption, HarnessAgentOptions, McpServersOption,
-        MemoryConfig, MemoryOption, SandboxOption, SessionConfig, SessionOption, SkillsOption,
+        create_harness, BackgroundTasksOption, CachingOption, HarnessAgentOptions, MemoryConfig,
+        MemoryOption, SandboxOption, SessionConfig, SessionOption, SkillsOption,
     };
     pub use crate::builtin_tools::{
         BuiltinPluginName, BuiltinToolName, BuiltinToolSetting, BuiltinToolsConfig,

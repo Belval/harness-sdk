@@ -14,9 +14,9 @@ pub mod web_search;
 pub use file_tools::{edit, make_read, read, write, ReadConfig};
 #[cfg(feature = "http")]
 pub use web_fetch::{make_web_fetch, FetchedPage, MakeWebFetchOptions, WebFetchTransport};
-pub use web_search::{
-    exa_web_search, make_exa_web_search, search_tool, SearchBackend, SearchResult, WebSearchError,
-};
+#[cfg(feature = "http")]
+pub use web_search::{exa_web_search, make_exa_web_search};
+pub use web_search::{search_tool, SearchBackend, SearchResult, WebSearchError};
 
 #[cfg(test)]
 pub(crate) mod test_support {

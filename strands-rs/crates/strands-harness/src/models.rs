@@ -16,8 +16,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "anthropic", feature = "bedrock", feature = "openai"))]
 use serde_json::json;
 use strands_agents::models::Model;
+#[cfg(any(feature = "anthropic", feature = "bedrock"))]
 use strands_agents::types::JsonValue;
 use strands_agents::{Error, Result};
 
@@ -33,13 +35,16 @@ use strands_agents::models::{BedrockMantleConfig, OpenAICacheConfig, OpenAIModel
 #[cfg(feature = "bedrock")]
 use strands_agents::models::{BedrockModel, BedrockModelConfig, CacheConfig, CacheStrategy};
 
+#[cfg(any(feature = "anthropic", feature = "bedrock"))]
 const ANTHROPIC_MAX_TOKENS: i32 = 32_000;
+#[cfg(any(feature = "anthropic", feature = "bedrock"))]
 const CLAUDE_MAX_TOKENS: &[(&str, i32)] = &[
     ("claude-opus-", 128_000),
     ("claude-sonnet-", 128_000),
     ("claude-haiku-", 64_000),
     ("claude-fable-", 128_000),
 ];
+#[cfg(any(feature = "anthropic", feature = "bedrock"))]
 const CLAUDE_MAX_TOKENS_BY_VERSION: &[(&str, i32)] = &[
     ("claude-opus-4-5", 64_000),
     ("claude-opus-4.5", 64_000),
@@ -63,6 +68,7 @@ const ADAPTIVE_THINKING_SINCE: &[(&str, (u32, u32))] =
 /// `family → [major, minor]` floor at which Claude serves extended thinking.
 const EXTENDED_THINKING_SINCE: &[(&str, (u32, u32))] =
     &[("opus", (4, 5)), ("sonnet", (4, 5)), ("haiku", (4, 5))];
+#[cfg(any(feature = "anthropic", feature = "bedrock"))]
 const EXTENDED_THINKING_BUDGETS: &[(&str, i32)] = &[
     ("low", 2_048),
     ("medium", 8_192),
@@ -309,6 +315,7 @@ fn bedrock_family(id: &str) -> &str {
     id
 }
 
+#[cfg(any(feature = "anthropic", feature = "bedrock"))]
 fn claude_max_tokens(id: &str) -> Option<i32> {
     CLAUDE_MAX_TOKENS_BY_VERSION
         .iter()
@@ -377,6 +384,7 @@ fn claude_thinking_mode(id: &str) -> Option<ThinkingMode> {
     None
 }
 
+#[cfg(any(feature = "anthropic", feature = "bedrock"))]
 fn claude_thinking_block(id: &str, effort: &str, max_tokens: i32) -> JsonValue {
     match claude_thinking_mode(id) {
         Some(ThinkingMode::Extended) => {
@@ -432,6 +440,7 @@ fn bedrock_effort(id: &str, effort: Effort) -> Result<Option<String>> {
     resolve_effort(effort, recommended, levels, &format!("Bedrock model {id}"))
 }
 
+#[cfg(feature = "bedrock")]
 fn bedrock_thinking(id: &str, effort: Option<&str>) -> Option<JsonValue> {
     let effort = effort?;
     let family = bedrock_family(id);
@@ -482,6 +491,7 @@ fn resolve_effort(
 }
 
 /// The Bedrock region TS reads from the environment, or `None` to let the AWS chain decide.
+#[cfg(feature = "bedrock")]
 fn bedrock_region() -> Option<String> {
     ["AWS_REGION", "AWS_DEFAULT_REGION"]
         .iter()
@@ -544,6 +554,7 @@ fn mantle_with_aws(mantle: Option<&mut BedrockMantleConfig>, aws: AwsSettings) {
 }
 
 /// The resolved provider, model name, effort level and effective caching flag for a spec.
+#[cfg_attr(not(any(feature = "anthropic", feature = "openai")), allow(dead_code))]
 struct Resolved<'a> {
     provider: &'a str,
     name: &'a str,
@@ -1827,6 +1838,7 @@ mod anthropic_tests {
 mod openai_tests {
     use super::*;
     use strands_agents::models::openai::resolve_mantle_base_url;
+    use strands_agents::types::JsonValue;
 
     fn resolve(spec: &str, effort: Effort, web_search: bool) -> OpenAIModelConfig {
         openai_config_for(spec, effort, web_search, false, false).expect("resolves")

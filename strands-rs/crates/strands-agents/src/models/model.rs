@@ -49,6 +49,7 @@ pub struct StreamOptions {
 
 /// `messages` and `options` without their cache points, when [`StreamOptions::no_cache`] asks
 /// for that; `None` otherwise. Providers format the returned pair instead, with caching off.
+#[cfg(any(feature = "anthropic", feature = "bedrock"))]
 pub(crate) fn uncached(
     messages: &[Message],
     options: &StreamOptions,

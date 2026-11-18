@@ -10,14 +10,17 @@
 //! schema, result formatting and error text — is verbatim.
 
 use std::sync::Arc;
+#[cfg(feature = "http")]
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use strands_agents::tools::FunctionTool;
 
+#[cfg(feature = "http")]
 const EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 const EXA_TOOL: &str = "web_search_exa";
+#[cfg(feature = "http")]
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESULTS: u32 = 10;
 const DEFAULT_RESULTS: u32 = 5;
