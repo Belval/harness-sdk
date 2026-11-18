@@ -33,7 +33,8 @@ skills, the skills list at 2.5 kB of it.
 ## Run
 
 ```sh
-cargo build --release -p strands-swarm
+# Setting the head makes the build embed it even when worktrees share a target dir.
+STRANDS_SWARM_BUILD_HEAD=$(git rev-parse HEAD) cargo build --release -p strands-swarm
 strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model ID] [--effort E]
               [--cache-ttl 5m|1h] [--no-keep-warm]
               [--instructions FILE] [--memory FILE | --no-memory]

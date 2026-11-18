@@ -22,8 +22,9 @@ pub async fn stale(commit: Option<&str>, source: &Path) -> Option<String> {
     (head != commit).then(|| {
         format!(
             "this binary embeds commit {commit} but its checkout {} is at {head}: the build script \
-             did not rerun (cargo reused its output). Run `cargo build --release -p strands-swarm` \
-             again, or touch crates/strands-swarm/build.rs to force it, then retry.",
+             did not rerun (cargo reused its output). Rebuild with \
+             `STRANDS_SWARM_BUILD_HEAD=$(git rev-parse HEAD) cargo build --release -p strands-swarm`, \
+             which always reruns it when the head moved, then retry.",
             source.display()
         )
     })

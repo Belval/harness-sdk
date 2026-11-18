@@ -24,7 +24,10 @@ fn main() {
     // judged from the fingerprint of the last run, which worktrees sharing a target dir also
     // share (their package hashes alike): a build in one can leave another embedding a stale
     // commit, and the reload self-test refuses such a binary (`version::stale`). Rerunning on
-    // every build would recompile the crate every time, so the check lives there instead.
+    // every build would recompile the crate every time. A build that sets
+    // `STRANDS_SWARM_BUILD_HEAD` (e.g. to `$(git rev-parse HEAD)`) reruns this script whenever that
+    // value differs from the last run's, which no shared fingerprint can hide.
+    println!("cargo:rerun-if-env-changed=STRANDS_SWARM_BUILD_HEAD");
     // Rebuild when HEAD moves: its file, the branch it points at, packed refs, and HEAD's reflog,
     // which every commit, merge and checkout appends to (a branch ref packed when this ran has no
     // file to watch, and the loose one written by the next commit would go unnoticed).
