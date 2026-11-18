@@ -68,9 +68,28 @@ impl FileStorage {
     }
 
     async fn write_json<T: serde::Serialize>(&self, path: &Path, data: &T) -> Result<()> {
-        write_json_atomically(path, data)
+        let json = serde_json::to_vec_pretty(data)
+            .map_err(|err| session_error(format!("Failed to write file {}", path.display()), err))?;
+        self.write_bytes(path, &json).await
+    }
+
+    async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        write_atomically(path, bytes)
             .await
             .map_err(|err| session_error(format!("Failed to write file {}", path.display()), err))
+    }
+
+    fn snapshot_path(
+        &self,
+        location: &SnapshotLocation,
+        snapshot_id: &str,
+        is_latest: bool,
+    ) -> Result<PathBuf> {
+        if is_latest {
+            self.latest_snapshot_path(location)
+        } else {
+            self.history_snapshot_path(location, snapshot_id)
+        }
     }
 
     async fn read_json<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<Option<T>> {
@@ -90,17 +109,14 @@ impl FileStorage {
     }
 }
 
-async fn write_json_atomically<T: serde::Serialize>(
-    path: &Path,
-    data: &T,
-) -> std::result::Result<(), BoxError> {
+async fn write_atomically(path: &Path, bytes: &[u8]) -> std::result::Result<(), BoxError> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let mut tmp_path = path.as_os_str().to_owned();
     tmp_path.push(".tmp");
     let tmp_path = PathBuf::from(tmp_path);
-    write_synced(&tmp_path, &serde_json::to_vec_pretty(data)?).await?;
+    write_synced(&tmp_path, bytes).await?;
     tokio::fs::rename(&tmp_path, path).await?;
     sync_parent(path).await;
     Ok(())
@@ -154,12 +170,19 @@ impl SnapshotStorage for FileStorage {
         is_latest: bool,
         snapshot: &Snapshot,
     ) -> Result<()> {
-        let path = if is_latest {
-            self.latest_snapshot_path(location)?
-        } else {
-            self.history_snapshot_path(location, snapshot_id)?
-        };
+        let path = self.snapshot_path(location, snapshot_id, is_latest)?;
         self.write_json(&path, snapshot).await
+    }
+
+    async fn save_snapshot_json(
+        &self,
+        location: &SnapshotLocation,
+        snapshot_id: &str,
+        is_latest: bool,
+        json: &[u8],
+    ) -> Result<()> {
+        let path = self.snapshot_path(location, snapshot_id, is_latest)?;
+        self.write_bytes(&path, json).await
     }
 
     async fn load_snapshot(
@@ -729,5 +752,32 @@ mod tests {
         assert!(content.starts_with("{\n  \"scope\": \"agent\","), "{content}");
         assert!(content.ends_with('}'), "{content}");
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn stores_snapshot_json_as_given_and_loads_compact_and_pretty_alike() {
+        let (dir, storage) = storage();
+        let snapshot = test_snapshot();
+        let path = snapshots_dir(dir.path(), &location()).join("snapshot_latest.json");
+        for json in [
+            serde_json::to_vec(&snapshot).unwrap(),
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        ] {
+            storage
+                .save_snapshot_json(&location(), "1", true, &json)
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), json);
+            let loaded = storage.load_snapshot(&location(), None).await.unwrap();
+            assert_eq!(loaded, Some(snapshot.clone()));
+        }
+        storage
+            .save_snapshot_json(&location(), IDS[0], false, b"{}")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.list_snapshot_ids(&location(), None, None).await.unwrap(),
+            [IDS[0]]
+        );
     }
 }

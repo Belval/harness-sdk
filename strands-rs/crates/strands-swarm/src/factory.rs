@@ -262,10 +262,12 @@ fn model_option(options: &HarnessFactoryOptions, model: Option<String>) -> Optio
 
 /// A session manager for `agent_id` under `dir` (a run's `sessions` dir), saved after every
 /// message so a crash loses at most the in-flight model call. A save that finds the disk full
-/// spends the run's reserve ([`crate::reserve`]) on it.
+/// spends the run's reserve ([`crate::reserve`]) on it. Snapshots are compact JSON: nobody reads
+/// them by hand, and pretty ones cost a quarter more to write.
 pub fn agent_session_manager(dir: &std::path::Path, agent_id: &str) -> Result<SessionManager> {
     let options = SessionManagerOptions {
         save_latest_on: SaveLatestStrategy::Message,
+        compact: true,
         ..Default::default()
     };
     let run_dir = dir.parent().unwrap_or(dir);
@@ -1239,5 +1241,41 @@ mod tests {
             .unwrap();
         let schema = tool.spec().input_schema.clone().unwrap();
         assert!(schema["properties"]["line_range"].is_object(), "{schema}");
+    }
+
+    #[tokio::test]
+    async fn conversations_are_saved_compact_and_old_pretty_ones_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = || {
+            Agent::builder()
+                .model(Arc::new(MockMessageModel::new(Vec::new())))
+                .build()
+                .unwrap()
+        };
+        let source = agent();
+        source.set_messages(
+            [Message::user("one\ntwo")]
+                .into_iter()
+                .chain(exchange("t1", 50))
+                .collect(),
+        );
+        let manager = agent_session_manager(dir.path(), "a1").unwrap();
+        manager.save_snapshot(&source, true).await.unwrap();
+        let path = dir.path().join(format!(
+            "a1/scopes/agent/{}/snapshots/snapshot_latest.json",
+            source.id()
+        ));
+        let compact = std::fs::read(&path).unwrap();
+        assert!(!compact.contains(&b'\n'), "compact");
+        let restored = agent();
+        assert!(manager.restore_snapshot(&restored, None).await.unwrap());
+        assert_eq!(restored.messages(), source.messages());
+
+        // As runs before compact snapshots wrote it.
+        let old: serde_json::Value = serde_json::from_slice(&compact).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+        let restored = agent();
+        assert!(manager.restore_snapshot(&restored, None).await.unwrap());
+        assert_eq!(restored.messages(), source.messages());
     }
 }

@@ -106,6 +106,10 @@ impl S3SessionStorage {
     async fn write_json<T: serde::Serialize>(&self, key: &str, data: &T) -> Result<()> {
         let body = serde_json::to_vec_pretty(data)
             .map_err(|err| session_error(format!("Failed to write S3 object {key}"), err))?;
+        self.write_bytes(key, body).await
+    }
+
+    async fn write_bytes(&self, key: &str, body: Vec<u8>) -> Result<()> {
         self.client
             .put_object()
             .bucket(&self.bucket)
@@ -234,6 +238,21 @@ impl SnapshotStorage for S3SessionStorage {
             self.history_snapshot_key(location, snapshot_id)?
         };
         self.write_json(&key, snapshot).await
+    }
+
+    async fn save_snapshot_json(
+        &self,
+        location: &SnapshotLocation,
+        snapshot_id: &str,
+        is_latest: bool,
+        json: &[u8],
+    ) -> Result<()> {
+        let key = if is_latest {
+            self.latest_snapshot_key(location)?
+        } else {
+            self.history_snapshot_key(location, snapshot_id)?
+        };
+        self.write_bytes(&key, json.to_vec()).await
     }
 
     async fn load_snapshot(

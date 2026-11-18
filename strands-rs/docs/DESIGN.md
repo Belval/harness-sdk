@@ -75,6 +75,11 @@ installs the exporter).
 - `AgentBuilder::build()` and `Agent::new()` are **synchronous**: they allocate the agent and
   nothing else. `Agent::initialize()` (plugins, session restore, sandbox tools) runs lazily on the
   first `invoke`/`stream`; call it explicitly to observe that state earlier.
+- `SessionManager` serializes an agent's snapshot straight from the agent into one buffer (the
+  conversation under its read lock: no clone, no `Value` tree) and hands the bytes to
+  `SnapshotStorage::save_snapshot_json`, which `FileStorage` and `S3SessionStorage` store as is
+  (the default parses them for `save_snapshot`). The bytes are TS's pretty form unless
+  `SessionManagerOptions::compact` (Rust-only) asks for compact JSON; loading accepts both.
 - Option/result structs that will grow are `#[non_exhaustive]` and built from `Default` plus
   `with_*` setters (`InvokeOptions::default().with_limits(Limits::default().with_turns(2))`);
   public enums that mirror a provider's wire format are `#[non_exhaustive]` too.

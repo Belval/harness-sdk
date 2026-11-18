@@ -41,6 +41,20 @@ pub trait SnapshotStorage: Send + Sync {
         snapshot: &Snapshot,
     ) -> Result<()>;
 
+    /// [`SnapshotStorage::save_snapshot`] for a snapshot already serialized as JSON (pretty or
+    /// compact). The default parses it; storages that keep bytes override it to store them as is.
+    async fn save_snapshot_json(
+        &self,
+        location: &SnapshotLocation,
+        snapshot_id: &str,
+        is_latest: bool,
+        json: &[u8],
+    ) -> Result<()> {
+        let snapshot: Snapshot = serde_json::from_slice(json)?;
+        self.save_snapshot(location, snapshot_id, is_latest, &snapshot)
+            .await
+    }
+
     /// Loads a snapshot, or the latest one when `snapshot_id` is `None`. Absent is `Ok(None)`.
     async fn load_snapshot(
         &self,

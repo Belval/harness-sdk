@@ -1,11 +1,12 @@
 //! The `SessionManager` plugin (`strands-ts/src/session/session-manager.ts`).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::agent_snapshot::{load_agent_snapshot, take_agent_snapshot};
+use super::agent_snapshot::{load_agent_snapshot, take_agent_snapshot_json};
 use super::storage::{SnapshotLocation, SnapshotStorage};
 use super::validation::validate_identifier;
 use crate::agent::Agent;
@@ -41,6 +42,9 @@ pub struct SessionManagerOptions {
     pub save_latest_on: SaveLatestStrategy,
     /// Callback deciding when to add an immutable snapshot.
     pub snapshot_trigger: Option<SnapshotTrigger>,
+    /// Write snapshots as compact JSON instead of TS's 2-space pretty form: about a quarter
+    /// smaller and faster. Loading accepts both.
+    pub compact: bool,
 }
 
 impl std::fmt::Debug for SessionManagerOptions {
@@ -48,6 +52,7 @@ impl std::fmt::Debug for SessionManagerOptions {
         f.debug_struct("SessionManagerOptions")
             .field("save_latest_on", &self.save_latest_on)
             .field("snapshot_trigger", &self.snapshot_trigger.is_some())
+            .field("compact", &self.compact)
             .finish()
     }
 }
@@ -56,6 +61,8 @@ struct Inner {
     session_id: String,
     storage: Arc<dyn SnapshotStorage>,
     options: SessionManagerOptions,
+    /// Length of the last snapshot serialized, to size the next one's buffer.
+    last_len: AtomicUsize,
 }
 
 /// Persists agent state to a [`SnapshotStorage`] so conversations survive across invocations.
@@ -94,6 +101,7 @@ impl SessionManager {
                 session_id: session_id.to_owned(),
                 storage,
                 options,
+                last_len: AtomicUsize::new(0),
             }),
         })
     }
@@ -107,9 +115,19 @@ impl SessionManager {
         SnapshotLocation::agent(&self.inner.session_id, agent.id())
     }
 
+    /// The agent's snapshot as JSON, serialized straight from the agent into one buffer sized
+    /// after the last one (measured for the first).
+    fn snapshot_json(&self, agent: &Agent) -> Result<Vec<u8>> {
+        let last = self.inner.last_len.load(Ordering::Relaxed);
+        let capacity = (last > 0).then_some(last + last / 16);
+        let json = take_agent_snapshot_json(agent, !self.inner.options.compact, capacity)?;
+        self.inner.last_len.store(json.len(), Ordering::Relaxed);
+        Ok(json)
+    }
+
     /// Saves a snapshot of the agent's current state.
     pub async fn save_snapshot(&self, agent: &Agent, is_latest: bool) -> Result<()> {
-        let snapshot = take_agent_snapshot(agent);
+        let json = self.snapshot_json(agent)?;
         let snapshot_id = if is_latest {
             "latest".to_owned()
         } else {
@@ -117,7 +135,7 @@ impl SessionManager {
         };
         self.inner
             .storage
-            .save_snapshot(&self.location(agent), &snapshot_id, is_latest, &snapshot)
+            .save_snapshot_json(&self.location(agent), &snapshot_id, is_latest, &json)
             .await
     }
 
@@ -182,13 +200,13 @@ impl SessionManager {
 
     /// Captures one snapshot and writes it to both immutable history and `snapshot_latest`.
     async fn save_immutable_and_latest(&self, agent: &Agent) -> Result<()> {
-        let snapshot = take_agent_snapshot(agent);
+        let json = self.snapshot_json(agent)?;
         let location = self.location(agent);
         let snapshot_id = Uuid::now_v7().to_string();
         let storage = &self.inner.storage;
         tokio::try_join!(
-            storage.save_snapshot(&location, &snapshot_id, false, &snapshot),
-            storage.save_snapshot(&location, "latest", true, &snapshot),
+            storage.save_snapshot_json(&location, &snapshot_id, false, &json),
+            storage.save_snapshot_json(&location, "latest", true, &json),
         )?;
         Ok(())
     }
@@ -294,7 +312,7 @@ mod tests {
     fn options(save_latest_on: SaveLatestStrategy) -> SessionManagerOptions {
         SessionManagerOptions {
             save_latest_on,
-            snapshot_trigger: None,
+            ..Default::default()
         }
     }
 
@@ -305,6 +323,7 @@ mod tests {
         SessionManagerOptions {
             save_latest_on,
             snapshot_trigger: Some(Arc::new(trigger)),
+            ..Default::default()
         }
     }
 
@@ -1062,5 +1081,35 @@ mod tests {
         let err = agent.hooks().invoke_callbacks(&mut event).await.unwrap_err();
 
         assert_eq!(err.name(), "SessionError");
+    }
+
+    #[tokio::test]
+    async fn compact_and_pretty_snapshots_both_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn SnapshotStorage> = Arc::new(crate::session::FileStorage::new(dir.path()));
+        let pretty = SessionManager::new("s", Arc::clone(&storage)).unwrap();
+        let compact = SessionManagerOptions {
+            compact: true,
+            ..Default::default()
+        };
+        let compact = SessionManager::with_options("s", storage, compact).unwrap();
+        let agent = test_agent_for_session("test-agent");
+        agent.set_messages(vec![Message::user("hello\nthere"), Message::assistant("hi")]);
+        agent.state().set("k", json!([1, "two"]));
+        let path = dir
+            .path()
+            .join("s/scopes/agent/test-agent/snapshots/snapshot_latest.json");
+
+        for (saver, is_pretty) in [(&pretty, true), (&compact, false)] {
+            saver.save_snapshot(&agent, true).await.unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.contains('\n'), is_pretty, "{text}");
+            for loader in [&pretty, &compact] {
+                let target = test_agent_for_session("test-agent");
+                assert!(loader.restore_snapshot(&target, None).await.unwrap());
+                assert_eq!(target.messages(), agent.messages());
+                assert_eq!(target.state().to_json(), json!({ "k": [1, "two"] }));
+            }
+        }
     }
 }

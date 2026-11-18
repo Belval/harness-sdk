@@ -140,6 +140,20 @@ impl<S: strands_agents::session::SnapshotStorage> strands_agents::session::Snaps
         .await
     }
 
+    async fn save_snapshot_json(
+        &self,
+        location: &strands_agents::session::SnapshotLocation,
+        snapshot_id: &str,
+        is_latest: bool,
+        json: &[u8],
+    ) -> strands_agents::Result<()> {
+        save_with(&self.run_dir, || {
+            self.inner
+                .save_snapshot_json(location, snapshot_id, is_latest, json)
+        })
+        .await
+    }
+
     async fn load_snapshot(
         &self,
         location: &strands_agents::session::SnapshotLocation,

@@ -583,7 +583,7 @@ fn resolve_session(
                 Arc::new(FileStorage::new(&dir)),
                 SessionManagerOptions {
                     save_latest_on: SaveLatestStrategy::Message,
-                    snapshot_trigger: None,
+                    ..Default::default()
                 },
             )?;
             let storage = LocalFileStorage::new(dir.join(&id).to_string_lossy().as_ref());

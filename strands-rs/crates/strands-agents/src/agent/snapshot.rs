@@ -126,7 +126,98 @@ impl SnapshotField {
     }
 }
 
+/// [`Agent::take_snapshot`]'s wire form, serialized from the agent's own data: the conversation
+/// is written under its read lock, never cloned or turned into a `Value` tree.
+struct SnapshotJson<'a> {
+    agent: &'a Agent,
+    fields: &'a [SnapshotField],
+    app_data: &'a Map<String, Value>,
+    created_at: &'a str,
+}
+
+impl serde::Serialize for SnapshotJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // Snapshot's field order.
+        let mut map = serializer.serialize_map(Some(5))?;
+        map.serialize_entry("scope", &Scope::Agent)?;
+        map.serialize_entry("schemaVersion", SNAPSHOT_SCHEMA_VERSION)?;
+        map.serialize_entry("createdAt", self.created_at)?;
+        map.serialize_entry("data", &DataJson(self.agent, self.fields))?;
+        map.serialize_entry("appData", self.app_data)?;
+        map.end()
+    }
+}
+
+/// A writer that only counts bytes.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct DataJson<'a>(&'a Agent, &'a [SnapshotField]);
+
+impl serde::Serialize for DataJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let DataJson(agent, fields) = *self;
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for field in fields {
+            match field {
+                SnapshotField::Messages => {
+                    map.serialize_entry(field.key(), &*agent.inner.messages.read())?;
+                }
+                field => map.serialize_entry(field.key(), &field.capture(agent))?,
+            }
+        }
+        map.end()
+    }
+}
+
 impl Agent {
+    /// [`Agent::take_snapshot`] as JSON (`pretty`: TS's 2-space form), written straight into a
+    /// buffer of `capacity` bytes, grown if need be (`None`: measured by a first pass, so the
+    /// buffer never reallocates): no copy of the conversation, no `Value` tree.
+    pub(crate) fn take_snapshot_json(
+        &self,
+        options: &TakeSnapshotOptions,
+        pretty: bool,
+        capacity: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let snapshot = SnapshotJson {
+            agent: self,
+            fields: &options.fields(),
+            app_data: &options.app_data,
+            created_at: &now_iso8601(),
+        };
+        let write = |writer: &mut dyn std::io::Write| {
+            if pretty {
+                serde_json::to_writer_pretty(writer, &snapshot)
+            } else {
+                serde_json::to_writer(writer, &snapshot)
+            }
+        };
+        let capacity = match capacity {
+            Some(capacity) => capacity,
+            None => {
+                let mut count = ByteCount(0);
+                write(&mut count)?;
+                count.0
+            }
+        };
+        let mut json = Vec::with_capacity(capacity);
+        write(&mut json)?;
+        Ok(json)
+    }
+
     /// Captures the agent's state as a `Snapshot` (`scope: "agent"`).
     pub fn take_snapshot(&self, options: TakeSnapshotOptions) -> Snapshot {
         let mut data = Map::new();
@@ -405,6 +496,40 @@ mod tests {
         agent.load_snapshot(&snapshot).unwrap();
 
         assert!(agent.interrupt_state().is_activated());
+    }
+
+    #[test]
+    fn snapshot_json_is_the_snapshot_byte_for_byte_pretty_or_compact() {
+        let agent = test_agent_for_session("a");
+        agent.set_messages(vec![
+            Message::user("hello \"quoted\"\n"),
+            Message::assistant("hi"),
+        ]);
+        agent.state().set("k", json!({ "nested": [1, 2.5, null] }));
+        agent.interrupt_state_shared().lock().activate();
+        let options = TakeSnapshotOptions::default()
+            .exclude(SnapshotField::ModelState)
+            .app_data(Map::from_iter([("custom".to_owned(), json!(7))]));
+
+        for pretty in [true, false] {
+            let json = agent.take_snapshot_json(&options, pretty, None).unwrap();
+            assert_eq!(json.len(), json.capacity(), "measured exactly");
+            let parsed: Snapshot = serde_json::from_slice(&json).unwrap();
+            let expected = Snapshot {
+                created_at: parsed.created_at.clone(),
+                ..agent.take_snapshot(options.clone())
+            };
+            let bytes = if pretty {
+                serde_json::to_vec_pretty(&expected)
+            } else {
+                serde_json::to_vec(&expected)
+            };
+            assert_eq!(
+                String::from_utf8(json).unwrap(),
+                String::from_utf8(bytes.unwrap()).unwrap()
+            );
+            assert_eq!(parsed, expected);
+        }
     }
 
     #[test]

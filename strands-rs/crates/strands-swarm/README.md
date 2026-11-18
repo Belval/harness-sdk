@@ -507,6 +507,10 @@ messages you.
   `jobs/`, `journal.jsonl`, `events.jsonl`, `swarm.log`, `logs/` (MCP servers), `mcp-tools.json`
   and `bin/` (installed binaries). `swarmctl` adds `args`, `env`, `stderr.log`, `supervisor.log`,
   `supervisor.notice` and the `stop` marker.
+- **Saves.** An agent's conversation is saved after each message, as compact JSON serialized
+  straight from the agent into one buffer the size of the file (no copy of the conversation),
+  then written to a temp file, fsynced and renamed over the old one. Pretty-printed files from
+  older runs load as before.
 - **Bounds.** A run dir grows with the live agents' work since the last resume and with unreported
   jobs, not with the run's age:
   - `journal.jsonl` and `events.jsonl` are rotated to `<file>.1` at 16 MB, so each takes at most

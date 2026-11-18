@@ -8,8 +8,19 @@ use crate::agent::{Agent, TakeSnapshotOptions};
 use crate::error::Result;
 
 /// Captures the agent's session state (the `session` snapshot preset).
+#[cfg(test)]
 pub(crate) fn take_agent_snapshot(agent: &Agent) -> Snapshot {
     agent.take_snapshot(TakeSnapshotOptions::default())
+}
+
+/// The agent's session state (the `session` snapshot preset) serialized as JSON into a buffer of `capacity` bytes (see
+/// [`Agent::take_snapshot_json`]).
+pub(crate) fn take_agent_snapshot_json(
+    agent: &Agent,
+    pretty: bool,
+    capacity: Option<usize>,
+) -> Result<Vec<u8>> {
+    agent.take_snapshot_json(&TakeSnapshotOptions::default(), pretty, capacity)
 }
 
 /// Restores a snapshot into the agent. Absent keys leave the corresponding field unchanged.
