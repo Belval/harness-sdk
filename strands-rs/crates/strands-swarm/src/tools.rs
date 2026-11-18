@@ -101,7 +101,7 @@ struct SpawnInput {
     /// Checkable; a judge sends it back to work until met.
     #[serde(default)]
     goal: Option<String>,
-    /// Compaction point in tokens (default 300k).
+    /// Compaction point in tokens (default 85% of window).
     #[serde(default)]
     compact_at: Option<u64>,
     /// Token cap including descendants.

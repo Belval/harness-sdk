@@ -227,7 +227,7 @@ pub struct AgentSpec {
     /// ([`SwarmEvent::Compacted`]); a factory without summarization may ignore it.
     pub on_compacted: Option<crate::compaction::CompactedSink>,
     /// Input size (tokens) at which to summarize older turns, or 85% of the window when that is
-    /// smaller; `None` uses [`crate::compaction::DEFAULT_CAP`] ([`crate::compaction::compaction_point`]).
+    /// smaller; `None` uses the 85% alone ([`crate::compaction::compaction_point`]).
     pub compact_at: Option<u64>,
 }
 
@@ -278,8 +278,8 @@ pub struct SwarmConfig {
     /// agent's own model. Side calls are gated and counted like the agent's own calls either way.
     pub side_model: Option<Arc<dyn Model>>,
     /// Input size (tokens) at which the factory summarizes older turns, unless an agent was
-    /// spawned with its own ([`SpawnRequest::compact_at`]); `None` (the default) is
-    /// [`crate::compaction::DEFAULT_CAP`], or 85% of a smaller window ([`crate::compaction::compaction_point`]). The context share in
+    /// spawned with its own ([`SpawnRequest::compact_at`]); `None` (the default) is 85% of the
+    /// agent's model window ([`crate::compaction::compaction_point`]). The context share in
     /// [`SwarmEvent::Usage`] is relative to that point.
     pub compact_at: Option<u64>,
     /// Longest an idle-mode reload waits for in-flight tool calls before it restarts anyway.
@@ -782,7 +782,7 @@ impl Node {
     }
 
     /// Where older turns are summarized: the spawn's override, else the swarm's `--compact-at`,
-    /// else (`None`) the default cap or 85% of the window, if smaller.
+    /// else (`None`) 85% of the window.
     fn compact_at(&self, config: &SwarmConfig) -> Option<u64> {
         self.compact_at.or(config.compact_at)
     }

@@ -1,6 +1,6 @@
-//! When to summarize an agent's older turns: by default at 85% of its model's window, but never
-//! later than [`DEFAULT_CAP`] tokens; or at a fixed token count (`--compact-at`, `spawn_agent`'s
-//! `compact_at`) when that is smaller than the window's 85%.
+//! When to summarize an agent's older turns: by default at 85% of its model's window (850k
+//! tokens of a 1M window), or at a fixed token count (`--compact-at`, `spawn_agent`'s
+//! `compact_at`) when that is smaller.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -22,20 +22,11 @@ use strands_agents::models::{
 use strands_agents::types::{ContentBlock, Message, Role, SystemPrompt};
 use strands_agents::{Error, Model, Result};
 
-/// Without a `compact_at`, the latest point at which older turns are summarized, whatever the
-/// window. Every call re-reads the whole context at 0.1x input, so a 1M-window agent left to
-/// grow to 850k pays up to 8x the reads of one kept near 100k. A swarm of 1M-window agents
-/// priced from its `events.jsonl` spent 59% of its money on cache reads, 38% of it on calls
-/// above 300k tokens; a compaction (the summarizer's uncached read of the context, plus the
-/// rewrite of half of it) pays for itself within some 20 calls. `--compact-at` or `spawn_agent`'s
-/// `compact_at` can still go up to the 85% mark.
-pub const DEFAULT_CAP: u64 = 300_000;
-
-/// The input size (tokens) at which older turns are summarized: `compact_at` when given, else
-/// [`DEFAULT_CAP`], but never past the context manager's own 85% mark of `window`.
+/// The input size (tokens) at which older turns are summarized: the context manager's own 85%
+/// mark of `window`, or `compact_at` when given and smaller.
 pub fn compaction_point(window: u64, compact_at: Option<u64>) -> u64 {
     let auto = (window as f64 * AUTO_SUMMARIZE_UTILIZATION) as u64;
-    auto.min(compact_at.unwrap_or(DEFAULT_CAP)).max(1)
+    compact_at.map_or(auto, |at| auto.min(at)).max(1)
 }
 
 /// The utilization (share of `window`) at which to summarize:
@@ -132,8 +123,7 @@ pub struct CompactAt {
 }
 
 impl CompactAt {
-    /// Compact at `compact_at` tokens, or at [`DEFAULT_CAP`] when `None`; 85% of the window at
-    /// most.
+    /// Compact at `compact_at` tokens, or at 85% of the window when `None` or smaller.
     pub fn new(compact_at: Option<u64>) -> Self {
         Self {
             compact_at,
@@ -945,7 +935,7 @@ mod tests {
             .unwrap()
     }
 
-    /// The 85% point of a 1M window (850k) in ~2k-token tool results.
+    /// The default point of a 1M window (850k) in ~2k-token tool results.
     fn at_850k() -> Vec<Message> {
         let messages = tool_loop_of(425, 2_000);
         let tokens = heuristic(&messages);
@@ -959,7 +949,7 @@ mod tests {
         let summaries: Vec<&str> = summaries.iter().map(String::as_str).collect();
         let summarizer = Windowed::new(&summaries, 200_000);
         let agent = agent_with_summarizer(&summarizer);
-        let (manager, events) = manager(Some(850_000), None);
+        let (manager, events) = manager(None, None);
         let mut messages = at_850k();
         let before = heuristic(&messages);
 
@@ -991,7 +981,7 @@ mod tests {
         let summaries: Vec<&str> = summaries.iter().map(String::as_str).collect();
         let summarizer = Windowed::rejecting(&summaries, 1_000_000, 150_000);
         let agent = agent_with_summarizer(&summarizer);
-        let (manager, events) = manager(Some(850_000), None);
+        let (manager, events) = manager(None, None);
         let mut messages = at_850k();
         let before = heuristic(&messages);
 
@@ -1180,18 +1170,12 @@ mod tests {
     }
 
     #[test]
-    fn by_default_compacts_at_85_percent_of_the_window_but_not_past_the_cap() {
-        // A 1M window (Opus 5.5) is cut at the cap, not at 850k; a small window at its 85%.
-        assert_eq!(compaction_point(1_000_000, None), DEFAULT_CAP);
-        assert!((compaction_utilization(1_000_000, None) - 0.3).abs() < 1e-9);
+    fn by_default_compacts_at_85_percent_of_the_window() {
+        // A 1M window (Opus 5.5) is used to 850k, not cut at 200k as before.
+        assert_eq!(compaction_point(1_000_000, None), 850_000);
+        assert!((compaction_utilization(1_000_000, None) - AUTO_SUMMARIZE_UTILIZATION).abs() < 1e-9);
         assert_eq!(compaction_point(200_000, None), 170_000);
         assert_eq!(compaction_point(0, None), 1);
-    }
-
-    #[test]
-    fn compact_at_can_lift_the_point_above_the_cap_up_to_85_percent() {
-        assert_eq!(compaction_point(1_000_000, Some(600_000)), 600_000);
-        assert_eq!(compaction_point(1_000_000, Some(5_000_000)), 850_000);
     }
 
     #[test]

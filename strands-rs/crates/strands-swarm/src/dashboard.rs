@@ -44,7 +44,7 @@ pub struct ContextControl {
 
 impl ContextControl {
     /// A control for an agent whose older turns are summarized at `compact_at` tokens, or at
-    /// [`crate::compaction::DEFAULT_CAP`] when `None`; 85% of its window at most.
+    /// 85% of its window when `None` or smaller.
     pub fn new(compact_at: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
             compact_at,
@@ -513,13 +513,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_point_is_the_cap_unless_compact_at_says_otherwise() {
-        // A 1M window: the default cap, not 85%; `compact_at` goes either way up to 85%.
-        for (compact_at, point) in [
-            (None, "300,000"),
-            (Some(100_000), "100,000"),
-            (Some(600_000), "600,000"),
-        ] {
+    async fn the_point_is_85_percent_of_the_window_unless_compact_at_is_smaller() {
+        // Not the 200k the swarm used to cut every window at.
+        for (compact_at, point) in [(None, "850,000"), (Some(300_000), "300,000")] {
             let model = MockMessageModel::shared(vec![
                 call("context", "c1", serde_json::json!({})),
                 MockResponse::message(Message::assistant("done")),
