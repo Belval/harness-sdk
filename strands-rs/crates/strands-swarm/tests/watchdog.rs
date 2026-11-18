@@ -26,6 +26,9 @@ fn reports_a_lock_order_deadlock() {
         });
     }
 
-    let report = reported.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Detection is quick, but parking_lot then resolves each deadlocked thread's backtrace
+    // (symbols of a debug binary) before it reports: ~7 s on a host at load 100, so 10 s flaked.
+    // A missed deadlock still fails, only later.
+    let report = reported.recv_timeout(Duration::from_secs(120)).unwrap();
     assert!(report.starts_with("1 deadlock cycle(s) detected"), "{report}");
 }
