@@ -35,10 +35,15 @@ pub fn replace(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> 
     Ok(())
 }
 
-/// [`replace`] on a blocking thread.
-pub async fn replace_async(path: &Path, bytes: Vec<u8>, durable: bool) -> std::io::Result<()> {
+/// [`replace`] on a blocking thread. `bytes` may be shared (an `Arc<Vec<u8>>`), so that a retry
+/// needs no copy.
+pub async fn replace_async<B>(path: &Path, bytes: B, durable: bool) -> std::io::Result<()>
+where
+    B: std::ops::Deref + Send + 'static,
+    B::Target: AsRef<[u8]>,
+{
     let path = path.to_owned();
-    tokio::task::spawn_blocking(move || replace(&path, &bytes, durable))
+    tokio::task::spawn_blocking(move || replace(&path, (*bytes).as_ref(), durable))
         .await
         .map_err(std::io::Error::other)?
 }

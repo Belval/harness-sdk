@@ -1881,7 +1881,7 @@ async fn a_calls_tokens_are_saved_before_the_turn_ends() {
     tool_started(&mut events, "wait").await;
     let state_file = state_dir.join("swarm.json");
     eventually("the call's tokens are saved", || {
-        std::fs::read_to_string(&state_file).is_ok_and(|text| text.contains("\"input_tokens\": 1234"))
+        std::fs::read_to_string(&state_file).is_ok_and(|text| text.contains("\"input_tokens\":1234"))
     })
     .await;
     swarm.shutdown().await;

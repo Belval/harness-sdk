@@ -215,7 +215,14 @@ async fn load_saved(dir: &Path) -> Result<Option<SwarmState>> {
 #[derive(Debug)]
 pub struct Persister {
     dir: PathBuf,
-    written: tokio::sync::Mutex<u64>,
+    written: tokio::sync::Mutex<Written>,
+}
+
+/// The state last written: its generation, and its length and hash.
+#[derive(Debug, Default)]
+struct Written {
+    generation: u64,
+    print: Option<(usize, u64)>,
 }
 
 impl Persister {
@@ -223,7 +230,7 @@ impl Persister {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
-            written: tokio::sync::Mutex::new(0),
+            written: Default::default(),
         }
     }
 
@@ -232,22 +239,39 @@ impl Persister {
         &self.dir
     }
 
-    /// Write `state` as generation `generation`, unless a newer one is already on disk.
+    /// Write `state` as generation `generation`, unless a newer one is already on disk or the file
+    /// already holds the same bytes. Compact JSON: nobody reads it by hand, and [`load`] takes
+    /// the pretty form older runs wrote too.
     pub async fn write(&self, generation: u64, state: &SwarmState) -> Result<()> {
         let mut written = self.written.lock().await;
-        if generation <= *written {
+        if generation <= written.generation {
             return Ok(());
         }
-        let json = serde_json::to_vec_pretty(state).map_err(|e| Error::other(e.to_string()))?;
-        // Durable: after a power loss, the old state or the new one, never an empty file. A full
-        // disk spends the run's reserve on it.
-        let path = self.dir.join(STATE_FILE);
-        crate::reserve::save_with(&self.dir, || {
-            crate::files::replace_async(&path, json.clone(), true)
-        })
-        .await
-        .map_err(|e| Error::other(format!("Failed to save swarm state: {e}")))?;
-        *written = generation;
+        let capacity = written.print.map_or(0, |(len, _)| len + len / 16);
+        let mut json = Vec::with_capacity(capacity);
+        serde_json::to_writer(&mut json, state).map_err(|e| Error::other(e.to_string()))?;
+        let print = {
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(&json);
+            (json.len(), hasher.finish())
+        };
+        if written.print != Some(print) {
+            written.print = None;
+            // Durable: after a power loss, the old state or the new one, never an empty file. A
+            // full disk spends the run's reserve on it.
+            let path = self.dir.join(STATE_FILE);
+            let json = std::sync::Arc::new(json);
+            crate::reserve::save_with(&self.dir, || {
+                crate::files::replace_async(&path, std::sync::Arc::clone(&json), true)
+            })
+            .await
+            .map_err(|e| Error::other(format!("Failed to save swarm state: {e}")))?;
+        }
+        *written = Written {
+            generation,
+            print: Some(print),
+        };
         Ok(())
     }
 }
@@ -292,5 +316,56 @@ mod tests {
         // The resuming process's own log is no sign of the old one's life.
         touch(&dir.path().join(crate::logging::LOG_FILE), now, 0);
         assert_eq!(ran(load(dir.path()).await.unwrap()), 70);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_state_is_written_compact_in_order_and_not_again_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let mut state: SwarmState = serde_json::from_value(serde_json::json!({
+            "run_id": "r", "cwd": dir.path(), "next_id": 2,
+            "agents": [{"id": "a1", "parent": "user", "cwd": dir.path(), "task": "t",
+                        "status": "idle", "mailbox": []}],
+        }))
+        .unwrap();
+        let persister = Persister::new(dir.path());
+        // Each write renames a new file into place.
+        let inode = || std::fs::metadata(&path).unwrap().ino();
+
+        persister.write(1, &state).await.unwrap();
+        let first = inode();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains('\n') && text.contains("\"next_id\":2"), "{text}");
+        persister.write(2, &state).await.unwrap();
+        assert_eq!(inode(), first, "the same state");
+
+        state.next_id = 3;
+        persister.write(3, &state).await.unwrap();
+        assert_ne!(inode(), first, "a new state");
+        state.next_id = 4;
+        persister.write(3, &state).await.unwrap();
+        assert_eq!(
+            load(dir.path()).await.unwrap().unwrap().next_id,
+            3,
+            "not older than written"
+        );
+        persister.write(4, &state).await.unwrap();
+        assert_eq!(load(dir.path()).await.unwrap().unwrap().next_id, 4);
+    }
+
+    #[tokio::test]
+    async fn a_pretty_state_from_an_older_run_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = serde_json::json!({
+            "run_id": "r", "cwd": dir.path(), "next_id": 7,
+            "agents": [{"id": "a1", "parent": "user", "cwd": dir.path(), "task": "t",
+                        "status": "idle", "mailbox": []}],
+        });
+        let pretty = serde_json::to_vec_pretty(&state).unwrap();
+        std::fs::write(dir.path().join(STATE_FILE), pretty).unwrap();
+        let loaded = load(dir.path()).await.unwrap().unwrap();
+        assert_eq!((loaded.next_id, loaded.agents[0].id.as_str()), (7, "a1"));
     }
 }

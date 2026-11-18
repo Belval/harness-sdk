@@ -513,7 +513,8 @@ messages you.
   nothing but the snapshot's `createdAt` (the end of a turn, after the reply was saved) is
   skipped: the agent's session manager keeps a hash of what it last wrote, and the swarm's own
   saves (mail folded into an open turn, a restored tool batch) go through it too. Pretty-printed
-  files from older runs load as before.
+  files from older runs load as before. `swarm.json` is written the same way, compact and from
+  one buffer, and not at all when it would hold the same bytes as the file already does.
 - **Bounds.** A run dir grows with the live agents' work since the last resume and with unreported
   jobs, not with the run's age:
   - `journal.jsonl` and `events.jsonl` are rotated to `<file>.1` at 16 MB, so each takes at most
