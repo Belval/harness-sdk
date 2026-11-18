@@ -6,8 +6,8 @@ use serde_json::{Map, Value};
 
 use super::{
     model_error, resolve_cache_section, BedrockModelConfig, CacheSection, CacheStrategy,
-    GuardrailStreamProcessingMode, GuardrailTraceMode, IncludeToolResultStatus, MODELS_INCLUDE_STATUS,
-    MODELS_SUPPORTING_ANTHROPIC_CACHING,
+    GuardrailStreamProcessingMode, GuardrailTraceMode, IncludeToolResultStatus, MODELS_CACHING_IMPLICITLY,
+    MODELS_INCLUDE_STATUS, MODELS_SUPPORTING_ANTHROPIC_CACHING,
 };
 use crate::aws_document::json_to_document;
 use crate::error::{Error, Result};
@@ -267,9 +267,12 @@ fn format_tool_choice(tool_choice: &ToolChoice) -> Result<bt::ToolChoice> {
     })
 }
 
-/// `additionalRequestFields`, with `thinking` stripped when tool choice forces a tool call.
+/// `additionalRequestFields`, with `thinking` stripped when tool choice forces a tool call, and
+/// for a model that caches prompts on its own ([`caches_implicitly`]) the `prompt_cache_key` it
+/// routes cache reads on, as OpenAI does.
 fn additional_request_fields(config: &BedrockModelConfig, options: &StreamOptions) -> Option<JsonValue> {
-    let fields = config.additional_request_fields.clone()?;
+    let fields = with_prompt_cache_key(config.additional_request_fields.clone(), config, options);
+    let fields = fields?;
     let has_thinking = fields.get("thinking").is_some();
     if !has_thinking {
         return Some(fields);
@@ -298,6 +301,51 @@ fn cache_point(ttl: Option<&str>) -> Result<bt::CachePointBlock> {
         .map_err(|e| model_error("invalid cache point block", e))
 }
 
+/// Whether the model caches prompt prefixes itself, with no cache points: OpenAI's on Bedrock
+/// (Implicit Prompt Caching, the default mode; Converse supports no explicit cache points for
+/// them). Rust-only.
+pub(crate) fn caches_implicitly(config: &BedrockModelConfig) -> bool {
+    config
+        .model_id
+        .as_deref()
+        .is_some_and(|model_id| model_id.contains(MODELS_CACHING_IMPLICITLY))
+}
+
+/// `fields` plus `prompt_cache_key` for a model that [`caches_implicitly`] with a cache config:
+/// [`CacheConfig::cache_key`], else `strands-<session id>` (TS `resolveCacheKey`). OpenAI routes
+/// requests by a hash of the prompt prefix and this key, and overflows a prefix sent more than
+/// about 15 times a minute to other servers, where the cache misses: agents sharing a system
+/// prompt would otherwise read their cache almost never. A key already in `fields` wins.
+/// Rust-only: TS Bedrock sends no key.
+fn with_prompt_cache_key(
+    fields: Option<JsonValue>,
+    config: &BedrockModelConfig,
+    options: &StreamOptions,
+) -> Option<JsonValue> {
+    let Some(cache_config) = config.cache_config.as_ref().filter(|_| caches_implicitly(config)) else {
+        return fields;
+    };
+    let session = options
+        .agent_metadata
+        .as_ref()
+        .and_then(|meta| meta.session_id.as_deref());
+    let key = match (&cache_config.cache_key, session) {
+        (Some(key), _) => key.clone(),
+        (None, Some(session)) => format!("strands-{session}"),
+        (None, None) => return fields,
+    };
+    let mut object = match fields {
+        Some(Value::Object(object)) => object,
+        None => serde_json::Map::new(),
+        other => return other,
+    };
+    if key.is_empty() {
+        return (!object.is_empty()).then_some(Value::Object(object));
+    }
+    object.entry("prompt_cache_key").or_insert(Value::String(key));
+    Some(Value::Object(object))
+}
+
 fn cache_strategy(config: &BedrockModelConfig) -> Option<CacheStrategy> {
     let model_id = config.model_id.as_deref().unwrap_or_default();
     MODELS_SUPPORTING_ANTHROPIC_CACHING
@@ -315,10 +363,13 @@ pub(crate) fn should_enable_caching(config: &BedrockModelConfig) -> bool {
         CacheStrategy::Anthropic => true,
         CacheStrategy::Auto => {
             if cache_strategy(config).is_none() {
-                tracing::warn!(
-                    "model_id=<{}> | cache_config is enabled but this model does not support automatic caching",
-                    config.model_id.as_deref().unwrap_or_default()
-                );
+                // They cache without cache points; the cache key is all there is to send.
+                if !caches_implicitly(config) {
+                    tracing::warn!(
+                        "model_id=<{}> | cache_config is enabled but this model does not support automatic caching",
+                        config.model_id.as_deref().unwrap_or_default()
+                    );
+                }
                 return false;
             }
             true
@@ -1693,6 +1744,69 @@ mod tests {
             request.additional_model_response_field_paths.as_deref(),
             Some(["/stop_reason".to_owned()].as_slice())
         );
+    }
+
+    #[test]
+    fn an_openai_model_gets_a_prompt_cache_key_and_no_cache_points() {
+        let mut config = BedrockModelConfig::new("us.openai.gpt-6.2-astra");
+        config.cache_config = Some(CacheConfig::default());
+        config.additional_request_fields = Some(json!({"reasoning_effort": "high"}));
+        let session = StreamOptions {
+            system_prompt: Some(SystemPrompt::Text("be brief".into())),
+            agent_metadata: Some(crate::models::AgentMetadata {
+                session_id: Some("a7".into()),
+            }),
+            ..Default::default()
+        };
+        let request = format(&config, &[user(vec![ContentBlock::text("hi")])], &session);
+        let sent = format!("{:?}{:?}", request.system, request.messages);
+        assert!(
+            !sent.contains("CachePoint"),
+            "Converse takes no cache points for them: {sent}"
+        );
+        let high = json!({"reasoning_effort": "high"});
+        let keyed = |key: &str| json!({"reasoning_effort": "high", "prompt_cache_key": key});
+        assert_eq!(
+            fields_of(&config, &session),
+            Some(keyed("strands-a7")),
+            "from the session"
+        );
+        assert_eq!(
+            fields_of(&config, &StreamOptions::default()),
+            Some(high.clone()),
+            "no session"
+        );
+        config.cache_config.as_mut().unwrap().cache_key = Some("run/a7".into());
+        assert_eq!(
+            fields_of(&config, &session),
+            Some(keyed("run/a7")),
+            "the configured key wins"
+        );
+        config.additional_request_fields = Some(keyed("mine"));
+        assert_eq!(
+            fields_of(&config, &session),
+            Some(keyed("mine")),
+            "a key in the fields wins"
+        );
+        config.additional_request_fields = Some(high.clone());
+        config.cache_config.as_mut().unwrap().cache_key = Some(String::new());
+        assert_eq!(
+            fields_of(&config, &session),
+            Some(high.clone()),
+            "an empty key opts out"
+        );
+        config.cache_config = None;
+        assert_eq!(fields_of(&config, &session), Some(high), "no key without caching");
+        let mut claude = claude();
+        claude.cache_config = Some(CacheConfig::default());
+        assert_eq!(fields_of(&claude, &session), None, "none for other models");
+    }
+
+    fn fields_of(config: &BedrockModelConfig, options: &StreamOptions) -> Option<JsonValue> {
+        format(config, &[user(vec![ContentBlock::text("hi")])], options)
+            .additional_model_request_fields
+            .as_ref()
+            .map(document_to_json)
     }
 
     #[test]

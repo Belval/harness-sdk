@@ -22,8 +22,8 @@ use crate::hooks::HookEvent;
 use crate::interrupt::{Interrupt, PendingToolExecution};
 use crate::middleware::{EventSink, EventTarget, InvokeModelContext, InvokeModelStage};
 use crate::models::{
-    AggregatedItem, ContentBlockDelta, CountTokensOptions, Model, ModelStreamEvent, StreamAggregatedResult,
-    StreamOptions,
+    AgentMetadata, AggregatedItem, ContentBlockDelta, CountTokensOptions, Model, ModelStreamEvent,
+    StreamAggregatedResult, StreamOptions,
 };
 use crate::tools::{
     ExecuteToolsInput, StructuredOutputTool, ToolExecutorEvent, EXECUTION_CANCELLED_MESSAGE,
@@ -1378,6 +1378,9 @@ fn model_terminal(
                 tool_choice: context.tool_choice.clone(),
                 dynamic_trailing_blocks: (context.dynamic_trailing_blocks > 0)
                     .then_some(context.dynamic_trailing_blocks),
+                agent_metadata: agent.session_manager().map(|manager| AgentMetadata {
+                    session_id: Some(manager.session_id().to_owned()),
+                }),
                 ..StreamOptions::default()
             };
             stream_from_model(

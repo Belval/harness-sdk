@@ -420,6 +420,26 @@ mod tests {
         MockMessageModel::shared(vec![MockResponse::message(Message::assistant(text))])
     }
 
+    #[tokio::test]
+    async fn model_calls_carry_the_session_id_when_a_session_is_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(crate::session::FileStorage::new(dir.path()));
+        let model = mock("hi");
+        let agent = Agent::builder()
+            .model(model.clone())
+            .session_manager(Arc::new(SessionManager::new("s7", storage).unwrap()))
+            .build()
+            .unwrap();
+        agent.invoke("hello").await.unwrap();
+        let metadata = model.calls()[0].1.agent_metadata.clone();
+        assert_eq!(metadata.and_then(|m| m.session_id).as_deref(), Some("s7"));
+
+        let model = mock("hi");
+        let agent = Agent::builder().model(model.clone()).build().unwrap();
+        agent.invoke("hello").await.unwrap();
+        assert_eq!(model.calls()[0].1.agent_metadata, None, "none without a session");
+    }
+
     #[test]
     fn the_session_manager_is_kept_for_explicit_saves() {
         let storage = Arc::new(crate::session::FileStorage::new("/nonexistent"));

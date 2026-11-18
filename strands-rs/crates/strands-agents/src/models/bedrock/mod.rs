@@ -33,6 +33,8 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(120_000);
 const MODELS_INCLUDE_STATUS: &[&str] = &["anthropic.claude"];
 /// Model id fragments that support Anthropic-style prompt caching.
 const MODELS_SUPPORTING_ANTHROPIC_CACHING: &[&str] = &["anthropic", "claude"];
+/// Model id fragment of the models that cache prompt prefixes on their own (OpenAI's). Rust-only.
+const MODELS_CACHING_IMPLICITLY: &str = "openai.";
 /// Provider messages that mean "the prompt did not fit the context window".
 const BEDROCK_CONTEXT_WINDOW_OVERFLOW_MESSAGES: &[&str] = &[
     "Input is too long for requested model",
@@ -100,7 +102,9 @@ pub struct CacheConfig {
     pub system_prompt_ttl: Option<CacheSection>,
     /// Conversation section.
     pub messages_ttl: Option<CacheSection>,
-    /// Provider cache key; a no-op on Bedrock.
+    /// Provider cache key: sent as `prompt_cache_key` to models that cache on their own (OpenAI's),
+    /// which route cache reads on it; unset, `strands-<session id>`; empty, none. A no-op for other
+    /// models.
     pub cache_key: Option<String>,
 }
 
