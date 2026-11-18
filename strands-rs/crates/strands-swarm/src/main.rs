@@ -8,6 +8,7 @@ use std::time::Duration;
 use clap::Parser;
 use strands_agents::tools::Tool;
 use strands_harness::Effort;
+use strands_swarm::catalog::Reserved;
 use strands_swarm::logging;
 use strands_swarm::mcp::MCP_CACHE_FILE;
 use strands_swarm::state;
@@ -126,6 +127,10 @@ struct Cli {
     /// Regex over `<server>_<tool>` names to hide from agents. Repeatable.
     #[arg(long = "mcp-deny")]
     mcp_deny: Vec<String>,
+    /// `REGEX=AGENT[,AGENT…]`: MCP tools matching REGEX are denied to every agent but the named
+    /// ones (ids or names, as `send_message` takes them). Repeatable.
+    #[arg(long = "mcp-deny-except", value_name = "REGEX=AGENTS")]
+    mcp_deny_except: Vec<String>,
     /// Register every MCP tool on every agent up front instead of on demand through `find_tools`.
     #[arg(long)]
     mcp_eager: bool,
@@ -336,6 +341,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         skills.shadowed.len()
     );
     let mcp_logs = tui.then(|| private_path("logs", ""));
+    let reserved = Reserved::parse(&cli.mcp_deny_except)?;
     let started = std::time::Instant::now();
     let mcp_options = McpOptions {
         deny: cli.mcp_deny.clone(),
@@ -379,6 +385,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         instructions,
         tools,
         catalog,
+        reserved,
         skills: std::sync::Arc::new(skills.for_agents()),
         compact_at: cli.compact_at,
         cache_ttl: cli.cache_ttl.clone(),

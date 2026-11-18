@@ -4,9 +4,10 @@
 
 use std::sync::Arc;
 
+use regex::Regex;
 use serde::Deserialize;
 use strands_agents::tools::{FunctionTool, ToolContext, ToolRef};
-use strands_agents::{Agent, Result};
+use strands_agents::{Agent, Error, Result};
 
 /// Name of the discovery tool.
 pub const FIND_TOOLS_NAME: &str = "find_tools";
@@ -22,21 +23,97 @@ const SUMMARY_CHARS: usize = 160;
 /// Called with the names an agent just enabled through `find_tools`.
 pub type OnEnable = Arc<dyn Fn(&[String]) + Send + Sync>;
 
+/// `--mcp-deny-except` rules: a tool whose name matches a rule's regex is reserved for the rule's
+/// agents (ids or names, resolved like `send_message` addresses); any other agent can neither
+/// find, enable nor call it. A tool matching several rules is reserved for every one of them.
+#[derive(Clone, Debug, Default)]
+pub struct Reserved(Vec<(Regex, Vec<String>)>);
+
+impl Reserved {
+    /// Rules written `REGEX=AGENT[,AGENT…]`, split at the last `=` (ids and names have none).
+    pub fn parse(rules: &[String]) -> Result<Self> {
+        let rule = |text: &String| {
+            let invalid = |why: String| Error::other(format!("Invalid --mcp-deny-except {text}: {why}"));
+            let (pattern, agents) = text
+                .rsplit_once('=')
+                .ok_or_else(|| invalid("expected REGEX=AGENT[,AGENT…]".into()))?;
+            let agents: Vec<String> = agents
+                .split(',')
+                .map(str::trim)
+                .filter(|agent| !agent.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if agents.is_empty() {
+                return Err(invalid("no agent after `=`".into()));
+            }
+            let pattern = Regex::new(pattern).map_err(|e| invalid(e.to_string()))?;
+            Ok((pattern, agents))
+        };
+        Ok(Self(rules.iter().map(rule).collect::<Result<_>>()?))
+    }
+
+    /// The agents `tool` is reserved for, unless the agent `id` called `name` is one of them.
+    pub fn withheld(&self, tool: &str, id: &str, name: &str) -> Option<&[String]> {
+        self.0
+            .iter()
+            .find(|(pattern, agents)| {
+                pattern.is_match(tool) && !agents.iter().any(|who| crate::names::addresses(who, id, name))
+            })
+            .map(|(_, agents)| agents.as_slice())
+    }
+}
+
 /// The MCP tools agents can enable, and how many each server offers.
 pub struct ToolCatalog {
     tools: Vec<ToolRef>,
     servers: Vec<(String, usize)>,
     on_enable: Option<OnEnable>,
+    /// Tools left out of this agent's view ([`ToolCatalog::for_agent`]), with the agents they
+    /// are reserved for.
+    withheld: Vec<(String, Vec<String>)>,
+    /// Tools in the shared catalog: the description counts them, so it is the same for every
+    /// agent and stays in the prompt-cache prefix they share.
+    total: usize,
 }
 
 impl ToolCatalog {
     /// A catalog of `tools`; `servers` lists `(server name, tool count)` for the tool description.
     pub fn new(tools: Vec<ToolRef>, servers: Vec<(String, usize)>) -> Self {
         Self {
+            total: tools.len(),
             tools,
             servers,
             on_enable: None,
+            withheld: Vec::new(),
         }
+    }
+
+    /// The catalog as the agent `id` called `name` sees it: without the tools `reserved` for
+    /// other agents, which it can then neither find, enable, nor get back on a resume.
+    pub fn for_agent(self: &Arc<Self>, reserved: &Reserved, id: &str, name: &str) -> Arc<Self> {
+        let mut withheld = Vec::new();
+        let tools: Vec<ToolRef> = self
+            .tools
+            .iter()
+            .filter(|tool| match reserved.withheld(tool.name(), id, name) {
+                Some(agents) => {
+                    withheld.push((tool.name().to_owned(), agents.to_vec()));
+                    false
+                }
+                None => true,
+            })
+            .cloned()
+            .collect();
+        if withheld.is_empty() {
+            return self.clone();
+        }
+        Arc::new(Self {
+            tools,
+            servers: self.servers.clone(),
+            on_enable: self.on_enable.clone(),
+            withheld,
+            total: self.total,
+        })
     }
 
     /// Call `on_enable` whenever an agent enables tools through `find_tools` (not on
@@ -46,9 +123,9 @@ impl ToolCatalog {
         self
     }
 
-    /// Whether the catalog has no tools (then `find_tools` is not worth registering).
+    /// Whether the shared catalog has no tools (then `find_tools` is not worth registering).
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.total == 0
     }
 
     /// The tool named `name`.
@@ -119,7 +196,7 @@ impl ToolCatalog {
             "Search and enable MCP tools ({} not loaded, named `<server>_<tool>`) from: {}. `query` \
              searches names and descriptions; `enable` loads tools by exact name, callable from your next \
              step and kept across restarts.",
-            self.tools.len(),
+            self.total,
             servers.join(", ")
         )
     }
@@ -127,7 +204,10 @@ impl ToolCatalog {
     fn run(&self, agent: &Agent, input: FindInput) -> String {
         let mut out = Vec::new();
         if !input.enable.is_empty() {
-            let (tools, unknown) = self.resolve(&input.enable);
+            let (tools, missing) = self.resolve(&input.enable);
+            let (reserved, unknown): (Vec<String>, Vec<String>) = missing
+                .into_iter()
+                .partition(|name| self.withheld.iter().any(|(withheld, _)| withheld == name));
             if !tools.is_empty() {
                 let names: Vec<String> = tools.iter().map(|tool| tool.name().to_owned()).collect();
                 add_tools(agent, tools);
@@ -135,6 +215,12 @@ impl ToolCatalog {
                     on_enable(&names);
                 }
                 out.push(format!("Enabled: {}.", names.join(", ")));
+            }
+            for (name, agents) in self.withheld.iter().filter(|(name, _)| reserved.contains(name)) {
+                out.push(format!(
+                    "Denied: {name} is reserved for {} (--mcp-deny-except); you cannot enable or call it.",
+                    agents.join(", ")
+                ));
             }
             if !unknown.is_empty() {
                 out.push(format!(
@@ -409,5 +495,129 @@ mod tests {
         assert_eq!(names(&resumed), ["find_tools"]);
         catalog.restore(&resumed);
         assert_eq!(names(&resumed), ["find_tools", "wiki_read", "tickets_get"]);
+    }
+
+    fn reserved() -> Reserved {
+        Reserved::parse(&["slack_(post|delete)=slack-bridge,a9".into()]).unwrap()
+    }
+
+    #[test]
+    fn reserved_rules_parse_regex_and_agents() {
+        let rules = Reserved::parse(&["a=b=c, d ,".into()]).unwrap();
+        assert_eq!(
+            rules.withheld("xa=b", "a1", "x"),
+            Some(&["c".to_owned(), "d".to_owned()][..])
+        );
+        assert_eq!(rules.withheld("xa=b", "a1", "d"), None);
+        assert_eq!(rules.withheld("other", "a1", "x"), None);
+        for bad in ["no-equals", "x=", "x= , ", "(=a"] {
+            let error = Reserved::parse(&[bad.into()]).unwrap_err().to_string();
+            assert!(error.contains("Invalid --mcp-deny-except"), "{bad}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reserved_tool_is_denied_to_other_agents_only() {
+        let catalog = catalog();
+        let worker = catalog.for_agent(&reserved(), "a2", "worker");
+        assert_eq!(
+            worker.description(),
+            catalog.description(),
+            "one description for all"
+        );
+        let agent_with = |catalog: &Arc<ToolCatalog>| agent(MockMessageModel::shared(vec![]), catalog);
+        let agent = agent_with(&worker);
+        let text = worker.run(
+            &agent,
+            FindInput {
+                query: Some("slack post message".into()),
+                enable: vec!["slack_post_message".into(), "slack_search".into()],
+                limit: None,
+            },
+        );
+        assert!(text.contains("Enabled: slack_search."), "{text}");
+        assert!(
+            text.contains(
+                "Denied: slack_post_message is reserved for slack-bridge, a9 (--mcp-deny-except); \
+                 you cannot enable or call it."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("- slack_post_message"), "not searchable: {text}");
+        assert!(!text.contains("Unknown"), "{text}");
+        assert_eq!(names(&agent), ["find_tools", "slack_search"]);
+
+        for (id, name) in [("a3", "slack-bridge"), ("a9", "someone")] {
+            let allowed = catalog.for_agent(&reserved(), id, name);
+            let bridge = agent_with(&allowed);
+            let text = allowed.run(
+                &bridge,
+                FindInput {
+                    query: Some("post".into()),
+                    enable: vec!["slack_post_message".into()],
+                    limit: None,
+                },
+            );
+            assert!(text.contains("Enabled: slack_post_message."), "{name}: {text}");
+            assert!(text.contains("- slack_post_message (enabled)"), "{name}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_agent_loses_a_reserved_tool_it_enabled_before_unless_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = catalog();
+        let session = |model: Arc<MockMessageModel>, catalog: &Arc<ToolCatalog>| {
+            Agent::builder()
+                .model(model)
+                .tools(vec![catalog.find_tool()])
+                .no_sandbox()
+                .session_manager(crate::agent_session_manager(dir.path(), "a2").unwrap())
+                .build()
+                .unwrap()
+        };
+        // Enabled in a run without the rule.
+        let first = session(
+            MockMessageModel::shared(vec![
+                tool_call(
+                    "find_tools",
+                    "t1",
+                    json!({ "enable": ["slack_post_message", "wiki_read"] }),
+                ),
+                MockResponse::message(Message::assistant("done")),
+            ]),
+            &catalog,
+        );
+        first.invoke("go").await.unwrap();
+        drop(first);
+
+        let bridge = catalog.for_agent(&reserved(), "a2", "slack-bridge");
+        let resumed = session(MockMessageModel::shared(vec![]), &bridge);
+        resumed.initialize().await.unwrap();
+        bridge.restore(&resumed);
+        assert_eq!(names(&resumed), ["find_tools", "slack_post_message", "wiki_read"]);
+        drop(resumed);
+
+        let worker = catalog.for_agent(&reserved(), "a2", "worker");
+        let model = MockMessageModel::shared(vec![
+            tool_call("slack_post_message", "t2", json!({})),
+            MockResponse::message(Message::assistant("done")),
+        ]);
+        let resumed = session(model.clone(), &worker);
+        resumed.initialize().await.unwrap();
+        worker.restore(&resumed);
+        assert_eq!(names(&resumed), ["find_tools", "wiki_read"]);
+        resumed.invoke("post").await.unwrap();
+        let calls = model.calls();
+        let result = calls[1]
+            .0
+            .last()
+            .unwrap()
+            .tool_results()
+            .find(|result| result.tool_use_id == "t2")
+            .cloned()
+            .expect("slack_post_message result");
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert!(!format!("{:?}", result.content).contains("slack_post_message ran"));
     }
 }

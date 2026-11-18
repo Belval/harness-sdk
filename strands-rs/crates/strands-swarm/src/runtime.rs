@@ -1250,21 +1250,16 @@ impl Swarm {
     pub fn resolve(&self, who: &str) -> Result<String> {
         let who = who.trim();
         let agents = self.inner.agents.lock();
-        let labelled = who
-            .strip_suffix(')')
-            .and_then(|rest| rest.rsplit_once(" ("))
-            .map(|(_, id)| id);
-        if let Some(id) = [Some(who), labelled]
+        if let Some(id) = [Some(who), names::label_id(who)]
             .into_iter()
             .flatten()
             .find(|id| agents.contains_key(*id))
         {
             return Ok(id.to_owned());
         }
-        let slug = names::slug(who);
         let matches: Vec<&str> = agents
             .values()
-            .filter(|node| node.name == who || node.name == slug)
+            .filter(|node| names::is_name(who, &node.name))
             .map(|node| node.id.as_str())
             .collect();
         match matches.as_slice() {

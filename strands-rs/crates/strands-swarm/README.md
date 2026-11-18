@@ -38,7 +38,8 @@ STRANDS_SWARM_BUILD_HEAD=$(git rev-parse HEAD) cargo build --release -p strands-
 strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model ID] [--effort E]
               [--cache-ttl 5m|1h] [--no-keep-warm]
               [--instructions FILE] [--memory FILE | --no-memory]
-              [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-eager] [--list-tools]
+              [--mcp-config mcp.json]... [--mcp-deny REGEX]... [--mcp-deny-except REGEX=AGENT[,AGENT…]]...
+              [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
               [--max-agents N] [--max-concurrent-calls N] [--max-load N] [--min-free-mem SIZE]
               [--build-jobs N]
@@ -641,6 +642,13 @@ messages you.
     catalog and enables tools from the next call on. Enabled tools come back on resume.
   - `--mcp-eager` registers every tool on every agent, `--mcp-deny` hides tools by name, and
     `--list-tools` prints what is allowed and denied.
+  - `--mcp-deny-except 'REGEX=AGENT[,AGENT…]'` (repeatable) denies matching tools to every agent
+    but the named ones, given by id or name as `send_message` takes them. Others neither find nor
+    enable them (`find_tools` says whom they are reserved for), and a resumed agent that had one
+    enabled loses it. A server acting with your own token can thus write only through one agent:
+    `--mcp-deny-except 'slack-mcp_(post|reply|upload|add_reaction|update|delete|send|create)=slack-bridge'`.
+    A name belongs to whichever agent claims it first, so give an id to pin a rule to an
+    agent that exists already. Nothing is saved: a resumed run gets the rule from its arguments.
   - Under the TUI a server's stderr goes to `<run dir>/logs/mcp-<server>.log`
     (`$TMPDIR/strands-swarm-<pid>/` without `--run`), rotated to `<log>.1` at 4 MB; other modes
     keep it on the terminal.

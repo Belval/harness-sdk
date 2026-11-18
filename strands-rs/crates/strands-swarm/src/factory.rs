@@ -24,7 +24,7 @@ use strands_harness::{
     SessionOption, SkillsOption,
 };
 
-use crate::catalog::ToolCatalog;
+use crate::catalog::{Reserved, ToolCatalog};
 use crate::compaction::{CompactAt, CompactedSink};
 use crate::dashboard::ContextControl;
 use crate::pruning::{CachePrune, CACHE_TTL, CACHE_TTL_1H};
@@ -88,6 +88,9 @@ pub struct HarnessFactoryOptions {
     /// Tools every agent can enable on demand through `find_tools`, e.g. the shared MCP tools.
     /// `find_tools` is registered only when the catalog has tools.
     pub catalog: Option<Arc<ToolCatalog>>,
+    /// MCP tools reserved for some agents (`--mcp-deny-except`): left out of every other agent's
+    /// `tools` and catalog.
+    pub reserved: Reserved,
     /// Skills offered to every agent: one line each in the system prompt, loaded with the
     /// `skills` tool. Neither when empty.
     pub skills: Arc<Vec<Skill>>,
@@ -122,9 +125,28 @@ pub fn swarm_aws_settings(var: impl Fn(&str) -> Option<String>) -> AwsSettings {
 /// memory directory would interleave writes from concurrent agents.
 pub fn harness_factory(options: HarnessFactoryOptions) -> AgentFactory {
     Arc::new(move |spec: AgentSpec| {
-        let options = options.clone();
+        let options = options.for_agent(&spec);
         Box::pin(async move { build(&options, harness_options(&options, spec)?).await })
     })
+}
+
+impl HarnessFactoryOptions {
+    /// These options as the agent `spec` describes gets them: without the MCP tools reserved for
+    /// other agents, up front or in the catalog.
+    fn for_agent(&self, spec: &AgentSpec) -> Self {
+        let withheld = |tool: &ToolRef| {
+            self.reserved
+                .withheld(tool.name(), &spec.id, &spec.name)
+                .is_some()
+        };
+        let mut options = self.clone();
+        options.tools.retain(|tool| !withheld(tool));
+        options.catalog = self
+            .catalog
+            .as_ref()
+            .map(|catalog| catalog.for_agent(&self.reserved, &spec.id, &spec.name));
+        options
+    }
 }
 
 pub(crate) async fn build(options: &HarnessFactoryOptions, harness: HarnessAgentOptions) -> Result<Agent> {
@@ -438,7 +460,7 @@ mod tests {
     use strands_agents::context_manager::ContextManager;
     use strands_agents::testing::{MockMessageModel, MockResponse};
     use strands_agents::types::{
-        ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolUseBlock,
+        ContentBlock, Message, Role, ToolResultBlock, ToolResultContent, ToolResultStatus, ToolUseBlock,
     };
 
     fn exchange(id: &str, chars: usize) -> [Message; 2] {
@@ -773,6 +795,7 @@ mod tests {
         responses: Vec<MockResponse>,
         prompt: &str,
     ) -> Arc<MockMessageModel> {
+        let options = &options.for_agent(&spec);
         let mut harness = harness_options(options, spec).unwrap();
         let model = MockMessageModel::shared(responses);
         harness.model = Some(ModelOption::Instance(model.clone()));
@@ -924,6 +947,62 @@ mod tests {
         )
         .await;
         assert_eq!(after[0], before[1], "a resumed agent sends what it sent last");
+    }
+
+    #[tokio::test]
+    async fn reserved_mcp_tools_reach_only_their_agents_across_a_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = |name: &str| -> ToolRef {
+            Arc::new(
+                FunctionTool::builder(name)
+                    .description(format!("Tool {name}."))
+                    .handler(|_input: serde_json::Value, _ctx| async move { Result::Ok("posted") }),
+            )
+        };
+        let catalog = ToolCatalog::new(vec![tool("srv_post"), tool("srv_read")], vec![("srv".into(), 2)]);
+        let open = HarnessFactoryOptions {
+            tools: vec![tool("eager_post")],
+            catalog: Some(Arc::new(catalog)),
+            ..Default::default()
+        };
+        // What every start of the run replays from its `--mcp-deny-except` argument.
+        let guarded = HarnessFactoryOptions {
+            reserved: Reserved::parse(&["_post$=bridge".into()]).unwrap(),
+            ..open.clone()
+        };
+        let saved = |name: &str| AgentSpec {
+            name: name.into(),
+            session_dir: Some(dir.path().join("sessions")),
+            ..spec()
+        };
+        let sent = |model: &MockMessageModel| -> Vec<String> {
+            let calls = model.calls();
+            let mut names: Vec<String> = calls[0]
+                .1
+                .tool_specs
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
+            names.retain(|name| ["eager_post", "srv_post", "srv_read"].contains(&name.as_str()));
+            names
+        };
+        let enable = tool_call(
+            "find_tools",
+            "f1",
+            serde_json::json!({ "enable": ["srv_post", "srv_read"] }),
+        );
+        run(&open, saved("worker"), calls_then_done(vec![enable]), "go").await;
+
+        let post = tool_call("srv_post", "p1", serde_json::json!({}));
+        let worker = run(&guarded, saved("worker"), calls_then_done(vec![post]), "go").await;
+        assert_eq!(sent(&worker), ["srv_read"]);
+        let calls = worker.calls();
+        let result = calls[1].0.last().unwrap().tool_results().next().cloned().unwrap();
+        assert_eq!(result.status, ToolResultStatus::Error, "{result:?}");
+
+        let done = vec![MockResponse::message(Message::assistant("done"))];
+        let bridge = run(&guarded, saved("bridge"), done, "go").await;
+        assert_eq!(sent(&bridge), ["eager_post", "srv_post", "srv_read"]);
     }
 
     #[tokio::test]

@@ -112,6 +112,27 @@ pub fn renamed(requested: &str, given: &str) -> Option<String> {
     ))
 }
 
+/// The id in a `name (id)` label, as the swarm prints agents in messages and listings.
+pub fn label_id(who: &str) -> Option<&str> {
+    who.strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" ("))
+        .map(|(_, id)| id)
+}
+
+/// Whether `who` is the agent name `name`: as given, or as the spawner wrote it before it was
+/// normalized (`Fix-P123` for `fix-p123`).
+pub fn is_name(who: &str, name: &str) -> bool {
+    name == who || name == slug(who)
+}
+
+/// Whether the address `who` refers to the agent `id` called `name`, as `send_message` resolves
+/// it: its id, its `name (id)` label or its name. Names are unique and never shaped like an id,
+/// so this agrees with resolving `who` against the whole swarm.
+pub fn addresses(who: &str, id: &str, name: &str) -> bool {
+    let who = who.trim();
+    who == id || label_id(who) == Some(id) || is_name(who, name)
+}
+
 /// Whether `text` has the shape of an agent id (`a` followed by digits).
 pub fn looks_like_id(text: &str) -> bool {
     text.strip_prefix('a')
@@ -190,6 +211,22 @@ mod tests {
             choose(Some(long), "", [long].iter().copied()),
             "abcdefghijklmnopqrstuv-2"
         );
+    }
+
+    #[test]
+    fn an_address_is_an_id_a_label_or_a_name() {
+        for who in [
+            "a17",
+            " a17 ",
+            "slack-bridge (a17)",
+            "slack-bridge",
+            "Slack Bridge",
+        ] {
+            assert!(addresses(who, "a17", "slack-bridge"), "{who}");
+        }
+        for who in ["a1", "slack-bridge (a1)", "slack", "slack-bridge-2", ""] {
+            assert!(!addresses(who, "a17", "slack-bridge"), "{who}");
+        }
     }
 
     #[test]
