@@ -619,16 +619,28 @@ fn restart_keeps_the_session_and_its_clients_and_rereads_the_arguments() {
 #[test]
 fn restart_from_a_job_of_the_swarm_survives_the_job() {
     let Some(tmux) = Tmux::new() else { return };
+    // The job restarts only when the test says so (`go`), so `before` is taken first. Whether
+    // the job is killed by the swarm's trap or by the C-c itself (it may even finish first) is
+    // up to the scheduler; what counts is that the restart does not depend on it.
     let script = format!(
-        r#"( sleep 1; bash '{SCRIPT}' restart r > "$RUN/job.out" 2>&1; touch "$RUN/job.survived" ) &
-  job=$!"#
+        r#"( while [ ! -f "$RUN/go" ]; do sleep 0.05; done; bash '{SCRIPT}' restart r > "$RUN/job.out" 2>&1 ) &
+  job=$!
+  echo "$job" > "$RUN/job.pid""#
     );
     let binary = tmux.fake_swarm(&script);
     let started = tmux.swarmctl(&["start", "r", binary.to_str().unwrap()]);
     assert!(started.status.success(), "{started:?}");
     tmux.wait_for_starts(1);
+    let job = tmux.wait_for("the job to start", || {
+        std::fs::read_to_string(tmux.run_dir().join("job.pid")).ok()
+    });
+    let job = job.trim();
     let before = tmux.pane();
+    std::fs::write(tmux.run_dir().join("go"), "").unwrap();
 
+    tmux.wait_for("the restart to finish", || {
+        tmux.run_dir().join("restart.status").exists().then_some(())
+    });
     tmux.wait_for_starts(2);
 
     let after = tmux.pane();
@@ -638,10 +650,14 @@ fn restart_from_a_job_of_the_swarm_survives_the_job() {
     );
     assert_ne!(before, after);
     assert!(!tmux.run_dir().join("stop").exists());
-    assert!(
-        !tmux.run_dir().join("job.survived").exists(),
-        "the job was meant to die with the swarm"
-    );
+    tmux.wait_for("the job to be gone", || {
+        // A killed job may linger as a zombie until its new parent reaps it.
+        match std::fs::read_to_string(format!("/proc/{job}/stat")) {
+            Ok(stat) => stat.rsplit(") ").next().is_some_and(|rest| rest.starts_with('Z')),
+            Err(_) => true,
+        }
+        .then_some(())
+    });
     assert_eq!(
         tmux.tmux(&["display-message", "-p", "-t", "swarm-r", "#{pane_dead}"]),
         "0"
