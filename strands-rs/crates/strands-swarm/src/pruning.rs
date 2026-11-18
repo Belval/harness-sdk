@@ -1,9 +1,13 @@
 //! What to drop from an agent's context before each model call, beyond the SDK's pipeline.
 //!
 //! Reasoning: models that keep prior turns' thinking (Claude Opus 4.5+) bill it as input on every
-//! later call, and its signatures alone are most of a long agent's reasoning bytes. Anthropic
-//! requires thinking blocks within the turn in progress (a tool-use loop is one turn) and allows
-//! omitting earlier turns' thinking, as long as no dropped block sits between two kept ones.
+//! later call, and its signatures alone are most of a long agent's reasoning bytes. A long tool
+//! loop (one turn) re-sends every step's reasoning on every call. Bedrock requires the thinking
+//! of "the last assistant message", whole and signed; Anthropic's prefix check lets the sent
+//! thinking leave out "the oldest, the newest, or all of them, but not one in between". So all
+//! reasoning goes but the latest assistant message's that has any: on Claude Haiku 5.5 dropping
+//! an earlier step's thinking mid-loop was accepted with no prefix mismatch reported, while a
+//! block without its signature was rejected.
 //!
 //! Old tool output: a `shell`, `read` or MCP result is mostly read once, then re-sent on every call.
 //! Older ones are cut to their head and tail; the full text stays in the stash under the
@@ -51,14 +55,29 @@ fn is_restart_notice(message: &Message) -> bool {
     matches!(message.content.first(), Some(ContentBlock::Text(text)) if text.starts_with(NOTICE_PREFIX))
 }
 
-/// Removes reasoning from the assistant messages before the current turn; `true` when any went.
+fn is_reasoning(block: &ContentBlock) -> bool {
+    matches!(block, ContentBlock::Reasoning(_))
+}
+
+fn has_reasoning(message: &Message) -> bool {
+    message.role == Role::Assistant && message.content.iter().any(is_reasoning)
+}
+
+/// The one message whose reasoning is kept: the current turn's latest assistant message that has
+/// any, which in a tool loop is usually the one whose tool use is being answered.
+fn kept_reasoning(messages: &[Message]) -> Option<usize> {
+    let start = turn_start(messages);
+    let latest = messages[start..].iter().rposition(has_reasoning)?;
+    Some(start + latest)
+}
+
+/// Removes reasoning from every assistant message but [`kept_reasoning`]'s; `true` when any went.
 /// A message left empty gets [`REASONING_DROPPED`] so the history stays valid.
 fn drop_old_reasoning(messages: &mut [Message]) -> bool {
-    let start = turn_start(messages);
+    let kept = kept_reasoning(messages);
     let mut acted = false;
-    for message in &mut messages[..start] {
-        let is_reasoning = |block: &ContentBlock| matches!(block, ContentBlock::Reasoning(_));
-        if message.role != Role::Assistant || !message.content.iter().any(is_reasoning) {
+    for (i, message) in messages.iter_mut().enumerate() {
+        if Some(i) == kept || !has_reasoning(message) {
             continue;
         }
         message.content.retain(|block| !is_reasoning(block));
@@ -135,9 +154,9 @@ pub enum PruneReason {
     Large,
 }
 
-/// Drops earlier turns' reasoning and trims old results, together and only for a
-/// [`PruneReason`]; on any other call history reaches the model byte for byte as last time. Goes
-/// first in the pipeline, with [`CachePrune::mark`] last.
+/// Drops reasoning the model no longer needs (all but [`kept_reasoning`]'s) and trims old
+/// results, together and only for a [`PruneReason`]; on any other call history reaches the
+/// model byte for byte as last time. Goes first in the pipeline, with [`CachePrune::mark`] last.
 #[derive(Clone)]
 pub struct CachePrune {
     gate: Arc<Gate>,
@@ -267,11 +286,13 @@ fn removable_share(messages: &[Message]) -> f64 {
     if total == 0 {
         return 0.0;
     }
-    let reasoning: usize = messages[..turn_start(messages)]
+    let kept = kept_reasoning(messages);
+    let reasoning: usize = messages
         .iter()
-        .filter(|m| m.role == Role::Assistant)
-        .flat_map(|m| &m.content)
-        .filter(|block| matches!(block, ContentBlock::Reasoning(_)))
+        .enumerate()
+        .filter(|(i, m)| Some(*i) != kept && m.role == Role::Assistant)
+        .flat_map(|(_, m)| &m.content)
+        .filter(|block| is_reasoning(block))
         .map(json_len)
         .sum();
     let preview = TRIM_PREVIEW_TOKENS * 4;
@@ -326,10 +347,15 @@ fn result_chars(result: &ToolResultBlock) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use strands_agents::context_manager::{ContextManagerConfig, ContextManagerOption};
+    use strands_agents::models::{ContentBlockDelta, ModelEventStream, ModelStreamEvent, StreamOptions};
     use strands_agents::testing::{MockMessageModel, MockResponse};
+    use strands_agents::tools::{FunctionTool, ToolContext};
     use strands_agents::types::{ReasoningBlock, ToolResultBlock, ToolResultContent, ToolUseBlock};
-    use strands_agents::InMemoryStorage;
+    use strands_agents::{InMemoryStorage, Model};
 
     use crate::compaction::CompactAt;
 
@@ -396,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_earlier_turns_reasoning_and_keeps_the_whole_tool_loop_in_progress() {
+    fn drops_all_reasoning_but_the_tool_loop_s_latest() {
         let mut messages = vec![
             Message::user("first task"),
             assistant(vec![thinking("old"), tool_call("t1")]),
@@ -411,18 +437,54 @@ mod tests {
 
         assert!(drop_old_reasoning(&mut messages));
 
-        assert_eq!(reasoning_count(&messages[..4]), 0);
         assert_eq!(messages[1].content, vec![tool_call("t1")]);
         assert_eq!(messages[3].content, vec![ContentBlock::text("done")]);
         assert_eq!(
-            reasoning_count(&messages[4..]),
-            2,
-            "the turn in progress is untouched"
+            messages[5].content,
+            vec![tool_call("t2")],
+            "an earlier step of the loop"
         );
+        assert_eq!(
+            messages[7].content,
+            vec![thinking("still now"), tool_call("t3")],
+            "the message whose tool use is being answered keeps its reasoning whole"
+        );
+        assert_eq!(reasoning_count(&messages), 1);
         assert!(
             !drop_old_reasoning(&mut messages),
             "a second pass changes nothing"
         );
+    }
+
+    #[test]
+    fn the_latest_reasoning_is_kept_when_the_last_steps_had_none() {
+        let mut messages = vec![
+            Message::user("task"),
+            assistant(vec![thinking("first"), tool_call("t1")]),
+            tool_result("t1"),
+            assistant(vec![thinking("second"), tool_call("t2")]),
+            tool_result("t2"),
+            assistant(vec![ContentBlock::text("no thinking"), tool_call("t3")]),
+            tool_result("t3"),
+        ];
+        assert_eq!(kept_reasoning(&messages), Some(3));
+
+        assert!(drop_old_reasoning(&mut messages));
+
+        assert_eq!(messages[1].content, vec![tool_call("t1")]);
+        assert_eq!(messages[3].content, vec![thinking("second"), tool_call("t2")]);
+    }
+
+    #[test]
+    fn a_new_turn_keeps_no_earlier_reasoning() {
+        let mut messages = vec![
+            Message::user("task"),
+            assistant(vec![thinking("a"), ContentBlock::text("done")]),
+            Message::user("next task"),
+        ];
+        assert_eq!(kept_reasoning(&messages), None);
+        assert!(drop_old_reasoning(&mut messages));
+        assert_eq!(reasoning_count(&messages), 0);
     }
 
     #[test]
@@ -687,5 +749,118 @@ mod tests {
         ctx.overflow = true;
         assert_eq!(prune.reason(&ctx), Some(PruneReason::Overflow));
         assert!(prune.apply(&mut ctx).await.unwrap());
+    }
+
+    /// `inner`'s replies, each opened by a signed reasoning block `step N` (the mock replays none).
+    struct Thinking {
+        inner: Arc<MockMessageModel>,
+        step: AtomicUsize,
+    }
+
+    impl Model for Thinking {
+        fn model_id(&self) -> Option<String> {
+            self.inner.model_id()
+        }
+
+        fn stream<'a>(&'a self, messages: &'a [Message], options: &'a StreamOptions) -> ModelEventStream<'a> {
+            let step = self.step.fetch_add(1, Ordering::SeqCst);
+            let reasoning = vec![
+                ModelStreamEvent::ContentBlockStart { start: None },
+                ModelStreamEvent::ContentBlockDelta {
+                    delta: ContentBlockDelta::ReasoningContent {
+                        text: Some(format!("step {step}")),
+                        signature: Some("sig".into()),
+                        redacted_content: None,
+                    },
+                },
+                ModelStreamEvent::ContentBlockStop {},
+            ];
+            let mut reasoning = Some(reasoning);
+            // After the message start, which comes first.
+            Box::pin(self.inner.stream(messages, options).flat_map(move |event| {
+                let after = reasoning.take().unwrap_or_default().into_iter().map(Ok);
+                futures::stream::iter(std::iter::once(event).chain(after))
+            }))
+        }
+    }
+
+    /// An agent behind the swarm's gate that runs a tool loop of `steps` `shell` calls, each
+    /// reasoned, then ends its turn. The call answering `expire_at` finds the cache expired.
+    async fn tool_loop(steps: usize, expire_at: Option<&'static str>) -> Vec<Vec<Message>> {
+        let mut responses: Vec<MockResponse> = (0..steps)
+            .map(|i| MockResponse::message(assistant(vec![tool_call(&format!("t{i}"))])))
+            .collect();
+        responses.push(MockResponse::message(Message::assistant("done")));
+        let model = Arc::new(Thinking {
+            inner: MockMessageModel::shared(responses),
+            step: AtomicUsize::new(0),
+        });
+        let prune = CachePrune::new(None, CACHE_TTL);
+        let config = ContextManagerConfig {
+            strategies: Some(vec![Arc::new(prune.clone()), prune.mark()]),
+            ..Default::default()
+        };
+        let shell = FunctionTool::builder("shell").description("x").handler(
+            move |_input, ctx: ToolContext| async move {
+                if Some(ctx.tool_use.tool_use_id.as_str()) == expire_at {
+                    ctx.agent.state().set(LAST_CALL_KEY, minutes_ago(6));
+                }
+                Result::Ok("ok")
+            },
+        );
+        let agent = Agent::builder()
+            .model(Arc::clone(&model))
+            .tool(shell)
+            .context_manager(ContextManagerOption::Config(config))
+            .no_sandbox()
+            .build()
+            .unwrap();
+        agent.invoke("task").await.unwrap();
+        model
+            .inner
+            .calls()
+            .into_iter()
+            .map(|(messages, _)| messages)
+            .collect()
+    }
+
+    fn reasoning_texts(messages: &[Message]) -> Vec<(usize, String)> {
+        let mut texts = Vec::new();
+        for (i, message) in messages.iter().enumerate() {
+            for block in &message.content {
+                if let ContentBlock::Reasoning(reasoning) = block {
+                    texts.push((i, reasoning.text.clone().unwrap_or_default()));
+                }
+            }
+        }
+        texts
+    }
+
+    #[tokio::test]
+    async fn a_warm_tool_loop_sends_every_step_s_reasoning_unchanged() {
+        let calls = tool_loop(4, None).await;
+        assert_eq!(calls.len(), 5);
+        for (k, messages) in calls.iter().enumerate() {
+            let expected: Vec<(usize, String)> = (0..k).map(|i| (1 + 2 * i, format!("step {i}"))).collect();
+            assert_eq!(reasoning_texts(messages), expected, "call {k}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cold_cache_mid_loop_keeps_only_the_latest_step_s_reasoning() {
+        let calls = tool_loop(4, Some("t2")).await;
+        let texts: Vec<Vec<(usize, String)>> = calls.iter().map(|m| reasoning_texts(m)).collect();
+        assert_eq!(texts[2].len(), 2, "warm until then: {texts:?}");
+        assert_eq!(
+            texts[3],
+            vec![(5, "step 2".to_owned())],
+            "the call answering t2 keeps t2's reasoning only"
+        );
+        assert_eq!(calls[3][1].content, vec![tool_call("t0")]);
+        assert_eq!(
+            texts[4],
+            vec![(5, "step 2".to_owned()), (7, "step 3".to_owned())],
+            "then warm again: only appended to"
+        );
     }
 }

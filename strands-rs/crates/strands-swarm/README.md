@@ -125,9 +125,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   - When a compaction changes nothing (the summarizer failed, or nothing could be cut), automatic
     retries wait until the input has grown 10% or ten calls have passed; overflow and `context`
     requests still retry at once.
-  - **Pruning.** Reasoning from earlier turns (thinking text and signatures, which some models bill
-    as input on every call) is dropped; the turn in progress keeps it, as Anthropic requires within
-    a tool-use loop. Tool results over 2,000 characters (`shell`, `read`, MCP listings and the
+  - **Pruning.** Reasoning (thinking text and signatures, which some models bill as input on
+    every call) is dropped from every assistant message but the latest one in the turn in progress
+    that has any: in a long tool loop, earlier steps' reasoning goes too. Bedrock requires the last
+    assistant message's thinking back, whole and signed, and Anthropic accepts leaving out the
+    oldest blocks. Tool results over 2,000 characters (`shell`, `read`, MCP listings and the
     rest, but not `skills`, `wait` or `retrieve_context`) are cut to their head and tail (~800
     characters) once six newer ones exist; `retrieve_context` with the reference at the end returns
     the full output.
