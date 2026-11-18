@@ -182,6 +182,9 @@ pub enum PruneReason {
     Compaction,
     /// History changed since the last call (the `context` tool offloaded results, say).
     Edited,
+    /// The system prompt (a `cd`) or the tool specs (a `find_tools` enable) changed since the
+    /// last call: they precede the history in the cache.
+    Prompt,
     /// The last call was longer ago than the cache lives ([`CACHE_TTL`] by default), so the cache
     /// has expired.
     Idle,
@@ -204,6 +207,8 @@ struct Gate {
     ttl: Duration,
     /// A hash of each message as the last call sent it (this process only).
     sent: Mutex<Option<Vec<u64>>>,
+    /// A hash of the system prompt and tool specs the last call sent (this process only).
+    prompt: Mutex<Option<u64>>,
 }
 
 impl CachePrune {
@@ -215,12 +220,14 @@ impl CachePrune {
             compaction,
             ttl,
             sent: Mutex::new(None),
+            prompt: Mutex::new(None),
         };
         Self { gate: Arc::new(gate) }
     }
 
     /// The pipeline's last strategy: notes what this call sends and when, for the next call's
-    /// [`PruneReason::Edited`] and [`PruneReason::Idle`]. It never edits the context.
+    /// [`PruneReason::Edited`], [`PruneReason::Prompt`] and [`PruneReason::Idle`]. It never edits
+    /// the context.
     pub fn mark(&self) -> Arc<dyn ContextStrategy> {
         Arc::new(Mark(Arc::clone(&self.gate)))
     }
@@ -237,6 +244,9 @@ impl CachePrune {
         if self.edited(ctx.messages) {
             return Some(PruneReason::Edited);
         }
+        if self.prompt_changed(ctx.agent) {
+            return Some(PruneReason::Prompt);
+        }
         let idle = last_call(ctx.agent)
             .is_some_and(|at| SystemTime::now().duration_since(at).unwrap_or_default() > self.gate.ttl);
         if idle {
@@ -251,6 +261,23 @@ impl CachePrune {
             Some(sent) => sent.len() > messages.len() || first_change(sent, messages, hash).is_some(),
         }
     }
+
+    fn prompt_changed(&self, agent: &Agent) -> bool {
+        self.gate
+            .prompt
+            .lock()
+            .is_some_and(|sent| sent != prompt_hash(agent))
+    }
+}
+
+/// A hash of what precedes the history in a request: `agent`'s system prompt and tool specs.
+fn prompt_hash(agent: &Agent) -> u64 {
+    let specs: Vec<_> = agent.tools().iter().map(|tool| tool.spec().clone()).collect();
+    let mut hasher = DefaultHasher::new();
+    serde_json::to_string(&(agent.system_prompt(), specs))
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 #[async_trait]
@@ -272,8 +299,10 @@ impl ContextStrategy for CachePrune {
             (self.gate.sent.lock().as_deref()).and_then(|sent| first_change(sent, ctx.messages, hash));
         let dropped = drop_old_reasoning(ctx.messages);
         let trimmed = self.gate.trim.apply(ctx).await?;
-        // A summary (compaction, or the overflow it answers) rewrites everything before the tail.
+        // A summary (compaction, or the overflow it answers) rewrites everything before the tail;
+        // a new system prompt or tool set precedes all of it, so every thinking block goes.
         let edited = match reason {
+            _ if self.prompt_changed(ctx.agent) => Some(0),
             PruneReason::Compaction | PruneReason::Overflow => Some(0),
             _ => {
                 let now = first_change(&before, ctx.messages, hash_without_reasoning);
@@ -304,6 +333,7 @@ impl ContextStrategy for Mark {
 
     async fn apply(&self, ctx: &mut ContextState<'_>) -> Result<bool> {
         *self.0.sent.lock() = Some(ctx.messages.iter().map(hash).collect());
+        *self.0.prompt.lock() = Some(prompt_hash(ctx.agent));
         note_model_call(ctx.agent);
         Ok(false)
     }
@@ -404,8 +434,10 @@ mod tests {
     use strands_agents::context_manager::{ContextManagerConfig, ContextManagerOption};
     use strands_agents::models::{ContentBlockDelta, ModelEventStream, ModelStreamEvent, StreamOptions};
     use strands_agents::testing::{MockMessageModel, MockResponse};
-    use strands_agents::tools::{FunctionTool, ToolContext};
-    use strands_agents::types::{ReasoningBlock, ToolResultBlock, ToolResultContent, ToolUseBlock};
+    use strands_agents::tools::{FunctionTool, ToolContext, ToolRef};
+    use strands_agents::types::{
+        ReasoningBlock, SystemPrompt, ToolResultBlock, ToolResultContent, ToolUseBlock,
+    };
     use strands_agents::{InMemoryStorage, Model};
 
     use crate::compaction::CompactAt;
@@ -775,6 +807,43 @@ mod tests {
         assert!(pass(&prune, &agent, &mut messages, 0.1).await);
         assert!(pruned(&messages));
         assert!(removable_share(&messages) < 0.01);
+    }
+
+    #[tokio::test]
+    async fn a_new_system_prompt_or_tool_set_drops_all_thinking() {
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+        let mut messages = reasoned_loop(&[100; 3]);
+        agent.state().set(LAST_CALL_KEY, minutes_ago(6));
+        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
+        assert_eq!(reasoned(&messages), vec![5]);
+        assert!(
+            !pass(&prune, &agent, &mut messages, 0.1).await,
+            "warm and unchanged"
+        );
+        assert_eq!(reasoned(&messages), vec![5]);
+
+        // A lone `cd` rewrites the system prompt.
+        agent.set_system_prompt(Some(SystemPrompt::Text("moved".into())));
+        let mut ctx = ctx(&mut messages, &agent, 0.1);
+        assert_eq!(prune.reason(&ctx), Some(PruneReason::Prompt));
+        assert!(prune.apply(&mut ctx).await.unwrap());
+        prune.mark().apply(&mut ctx).await.unwrap();
+        assert_eq!(reasoned(&messages), Vec::<usize>::new());
+
+        // A `find_tools` enable adds a tool.
+        messages.push(assistant(vec![thinking("step 3"), tool_call("t3")]));
+        messages.push(tool_result("t3"));
+        assert!(!pass(&prune, &agent, &mut messages, 0.1).await, "warm again");
+        assert_eq!(reasoned(&messages), vec![7]);
+        let tool = FunctionTool::builder("enabled")
+            .description("x")
+            .handler(|_input, _ctx: ToolContext| async move { Result::Ok("ok") });
+        let tool: ToolRef = Arc::new(tool);
+        agent
+            .with_tool_registry(|registry| registry.add_or_replace(vec![tool]))
+            .unwrap();
+        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
+        assert_eq!(reasoned(&messages), Vec::<usize>::new());
     }
 
     #[tokio::test]

@@ -137,9 +137,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     the end returns the full output.
   - Both edit history, and the prompt cache only matches an unchanged prefix, so they run only when
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
-    the `context` tool), on the first call after the cache's lifetime (five idle minutes, an hour
-    with `--cache-ttl 1h`), on overflow, or once they would remove 40% of the history. Every other
-    call re-sends history byte for byte.
+    the `context` tool), after the system prompt or tools changed (a `cd`, a `find_tools` enable;
+    then all thinking goes, as it is bound to them), on the first call after the cache's lifetime
+    (five idle minutes, an hour with `--cache-ttl 1h`), on overflow, or once they would remove 40%
+    of the history. Every other call re-sends history byte for byte.
   - The `context` tool lets the agent manage its own context. It lists the biggest items with tool
     results numbered (not previews and stubs, which offloading would not shrink). `offload: [n, …]`
     replaces results with a stub whose reference reads them back; a stub names only its own
