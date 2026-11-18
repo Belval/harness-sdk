@@ -333,6 +333,28 @@ impl AgentView {
     }
 }
 
+/// One line of the agent tree ([`App::tree`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Row<'a> {
+    /// Spawn depth; roots are 0.
+    pub depth: usize,
+    /// The agent.
+    pub view: &'a AgentView,
+    /// What its folded subtree hides; `None` when it hides nothing.
+    pub fold: Option<Fold>,
+}
+
+/// The descendants a folded agent hides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Fold {
+    /// Descendants not listed.
+    pub hidden: usize,
+    /// Those that work (running, not waiting), as the header counts them.
+    pub running: usize,
+    /// Those whose last turn failed.
+    pub errored: usize,
+}
+
 /// Everything the view renders.
 #[derive(Debug, Default)]
 pub struct App {
@@ -364,6 +386,8 @@ pub struct App {
     pub tree_adjust: i16,
     /// Show cancelled agents in the tree (hidden by default).
     pub show_cancelled: bool,
+    /// Agents whose descendants the tree hides (←/→), for this session.
+    pub folded: HashSet<String>,
     /// Highlighted entry of the slash-command popup.
     pub completion: usize,
     /// Swarm-wide token budget, if any.
@@ -591,7 +615,8 @@ impl App {
     ///
     /// Built several times a frame and twice per event, so in time linear in the agents: a long
     /// run keeps every cancelled agent.
-    pub fn tree(&self) -> Vec<(usize, &AgentView)> {
+    /// A [folded](Self::folded) agent's descendants are left out and counted in its row.
+    pub fn tree(&self) -> Vec<Row<'_>> {
         let mut children: HashMap<&str, Vec<&AgentView>> = HashMap::new();
         for view in self.agents.values() {
             children.entry(view.parent.as_str()).or_default().push(view);
@@ -614,15 +639,75 @@ impl App {
         let kids = |id: &str| children.get(id).into_iter().flatten().rev().copied();
         let mut stack: Vec<(usize, &AgentView)> = kids(USER).filter(|v| visible(v)).map(|v| (0, v)).collect();
         while let Some((depth, view)) = stack.pop() {
-            out.push((depth, view));
-            stack.extend(kids(&view.id).filter(|v| visible(v)).map(|v| (depth + 1, v)));
+            let below = kids(&view.id).filter(|v| visible(v));
+            if !self.folded.contains(&view.id) {
+                stack.extend(below.map(|v| (depth + 1, v)));
+                out.push(Row {
+                    depth,
+                    view,
+                    fold: None,
+                });
+                continue;
+            }
+            // Each hidden agent is counted once: the walk never enters a folded subtree.
+            let mut fold = Fold::default();
+            let mut hidden: Vec<&AgentView> = below.collect();
+            while let Some(view) = hidden.pop() {
+                fold.hidden += 1;
+                fold.running += usize::from(view.status == AgentStatus::Running && view.waiting().is_none());
+                fold.errored += usize::from(matches!(view.status, AgentStatus::Errored(_)));
+                hidden.extend(kids(&view.id).filter(|v| visible(v)));
+            }
+            let fold = (fold.hidden > 0).then_some(fold);
+            out.push(Row { depth, view, fold });
         }
         out
     }
 
-    /// Cancelled agents left out of the tree.
+    /// Cancelled agents left out of the tree (not those inside a folded subtree).
     pub fn hidden(&self) -> usize {
-        self.agents.len().saturating_sub(self.tree().len())
+        let listed: usize = self
+            .tree()
+            .iter()
+            .map(|row| 1 + row.fold.map_or(0, |fold| fold.hidden))
+            .sum();
+        self.agents.len().saturating_sub(listed)
+    }
+
+    /// ← with an empty input: hide the selected agent's descendants; when it shows none, select
+    /// its parent instead, as in a file tree.
+    pub fn fold(&mut self) {
+        let tree = self.tree();
+        let Some(index) = self.selected_index(&tree) else {
+            return;
+        };
+        let row = tree[index];
+        let child = tree.get(index + 1).is_some_and(|next| next.depth > row.depth);
+        let parent = tree[..index].iter().rposition(|up| up.depth < row.depth);
+        let id = row.view.id.clone();
+        if child {
+            self.folded.insert(id.clone());
+            self.reselect(Some(id));
+        } else if let Some(parent) = parent {
+            self.select(parent);
+        }
+    }
+
+    /// → with an empty input: show the selected agent's hidden descendants; when none are
+    /// hidden, select its first child.
+    pub fn unfold(&mut self) {
+        let tree = self.tree();
+        let Some(index) = self.selected_index(&tree) else {
+            return;
+        };
+        let row = tree[index];
+        let child = tree.get(index + 1).is_some_and(|next| next.depth > row.depth);
+        let id = row.view.id.clone();
+        if self.folded.remove(&id) {
+            self.reselect(Some(id));
+        } else if child {
+            self.select(index + 1);
+        }
     }
 
     /// Whether the screen changes with time alone: an agent's glyph [`spins`](AgentView::spins)
@@ -639,19 +724,34 @@ impl App {
         self.reselect(selected);
     }
 
-    /// Keep `previous` selected after the tree changed; when it is gone, stay on the same row.
+    /// Keep `previous` selected after the tree changed. When a folded ancestor hides it, select
+    /// that ancestor; when it is gone, stay on the same row.
     fn reselect(&mut self, previous: Option<String>) {
         let tree = self.tree();
-        self.selected = previous
-            .and_then(|id| tree.iter().position(|(_, view)| view.id == id))
+        let at = |id: &str| tree.iter().position(|row| row.view.id == id);
+        let folded_ancestor = |id: &str| {
+            let mut id = self.agents.get(id)?.parent.as_str();
+            while !self.folded.contains(id) {
+                id = self.agents.get(id)?.parent.as_str();
+            }
+            at(id)
+        };
+        let selected = previous
+            .and_then(|id| at(&id).or_else(|| folded_ancestor(&id)))
             .unwrap_or_else(|| self.selected.min(tree.len().saturating_sub(1)));
+        self.selected = selected;
+    }
+
+    /// The selected row of `tree`, if any.
+    fn selected_index(&self, tree: &[Row]) -> Option<usize> {
+        (!tree.is_empty()).then(|| self.selected.min(tree.len() - 1))
     }
 
     /// The selected agent.
     pub fn selected_view(&self) -> Option<&AgentView> {
         let tree = self.tree();
-        let index = self.selected.min(tree.len().saturating_sub(1));
-        tree.get(index).map(|(_, view)| *view)
+        let index = self.selected_index(&tree)?;
+        Some(tree[index].view)
     }
 
     /// Id of the selected agent.
@@ -665,12 +765,16 @@ impl App {
         if len == 0 {
             return;
         }
-        let selected = self.selected.saturating_add_signed(delta).min(len - 1);
-        if selected != self.selected {
+        self.select(self.selected.saturating_add_signed(delta).min(len - 1));
+    }
+
+    /// Select row `index` of the tree.
+    fn select(&mut self, index: usize) {
+        if index != self.selected {
             // A notice is about the agent it was shown for (`sent to …`, `press esc again`).
             self.notice = None;
         }
-        self.selected = selected;
+        self.selected = index;
         self.scroll = 0;
     }
 
@@ -878,8 +982,68 @@ mod tests {
         ] {
             app.apply(spawned(id, parent));
         }
-        let tree: Vec<(usize, &str)> = app.tree().iter().map(|(d, v)| (*d, v.id.as_str())).collect();
+        let tree: Vec<(usize, &str)> = app
+            .tree()
+            .iter()
+            .map(|row| (row.depth, row.view.id.as_str()))
+            .collect();
         assert_eq!(tree, vec![(0, "a1"), (1, "a2"), (2, "a5"), (1, "a4"), (0, "a3")]);
+    }
+
+    #[test]
+    fn a_folded_agent_counts_what_it_hides_and_takes_a_hidden_selection() {
+        let mut app = App::default();
+        for (id, parent) in [
+            ("a1", USER),
+            ("a2", "a1"),
+            ("a3", USER),
+            ("a4", "a1"),
+            ("a5", "a2"),
+            ("a6", "a2"),
+        ] {
+            app.apply(spawned(id, parent));
+        }
+        let status = |id: &str, status| SwarmEvent::Status {
+            id: id.into(),
+            status,
+        };
+        app.apply(status("a5", AgentStatus::Running));
+        app.apply(status("a6", AgentStatus::Errored("boom".into())));
+        app.apply(status("a4", AgentStatus::Cancelled));
+        let rows = |app: &App| {
+            let tree = app.tree();
+            tree.iter()
+                .map(|row| (row.view.id.clone(), row.fold))
+                .collect::<Vec<_>>()
+        };
+        // a5 is selected when a fold hides it: its folded ancestor takes the selection.
+        app.selected = 2;
+        assert_eq!(app.selected_id().as_deref(), Some("a5"));
+        let selected = app.selected_id();
+        app.folded.insert("a1".into());
+        app.reselect(selected);
+        assert_eq!(app.selected_id().as_deref(), Some("a1"));
+        let fold = Fold {
+            hidden: 3,
+            running: 1,
+            errored: 1,
+        };
+        assert_eq!(rows(&app), [("a1".into(), Some(fold)), ("a3".into(), None)]);
+        // The cancelled a4 counts as hidden by the F3 filter, not by the fold.
+        assert_eq!(app.hidden(), 1);
+        // A nested fold inside a folded one changes nothing; unfolding the outer shows it.
+        app.folded.insert("a2".into());
+        assert_eq!(rows(&app)[0].1, Some(fold));
+        app.folded.remove("a1");
+        let fold = Fold {
+            hidden: 2,
+            running: 1,
+            errored: 1,
+        };
+        assert_eq!(rows(&app)[1], ("a2".into(), Some(fold)));
+        // Showing cancelled agents does not unfold anything.
+        app.toggle_cancelled();
+        assert_eq!(rows(&app).len(), 4);
     }
 
     #[test]
@@ -1184,7 +1348,7 @@ mod tests {
         let tree = |app: &App| {
             app.tree()
                 .iter()
-                .map(|(depth, v)| format!("{depth}{}", v.id))
+                .map(|row| format!("{}{}", row.depth, row.view.id))
                 .collect::<Vec<_>>()
         };
         assert_eq!(tree(&app), ["0a1", "1a2", "2a4", "3a6", "1a5", "2a7", "0a3"]);
@@ -1219,7 +1383,12 @@ mod tests {
                 status: AgentStatus::Cancelled,
             })
         };
-        let ids = |app: &App| app.tree().iter().map(|(_, v)| v.id.clone()).collect::<Vec<_>>();
+        let ids = |app: &App| {
+            app.tree()
+                .iter()
+                .map(|row| row.view.id.clone())
+                .collect::<Vec<_>>()
+        };
         app.selected = 3; // a4
         cancel(&mut app, "a2");
         assert_eq!(ids(&app), ["a1", "a2", "a3", "a4", "a5"], "a2 has a live child");
@@ -1435,7 +1604,7 @@ mod tests {
 
         // On screen, the shrunk log still ends with the agent's last steps.
         app.show_cancelled = true;
-        app.selected = app.tree().iter().position(|(_, view)| view.id == "a2").unwrap();
+        app.selected = app.tree().iter().position(|row| row.view.id == "a2").unwrap();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
         terminal
             .draw(|frame| super::super::view::draw(frame, &app, "r", 0))

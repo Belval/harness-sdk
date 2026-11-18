@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AgentView, App, LogEntry, SlashCommand, Waiting};
+use super::app::{AgentView, App, Fold, LogEntry, Row, SlashCommand, Waiting};
 use super::select::{self, Pane};
 use crate::runtime::{AgentStatus, USER};
 use crate::text::compact;
@@ -23,6 +23,7 @@ const KEYS: &[(&str, &str)] = &[
     ("enter", "send to the selected agent"),
     ("/", "commands"),
     ("↑ ↓", "select an agent (or a command)"),
+    ("← → no text", "hide, show sub-agents (← on a leaf: its parent)"),
     ("pgup pgdn end", "scroll the log (or the mouse wheel)"),
     ("drag", "select in one pane and copy (shift-drag: terminal's own)"),
     (
@@ -194,7 +195,7 @@ fn draw_agents(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let items: Vec<ListItem> = app
         .tree()
         .into_iter()
-        .map(|(depth, view)| ListItem::new(fit_row(agent_item(depth, view, tick), width, view.unseen)))
+        .map(|row| ListItem::new(fit_row(agent_item(row, tick), width, row.view.unseen)))
         .collect();
     let list = List::new(items)
         .block(
@@ -208,12 +209,22 @@ fn draw_agents(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
 }
 
 /// The agent tree's width: its longest name line plus room for the unseen marker, at most 30% of
-/// `total`, adjusted by the user (up to 60%); 0 hides it.
+/// `total`, adjusted by the user (up to 60%); 0 hides it. A folded row needs room for its name
+/// and count only: the count may clip its model and id, so folding widens the tree little.
 fn tree_width(app: &App, total: u16) -> u16 {
+    let row_width = |row: Row| {
+        let plain = agent_item(Row { fold: None, ..row }, 0);
+        let folded = row.fold.map_or(0, |fold| {
+            // Indent, glyph and name come first.
+            let head: usize = plain.spans.iter().take(3).map(Span::width).sum();
+            head + fold_spans(fold).iter().map(Span::width).sum::<usize>()
+        });
+        plain.width().max(folded) + if row.view.unseen { 1 } else { 3 }
+    };
     let fit = app
         .tree()
         .into_iter()
-        .map(|(depth, view)| agent_item(depth, view, 0).width() + if view.unseen { 1 } else { 3 })
+        .map(row_width)
         .max()
         .unwrap_or(0)
         .max(MIN_TREE);
@@ -227,15 +238,33 @@ fn tree_width(app: &App, total: u16) -> u16 {
     }
 }
 
-/// One line per agent: `⠋ parser opus-5-5 1.2M/34k 34% a2 ⎇ •`. The list clips it at its
-/// width, so the trailing id goes first on narrow terminals.
-fn agent_item(depth: usize, view: &AgentView, tick: usize) -> Line<'static> {
+/// `▸ (+12, 2 running, 1 errored)`: what a folded agent hides, and who of them works or failed.
+fn fold_spans(fold: Fold) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw(format!(" ▸ (+{}", fold.hidden))];
+    if fold.running > 0 {
+        let running = format!(", {} running", fold.running);
+        spans.push(Span::styled(running, Style::new().fg(Color::Cyan)));
+    }
+    if fold.errored > 0 {
+        let errored = format!(", {} errored", fold.errored);
+        spans.push(Span::styled(errored, Style::new().fg(Color::Red)));
+    }
+    spans.push(Span::raw(")"));
+    spans
+}
+
+/// One line per agent: `⠋ parser opus-5-5 1.2M/34k 34% a2 ⎇ •`, and after a folded agent's name
+/// what it hides: `▸ (+12, 2 running, 1 errored)`. The list clips it at its width, so the
+/// trailing id goes first on narrow terminals.
+fn agent_item(row: Row, tick: usize) -> Line<'static> {
+    let Row { depth, view, fold } = row;
     let (glyph, color) = status_glyph(view, tick);
     let mut spans = vec![
         Span::raw("  ".repeat(depth)),
         Span::styled(format!("{glyph} "), Style::new().fg(color)),
         Span::styled(view.name.clone(), Style::new().bold()),
     ];
+    spans.extend(fold.map(fold_spans).into_iter().flatten());
     if let Some(model) = &view.model {
         spans.push(Span::styled(
             format!(" {}", short_model(model)),
@@ -1418,7 +1447,12 @@ mod tests {
             context: Some(0.34),
         });
         let view = &app.agents["a2"];
-        let item = agent_item(0, view, 0).to_string();
+        let row = Row {
+            depth: 0,
+            view,
+            fold: None,
+        };
+        let item = agent_item(row, 0).to_string();
         assert!(item.contains("parser opus-5-5 1.2M/34.0k 34% a2"), "{item}");
         assert_eq!(
             log_title(view),

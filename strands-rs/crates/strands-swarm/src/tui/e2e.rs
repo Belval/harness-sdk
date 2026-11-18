@@ -611,3 +611,109 @@ async fn budget_shows_usage_just_over_it_as_over_budget() {
     );
     swarm.shutdown().await;
 }
+
+/// ← and → with an empty input fold and unfold the selected agent's subtree; with text they
+/// move the cursor.
+#[tokio::test]
+async fn arrows_fold_the_tree_with_an_empty_input_and_edit_it_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let spawn = |name: &str, id: &str| {
+        ContentBlock::ToolUse(ToolUseBlock::new(
+            "spawn_agent",
+            id,
+            json!({"task": format!("run the {name}"), "name": name}),
+        ))
+    };
+    let wait = ContentBlock::ToolUse(ToolUseBlock::new(
+        "wait",
+        "t3",
+        json!({"from": ["parser", "linter"], "all": true, "timeout_seconds": 30}),
+    ));
+    let root = Message::new(
+        Role::Assistant,
+        vec![spawn("parser", "t1"), spawn("linter", "t2"), wait],
+    );
+    let scripts = HashMap::from([
+        ("a1", vec![MockResponse::message(root), say("root: done")]),
+        ("a2", vec![say("parser: all green")]),
+        ("a3", vec![say("linter: all green")]),
+    ]);
+    let gate = Arc::new(Semaphore::new(0));
+    let factory = gated_factory(scripts, &["a2", "a3"], &gate, &Sinks::default());
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.max_concurrent_calls = 1;
+    let (swarm, mut events) = Swarm::new(config);
+    let mut app = App::default();
+    let mut screen = Screen::new();
+    screen.type_line(&swarm, &mut app, "fix the bug").await;
+    let before = screen
+        .until(&mut app, &mut events, "3 agents · 1 running · 2 waiting")
+        .await;
+    assert!(!before.contains('▸'), "an unfolded tree has no marker\n{before}");
+    let child_rows = |shown: &str| {
+        ["  ⠋ parser", "  ◌ parser", "  ⠋ linter", "  ◌ linter"]
+            .iter()
+            .filter(|row| shown.contains(*row))
+            .count()
+    };
+    assert_eq!(child_rows(&before), 2, "{before}");
+
+    // ← folds the root: its children leave the list, its row counts them and who works.
+    let folded = screen.press(&swarm, &mut app, KeyCode::Left).await;
+    assert!(folded.contains("⧗ fix-bug ▸ (+2, 1 running)"), "{folded}");
+    assert_eq!(child_rows(&folded), 0, "{folded}");
+    assert!(
+        folded.contains("3 agents · 1 running · 2 waiting"),
+        "the header still counts them\n{folded}"
+    );
+    assert!(
+        !folded.contains("hidden (f3)"),
+        "folded agents are not cancelled ones\n{folded}"
+    );
+    // ↓ skips the hidden agents; ← on a folded root has no parent to go to.
+    screen.press(&swarm, &mut app, KeyCode::Down).await;
+    assert_eq!(app.selected_id().as_deref(), Some("a1"));
+    screen.press(&swarm, &mut app, KeyCode::Left).await;
+    assert_eq!(app.selected_id().as_deref(), Some("a1"));
+
+    // → unfolds it, and the screen is as it was.
+    let unfolded = screen.press(&swarm, &mut app, KeyCode::Right).await;
+    assert_eq!(unfolded, before);
+    // → on an unfolded agent selects its first child; ← on a leaf, its parent.
+    screen.press(&swarm, &mut app, KeyCode::Right).await;
+    assert_eq!(app.selected_id().as_deref(), Some("a2"));
+    screen.press(&swarm, &mut app, KeyCode::Down).await;
+    assert_eq!(app.selected_id().as_deref(), Some("a3"));
+    screen.press(&swarm, &mut app, KeyCode::Left).await;
+    assert_eq!(app.selected_id().as_deref(), Some("a1"));
+
+    // With text in the input, the arrows move the cursor and fold nothing.
+    for code in [
+        KeyCode::Char('a'),
+        KeyCode::Char('b'),
+        KeyCode::Left,
+        KeyCode::Char('X'),
+        KeyCode::Right,
+        KeyCode::Char('Y'),
+    ] {
+        screen.press(&swarm, &mut app, code).await;
+    }
+    assert_eq!(app.input, "aXbY");
+    assert!(app.folded.is_empty());
+    let shown = screen.press(&swarm, &mut app, KeyCode::Esc).await;
+    assert_eq!(child_rows(&shown), 2, "{shown}");
+
+    // Folded agents' events still arrive: the count follows them as they finish.
+    screen.press(&swarm, &mut app, KeyCode::Left).await;
+    gate.add_permits(2);
+    let shown = screen.until(&mut app, &mut events, "fix-bug ▸ (+2) ").await;
+    assert_eq!(child_rows(&shown), 0, "{shown}");
+    screen.until(&mut app, &mut events, "root: done").await;
+    screen.press(&swarm, &mut app, KeyCode::Right).await;
+    let selected = |app: &App| app.selected_id();
+    screen.press(&swarm, &mut app, KeyCode::Down).await;
+    assert_eq!(selected(&app).as_deref(), Some("a2"));
+    let shown = screen.until(&mut app, &mut events, "parser: all green").await;
+    assert!(shown.contains("  ● parser"), "{shown}");
+    swarm.shutdown().await;
+}

@@ -340,6 +340,8 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
         KeyCode::Left | KeyCode::Right if ctrl => {
             app.move_word(if key.code == KeyCode::Left { -1 } else { 1 })
         }
+        KeyCode::Left if app.input.is_empty() => app.fold(),
+        KeyCode::Right if app.input.is_empty() => app.unfold(),
         KeyCode::Left => app.move_char(-1),
         KeyCode::Right => app.move_char(1),
         // Shift-Enter (where the terminal reports it) or Alt-Enter starts a new line.

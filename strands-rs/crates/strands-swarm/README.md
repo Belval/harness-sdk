@@ -470,6 +470,11 @@ Other text messages the selected agent, or starts a root agent when there is non
 - The status spins while the agent works (a model call or a tool call). A still `◌` means it
   waits for a model-call slot or for a pending reload, a still `⧗` that it is blocked in `wait`.
 - Cancelled agents without a live descendant are hidden (the header counts them); F3 shows them.
+- With an empty input, ← folds the selected agent: its descendants leave the list, and its row
+  counts them and those of them that work or failed, e.g. `● parser ▸ (+12, 2 running, 1 errored)`.
+  → unfolds it. ← on an agent that shows no children selects its parent, → on an unfolded one
+  its first child, as in a file tree. ↑/↓ skip folded agents, which still get mail and log
+  events. Folds last for the session, not across restarts or reloads.
 - Alt-←/→ narrows or widens the tree. Narrow it past its minimum to hide it.
 
 **Header.**
@@ -482,8 +487,8 @@ Other text messages the selected agent, or starts a root agent when there is non
 
 **Input.**
 
-- The input box edits like a shell line: ←/→, Home/End (Ctrl-A/E), Ctrl-←/→ by word, Delete,
-  Ctrl-W/Ctrl-U (Alt-Backspace). Tab completes the highlighted command.
+- The input box edits like a shell line: ←/→ (when it has text), Home/End (Ctrl-A/E), Ctrl-←/→
+  by word, Delete, Ctrl-W/Ctrl-U (Alt-Backspace). Tab completes the highlighted command.
 - Alt-Enter (or Shift-Enter where reported) inserts a new line.
 - A long line wraps (at a space where one fits) instead of scrolling sideways; the box grows to
   6 rows, then scrolls with the cursor.
