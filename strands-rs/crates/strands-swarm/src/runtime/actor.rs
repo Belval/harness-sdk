@@ -541,13 +541,17 @@ impl Swarm {
     }
 }
 
-/// A final reply that is only this (or only whitespace) is not delivered to an agent parent.
+/// A final reply that starts with this (or is only whitespace) is not delivered to an agent
+/// parent. Models often add a line on why after the marker; that still means "nothing to tell".
 pub const SILENT_REPLY: &str = "[silent]";
 
 /// Whether `reply` ends the turn without a message to the parent ([`SILENT_REPLY`]).
 pub(super) fn is_silent(reply: &str) -> bool {
-    let reply = reply.trim();
-    reply.is_empty() || reply.eq_ignore_ascii_case(SILENT_REPLY)
+    let reply = reply.trim_start();
+    reply.is_empty()
+        || reply
+            .get(..SILENT_REPLY.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(SILENT_REPLY))
 }
 
 pub(super) const RETRY_INITIAL: Duration = Duration::from_secs(15);
@@ -717,8 +721,24 @@ fn scalar_list(value: &serde_json::Value) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{summarize_input, usage_counts};
+    use super::{is_silent, summarize_input, usage_counts};
     use strands_agents::types::Usage;
+
+    #[test]
+    fn a_reply_that_starts_with_the_silent_marker_is_silent_whatever_follows() {
+        for silent in [
+            "[silent]",
+            " [SILENT]\n",
+            "",
+            "  \n",
+            "[silent]\n\n(poll at 07:05: nothing new)",
+        ] {
+            assert!(is_silent(silent), "{silent:?}");
+        }
+        for loud in ["CI is green", "Nothing new. [silent]", "[sile", "é[silent]"] {
+            assert!(!is_silent(loud), "{loud:?}");
+        }
+    }
 
     #[test]
     fn counts_cache_tokens_into_the_input_once_whichever_way_the_provider_reports_them() {
