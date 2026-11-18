@@ -56,13 +56,13 @@ fn compact_to(n: u64, decimals: usize) -> String {
     number + unit
 }
 
-/// Token usage against a budget, e.g. `1.1M of 1.2M tokens used`, `all 1.2M tokens used` or
 /// What an agent waits for when the model-call cap is full, e.g.
 /// `queued for a model slot (8/8 calls in flight; /max-calls to raise)`.
 pub fn queued_for_call(calls: usize, limit: usize) -> String {
     format!("queued for a model slot ({calls}/{limit} calls in flight; /max-calls to raise)")
 }
 
+/// Token usage against a budget, e.g. `1.1M of 1.2M tokens used`, `all 1.2M tokens used` or
 /// `1.3M tokens used, over the 1.2M budget`. Two different counts are shown with enough places to
 /// tell them apart, so usage just under the budget never reads as equal to it or over it.
 pub fn usage(used: u64, budget: u64) -> String {

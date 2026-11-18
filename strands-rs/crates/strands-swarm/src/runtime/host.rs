@@ -61,7 +61,7 @@ pub(super) struct HostGate {
     /// Set with [`Swarm::set_min_free_mem`]; overrides the config.
     pub(super) min_free_mem: Mutex<Option<u64>>,
     /// Agents held now, with why.
-    held: Mutex<BTreeMap<String, String>>,
+    pub(super) held: Mutex<BTreeMap<String, String>>,
     /// Why worktree spawns and land jobs wait: space is low ([`Swarm::guard_disk`]).
     pub(super) disk_low: Mutex<Option<String>>,
 }
@@ -155,12 +155,6 @@ impl Swarm {
                 crate::gc::human(floor)
             )
         })
-    }
-
-    /// What agent `id` waits for, if the host holds it: `waiting: host load 180/128 …`.
-    pub fn held_for_host(&self, id: &str) -> Option<String> {
-        let held = self.inner.host.held.lock();
-        held.get(id).map(|why| format!("waiting: {why}"))
     }
 
     /// Wait while [`Self::host_busy`] (with `disk`, also while disk space is low:
