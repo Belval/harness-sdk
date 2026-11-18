@@ -2909,6 +2909,23 @@ async fn host_held(events: &mut UnboundedReceiver<SwarmEvent>, id: &str) -> Opti
     tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap()
 }
 
+/// A host probe reading `load` and `mem_available`, counting its readings in `reads`.
+fn host_probe(
+    load: &Arc<std::sync::atomic::AtomicU64>,
+    mem_available: u64,
+    reads: &Arc<std::sync::atomic::AtomicU64>,
+) -> strands_swarm::runtime::HostProbe {
+    use std::sync::atomic::Ordering;
+    let (load, reads) = (load.clone(), reads.clone());
+    Arc::new(move || {
+        reads.fetch_add(1, Ordering::SeqCst);
+        Some(strands_swarm::runtime::HostStats {
+            load: load.load(Ordering::SeqCst) as f64,
+            mem_available,
+        })
+    })
+}
+
 #[tokio::test]
 async fn an_overloaded_host_holds_new_model_calls_and_jobs_until_it_recovers() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2917,15 +2934,7 @@ async fn an_overloaded_host_holds_new_model_calls_and_jobs_until_it_recovers() {
     let load = Arc::new(AtomicU64::new(50));
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.max_load = 10.0;
-    config.host_probe = {
-        let load = load.clone();
-        Arc::new(move || {
-            Some(strands_swarm::runtime::HostStats {
-                load: load.load(Ordering::SeqCst) as f64,
-                mem_available: 1 << 40,
-            })
-        })
-    };
+    config.host_probe = host_probe(&load, 1 << 40, &Arc::default());
     let (swarm, mut events) = Swarm::new(config);
     spawn_root(&swarm, "go").await;
 
@@ -2975,16 +2984,7 @@ async fn one_reading_of_a_recovered_host_releases_every_held_caller() {
     let reads = Arc::new(AtomicU64::new(0));
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.max_load = 10.0;
-    config.host_probe = {
-        let (load, reads) = (load.clone(), reads.clone());
-        Arc::new(move || {
-            reads.fetch_add(1, Ordering::SeqCst);
-            Some(strands_swarm::runtime::HostStats {
-                load: load.load(Ordering::SeqCst) as f64,
-                mem_available: 1 << 40,
-            })
-        })
-    };
+    config.host_probe = host_probe(&load, 1 << 40, &reads);
     let (swarm, mut events) = Swarm::new(config);
 
     // Two callers are held, half a poll apart; the host recovers right after.
@@ -3031,12 +3031,7 @@ async fn low_host_memory_holds_new_work_and_no_limit_holds_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let map = scripts_of(vec![]);
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
-    config.host_probe = Arc::new(|| {
-        Some(strands_swarm::runtime::HostStats {
-            load: 500.0,
-            mem_available: 1 << 30,
-        })
-    });
+    config.host_probe = host_probe(&Arc::new(500.into()), 1 << 30, &Arc::default());
     let (swarm, _events) = Swarm::new(config.clone());
     assert_eq!(swarm.host_busy(), None, "off by default");
     config.min_free_mem = 8 << 30;
