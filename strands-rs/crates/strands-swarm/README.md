@@ -42,7 +42,7 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
               [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
               [--max-agents N] [--max-concurrent-calls N] [--max-load N] [--min-free-mem SIZE]
-              [--build-jobs N]
+              [--priority AGENT]... [--build-jobs N]
               [--budget-tokens N] [--compact-at TOKENS]
               [--allow-land] [--land-into GLOB]... [--gate CMD]...
               [--notify] [--status-base BRANCH] [--prices FILE] [--min-free-disk SIZE] [--headless]
@@ -180,7 +180,8 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
 ## Limits
 
 - **Agents.** `--max-agents N` (16) caps live agents.
-  - Spawns beyond the cap are `queued` and start oldest first as slots free.
+  - Spawns beyond the cap are `queued` and start oldest first as slots free (the priority lane,
+    below, never queues).
   - A queued agent can already be messaged; cancelling it drops it.
   - A `wait` for queued agents returns at once, naming the idle agents that hold slots, when no
     other agent is running that could cancel one: only the waiter can free a slot for them.
@@ -218,7 +219,8 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   turns it off).
   - What waits: a new model call (before it queues for a model slot), a background job's start
     (`run_background`, land jobs too) and an agent's `spawn_agent`. Nothing already running is
-    held or slowed: a build in flight keeps going, and the user's own spawns are not held.
+    held or slowed: a build in flight keeps going, and the user's own spawns are not held. Nor is
+    the priority lane, below.
   - A held agent says why, like a queued call: `waiting: host load 180/128 (/max-load to
     change)` in its log line, `/status` and `list_agents`; `/status` starts with
     `agents 3/100 · calls 8/8 · load 45/128`. Holds are logged as `host_held` in `events.jsonl`.
@@ -228,6 +230,22 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   - `/max-load N` changes the limit for the running swarm, `/max-load off` lifts it and
     `/max-load default` returns to the flag; `/min-free-mem SIZE|off|default` does the same for
     memory. Both are kept in `swarm.json` across restarts, ahead of the flags, like `/max-calls`.
+- **Priority lane.** Root agents, and the agents named with `--priority AGENT` (repeatable; an id
+  or name, as `send_message` takes it, so a name can be given before that agent is spawned), never
+  wait on the host or the caps; for an agent that relays the user's messages, a hold makes the
+  user wait.
+  - Their model calls skip the host load and memory holds and never wait for a model slot. They
+    still count toward `--max-concurrent-calls`: the cap keeps bounding everyone else, and a
+    priority call takes a slot from the queue rather than stacking new streams on a throttled
+    account unseen; only priority calls can push it past the cap (`calls 9/8`).
+  - They are never `queued` at `--max-agents` and start at once when added; they hold a slot
+    like any agent. Their background jobs and spawns skip the host hold too, but worktree spawns
+    and lands still wait while disk space is low: a priority agent can still fill the disk.
+  - `/status` and `list_agents` mark them `priority`.
+  - `/priority AGENT…` replaces the lane (every agent named must exist; it is kept by id),
+    `/priority off` leaves only the roots, `/priority default` returns to the flags and
+    `/priority` shows it. Kept in `swarm.json` across restarts, ahead of the flags, like
+    `/max-calls`.
 - **Builds.** Agents' shell commands and background jobs (land checks included) get
   `CARGO_BUILD_JOBS` set to `--build-jobs N` (default a quarter of the CPUs, 1 to 16; `0` sets
   none) unless the swarm's own environment sets it; without it every cargo build starts a
@@ -415,7 +433,7 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
 | `/cancel` | Stop the selected agent and its subtree for good. |
 | `/status` | Each live agent's state, activity, todos, unmerged commits and merge outlook, jobs and schedules, without a model call. |
 | `/cost` | Estimated spend (see [Cost](#cost)); its intro and footnote wrap, its table is clipped on narrow terminals. |
-| `/budget`, `/max-agents`, `/max-calls`, `/max-load`, `/min-free-mem` | See [Limits](#limits). |
+| `/budget`, `/max-agents`, `/max-calls`, `/max-load`, `/min-free-mem`, `/priority` | See [Limits](#limits). |
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
 | `/schedules` | All schedules. |
 | `/gc` | Retry reclaiming the disk of cancelled worktree agents. |

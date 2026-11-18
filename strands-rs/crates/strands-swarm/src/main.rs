@@ -64,6 +64,11 @@ struct Cli {
     /// its memory, at most 8 GB; `0` turns it off).
     #[arg(long, value_name = "SIZE", value_parser = strands_swarm::text::parse_bytes)]
     min_free_mem: Option<u64>,
+    /// Put an agent (id or name, as `send_message` takes it) in the priority lane besides the
+    /// root agents: its model calls and jobs skip the host load and memory holds and the call
+    /// and agent caps. Repeatable; TUI `/priority`.
+    #[arg(long, value_name = "AGENT")]
+    priority: Vec<String>,
     /// `CARGO_BUILD_JOBS` for agents' shell commands, jobs and land checks unless the
     /// environment sets it (default: a quarter of the CPUs, 1 to 16; `0` sets none).
     #[arg(long, value_name = "N")]
@@ -400,6 +405,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.models = Some(models);
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
+    config.priority = cli.priority.clone();
     config.max_load = cli
         .max_load
         .unwrap_or_else(strands_swarm::runtime::default_max_load);

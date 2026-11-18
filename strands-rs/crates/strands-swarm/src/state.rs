@@ -51,6 +51,10 @@ pub struct SwarmState {
     /// Free-memory floor set at runtime (`0`: none), overriding `--min-free-mem`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_free_mem: Option<u64>,
+    /// The priority lane set at runtime (agent ids; empty: root agents only), overriding
+    /// `--priority`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Vec<String>>,
     /// Commit of the binary that saved it (`None` for older runs or builds outside git).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,

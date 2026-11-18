@@ -18,6 +18,7 @@ impl Swarm {
         *swarm.inner.max_calls.lock() = state.max_calls;
         *swarm.inner.host.max_load.lock() = state.max_load;
         *swarm.inner.host.min_free_mem.lock() = state.min_free_mem;
+        *swarm.inner.priority.lock() = state.priority.clone();
         let budget = resumed_budget(swarm.inner.config.budget_tokens, &state);
         *swarm.inner.budget.lock() = budget;
         if budget.is_some() {
@@ -183,6 +184,7 @@ impl Swarm {
             max_calls: *self.inner.max_calls.lock(),
             max_load: *self.inner.host.max_load.lock(),
             min_free_mem: *self.inner.host.min_free_mem.lock(),
+            priority: self.inner.priority.lock().clone(),
             commit: self.inner.config.commit.clone(),
             schedules: self.inner.schedules.lock().clone(),
         }

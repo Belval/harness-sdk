@@ -177,6 +177,8 @@ pub struct AgentReport {
     pub status: crate::AgentStatus,
     /// Unread messages.
     pub unread: usize,
+    /// In the priority lane ([`crate::Swarm::is_priority`]).
+    pub priority: bool,
     /// Its worktree branch, if any.
     pub branch: Option<String>,
     /// How `branch` stands against the base; `None` while unknown.
@@ -248,6 +250,9 @@ impl StatusReport {
         lines.extend(self.limits.map(|limits| limits.describe()));
         for agent in &self.agents {
             let mut head = format!("{} · {}", agent.label, agent.status);
+            if agent.priority {
+                head.push_str(" · priority");
+            }
             if agent.unread > 0 {
                 head.push_str(&format!(" · {} unread", agent.unread));
             }
@@ -632,6 +637,7 @@ mod tests {
             id: "a1".into(),
             status: crate::AgentStatus::Running,
             unread: 0,
+            priority: false,
             branch: None,
             git: None,
             quiet: Some(Duration::from_secs(60)),
@@ -667,6 +673,7 @@ mod tests {
                     label: "tui (a2)".into(),
                     status: crate::AgentStatus::Running,
                     unread: 1,
+                    priority: true,
                     branch: Some("swarm/r/a2".into()),
                     git: Some(BranchState {
                         ahead: vec!["abc1234 feat: x".into()],
@@ -688,6 +695,7 @@ mod tests {
                     label: "a3".into(),
                     status: crate::AgentStatus::Idle,
                     unread: 0,
+                    priority: false,
                     branch: Some("swarm/r/a3".into()),
                     git: Some(BranchState::default()),
                     quiet: None,
@@ -703,7 +711,7 @@ mod tests {
             [
                 "2 live agents · base main",
                 "",
-                "tui (a2) · running · 1 unread · shell cargo test",
+                "tui (a2) · running · priority · 1 unread · shell cargo test",
                 "  [x] Test",
                 "  [>] Commiting",
                 "  [ ] Report",
@@ -728,6 +736,7 @@ mod tests {
                 label: "a1".into(),
                 status: crate::AgentStatus::Queued,
                 unread: 0,
+                priority: false,
                 branch: Some("b".into()),
                 git: None,
                 quiet: None,
@@ -893,6 +902,7 @@ mod tests {
                 label: "a7".into(),
                 status: crate::AgentStatus::Running,
                 unread: 0,
+                priority: false,
                 branch: Some("swarm/r/a7".into()),
                 git: Some(state.clone()),
                 quiet: None,

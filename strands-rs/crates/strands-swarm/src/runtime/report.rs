@@ -42,6 +42,7 @@ impl Swarm {
                     label: node.label(),
                     status: info.status,
                     unread: info.unread,
+                    priority: self.priority_of(&node.id, &node.name, &node.parent),
                     branch: info.branch,
                     git: cache.branches.get(&node.id).cloned(),
                     quiet,

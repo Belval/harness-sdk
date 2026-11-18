@@ -882,22 +882,28 @@ async fn spawns_beyond_the_agent_limit_queue_and_start_when_a_slot_frees() {
 #[tokio::test]
 async fn cancelling_a_queued_agent_drops_it() {
     let dir = tempfile::tempdir().unwrap();
-    let map = scripts_of(vec![("a1", vec![say("one")]), ("a3", vec![say("three")])]);
+    let map = scripts_of(vec![
+        ("a1", vec![say("one"), say("ok"), say("ok")]),
+        ("a2", vec![say("two")]),
+        ("a4", vec![say("four")]),
+    ]);
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
-    config.max_agents = 1;
+    config.max_agents = 2;
     let (swarm, mut events) = Swarm::new(config);
     spawn_root(&swarm, "one").await;
     assert_eq!(reply_to(&mut events, USER).await, "one");
-    spawn_root(&swarm, "two").await;
-    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
-    swarm.cancel("a2").unwrap();
-    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Cancelled);
+    spawn_child(&swarm, "a1", "two").await;
+    assert_eq!(reply_to(&mut events, "a1").await, "two");
+    spawn_child(&swarm, "a1", "three").await;
+    assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Queued);
+    swarm.cancel("a3").unwrap();
+    assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Cancelled);
 
-    // a2 has no script: it is never built, even once a slot frees.
-    swarm.cancel("a1").unwrap();
-    spawn_root(&swarm, "three").await;
-    assert_eq!(reply_to(&mut events, USER).await, "three");
-    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Cancelled);
+    // a3 has no script: it is never built, even once a slot frees.
+    swarm.cancel("a2").unwrap();
+    spawn_child(&swarm, "a1", "four").await;
+    assert_eq!(reply_to(&mut events, "a1").await, "four");
+    assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Cancelled);
 }
 
 #[tokio::test]
@@ -2337,11 +2343,17 @@ fn scripts_of(scripts: Vec<(&str, Vec<MockResponse>)>) -> Scripts {
 }
 
 async fn spawn_root(swarm: &Swarm, task: &str) -> String {
+    spawn_child(swarm, USER, task).await
+}
+
+/// Spawn an agent of `parent` (or the user's). Root agents are in the priority lane, so tests of
+/// the holds and caps hold children.
+async fn spawn_child(swarm: &Swarm, parent: &str, task: &str) -> String {
     let request = SpawnRequest {
         task: task.into(),
         ..Default::default()
     };
-    swarm.spawn(USER, request).await.unwrap()
+    swarm.spawn(parent, request).await.unwrap()
 }
 
 #[tokio::test]
@@ -2937,10 +2949,14 @@ async fn model_calls_beyond_the_swarm_cap_queue() {
     let factory: AgentFactory = {
         let (in_flight, peak) = (in_flight.clone(), peak.clone());
         Arc::new(move |spec: AgentSpec| {
-            let model = SlowModel {
-                inner: MockMessageModel::new(vec![say("hi")]),
-                in_flight: in_flight.clone(),
-                peak: peak.clone(),
+            // The root's calls, in the priority lane, are not measured.
+            let model: Arc<dyn strands_agents::Model> = match spec.id.as_str() {
+                "a1" => Arc::new(MockMessageModel::new((0..4).map(|_| say("lead")).collect())),
+                _ => Arc::new(SlowModel {
+                    inner: MockMessageModel::new(vec![say("hi")]),
+                    in_flight: in_flight.clone(),
+                    peak: peak.clone(),
+                }),
             };
             Box::pin(async move {
                 let agent = Agent::builder()
@@ -2957,14 +2973,15 @@ async fn model_calls_beyond_the_swarm_cap_queue() {
     let mut config = SwarmConfig::new(factory, dir.path());
     config.max_concurrent_calls = 1;
     let (swarm, mut events) = Swarm::new(config);
+    let root = spawn_root(&swarm, "lead").await;
     for task in ["one", "two", "three"] {
-        spawn_root(&swarm, task).await;
+        spawn_child(&swarm, &root, task).await;
     }
     let (mut replies, mut queued) = (0, 0);
     let collect = async {
         while replies < 3 {
             match events.recv().await.expect("event stream closed") {
-                SwarmEvent::Mail { to, mail } if to == USER && mail.kind == "reply" => replies += 1,
+                SwarmEvent::Mail { to, mail } if to == root && mail.kind == "reply" => replies += 1,
                 SwarmEvent::ModelQueued { queued: true, .. } => queued += 1,
                 _ => {}
             }
@@ -3011,18 +3028,24 @@ fn host_probe(
 async fn an_overloaded_host_holds_new_model_calls_and_jobs_until_it_recovers() {
     use std::sync::atomic::{AtomicU64, Ordering};
     let dir = tempfile::tempdir().unwrap();
-    let map = scripts_of(vec![("a1", vec![say("hi")])]);
+    let map = scripts_of(vec![
+        ("a1", vec![say("lead"), say("ok")]),
+        ("a2", vec![say("hi")]),
+    ]);
     let load = Arc::new(AtomicU64::new(50));
     let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
     config.max_load = 10.0;
     config.host_probe = host_probe(&load, 1 << 40, &Arc::default());
     let (swarm, mut events) = Swarm::new(config);
-    spawn_root(&swarm, "go").await;
+    // The root is in the priority lane: the host never holds it.
+    spawn_root(&swarm, "lead").await;
+    assert_eq!(reply_to(&mut events, USER).await, "lead");
+    spawn_child(&swarm, "a1", "go").await;
 
-    // The first model call waits, and says why.
+    // The child's first model call waits, and says why.
     let why = "host load 50/10 (/max-load to change)";
-    assert_eq!(host_held(&mut events, "a1").await.as_deref(), Some(why));
-    assert_eq!(swarm.waiting_for_call("a1"), Some(format!("waiting: {why}")));
+    assert_eq!(host_held(&mut events, "a2").await.as_deref(), Some(why));
+    assert_eq!(swarm.waiting_for_call("a2"), Some(format!("waiting: {why}")));
     let limits = swarm.status().limits.unwrap();
     assert!(
         limits.describe().ends_with(" · load 50/10"),
@@ -3032,22 +3055,22 @@ async fn an_overloaded_host_holds_new_model_calls_and_jobs_until_it_recovers() {
 
     // A raised limit lets it through within a poll.
     swarm.set_max_load(Some(100.0));
-    assert_eq!(host_held(&mut events, "a1").await, None);
-    assert_eq!(reply_to(&mut events, USER).await, "hi");
+    assert_eq!(host_held(&mut events, "a2").await, None);
+    assert_eq!(reply_to(&mut events, "a1").await, "hi");
 
     // Back at the flag's limit, a job waits to start until the load drops.
     swarm.set_max_load(None);
     let start = tokio::spawn({
         let swarm = swarm.clone();
-        async move { swarm.start_job("a1", "true", None).await }
+        async move { swarm.start_job("a2", "true", None).await }
     });
-    assert_eq!(host_held(&mut events, "a1").await.as_deref(), Some(why));
+    assert_eq!(host_held(&mut events, "a2").await.as_deref(), Some(why));
     assert!(swarm.jobs().await.is_empty(), "no job starts while held");
     load.store(5, Ordering::SeqCst);
-    assert_eq!(host_held(&mut events, "a1").await, None);
+    assert_eq!(host_held(&mut events, "a2").await, None);
     start.await.unwrap().unwrap();
     assert_eq!(swarm.jobs().await.len(), 1);
-    assert_eq!(swarm.waiting_for_call("a1"), None);
+    assert_eq!(swarm.waiting_for_call("a2"), None);
 }
 
 /// A reading that finds the host free releases every held caller at once, not each at its own
@@ -3057,9 +3080,10 @@ async fn one_reading_of_a_recovered_host_releases_every_held_caller() {
     use std::sync::atomic::{AtomicU64, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let map = scripts_of(vec![
-        ("a1", vec![say("one")]),
-        ("a2", vec![say("two")]),
-        ("a3", vec![say("three")]),
+        ("a1", (0..4).map(|_| say("lead")).collect()),
+        ("a2", vec![say("one")]),
+        ("a3", vec![say("two")]),
+        ("a4", vec![say("three")]),
     ]);
     let load = Arc::new(AtomicU64::new(50));
     let reads = Arc::new(AtomicU64::new(0));
@@ -3067,20 +3091,23 @@ async fn one_reading_of_a_recovered_host_releases_every_held_caller() {
     config.max_load = 10.0;
     config.host_probe = host_probe(&load, 1 << 40, &reads);
     let (swarm, mut events) = Swarm::new(config);
+    // The root is in the priority lane: it reads nothing.
+    spawn_root(&swarm, "lead").await;
+    assert_eq!(reply_to(&mut events, USER).await, "lead");
 
     // Two callers are held, half a poll apart; the host recovers right after.
-    spawn_root(&swarm, "go").await;
-    assert!(host_held(&mut events, "a1").await.is_some());
+    spawn_child(&swarm, "a1", "go").await;
+    assert!(host_held(&mut events, "a2").await.is_some());
     let start = tokio::time::Instant::now();
     tokio::time::sleep(strands_swarm::runtime::HOST_POLL / 2).await;
-    spawn_root(&swarm, "go").await;
-    assert!(host_held(&mut events, "a2").await.is_some());
+    spawn_child(&swarm, "a1", "go").await;
+    assert!(host_held(&mut events, "a3").await.is_some());
     load.store(5, Ordering::SeqCst);
 
-    // a1 looks again a poll after its first reading; a2 is released by that very reading
+    // a2 looks again a poll after its first reading; a3 is released by that very reading
     // instead of at its own poll half a second later.
-    assert_eq!(host_held(&mut events, "a1").await, None);
     assert_eq!(host_held(&mut events, "a2").await, None);
+    assert_eq!(host_held(&mut events, "a3").await, None);
     assert!(
         start.elapsed() < strands_swarm::runtime::HOST_POLL + strands_swarm::runtime::HOST_POLL / 4,
         "{:?}",
@@ -3095,11 +3122,11 @@ async fn one_reading_of_a_recovered_host_releases_every_held_caller() {
     // A changed limit releases a held caller without waiting for its poll.
     load.store(50, Ordering::SeqCst);
     tokio::time::sleep(strands_swarm::runtime::HOST_POLL).await;
-    spawn_root(&swarm, "go").await;
-    assert!(host_held(&mut events, "a3").await.is_some());
+    spawn_child(&swarm, "a1", "go").await;
+    assert!(host_held(&mut events, "a4").await.is_some());
     let start = tokio::time::Instant::now();
     swarm.set_max_load(Some(100.0));
-    assert_eq!(host_held(&mut events, "a3").await, None);
+    assert_eq!(host_held(&mut events, "a4").await, None);
     assert!(
         start.elapsed() < strands_swarm::runtime::HOST_POLL / 2,
         "{:?}",
@@ -3152,7 +3179,7 @@ async fn host_limits_set_at_runtime_survive_a_resume_and_default_returns_to_the_
 
 /// Delegates to a mock once the test hands out a permit of `gate`.
 struct GatedModel {
-    inner: MockMessageModel,
+    inner: Arc<MockMessageModel>,
     gate: Arc<tokio::sync::Semaphore>,
 }
 
@@ -3183,9 +3210,13 @@ async fn raising_the_call_limit_releases_a_queued_call_and_survives_a_resume() {
     let factory: AgentFactory = {
         let gate = gate.clone();
         Arc::new(move |spec: AgentSpec| {
-            let model = GatedModel {
-                inner: MockMessageModel::new(vec![say("hi")]),
-                gate: gate.clone(),
+            // The root, in the priority lane, answers at once and never queues.
+            let model: Arc<dyn strands_agents::Model> = match spec.id.as_str() {
+                "a1" => Arc::new(MockMessageModel::new((0..3).map(|_| say("lead")).collect())),
+                _ => Arc::new(GatedModel {
+                    inner: Arc::new(MockMessageModel::new(vec![say("hi")])),
+                    gate: gate.clone(),
+                }),
             };
             Box::pin(async move {
                 Agent::builder()
@@ -3202,8 +3233,10 @@ async fn raising_the_call_limit_releases_a_queued_call_and_survives_a_resume() {
     config.max_concurrent_calls = 1;
     let (swarm, mut events) = Swarm::new(config.clone());
     assert_eq!(swarm.max_calls(), 1);
-    spawn_root(&swarm, "one").await;
-    spawn_root(&swarm, "two").await;
+    spawn_root(&swarm, "lead").await;
+    assert_eq!(reply_to(&mut events, USER).await, "lead");
+    spawn_child(&swarm, "a1", "one").await;
+    spawn_child(&swarm, "a1", "two").await;
 
     // One call holds the only slot; the other agent queues and says why.
     let mut queued = None;
@@ -3250,7 +3283,7 @@ async fn raising_the_call_limit_releases_a_queued_call_and_survives_a_resume() {
     let collect = async {
         while replies < 2 {
             if let Some(SwarmEvent::Mail { to, mail }) = events.recv().await {
-                replies += usize::from(to == USER && mail.kind == "reply");
+                replies += usize::from(to == "a1" && mail.kind == "reply");
             }
         }
     };
@@ -3268,6 +3301,156 @@ async fn raising_the_call_limit_releases_a_queued_call_and_survives_a_resume() {
     swarm.set_max_calls(None);
     assert_eq!(swarm.max_calls(), 1);
     assert_eq!(swarm.snapshot().max_calls, None);
+}
+
+/// A factory of mock agents where `gated` agents' calls each wait for a permit of `gate`.
+fn gated_mock_factory(
+    scripts: &Scripts,
+    gated: &'static [&'static str],
+    gate: &Arc<tokio::sync::Semaphore>,
+) -> AgentFactory {
+    let (scripts, gate) = (scripts.clone(), gate.clone());
+    Arc::new(move |spec: AgentSpec| {
+        let inner = scripts.lock()[&spec.id].clone();
+        let model: Arc<dyn Model> = match gated.contains(&spec.id.as_str()) {
+            true => Arc::new(GatedModel {
+                inner,
+                gate: gate.clone(),
+            }),
+            false => inner,
+        };
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .system_prompt(spec.instructions)
+                .tools(spec.tools)
+                .no_sandbox()
+                .build()
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_priority_agent_skips_the_host_hold_and_a_full_call_cap_while_others_wait() {
+    use std::sync::atomic::AtomicU64;
+    let dir = tempfile::tempdir().unwrap();
+    let map = scripts_of(vec![
+        ("a1", (0..4).map(|_| say("lead")).collect()),
+        ("a2", vec![say("worked")]),
+        (
+            "a3",
+            vec![tool_call("list_agents", "t1", json!({})), say("relayed")],
+        ),
+    ]);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut config = SwarmConfig::new(gated_mock_factory(&map, &["a1"], &gate), dir.path());
+    config.max_load = 10.0;
+    config.host_probe = host_probe(&Arc::new(AtomicU64::new(50)), 1 << 40, &Arc::default());
+    config.max_concurrent_calls = 1;
+    config.priority = vec!["relay".into()];
+    let (swarm, mut events) = Swarm::new(config);
+
+    // The root is in the priority lane: past the overloaded host, its call fills the cap.
+    spawn_root(&swarm, "lead").await;
+    eventually("the root's call is in flight", || swarm.calls_in_flight() == 1).await;
+    let why = "waiting: host load 50/10 (/max-load to change)";
+
+    // A normal agent waits; the one `--priority` names goes through at once, past both.
+    spawn_child(&swarm, "a1", "work").await;
+    assert!(host_held(&mut events, "a2").await.is_some());
+    let relay = SpawnRequest {
+        task: "relay the user's messages".into(),
+        name: Some("relay".into()),
+        ..Default::default()
+    };
+    assert_eq!(swarm.spawn("a1", relay).await.unwrap(), "a3");
+    assert_eq!(reply_to(&mut events, "a1").await, "relayed");
+    assert_eq!(swarm.waiting_for_call("a2").as_deref(), Some(why));
+    let listed = sent_text(&map.lock()["a3"], 1);
+    for shown in [
+        "lead (a1): running, priority, parent user",
+        "relay (a3): running, priority, parent",
+    ] {
+        assert!(listed.contains(shown), "{shown:?} in {listed}");
+    }
+    assert!(
+        listed.contains(&format!("work (a2): running, {why}, parent")),
+        "{listed}"
+    );
+    let lane: Vec<bool> = ["a1", "a2", "a3"]
+        .iter()
+        .map(|id| swarm.is_priority(id))
+        .collect();
+    assert_eq!(lane, [true, false, true]);
+    let report = swarm.status();
+    let shown: Vec<bool> = report.agents.iter().map(|agent| agent.priority).collect();
+    assert_eq!(shown, [true, false, true]);
+    let lines = report.lines(&|_| None);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("relay (a3) · ") && line.ends_with(" · priority")),
+        "{lines:?}"
+    );
+    assert!(!lines
+        .iter()
+        .any(|line| line.starts_with("work (a2) ") && line.contains("priority")));
+
+    // Put in the lane at runtime, the waiting agent goes too; its call counts toward the cap.
+    swarm.set_priority(Some(vec!["a2".into()])).unwrap();
+    assert_eq!(reply_to(&mut events, "a1").await, "worked");
+    assert_eq!(swarm.calls_in_flight(), 1, "the root's call still holds the slot");
+    assert!(!swarm.is_priority("a3"), "the runtime lane replaces the flag's");
+    gate.add_permits(4);
+    assert_eq!(reply_to(&mut events, USER).await, "lead");
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_priority_lane_skips_the_agent_cap_and_survives_a_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let map = scripts_of(vec![
+        ("a1", vec![say("lead"), say("ok")]),
+        ("a2", vec![say("hi")]),
+    ]);
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.max_agents = 1;
+    config.priority = vec!["flagged".into()];
+    let (swarm, mut events) = Swarm::new(config.clone());
+    assert_eq!(swarm.priority(), ["flagged"]);
+    spawn_root(&swarm, "lead").await;
+    assert_eq!(reply_to(&mut events, USER).await, "lead");
+    spawn_child(&swarm, "a1", "late").await;
+    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
+
+    // Put in the lane, a queued agent starts past the cap; unknown agents are refused.
+    let unknown = swarm.set_priority(Some(vec!["a2".into(), "nobody".into()]));
+    assert!(unknown
+        .unwrap_err()
+        .to_string()
+        .contains("No agent with id or name `nobody`"));
+    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
+    swarm.set_priority(Some(vec!["late (a2)".into()])).unwrap();
+    assert_eq!(reply_to(&mut events, "a1").await, "hi");
+    assert_eq!(swarm.priority(), ["a2"]);
+    let state = swarm.snapshot();
+    assert_eq!(state.priority, Some(vec!["a2".to_owned()]));
+    swarm.shutdown().await;
+
+    // The saved lane wins over the flag after a resume; `None` returns to the flag.
+    let (swarm, _events) = Swarm::resume(config, state).await.unwrap();
+    assert_eq!(swarm.priority(), ["a2"]);
+    assert!(swarm.is_priority("a2"));
+    swarm.set_priority(Some(Vec::new())).unwrap();
+    assert!(
+        !swarm.is_priority("a2") && swarm.is_priority("a1"),
+        "roots stay in it"
+    );
+    swarm.set_priority(None).unwrap();
+    assert_eq!(swarm.priority(), ["flagged"]);
+    assert_eq!(swarm.snapshot().priority, None);
+    swarm.shutdown().await;
 }
 
 #[tokio::test]
@@ -4930,28 +5113,34 @@ async fn a_recurring_schedule_wakes_its_agent_until_it_is_cancelled() {
 #[tokio::test]
 async fn an_idle_agent_waiting_on_a_schedule_holds_no_agent_slot() {
     let dir = tempfile::tempdir().unwrap();
-    let scripts = scripts_of(vec![("a1", vec![say("idle now")]), ("a2", vec![say("hi")])]);
+    let scripts = scripts_of(vec![
+        ("a1", vec![say("root"), say("ok"), say("ok")]),
+        ("a2", vec![say("idle now")]),
+        ("a3", vec![say("hi")]),
+    ]);
     let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
-    config.max_agents = 1;
+    config.max_agents = 2;
     let (swarm, mut events) = Swarm::new(config);
-    let root = spawn_root(&swarm, "monitor").await;
+    let root = spawn_root(&swarm, "lead").await;
     reply_to(&mut events, USER).await;
-    eventually("the root is idle", || {
-        swarm.agent(&root).unwrap().status == AgentStatus::Idle
+    let monitor = spawn_child(&swarm, &root, "monitor").await;
+    reply_to(&mut events, &root).await;
+    eventually("the monitor is idle", || {
+        swarm.agent(&monitor).unwrap().status == AgentStatus::Idle
     })
     .await;
 
-    let queued = spawn_root(&swarm, "more").await;
+    let queued = spawn_child(&swarm, &root, "more").await;
     assert_eq!(swarm.agent(&queued).unwrap().status, AgentStatus::Queued);
-    swarm.schedule(&root, every(60, &root, "poll")).unwrap();
+    swarm.schedule(&monitor, every(60, &monitor, "poll")).unwrap();
     assert_eq!(
-        reply_to(&mut events, USER).await,
+        reply_to(&mut events, &root).await,
         "hi",
         "the queued agent started"
     );
 
     // Cancelling the receiver drops its schedules.
-    swarm.cancel(&root).unwrap();
+    swarm.cancel(&monitor).unwrap();
     assert!(swarm.schedules().is_empty());
     swarm.shutdown().await;
 }

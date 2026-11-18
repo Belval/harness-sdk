@@ -55,7 +55,7 @@ fn meminfo_bytes(text: &str, key: &str) -> Option<u64> {
 pub(super) struct HostGate {
     reading: Mutex<Option<(tokio::time::Instant, Option<HostStats>)>>,
     /// Fired on every fresh reading and limit change: held callers look at the cache again.
-    wake: tokio::sync::Notify,
+    pub(super) wake: tokio::sync::Notify,
     /// Set with [`Swarm::set_max_load`]; overrides the config.
     pub(super) max_load: Mutex<Option<f64>>,
     /// Set with [`Swarm::set_min_free_mem`]; overrides the config.
@@ -159,11 +159,12 @@ impl Swarm {
 
     /// Wait while [`Self::host_busy`] (with `disk`, also while disk space is low:
     /// [`Swarm::guard_disk`]), published as [`SwarmEvent::HostHeld`] for agent `id`. Errors with
-    /// [`Error::Cancelled`] when `cancel` fires or the swarm shuts down first.
+    /// [`Error::Cancelled`] when `cancel` fires or the swarm shuts down first. An agent in the
+    /// priority lane ([`Swarm::is_priority`]) waits for disk space only.
     pub(super) async fn wait_for_host(&self, id: &str, disk: bool, cancel: &CancellationToken) -> Result<()> {
         let busy = || {
-            self.host_busy()
-                .or_else(|| disk.then(|| self.disk_low()).flatten())
+            let host = || (!self.is_priority(id)).then(|| self.host_busy()).flatten();
+            host().or_else(|| disk.then(|| self.disk_low()).flatten())
         };
         let _held = Held(self, id);
         let wake = &self.inner.host.wake;

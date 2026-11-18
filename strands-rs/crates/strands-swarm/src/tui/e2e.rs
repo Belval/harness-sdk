@@ -612,6 +612,48 @@ async fn budget_shows_usage_just_over_it_as_over_budget() {
     swarm.shutdown().await;
 }
 
+#[tokio::test]
+async fn priority_shows_and_replaces_the_priority_lane_and_status_marks_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let factory = factory(root_spawns_parser(&["root: done"]), &Sinks::default());
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.priority = vec!["relay".into()];
+    let (swarm, mut events) = Swarm::new(config);
+    let mut app = App::default();
+    let mut screen = Screen::new();
+    screen.type_line(&swarm, &mut app, "fix the bug").await;
+    screen.until(&mut app, &mut events, "root: done").await;
+
+    // A `--priority` name no agent has yet shows as given; an unknown agent changes nothing.
+    screen.type_line(&swarm, &mut app, "/priority").await;
+    assert_eq!(app.notice.as_deref(), Some("priority lane: root agents, relay"));
+    screen
+        .type_line(&swarm, &mut app, "/priority parser nobody")
+        .await;
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("error: No agent with id or name `nobody`; call list_agents to see who exists.")
+    );
+    screen.type_line(&swarm, &mut app, "/priority parser").await;
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("priority lane: root agents, parser (a2)")
+    );
+    screen.type_line(&swarm, &mut app, "/status").await;
+    let shown = screen.draw(&mut app);
+    assert!(shown.contains("fix-bug (a1) · idle · priority"), "{shown}");
+    assert!(shown.contains("parser (a2) · idle · priority"), "{shown}");
+    screen.press(&swarm, &mut app, KeyCode::Char('x')).await;
+
+    // `off` leaves the roots; `default` returns to the flag.
+    screen.type_line(&swarm, &mut app, "/priority off").await;
+    assert_eq!(app.notice.as_deref(), Some("priority lane: root agents"));
+    assert!(!swarm.is_priority("a2"));
+    screen.type_line(&swarm, &mut app, "/priority default").await;
+    assert_eq!(app.notice.as_deref(), Some("priority lane: root agents, relay"));
+    swarm.shutdown().await;
+}
+
 /// ← and → with an empty input fold and unfold the selected agent's subtree; with text they
 /// move the cursor.
 #[tokio::test]

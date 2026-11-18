@@ -3,7 +3,8 @@
 use super::*;
 
 impl Swarm {
-    /// Start queued agents, oldest first, while there are free slots.
+    /// Start queued agents, oldest first, while there are free slots; queued agents in the
+    /// priority lane start whatever the cap, and count toward it.
     pub(super) fn start_queued(&self) {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return;
@@ -11,11 +12,12 @@ impl Swarm {
         let scheduled = self.scheduled_targets();
         let ready: Vec<Arc<Node>> = {
             let agents = self.inner.agents.lock();
-            let free = self.max_agents().saturating_sub(started(&agents, &scheduled));
+            let mut free = self.max_agents().saturating_sub(started(&agents, &scheduled));
             let mut ready = Vec::new();
             for node in agents.values() {
-                if ready.len() == free {
-                    break;
+                let priority = self.priority_of(&node.id, &node.name, &node.parent);
+                if free == 0 && !priority {
+                    continue;
                 }
                 // Checked and claimed under the status lock, so a concurrent cancel wins.
                 let mut status = node.status.lock();
@@ -23,6 +25,8 @@ impl Swarm {
                     *status = AgentStatus::Starting;
                     node.finished.store(false, Ordering::SeqCst);
                     ready.push(node.clone());
+                    // It holds a slot like any other, even past the cap.
+                    free = free.saturating_sub(1);
                 }
             }
             ready

@@ -1163,6 +1163,7 @@ mod tests {
             label: format!("agent-{n} (a{n})"),
             status: AgentStatus::Idle,
             unread: 0,
+            priority: false,
             branch: None,
             git: None,
             quiet: None,
@@ -1226,6 +1227,7 @@ mod tests {
                 label: "shots (a1)".into(),
                 status: AgentStatus::Idle,
                 unread: 0,
+                priority: false,
                 branch: Some("swarm/r/a1".into()),
                 git: Some(crate::status::BranchState {
                     ahead: vec![subject.into()],

@@ -47,6 +47,7 @@ mod host;
 mod landing;
 mod mailbox;
 mod persist;
+mod priority;
 mod reload;
 mod report;
 mod scheduler;
@@ -338,6 +339,9 @@ pub struct SwarmConfig {
     /// (or the agent started), delete the entries its saved session no longer names
     /// ([`crate::stash_gc::prune_unnamed`]); `None` prunes only on resume.
     pub stash_prune_every: Option<Duration>,
+    /// Agents in the priority lane besides the root agents (`--priority`): ids or names, as
+    /// `send_message` takes them ([`Swarm::is_priority`]).
+    pub priority: Vec<String>,
 }
 
 impl SwarmConfig {
@@ -376,6 +380,7 @@ impl SwarmConfig {
             build_jobs: Some(default_build_jobs()),
             disk_reserve: 0,
             stash_prune_every: Some(STASH_PRUNE_EVERY),
+            priority: Vec::new(),
         }
     }
 }
@@ -861,6 +866,8 @@ struct Inner {
     reports_posted: Mutex<std::collections::BTreeSet<String>>,
     /// Holds new work while the host is overloaded ([`Swarm::wait_for_host`]).
     host: host::HostGate,
+    /// The priority lane set at runtime with [`Swarm::set_priority`]; overrides the config.
+    priority: Mutex<Option<Vec<String>>>,
 }
 
 /// Handle to a running swarm. Cheap to clone.
@@ -910,6 +917,7 @@ impl Swarm {
             watching_jobs: AtomicBool::new(false),
             reports_posted: Mutex::default(),
             host: host::HostGate::default(),
+            priority: Mutex::new(None),
             config,
         };
         let swarm = Self {
@@ -1003,12 +1011,15 @@ impl Swarm {
         let scheduled = self.scheduled_targets();
         let node = {
             let mut agents = self.inner.agents.lock();
-            // Decided under the lock, so concurrent spawns cannot overshoot the limit.
-            let queued = started(&agents, &scheduled) >= self.max_agents();
             let taken = agents.values().map(|node| node.name.as_str());
+            let name = names::choose(request.name.as_deref(), &request.task, taken);
+            // Decided under the lock, so concurrent spawns cannot overshoot the limit; the
+            // priority lane is never queued.
+            let queued =
+                !self.priority_of(&id, &name, parent) && started(&agents, &scheduled) >= self.max_agents();
             let node = Arc::new(Node {
                 id: id.clone(),
-                name: names::choose(request.name.as_deref(), &request.task, taken),
+                name,
                 parent: parent.to_owned(),
                 workdir: crate::workdir::Workdir::new(&cwd),
                 cwd,

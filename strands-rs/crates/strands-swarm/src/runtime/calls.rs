@@ -27,7 +27,7 @@ impl Default for CallGate {
 }
 
 impl CallGate {
-    fn wake(&self) {
+    pub(super) fn wake(&self) {
         self.changed.send_modify(|version| *version += 1);
     }
 }
@@ -106,7 +106,9 @@ impl Swarm {
 
     /// Refuse a model call of agent `id` once the budget is spent, else wait for a slot under the
     /// call limit, to be held for the call's duration. Waiting is published as
-    /// [`SwarmEvent::ModelQueued`].
+    /// [`SwarmEvent::ModelQueued`]. An agent in the priority lane ([`Swarm::is_priority`]) takes
+    /// a slot at once, even past the limit: its call counts, so others wait for it, but it never
+    /// waits itself.
     pub(super) async fn admit_model_call(&self, id: &str, cancel: &CancellationToken) -> Result<CallPermit> {
         if let Some(message) = self.budget_exhausted(id) {
             let mut stopped = self.inner.over_budget.lock();
@@ -121,6 +123,8 @@ impl Swarm {
         // The counts the waiting event last told.
         let mut shown = None;
         loop {
+            // Looked at again on every wake: `/priority` may have added the agent meanwhile.
+            let priority = self.is_priority(id);
             let (calls, limit) = {
                 let mut slots = gate.slots.lock();
                 let limit = self.max_calls();
@@ -133,7 +137,7 @@ impl Swarm {
                     Some(ticket) => slots.waiting.iter().position(|(t, _)| *t == ticket),
                     None => Some(slots.waiting.len()),
                 };
-                if ahead.is_some_and(|ahead| ahead < free) {
+                if priority || ahead.is_some_and(|ahead| ahead < free) {
                     if let Some(ticket) = ticket {
                         slots.waiting.retain(|(t, _)| *t != ticket);
                     }

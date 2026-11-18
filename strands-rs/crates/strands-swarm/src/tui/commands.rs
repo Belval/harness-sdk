@@ -54,6 +54,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "show or change the available memory below which new model calls and jobs wait",
     },
     SlashCommand {
+        name: "/priority",
+        args: "[AGENTS|off|default]",
+        help: "show or set who skips host holds and caps besides root agents",
+    },
+    SlashCommand {
         name: "/budget",
         args: "[N|off]",
         help: "show, set or remove the swarm-wide token budget",
@@ -144,6 +149,8 @@ pub enum Command {
     MaxLoad(Option<String>),
     /// `/min-free-mem [SIZE|off|default]`: show or change the free-memory floor.
     MinFreeMem(Option<String>),
+    /// `/priority [AGENTS|off|default]`: show or replace the priority lane.
+    Priority(Option<String>),
     /// Add to the user's memory, or show it (`None`).
     Remember(Option<String>),
     /// Drop memory lines containing the text.
@@ -205,11 +212,12 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         });
     }
     // The limits: alone they show the limit, with an argument they set it.
-    let limits: [(&str, LimitCommand); 5] = [
+    let limits: [(&str, LimitCommand); 6] = [
         ("/max-agents", Command::MaxAgents),
         ("/max-calls", Command::MaxCalls),
         ("/max-load", Command::MaxLoad),
         ("/min-free-mem", Command::MinFreeMem),
+        ("/priority", Command::Priority),
         ("/budget", Command::Budget),
     ];
     for (name, command) in limits {
@@ -321,6 +329,11 @@ mod tests {
         assert_eq!(
             parse_command("/min-free-mem 4G", true),
             Some(Command::MinFreeMem(Some("4G".into())))
+        );
+        assert_eq!(parse_command("/priority", true), Some(Command::Priority(None)));
+        assert_eq!(
+            parse_command("/priority slack-bridge a7", true),
+            Some(Command::Priority(Some("slack-bridge a7".into())))
         );
         assert_eq!(
             parse_command("/max-load 96", true),

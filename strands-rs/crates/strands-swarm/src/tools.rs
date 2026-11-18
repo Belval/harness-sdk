@@ -895,8 +895,12 @@ fn describe(swarm: &Swarm, info: &AgentInfo) -> String {
         .waiting_for_call(&info.id)
         .map(|text| format!(", {text}"))
         .unwrap_or_default();
+    let priority = match info.status.is_live() && swarm.is_priority(&info.id) {
+        true => ", priority",
+        false => "",
+    };
     format!(
-        "{} ({}): {}{waiting}, parent {}, cwd {}{removed}{branch}",
+        "{} ({}): {}{priority}{waiting}, parent {}, cwd {}{removed}{branch}",
         info.name,
         info.id,
         info.status,

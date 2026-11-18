@@ -427,6 +427,13 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
                 min_free_mem_notice(swarm)
             })
         }
+        (Command::Priority(None), _) => Ok(priority_notice(swarm)),
+        (Command::Priority(Some(arg)), _) => match arg.as_str() {
+            "default" => swarm.set_priority(None),
+            "off" => swarm.set_priority(Some(Vec::new())),
+            agents => swarm.set_priority(Some(agents.split_whitespace().map(str::to_owned).collect())),
+        }
+        .map(|()| priority_notice(swarm)),
         (Command::Budget(None), _) => Ok(budget_notice(swarm)),
         (Command::Budget(Some(tokens)), _) => match tokens.as_str() {
             "off" | "none" => Ok(None),
@@ -553,6 +560,16 @@ fn min_free_mem_notice(swarm: &Swarm) -> String {
             crate::gc::human(floor)
         ),
     }
+}
+
+/// `priority lane: root agents, slack-bridge (a17)`; a `--priority` name no agent has yet shows
+/// as given.
+fn priority_notice(swarm: &Swarm) -> String {
+    let mut lane = vec!["root agents".to_owned()];
+    for who in swarm.priority() {
+        lane.push(swarm.resolve(&who).map_or(who, |id| swarm.label(&id)));
+    }
+    format!("priority lane: {}", lane.join(", "))
 }
 
 fn budget_notice(swarm: &Swarm) -> String {
