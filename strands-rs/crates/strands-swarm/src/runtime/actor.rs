@@ -134,6 +134,8 @@ impl Swarm {
         let mut backoff = RETRY_INITIAL;
         // Failed turns in a row that the agent retried on its own, and when the first started.
         let mut streak: Option<(u32, tokio::time::Instant)> = None;
+        // A resume has just pruned the stash, and a fresh agent has none.
+        let mut stash_pruned = tokio::time::Instant::now();
         while let Some(text) = self.next_input(&node, input.take()).await {
             // Of a retry streak only the first failure and then every doubling from the 8th on
             // reach the parent: each would wake it, but a retry loop that went quiet after its
@@ -148,7 +150,10 @@ impl Swarm {
                 since,
                 retries: node.goal.is_some(),
             });
-            let Some(error) = self.run_turn(&node, &agent, text, report).await else {
+            let failed = self.run_turn(&node, &agent, text, report).await;
+            self.prune_stash_between_turns(&node, &agent, &mut stash_pruned)
+                .await;
+            let Some(error) = failed else {
                 backoff = RETRY_INITIAL;
                 streak = None;
                 continue;

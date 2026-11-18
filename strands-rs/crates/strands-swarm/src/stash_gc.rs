@@ -4,9 +4,10 @@
 //! `<tool use or message id>_<index>`, so that `retrieve_context` can read back what the context
 //! manager truncated or summarized away, and deletes none. An agent can only retrieve an entry
 //! it can name, and it only knows the names its context holds, all of which its saved session
-//! holds too. So, on resume, a live agent's entries that nothing in its session directory names
-//! any more are deleted ([`prune_unnamed`]); a cancelled agent can retrieve nothing, so its
-//! whole stash goes ([`drop_stash`]).
+//! holds too. So a live agent's entries that nothing in its session directory names any more are
+//! deleted ([`prune_unnamed`]): on resume, and between its turns while the swarm runs (see
+//! `Swarm::prune_stash_between_turns`); a cancelled agent can retrieve nothing, so its whole stash
+//! goes ([`drop_stash`]).
 
 use std::collections::HashSet;
 use std::path::Path;

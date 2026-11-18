@@ -543,9 +543,14 @@ messages you.
     conversation, for `retrieve_context`. A cancelled agent's goes once its last turn has ended
     (or on resume). On each resume, before any agent runs, a live agent's entries are deleted
     unless a file of its saved session (the conversation with its summaries, an open tool batch)
-    still names their id, so whatever the agent can still name stays retrievable. A session that
-    is missing or does not read as JSON keeps its whole stash. Each pruning is logged as
-    `stash_pruned` (`entries`, `bytes`).
+    still names their id, so whatever the agent can still name stays retrievable. A live agent's
+    stash is pruned the same way while the swarm runs: when one of its turns ends at least an
+    hour (`SwarmConfig::stash_prune_every`) after its last pruning, its conversation is saved
+    and the unnamed entries go before its next turn can start. That cannot race the stash's
+    writes, which the SDK makes only while it builds the agent or runs one of its turns. A
+    session that is missing or does not read as JSON, or a save that fails, keeps the whole
+    stash. Each pruning is logged as `stash_pruned` (`entries`, `bytes`, and `id` for one
+    agent's).
   - `mcp-tools.json` is rewritten only when a server lists different tools.
 - **Journal.**
   - A persistent run keeps `journal.jsonl` with every message to and from the user, and

@@ -261,6 +261,45 @@ impl Swarm {
         self.journal_stash(Some(id), pruned);
     }
 
+    /// Between two of `node`'s turns, once [`SwarmConfig::stash_prune_every`] has passed since
+    /// `last`, save its conversation and then delete the stash entries nothing in its session
+    /// names any more ([`crate::stash_gc::prune_unnamed`]), as a resume does.
+    ///
+    /// This cannot race a write to the stash. The SDK writes entries only while it builds the
+    /// agent and while the agent runs a turn (each added message, the context pipeline, the
+    /// `context` tool); only the agent's own actor calls this, after one turn returned and before
+    /// it starts the next, so none of its turns runs meanwhile and no one else writes its stash.
+    /// The save puts the conversation as it is in memory on disk first (or finds it there), so
+    /// every name the agent still holds is in the files read; when it fails, nothing is pruned.
+    pub(super) async fn prune_stash_between_turns(
+        &self,
+        node: &Node,
+        agent: &Agent,
+        last: &mut tokio::time::Instant,
+    ) {
+        let (Some(every), Some(state_dir)) = (
+            self.inner.config.stash_prune_every,
+            self.inner.config.state_dir.as_ref(),
+        ) else {
+            return;
+        };
+        if last.elapsed() < every
+            || node.cancel.is_cancelled()
+            || self.inner.shutting_down.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        *last = tokio::time::Instant::now();
+        let dir = state_dir.join(SESSIONS_DIR).join(&node.id);
+        if !self.save_session(node, agent).await {
+            return;
+        }
+        let pruned = tokio::task::spawn_blocking(move || crate::stash_gc::prune_unnamed(&dir))
+            .await
+            .unwrap_or_default();
+        self.journal_stash(Some(&node.id), pruned);
+    }
+
     fn journal_stash(&self, id: Option<&str>, pruned: crate::stash_gc::Pruned) {
         if pruned.entries > 0 {
             let mut fields = serde_json::json!({ "entries": pruned.entries, "bytes": pruned.bytes });
@@ -330,10 +369,11 @@ impl Swarm {
 
     /// Save `agent`'s conversation now, after a change the SDK does not save itself (it saves
     /// when it adds a message). Through the agent's own session manager, which knows what it last
-    /// wrote and so skips a save that would change nothing.
-    pub(super) async fn save_session(&self, node: &Node, agent: &Agent) {
+    /// wrote and so skips a save that would change nothing. Whether the files on disk now hold
+    /// the conversation as it is in memory.
+    pub(super) async fn save_session(&self, node: &Node, agent: &Agent) -> bool {
         let Some(dir) = self.inner.config.state_dir.as_ref() else {
-            return;
+            return false;
         };
         let manager = match agent.session_manager() {
             Some(manager) => Ok(manager),
@@ -343,9 +383,10 @@ impl Swarm {
             Ok(manager) => manager.save_snapshot(agent, true).await,
             Err(error) => Err(error),
         };
-        if let Err(error) = saved {
+        if let Err(error) = &saved {
             tracing::warn!(agent = %node.id, %error, "could not save the conversation");
         }
+        saved.is_ok()
     }
 
     /// Save the state in the background.

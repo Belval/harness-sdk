@@ -77,6 +77,10 @@ pub const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// restarts anyway (the default of [`SwarmConfig::reload_idle_timeout`]).
 pub const RELOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How often a live agent's stash loses the entries its session no longer names, between its
+/// turns (the default of [`SwarmConfig::stash_prune_every`]).
+pub const STASH_PRUNE_EVERY: Duration = Duration::from_secs(3600);
+
 /// Tool calls that only wait, so a reload does not wait for them ([`Swarm::tool_calls_in_flight`]).
 const WAITING_TOOLS: &[&str] = &["wait"];
 
@@ -329,6 +333,10 @@ pub struct SwarmConfig {
     /// Bytes [`Swarm::guard_disk`] keeps allocated in the run dir ([`crate::reserve`]) for saves
     /// once the disk is full; `0` (the default) keeps none.
     pub disk_reserve: u64,
+    /// Between a live agent's turns, once this long has passed since its stash was last pruned
+    /// (or the agent started), delete the entries its saved session no longer names
+    /// ([`crate::stash_gc::prune_unnamed`]); `None` prunes only on resume.
+    pub stash_prune_every: Option<Duration>,
 }
 
 impl SwarmConfig {
@@ -366,6 +374,7 @@ impl SwarmConfig {
             host_probe: Arc::new(host_stats),
             build_jobs: Some(default_build_jobs()),
             disk_reserve: 0,
+            stash_prune_every: Some(STASH_PRUNE_EVERY),
         }
     }
 }

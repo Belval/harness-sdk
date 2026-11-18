@@ -996,6 +996,87 @@ async fn stashes_keep_only_what_a_live_agent_can_still_retrieve() {
 }
 
 #[tokio::test]
+async fn a_live_agents_stash_is_pruned_between_its_turns_never_during_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("run/sessions");
+    let stash = |id: &str| sessions.join(id).join("stash");
+    let keys = |id: &str| -> Vec<String> {
+        let mut keys: Vec<String> = std::fs::read_dir(stash(id))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        keys.sort();
+        keys
+    };
+    // Each agent's task names one of its entries; the other is left over from turns compacted
+    // away.
+    for (id, keys) in [
+        ("a1", ["tooluse_mine_0", "tooluse_old_0"]),
+        ("a2", ["tooluse_kept_0", "tooluse_gone_0"]),
+    ] {
+        std::fs::create_dir_all(stash(id)).unwrap();
+        for key in keys {
+            std::fs::write(stash(id).join(key), "{}").unwrap();
+        }
+    }
+    let scripts = scripts_of(vec![
+        (
+            "a1",
+            vec![
+                tool_call("wait", "w1", json!({ "from": ["parent"], "timeout_seconds": 30 })),
+                say("done"),
+            ],
+        ),
+        ("a2", vec![say("ok")]),
+    ]);
+    let mut config = persistent_swarm(&scripts, dir.path());
+    config.stash_prune_every = Some(Duration::ZERO);
+    let (swarm, mut events) = Swarm::new(config);
+    let busy = spawn_root(&swarm, "work on [ref: tooluse_mine_0]").await;
+    let waiting = async {
+        while let Some(event) = events.recv().await {
+            if matches!(&event, SwarmEvent::ToolStarted { id, name, .. } if *id == busy && name == "wait") {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("a1 never started waiting");
+    let idle = spawn_root(&swarm, "look at [ref: tooluse_kept_0]").await;
+    assert_eq!(reply_to(&mut events, USER).await, "ok");
+    eventually("the idle agent's unnamed entry goes", || {
+        keys(&idle) == ["tooluse_kept_0"]
+    })
+    .await;
+    assert_eq!(swarm.agent(&busy).unwrap().status, AgentStatus::Running);
+    assert_eq!(
+        keys(&busy),
+        ["tooluse_mine_0", "tooluse_old_0"],
+        "an agent mid-turn keeps its whole stash"
+    );
+
+    swarm.send(USER, &busy, "go on").unwrap();
+    eventually("its unnamed entry goes once the turn is over", || {
+        keys(&busy) == ["tooluse_mine_0"]
+    })
+    .await;
+    eventually("both prunings are logged", || {
+        let events = std::fs::read_to_string(dir.path().join("run/events.jsonl")).unwrap_or_default();
+        let pruned: Vec<&str> = events
+            .lines()
+            .filter(|line| line.contains("stash_pruned"))
+            .collect();
+        pruned.len() == 2
+            && pruned.iter().any(|line| line.contains("\"id\":\"a1\""))
+            && pruned.iter().any(|line| line.contains("\"id\":\"a2\""))
+            && pruned.iter().all(|line| line.contains("\"entries\":1"))
+    })
+    .await;
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
 async fn raising_the_agent_limit_at_runtime_starts_queued_agents_and_survives_a_resume() {
     let dir = tempfile::tempdir().unwrap();
     let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({
