@@ -60,11 +60,8 @@ pub fn check(path: &Path) -> Result<(), String> {
 pub fn load(path: &Path) -> Result<ImageBlock, String> {
     check(path)?;
     let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    fit(ImageBlock {
-        format: format_of(path).expect("checked"),
-        source: ImageSource::Bytes(bytes),
-    })
-    .map_err(|error| format!("{}: {error}", path.display()))
+    fit(image_block(format_of(path).expect("checked"), bytes))
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// Width and height of an encoded image, read from its header.
