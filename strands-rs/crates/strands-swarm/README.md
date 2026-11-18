@@ -61,13 +61,14 @@ TASK or `--goal`. Without a terminal, the TUI refuses to start (before resuming 
 points to `--headless`.
 
 **AWS credentials.** Every process the swarm starts (agent shells, `run_background` jobs, land
-checks, MCP servers) inherits its environment, `AWS_*` included, untouched. To call Bedrock (and Bedrock Mantle, whose bearer tokens it mints from the same credentials)
-under settings of its own without handing them to those, set `STRANDS_SWARM_AWS_PROFILE`,
+checks, MCP servers) inherits its environment, `AWS_*` included, untouched. To call Bedrock (and Bedrock Mantle, whose
+bearer tokens it mints from the same credentials) under settings of its own without handing them
+to those, set `STRANDS_SWARM_AWS_PROFILE`,
 `STRANDS_SWARM_AWS_CONFIG_FILE`, `STRANDS_SWARM_AWS_SHARED_CREDENTIALS_FILE` and/or
 `STRANDS_SWARM_AWS_REGION`: only the swarm's model client reads them, in place of the matching
 `AWS_*`, and no AWS tool knows these names. With a profile set, its credentials and region win
 over access keys and `AWS_REGION` in the environment; unset ones fall back to the AWS chain. A
-user who just exports `AWS_PROFILE` gets it for both, as before.
+user who just exports `AWS_PROFILE` gets it for both.
 
 ```sh
 STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-swarm/aws-config \
@@ -155,17 +156,17 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   `git status --short --branch` of its directory. After a hard crash, "how long" runs to the
   run's last write (an event, a save, or swarmctl noting the exit). When a cut call had run a
   minute or more, it also says that background jobs survive restarts. A cut `wait` is listed
-  apart, with the note that nothing it waited for is lost and polling is not needed (agents whose
-  waits restarts cut had taken to polling on a schedule). The cut turn ends with "Interrupted: the swarm
-  restarted." rather than the SDK's "Cancelled by user", which a real `/stop` keeps. An agent
+  apart, with the note that nothing it waited for is lost and polling is not needed. The cut
+  turn ends with "Interrupted: the swarm restarted." rather than the SDK's "Cancelled by user",
+  which a real `/stop` keeps. An agent
   that had finished its turn rests until its next message; a goal agent whose turn failed
   retries.
 - **Hard crashes.** The SDK adds a batch of tool calls to the conversation only once all of them
   finished, so each agent's batch in progress is also written ahead to
   `sessions/<agent>/open-batch.json`, synced to disk on each change. After a kill -9, OOM kill or
   power loss the resumed agent gets the batch back: the calls, the results that came in, and the
-  cut calls in its notice. Only after
-  such a crash (no `clean-stop` mark from a quit or reload) does a resume (Linux) kill the process
+  cut calls in its notice. Only after such a crash (no `clean-stop` mark from a quit or reload)
+  does a resume (Linux) kill the process
   groups of the shell calls the batch had cut, found by `STRANDS_SWARM_SHELL=<run dir>#<agent>`;
   `nohup … &` leftovers of earlier calls and background jobs run on.
 
@@ -189,13 +190,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     flag, like `/max-agents`; `/max-calls default` returns to the flag and `/max-calls 0` lifts
     it. Raising it lets queued calls through at once; lowering it cancels nothing in flight.
   - Why 32: a call holds a slot for its whole stream (seconds to minutes), so the cap bounds
-    simultaneous streams, not request rate. Throttling is answered by the backoff in
-    `retry.rs` (10 attempts, jittered), which the cap only has to keep from stampeding. The old 8
-    queued most of a 16-agent swarm, which mostly waits for tool results and mail. 32 never
-    queues the default 16 agents (each has at most one call in flight, plus side calls) and
-    still bounds a 100-agent swarm to a third of its agents. It is not tied to `--max-agents`,
-    since a cap equal to the agent count would never bind; lower it with `/max-calls` if your
-    account throttles.
+    simultaneous streams, not request rate; throttling is answered by the backoff in `retry.rs`.
+    32 never queues the default 16 agents (each has at most one call in flight, plus side calls)
+    and still bounds a 100-agent swarm to a third of its agents. Lower it with `/max-calls` if
+    your account throttles.
 - **Model errors.**
   - Throttling, server errors (5xx, Bedrock's `InternalServerException` and the like) and dropped
     connections are retried with backoff, up to 10 attempts (about eight minutes). A rejected
@@ -225,11 +223,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     memory. Both are kept in `swarm.json` across restarts, ahead of the flags, like `/max-calls`.
 - **Builds.** Agents' shell commands and background jobs (land checks included) get
   `CARGO_BUILD_JOBS` set to `--build-jobs N` (default a quarter of the CPUs, 1 to 16; `0` sets
-  none) unless the swarm's own environment sets it. Without it every cargo build starts a
-  compiler per CPU: a few dozen agents building at once put a 64-core host at load 400. Like any
-  `CARGO_BUILD_JOBS`, it overrides `build.jobs` in cargo's config files; `--build-jobs 0` keeps
-  theirs. It only
-  bounds each build; to bound all of them together, cap compilers host-wide:
+  none) unless the swarm's own environment sets it; without it every cargo build starts a
+  compiler per CPU. Like any `CARGO_BUILD_JOBS`, it overrides `build.jobs` in cargo's config
+  files; `--build-jobs 0` keeps theirs. It only bounds each build; to bound all of them
+  together, cap compilers host-wide:
   - cargo runs every compiler through `build.rustc-wrapper` from `~/.cargo/config.toml`
     (`[build]` / `rustc-wrapper = "/path/to/rustc-slot"`) with the real `rustc` and its
     arguments as `"$@"`.
@@ -266,9 +263,8 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     with that note, so one turn follows. A later `send_message` with a lower value lowers it
     again.
 - **Process memory.** The binary allocates with jemalloc, whose background threads return freed
-  pages to the system within seconds. Each model call and conversation save makes a transient
-  copy of the agent's conversation; under glibc's malloc each of the runtime's threads kept its
-  arena at its high-water mark (2.6 GB resident for 250 MB in use, 56 live agents).
+  pages to the system within seconds, so the transient conversation copies of model calls and
+  saves do not pin each thread's arena at its high-water mark.
 
 ## Cost
 
@@ -298,7 +294,9 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   read toward the agent's tokens, and are logged as `keep_warm` in `events.jsonl`. On by default
   with the 5-minute cache; `--no-keep-warm` turns it off. The interval follows the model's cache
   lifetime (`cost::cache_lifetime`, next to the prices): 4.5 minutes for the 5-minute cache,
-  27 for OpenAI's GPT-5.6 and later (below), so a tool call under half an hour sends none there.
+  27 for OpenAI's GPT-5.6 and later, which keep it at least 30 minutes (earlier GPT versions
+  and gpt-oss state no lifetime and keep the 5-minute assumption), so a tool call under half an
+  hour sends none there.
   - An idle agent whose next schedule fires in less than 11 refreshes (about 50 minutes) is kept
     warm the same way until it fires, e.g. a 30-minute poller: 6 refreshes cost 0.6 of its prefix
     against 1.15 more for rewriting it instead of reading it (1.25× against 0.1×): about half.
@@ -306,24 +304,17 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     left to expire, where `--cache-ttl 1h` is the cheaper answer. The limit counts refreshes at
     the model's interval, so on a 30-minute cache it reaches about six times as far.
 - **OpenAI models on Bedrock** (GPT-6.x Astra) cache prompt prefixes on their own, without cache
-  points, for at least 30 minutes (Bedrock's prompt caching guide: "Cached prefixes remain
-  available for reuse for at least 30 minutes"; stated for GPT-5.6 and later, not for earlier
-  GPT versions or gpt-oss, which keep the 5-minute assumption); `--cache-ttl` does not apply.
-  Cache writes (also in implicit mode) are billed at 1.25× input on GPT-5.6 and later (guide:
-  "billed at 1.25× the uncached input token rate"; the AWS Price List's `cache_write_tokens_30m`
-  agrees, e.g. GPT-6 Astra $12.50 against $10 input and $1 read per 1M) and carry no fee on
-  earlier versions.
-  Bedrock routes their requests by a hash of the prompt prefix (OpenAI's routing), and spills a prefix sent more than ~15 times a
-  minute to other servers, where the cache misses. Agents share the swarm's system prompt; in one
-  run 230 of 232 calls missed. With a state directory, each agent's calls (keep-warm refreshes
-  included) carry `prompt_cache_key` `strands-<agent id>` (on Converse and on Mantle's Responses API alike), so they stay on the server that holds
-  its cache.
+  points; `--cache-ttl` does not apply, and their cache lifetime and write prices are above. Bedrock
+  routes their requests by a hash of the prompt prefix and spills a prefix sent more than ~15
+  times a minute to other servers, where the cache misses; agents share the swarm's system
+  prompt. With a state directory, each agent's calls (keep-warm refreshes included) carry
+  `prompt_cache_key` `strands-<agent id>` (on Converse and on Mantle's Responses API alike), so
+  they stay on the server that holds its cache.
 - **Where it shows.**
   - `/cost` (or `--run NAME --cost`) shows per agent: input, output, cache-read and cache-write
     tokens, the model, an estimated `$`, and the median input per call and cache hit rate over the
     last 50 calls. Below the total, one line gives the swarm's cache hit rate over the last hour's
-    calls and since the run started: the run-long rate keeps every early miss (a night before
-    caching worked held a live run at 88-91% while it ran at 96-97%). Below the table, side calls
+    calls and since the run started (which keeps every early miss). Below the table, side calls
     get their own rows by purpose: the goal `judge`,
     the context `summarizer` and `other` calls on the auxiliary model (told apart by the system
     prompt they send, so a custom judge or summarizer prompt counts as `other`). They are already
@@ -461,8 +452,7 @@ Other text messages the selected agent, or starts a root agent when there is non
     of them changes is with the base and is left to the merge outlook above. Diffs and trial
     merges are cached by commit, so only a branch that moved is looked at again; pairs without a
     shared file cost nothing; at most 45 new trial merges run per refresh (later pairs read
-    `overlaps`). Ten branches take about 70 ms cached, 0.3 s new without a shared file, 1 s
-    new when all 45 pairs overlap (on a loaded machine).
+    `overlaps`).
   - It refreshes while open; git runs in the background and is cached for 5 s.
   - Programmatically: `Swarm::status`.
 
@@ -534,9 +524,9 @@ messages you.
   then written to a temp file, fsynced and renamed over the old one. A save that would change
   nothing but the snapshot's `createdAt` (the end of a turn, after the reply was saved) is
   skipped: the agent's session manager keeps a hash of what it last wrote, and the swarm's own
-  saves (mail folded into an open turn, a restored tool batch) go through it too. Pretty-printed
-  files from older runs load as before. `swarm.json` is written the same way, compact and from
-  one buffer, and not at all when it would hold the same bytes as the file already does.
+  saves (mail folded into an open turn, a restored tool batch) go through it too. `swarm.json`
+  is written the same way, compact and from one buffer, and not at all when it would hold the
+  same bytes as the file already does.
 - **Bounds.** A run dir grows with the live agents' work since the last resume and with unreported
   jobs, not with the run's age:
   - `journal.jsonl` and `events.jsonl` are rotated to `<file>.1` at 16 MB, so each takes at most
@@ -569,9 +559,9 @@ messages you.
   runs in a session of its own, without a controlling terminal. Nothing it writes to `/dev/tty`
   reaches the TUI, and a prompt (git credentials, an ssh host key) fails at once instead of hanging.
   On Linux each is started through util-linux's `setsid` (by absolute path) rather than a
-  `pre_exec` hook, so std spawns it with `posix_spawn` instead of `fork()`ing the whole swarm: from
-  a process with 2 GB resident a fork took ~160 ms and stalled every thread (the TUI too), a
-  spawn through `setsid` ~2 ms. Without a `setsid` binary it falls back to the hook.
+  `pre_exec` hook, so std spawns it with `posix_spawn` instead of `fork()`ing the whole swarm,
+  which stalls every thread (the TUI too) for as long as copying its page tables takes. Without
+  a `setsid` binary it falls back to the hook.
 - **Disk.**
   - Once a cancelled worktree agent and its subtree have stopped (or on resume), its private target
     dir is deleted.
@@ -584,7 +574,8 @@ messages you.
     `/status` uses has every commit on it: reachable (`merged`) or as a patch-equivalent copy
     (`all applied`, per `git cherry` or the landing record; a merge commit never counts as
     applied unless landed). Otherwise it stays, e.g. `kept branch swarm/r/a3 (2 commits not on
-    main)`, until a later pass (resume, `/gc`, `--gc`) finds it merged. The ref is deleted only if it still points at the commit checked.
+    main)`, until a later pass (resume, `/gc`, `--gc`) finds it merged. The ref is deleted only
+    if it still points at the commit checked.
   - `cancel_agent` waits up to 10 s for this and its result says what was removed and kept.
     `list_agents` with `include_cancelled` shows it later: `cwd … (removed)`, `branch … (deleted)`
     or `branch … (kept: 2 not on main, merges cleanly)`.
@@ -724,16 +715,15 @@ swarmctl status
 **Prompt caches across a reload.**
 
 - Providers cache tools, then the system prompt, then messages, so a restart keeps every agent's
-  cache only if the new binary sends the same fixed prefix. A live run's restart that kept it hit
-  the cache on 55 of 61 calls after it; reloads that changed a tool description read nothing back,
-  and with ~80 busy agents each such reload rewrites ~12M tokens (~$70).
+  cache only if the new binary sends the same fixed prefix; otherwise every busy agent rewrites
+  its whole prefix on its next call.
 - `NEW --print-prefix` prints a root agent's system prompt and tool specs on a canonical setup
   (the one the fixed-prefix budget test pins; `--allow-land` adds `land`). `reload_swarm`
   compares the running binary's with the new one's and says in its result whether caches
   survive, or which tools and prompt sections change, how many agents have a warm cache (a call
   or keep-warm refresh in the last 5 minutes) and their last calls' tokens and estimated extra
   cost. `check: true` reports only that, without self-testing or installing, so prefix changes
-  can be batched into one reload. A binary from before `--print-prefix` gets no note.
+  can be batched into one reload.
 
 **Reload timing.**
 
