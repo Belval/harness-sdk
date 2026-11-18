@@ -420,7 +420,7 @@ impl Swarm {
 }
 
 /// What a restored errored agent shows: the error itself is not persisted.
-const RESTORED_ERROR: &str = "its last turn failed before the restart";
+pub(crate) const RESTORED_ERROR: &str = "its last turn failed before the restart";
 
 pub(super) fn status_name(status: &AgentStatus) -> &'static str {
     match status {

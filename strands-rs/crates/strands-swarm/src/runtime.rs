@@ -63,6 +63,7 @@ pub use disk::{
 };
 pub use host::{default_max_load, default_min_free_mem, host_stats, HostProbe, HostStats, HOST_POLL};
 use persist::history_event;
+pub(crate) use persist::RESTORED_ERROR;
 pub use warm::{KEEP_WARM_EVERY, KEEP_WARM_MAX};
 
 /// Judge rejections in a row after which a goal agent's turn ends anyway, so a goal that cannot

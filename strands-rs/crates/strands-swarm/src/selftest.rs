@@ -201,10 +201,14 @@ pub async fn run(dir: &Path) -> Result<String> {
             SwarmEvent::Mail { mail, .. } if mail.kind == "error" => {
                 failure = Some(format!("{} reported: {}", mail.from_label, mail.text));
             }
+            // Restoring an agent whose turn had failed shows that old failure; the probe it then
+            // answers (or not) is what tests this binary.
             SwarmEvent::Status {
                 id,
                 status: AgentStatus::Errored(error),
-            } => failure = Some(format!("{} errored: {error}", swarm.label(id))),
+            } if error != crate::runtime::RESTORED_ERROR => {
+                failure = Some(format!("{} errored: {error}", swarm.label(id)))
+            }
             SwarmEvent::History { id, .. } => {
                 unrestored.remove(id);
             }

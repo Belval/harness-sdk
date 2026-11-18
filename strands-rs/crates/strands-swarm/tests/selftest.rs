@@ -135,6 +135,25 @@ async fn self_test_resumes_a_copy_and_leaves_the_run_untouched() {
 }
 
 #[tokio::test]
+async fn self_test_passes_a_run_whose_agent_had_errored_before_the_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state_dir, _config) = saved_run(dir.path()).await;
+    let copy = dir.path().join("copy");
+    selftest::copy_run(&state_dir, &copy).unwrap();
+    let path = copy.join("swarm.json");
+    let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for agent in saved["agents"].as_array_mut().unwrap() {
+        if agent["id"] == "a2" {
+            agent["status"] = json!("errored");
+        }
+    }
+    std::fs::write(&path, saved.to_string()).unwrap();
+    // Its restored "last turn failed" status is old news; it still answers the probe.
+    let summary = selftest::run(&copy).await.unwrap();
+    assert!(summary.contains("2 live agents replied"), "{summary}");
+}
+
+#[tokio::test]
 async fn self_test_fails_when_a_conversation_cannot_be_restored() {
     let dir = tempfile::tempdir().unwrap();
     let (state_dir, _config) = saved_run(dir.path()).await;
