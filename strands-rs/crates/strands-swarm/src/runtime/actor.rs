@@ -658,7 +658,6 @@ impl Model for SideModel {
     }
 }
 
-/// One model call's tokens from its usage metadata; `input` includes cache reads and writes.
 /// `true` when the full delay elapsed, `false` when the agent was cancelled first.
 async fn sleep_unless_cancelled(node: &Node, delay: Duration) -> bool {
     tokio::select! {
@@ -667,12 +666,15 @@ async fn sleep_unless_cancelled(node: &Node, delay: Duration) -> bool {
     }
 }
 
+/// One model call's tokens from its usage metadata; `input` includes cache reads and writes,
+/// which Bedrock and Anthropic report beside `input_tokens` but OpenAI's APIs (Bedrock Mantle)
+/// count in it ([`total_prompt_tokens`](strands_agents::models::streaming::total_prompt_tokens)).
 pub(super) fn usage_counts(usage: &Usage) -> crate::cost::Counts {
     let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
     let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
     crate::cost::Counts {
         calls: 1,
-        input: usage.input_tokens + cache_read + cache_write,
+        input: strands_agents::models::streaming::total_prompt_tokens(usage),
         output: usage.output_tokens,
         cache_read,
         cache_write,
@@ -715,7 +717,32 @@ fn scalar_list(value: &serde_json::Value) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::summarize_input;
+    use super::{summarize_input, usage_counts};
+    use strands_agents::types::Usage;
+
+    #[test]
+    fn counts_cache_tokens_into_the_input_once_whichever_way_the_provider_reports_them() {
+        // Bedrock Converse (Claude, and GPT on Bedrock): cache tokens beside `input_tokens`.
+        let converse = Usage {
+            input_tokens: 0,
+            output_tokens: 5,
+            total_tokens: 3318,
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: Some(3313),
+        };
+        let counts = usage_counts(&converse);
+        assert_eq!((counts.input, counts.cache_write), (3313, 3313));
+        // OpenAI's Responses API (Bedrock Mantle): `input_tokens` includes the cached ones.
+        let responses = Usage {
+            input_tokens: 1851,
+            output_tokens: 5,
+            total_tokens: 1856,
+            cache_read_input_tokens: Some(1800),
+            cache_write_input_tokens: None,
+        };
+        let counts = usage_counts(&responses);
+        assert_eq!((counts.input, counts.cache_read), (1851, 1800));
+    }
 
     #[test]
     fn summarizes_a_tool_input_in_words() {
