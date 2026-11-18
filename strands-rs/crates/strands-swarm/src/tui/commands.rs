@@ -167,6 +167,9 @@ pub enum Command {
     Quit,
 }
 
+/// A command that shows a limit (`None`) or changes it.
+type LimitCommand = fn(Option<String>) -> Command;
+
 /// Parse a submitted input line. `has_agents` decides whether plain text starts a root agent.
 pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     let line = line.trim();
@@ -201,20 +204,20 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
             text: text.trim().to_owned(),
         });
     }
-    if let Some(limit) = line.strip_prefix("/max-agents ") {
-        return Some(Command::MaxAgents(Some(limit.trim().to_owned())));
-    }
-    if let Some(limit) = line.strip_prefix("/max-calls ") {
-        return Some(Command::MaxCalls(Some(limit.trim().to_owned())));
-    }
-    if let Some(limit) = line.strip_prefix("/max-load ") {
-        return Some(Command::MaxLoad(Some(limit.trim().to_owned())));
-    }
-    if let Some(floor) = line.strip_prefix("/min-free-mem ") {
-        return Some(Command::MinFreeMem(Some(floor.trim().to_owned())));
-    }
-    if let Some(budget) = line.strip_prefix("/budget ") {
-        return Some(Command::Budget(Some(budget.trim().to_owned())));
+    // The limits: alone they show the limit, with an argument they set it.
+    let limits: [(&str, LimitCommand); 5] = [
+        ("/max-agents", Command::MaxAgents),
+        ("/max-calls", Command::MaxCalls),
+        ("/max-load", Command::MaxLoad),
+        ("/min-free-mem", Command::MinFreeMem),
+        ("/budget", Command::Budget),
+    ];
+    for (name, command) in limits {
+        match line.strip_prefix(name) {
+            Some("") => return Some(command(None)),
+            Some(arg) if arg.starts_with(' ') => return Some(command(Some(arg.trim().to_owned()))),
+            _ => {}
+        }
     }
     if let Some(model) = line.strip_prefix("/model ") {
         return Some(Command::SetModel(match model.trim() {
@@ -226,11 +229,6 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         "/cancel" => return Some(Command::Cancel),
         "/stop" => return Some(Command::Stop),
         "/model" => return Some(Command::ShowModel),
-        "/budget" => return Some(Command::Budget(None)),
-        "/max-agents" => return Some(Command::MaxAgents(None)),
-        "/max-calls" => return Some(Command::MaxCalls(None)),
-        "/max-load" => return Some(Command::MaxLoad(None)),
-        "/min-free-mem" => return Some(Command::MinFreeMem(None)),
         "/remember" => return Some(Command::Remember(None)),
         "/gc" => return Some(Command::Gc),
         "/schedules" => return Some(Command::Schedules),
