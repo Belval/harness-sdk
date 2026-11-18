@@ -129,10 +129,12 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     every call) is dropped from every assistant message but the latest one in the turn in progress
     that has any: in a long tool loop, earlier steps' reasoning goes too. Bedrock requires the last
     assistant message's thinking back, whole and signed, and Anthropic accepts leaving out the
-    oldest blocks. Tool results over 2,000 characters (`shell`, `read`, MCP listings and the
-    rest, but not `skills`, `wait` or `retrieve_context`) are cut to their head and tail (~800
-    characters) once six newer ones exist; `retrieve_context` with the reference at the end returns
-    the full output.
+    oldest blocks. Thinking after anything pruning edits (a trimmed result, a summary, a `context`
+    offload) goes as well, the latest included: Anthropic binds thinking to all that precedes it,
+    and allows leaving out the newest. Tool results over 2,000 characters (`shell`, `read`, MCP
+    listings and the rest, but not `skills`, `wait` or `retrieve_context`) are cut to their head
+    and tail (~800 characters) once six newer ones exist; `retrieve_context` with the reference at
+    the end returns the full output.
   - Both edit history, and the prompt cache only matches an unchanged prefix, so they run only when
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
     the `context` tool), on the first call after the cache's lifetime (five idle minutes, an hour

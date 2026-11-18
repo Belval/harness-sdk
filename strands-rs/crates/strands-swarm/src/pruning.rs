@@ -7,7 +7,9 @@
 //! thinking leave out "the oldest, the newest, or all of them, but not one in between". So all
 //! reasoning goes but the latest assistant message's that has any: on Claude Haiku 5.5 dropping
 //! an earlier step's thinking mid-loop was accepted with no prefix mismatch reported, while a
-//! block without its signature was rejected.
+//! block without its signature was rejected. An edit to an earlier message (a trimmed result, a
+//! summary) unbinds the thinking after it (the call then reported `thinking_mismatch_allowed`),
+//! so that goes too, the latest included.
 //!
 //! Old tool output: a `shell`, `read` or MCP result is mostly read once, then re-sent on every call.
 //! Older ones are cut to their head and tail; the full text stays in the stash under the
@@ -77,16 +79,49 @@ fn drop_old_reasoning(messages: &mut [Message]) -> bool {
     let kept = kept_reasoning(messages);
     let mut acted = false;
     for (i, message) in messages.iter_mut().enumerate() {
-        if Some(i) == kept || !has_reasoning(message) {
-            continue;
+        if Some(i) != kept {
+            acted |= strip_reasoning(message);
         }
-        message.content.retain(|block| !is_reasoning(block));
-        if message.content.is_empty() {
-            message.content.push(ContentBlock::text(REASONING_DROPPED));
-        }
-        acted = true;
     }
     acted
+}
+
+/// Removes reasoning from every message after `edited`, the latest one's too; `true` when any
+/// went. Anthropic's prefix check binds a thinking block to everything before it, so after an edit
+/// ("Changing, inserting, moving, or deleting an earlier message counts") later thinking no longer
+/// matches; leaving out the newest blocks is allowed.
+fn drop_reasoning_after(messages: &mut [Message], edited: usize) -> bool {
+    let mut acted = false;
+    for message in messages.iter_mut().skip(edited + 1) {
+        acted |= strip_reasoning(message);
+    }
+    acted
+}
+
+/// Removes `message`'s reasoning, leaving [`REASONING_DROPPED`] when nothing else is left.
+fn strip_reasoning(message: &mut Message) -> bool {
+    if !has_reasoning(message) {
+        return false;
+    }
+    message.content.retain(|block| !is_reasoning(block));
+    if message.content.is_empty() {
+        message.content.push(ContentBlock::text(REASONING_DROPPED));
+    }
+    true
+}
+
+/// A hash of `message` without its reasoning: dropping thinking is not an edit to the prefix
+/// check (a live call reported no mismatch), anything else is.
+fn hash_without_reasoning(message: &Message) -> u64 {
+    let mut message = message.clone();
+    message.content.retain(|block| !is_reasoning(block));
+    hash(&message)
+}
+
+/// The first of `messages` whose hash differs from `hashes`'; messages past either's end are not
+/// compared (appended ones are not edits).
+fn first_change(hashes: &[u64], messages: &[Message], hash: fn(&Message) -> u64) -> Option<usize> {
+    hashes.iter().zip(messages).position(|(h, m)| *h != hash(m))
 }
 
 /// Tools whose older results stay whole: a loaded skill is the procedure the agent follows, and
@@ -213,9 +248,7 @@ impl CachePrune {
     fn edited(&self, messages: &[Message]) -> bool {
         match &*self.gate.sent.lock() {
             None => false,
-            Some(sent) => {
-                sent.len() > messages.len() || sent.iter().zip(messages).any(|(h, m)| *h != hash(m))
-            }
+            Some(sent) => sent.len() > messages.len() || first_change(sent, messages, hash).is_some(),
         }
     }
 }
@@ -234,12 +267,30 @@ impl ContextStrategy for CachePrune {
         let Some(reason) = self.reason(ctx) else {
             return Ok(false);
         };
+        let before: Vec<u64> = ctx.messages.iter().map(hash_without_reasoning).collect();
+        let since_sent =
+            (self.gate.sent.lock().as_deref()).and_then(|sent| first_change(sent, ctx.messages, hash));
         let dropped = drop_old_reasoning(ctx.messages);
         let trimmed = self.gate.trim.apply(ctx).await?;
-        if dropped || trimmed {
-            tracing::debug!(?reason, dropped, trimmed, "pruned old reasoning and results");
+        // A summary (compaction, or the overflow it answers) rewrites everything before the tail.
+        let edited = match reason {
+            PruneReason::Compaction | PruneReason::Overflow => Some(0),
+            _ => {
+                let now = first_change(&before, ctx.messages, hash_without_reasoning);
+                since_sent.into_iter().chain(now).min()
+            }
+        };
+        let after_edit = edited.is_some_and(|at| drop_reasoning_after(ctx.messages, at));
+        if dropped || trimmed || after_edit {
+            tracing::debug!(
+                ?reason,
+                dropped,
+                trimmed,
+                ?edited,
+                "pruned old reasoning and results"
+            );
         }
-        Ok(dropped || trimmed)
+        Ok(dropped || trimmed || after_edit)
     }
 }
 
@@ -648,9 +699,16 @@ mod tests {
         let compact = Arc::new(CompactAt::new(Some(1_000)));
         let prune = CachePrune::new(Some(compact.clone()), CACHE_TTL);
         let mut messages = prunable();
+        let latest = messages.len() - 2;
+        messages[latest].content.insert(0, thinking("latest"));
         let mut ctx = ctx(&mut messages, &agent, 0.5);
         assert_eq!(prune.reason(&ctx), Some(PruneReason::Compaction));
         assert!(prune.apply(&mut ctx).await.unwrap());
+        assert_eq!(
+            reasoning_count(ctx.messages),
+            0,
+            "the summary unbinds all thinking"
+        );
         // Pruning lowered the count below the point (1k of the mock's assumed 200k window), though
         // not below the target; the armed compaction still runs, once.
         ctx.utilization = 800.0 / 200_000.0;
@@ -728,6 +786,85 @@ mod tests {
         messages[6] = tool_result("t2");
         assert!(pass(&prune, &agent, &mut messages, 0.1).await);
         assert!(pruned(&messages));
+    }
+
+    /// One tool loop of `results` (characters each), every step reasoned; the last step's result
+    /// is still to come, so its reasoning is the latest.
+    fn reasoned_loop(results: &[usize]) -> Vec<Message> {
+        let mut messages = vec![Message::user("task")];
+        for (i, chars) in results.iter().enumerate() {
+            let id = format!("t{i}");
+            messages.push(assistant(vec![thinking(&format!("step {i}")), tool_call(&id)]));
+            messages.push(result(&id, "x".repeat(*chars)));
+        }
+        messages
+    }
+
+    /// Indexes of the messages that still carry reasoning.
+    fn reasoned(messages: &[Message]) -> Vec<usize> {
+        (0..messages.len())
+            .filter(|&i| has_reasoning(&messages[i]))
+            .collect()
+    }
+
+    /// The gate's pass on the first call after the cache expired.
+    async fn cold_pass(messages: &mut Vec<Message>) -> bool {
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+        agent.state().set(LAST_CALL_KEY, minutes_ago(6));
+        pass(&prune, &agent, messages, 0.1).await
+    }
+
+    #[tokio::test]
+    async fn an_untouched_loop_keeps_the_latest_thinking() {
+        let mut messages = reasoned_loop(&[100; 9]);
+        assert!(cold_pass(&mut messages).await);
+        assert_eq!(reasoned(&messages), vec![17]);
+        assert_eq!(messages[17].content[0], thinking("step 8"));
+    }
+
+    #[tokio::test]
+    async fn a_trimmed_result_leaves_no_thinking_after_it() {
+        let mut steps = vec![100, 5_000];
+        steps.extend([100; KEEP_RECENT_RESULTS + 2]);
+        let mut messages = reasoned_loop(&steps);
+        assert!(cold_pass(&mut messages).await);
+        assert!(
+            result_text(&messages[4]).len() < TRIM_ABOVE_CHARS,
+            "t1 was trimmed"
+        );
+        assert_eq!(reasoned(&messages), Vec::<usize>::new(), "the latest went too");
+        assert_eq!(messages[messages.len() - 2].content, vec![tool_call("t9")]);
+    }
+
+    #[tokio::test]
+    async fn an_edit_since_the_last_call_drops_the_thinking_after_it() {
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+        let mut messages = reasoned_loop(&[100; 3]);
+        messages.push(assistant(vec![ContentBlock::text("done")]));
+        messages.push(Message::user("next task"));
+        messages.extend(reasoned_loop(&[100; 3]).into_iter().skip(1));
+        agent.state().set(LAST_CALL_KEY, minutes_ago(6));
+        assert!(
+            pass(&prune, &agent, &mut messages, 0.1).await,
+            "earlier turns' thinking"
+        );
+        assert_eq!(reasoned(&messages), vec![13]);
+        // The `context` tool offloads the last result but one; the latest thinking is after it.
+        messages[12] = tool_result("t1");
+        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
+        assert_eq!(reasoned(&messages), Vec::<usize>::new());
+    }
+
+    #[tokio::test]
+    async fn an_edit_after_the_latest_thinking_keeps_it() {
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+        let mut messages = reasoned_loop(&[100; 3]);
+        agent.state().set(LAST_CALL_KEY, minutes_ago(6));
+        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
+        assert_eq!(reasoned(&messages), vec![5]);
+        messages[6] = tool_result("edited");
+        assert!(!pass(&prune, &agent, &mut messages, 0.1).await, "nothing to drop");
+        assert_eq!(reasoned(&messages), vec![5]);
     }
 
     #[test]
