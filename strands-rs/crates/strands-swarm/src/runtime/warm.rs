@@ -4,7 +4,7 @@
 //! An idle agent whose next schedule fires soon is kept warm the same way until it fires, when
 //! that costs less than the rewrite ([`Swarm::refreshes_until_fire`]).
 
-use strands_agents::models::StreamAggregatedResult;
+use strands_agents::models::{AgentMetadata, StreamAggregatedResult};
 use strands_agents::types::StopReason;
 
 use super::*;
@@ -56,6 +56,10 @@ impl Swarm {
                             tool_specs: context.tool_specs.clone(),
                             tool_choice: context.tool_choice.clone(),
                             dynamic_trailing_blocks: Some(context.dynamic_trailing_blocks),
+                            // The same cache key as the call itself, where the model takes one.
+                            agent_metadata: context.agent.session_manager().map(|manager| AgentMetadata {
+                                session_id: Some(manager.session_id().to_owned()),
+                            }),
                             ..Default::default()
                         },
                     };

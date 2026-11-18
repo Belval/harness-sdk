@@ -301,6 +301,13 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     against 1.15 more for rewriting it instead of reading it (1.25× against 0.1×): about half.
     The limit is priced per model (`--prices` cache read and write); a poller further out is
     left to expire, where `--cache-ttl 1h` is the cheaper answer.
+- **OpenAI models on Bedrock** (GPT-6.x Astra) cache prompt prefixes on their own, without cache
+  points, for at least 30 minutes; `--cache-ttl` does not apply. Bedrock routes their requests by
+  a hash of the prompt prefix (OpenAI's routing), and spills a prefix sent more than ~15 times a
+  minute to other servers, where the cache misses. Agents share the swarm's system prompt; in one
+  run 230 of 232 calls missed. With a state directory, each agent's calls (keep-warm refreshes
+  included) carry `prompt_cache_key` `strands-<agent id>`, so they stay on the server that holds
+  its cache.
 - **Where it shows.**
   - `/cost` (or `--run NAME --cost`) shows per agent: input, output, cache-read and cache-write
     tokens, the model, an estimated `$`, and the median input per call and cache hit rate over the
