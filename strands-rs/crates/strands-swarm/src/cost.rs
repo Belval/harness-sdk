@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,32 @@ pub const CACHE_WRITE_FACTOR: f64 = 1.25;
 
 /// [`CACHE_WRITE_FACTOR`] for writes with the one-hour cache TTL (`--cache-ttl 1h`).
 pub const CACHE_WRITE_1H_FACTOR: f64 = 2.0;
+
+/// How long a prompt-cache entry lives without a hit when nothing says otherwise: Anthropic's
+/// default TTL, and the assumption for models not known to keep it longer.
+pub const CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
+
+/// The longest an OpenAI model's implicit cache is kept (30 minutes on GPT-5.6 and later).
+const OPENAI_CACHE_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+/// How long the provider keeps `model`'s cached prefix without a hit, at least: five minutes
+/// ([`CACHE_LIFETIME`]) except for OpenAI's GPT-5.6 and later (GPT-6 Astra, ...) on Bedrock and
+/// Mantle, which cache implicitly for at least 30 minutes ("Cached prefixes remain available for
+/// reuse for at least 30 minutes", Bedrock user guide, Prompt caching: OpenAI models). Earlier
+/// GPT versions and `gpt-oss` state no lifetime and keep the default. Keep-warm refreshes at
+/// this pace.
+pub fn cache_lifetime(model: &str) -> Duration {
+    let model = model.to_lowercase();
+    let version = model.split("openai.gpt-").nth(1).and_then(|rest| {
+        let mut parts = rest.split(|c: char| !c.is_ascii_digit() && c != '.');
+        let mut numbers = parts.next()?.split('.').map(|n| n.parse::<u32>().ok());
+        Some((numbers.next()??, numbers.next().flatten().unwrap_or(0)))
+    });
+    match version {
+        Some(version) if version >= (5, 6) => OPENAI_CACHE_LIFETIME,
+        _ => CACHE_LIFETIME,
+    }
+}
 
 /// Built-in USD list prices per 1M input/output tokens, by model-id substring. Unknown newer
 /// versions fall back to their tier's latest known price.
@@ -729,6 +756,20 @@ mod tests {
         assert_eq!(price(Some(1.0), Some(12.0)).warm_refreshes(), 10);
         // With the 1h TTL's 2x writes: 19 x 0.1 = 1.9 = 2 - 0.1 is a tie, 18 pay.
         assert_eq!(price(None, Some(8.0)).warm_refreshes(), 18);
+    }
+
+    #[test]
+    fn openai_gpt_5_6_and_later_keep_their_cache_thirty_minutes_the_rest_five() {
+        let minutes = |model| cache_lifetime(model).as_secs() / 60;
+        assert_eq!(minutes("openai.gpt-6-astra"), 30);
+        assert_eq!(minutes("bedrock-mantle/openai.gpt-6-astra"), 30);
+        assert_eq!(minutes("bedrock/us.OpenAI.gpt-6.2-astra"), 30);
+        assert_eq!(minutes("openai.gpt-5.6-sol"), 30);
+        assert_eq!(minutes("openai.gpt-5.5"), 5);
+        assert_eq!(minutes("openai.gpt-5.4"), 5);
+        assert_eq!(minutes("openai.gpt-oss-120b"), 5);
+        assert_eq!(minutes("us.anthropic.claude-sonnet-4-5"), 5);
+        assert_eq!(minutes(""), 5);
     }
 
     #[test]

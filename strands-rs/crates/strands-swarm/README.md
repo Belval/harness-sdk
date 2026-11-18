@@ -295,15 +295,20 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   and be rewritten (1.25×) on the next call. It stops at that call, an interrupt or cancel, or
   after 12 refreshes (under an hour); refreshes pass the model-call gate, count as a full cache
   read toward the agent's tokens, and are logged as `keep_warm` in `events.jsonl`. On by default
-  with the 5-minute cache; `--no-keep-warm` turns it off.
+  with the 5-minute cache; `--no-keep-warm` turns it off. The interval follows the model's cache
+  lifetime (`cost::cache_lifetime`, next to the prices): 4.5 minutes for the 5-minute cache,
+  27 for OpenAI's GPT-5.6 and later (below), so a tool call under half an hour sends none there.
   - An idle agent whose next schedule fires in less than 11 refreshes (about 50 minutes) is kept
     warm the same way until it fires, e.g. a 30-minute poller: 6 refreshes cost 0.6 of its prefix
     against 1.15 more for rewriting it instead of reading it (1.25× against 0.1×): about half.
     The limit is priced per model (`--prices` cache read and write); a poller further out is
-    left to expire, where `--cache-ttl 1h` is the cheaper answer.
+    left to expire, where `--cache-ttl 1h` is the cheaper answer. The limit counts refreshes at
+    the model's interval, so on a 30-minute cache it reaches about six times as far.
 - **OpenAI models on Bedrock** (GPT-6.x Astra) cache prompt prefixes on their own, without cache
-  points, for at least 30 minutes; `--cache-ttl` does not apply. Bedrock routes their requests by
-  a hash of the prompt prefix (OpenAI's routing), and spills a prefix sent more than ~15 times a
+  points, for at least 30 minutes (Bedrock's prompt caching guide: "Cached prefixes remain
+  available for reuse for at least 30 minutes"; stated for GPT-5.6 and later, not for earlier
+  GPT versions or gpt-oss, which keep the 5-minute assumption); `--cache-ttl` does not apply.
+  Bedrock routes their requests by a hash of the prompt prefix (OpenAI's routing), and spills a prefix sent more than ~15 times a
   minute to other servers, where the cache misses. Agents share the swarm's system prompt; in one
   run 230 of 232 calls missed. With a state directory, each agent's calls (keep-warm refreshes
   included) carry `prompt_cache_key` `strands-<agent id>`, so they stay on the server that holds

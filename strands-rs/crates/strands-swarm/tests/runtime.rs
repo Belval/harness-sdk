@@ -5639,13 +5639,24 @@ async fn compactions_reported_by_the_factorys_pipeline_become_swarm_events() {
 /// reports a cache hit on a 1,000-token prompt. Counts calls by whether they repeat the first.
 #[derive(Default)]
 struct CachingModel {
+    id: &'static str,
     calls: std::sync::atomic::AtomicUsize,
     repeats: std::sync::atomic::AtomicUsize,
 }
 
+impl CachingModel {
+    fn named(id: &'static str) -> Self {
+        Self {
+            id,
+            calls: Default::default(),
+            repeats: Default::default(),
+        }
+    }
+}
+
 impl Model for CachingModel {
     fn model_id(&self) -> Option<String> {
-        Some("caching".into())
+        Some(self.id.into())
     }
 
     fn stream<'a>(
@@ -5688,7 +5699,7 @@ impl Model for CachingModel {
 async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_call() {
     use std::sync::atomic::Ordering;
     let dir = tempfile::tempdir().unwrap();
-    let model = Arc::new(CachingModel::default());
+    let model = Arc::new(CachingModel::named("caching"));
     let shared = model.clone();
     let built: Arc<Mutex<Option<Agent>>> = Arc::default();
     let keep = built.clone();
@@ -5745,15 +5756,66 @@ async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_cal
     swarm.shutdown().await;
 }
 
+/// Refreshes sent while a turn waits `wait` on a tool, by an agent on `model_id`, with the
+/// default interval for the 5-minute cache (4.5 minutes) scaled to 270 ms: a minute is 1 ms.
+async fn refreshes_during_a_tool_wait(model_id: &'static str, wait: Duration) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(CachingModel::named(model_id));
+    let shared = model.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let model = shared.clone();
+        let pause = strands_agents::tools::FunctionTool::builder("pause")
+            .description("Takes a while.")
+            .handler(move |_input: serde_json::Value, _ctx| async move {
+                tokio::time::sleep(wait).await;
+                strands_agents::Result::Ok("back".to_owned())
+            });
+        let mut tools = spec.tools;
+        tools.push(Arc::new(pause));
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(tools)
+                .no_sandbox()
+                .build()
+        })
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.keep_warm = Some(strands_swarm::runtime::KEEP_WARM_EVERY / 1000);
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    swarm.shutdown().await;
+    model.repeats.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A 10-minute tool call (here 600 ms): the 5-minute cache is refreshed at 4.5 and 9 minutes,
+/// OpenAI's GPT-6 cache (at least 30 minutes) not at all, and in a 70-minute one at 27 and 54.
+#[tokio::test(start_paused = true)]
+async fn a_cache_that_outlives_the_wait_is_not_refreshed() {
+    let ten = Duration::from_millis(600);
+    assert_eq!(refreshes_during_a_tool_wait("claude-sonnet-4-5", ten).await, 2);
+    assert_eq!(refreshes_during_a_tool_wait("openai.gpt-6-astra", ten).await, 0);
+    assert_eq!(
+        refreshes_during_a_tool_wait("bedrock-mantle/openai.gpt-6.2-astra", ten).await,
+        0
+    );
+    // Earlier GPT versions state no lifetime: refreshed like the 5-minute cache.
+    assert_eq!(refreshes_during_a_tool_wait("openai.gpt-5.5", ten).await, 2);
+    let long = Duration::from_millis(4200);
+    assert_eq!(refreshes_during_a_tool_wait("openai.gpt-6-astra", long).await, 2);
+}
+
 /// Answers every call with a cached reply, counting calls.
-#[derive(Default)]
 struct IdleModel {
+    id: &'static str,
     calls: std::sync::atomic::AtomicUsize,
 }
 
 impl Model for IdleModel {
     fn model_id(&self) -> Option<String> {
-        Some("idle".into())
+        Some(self.id.into())
     }
 
     fn stream<'a>(
@@ -5773,9 +5835,12 @@ impl Model for IdleModel {
 
 /// Model calls an agent makes while idle between two fires of a schedule `minutes` apart, with a
 /// keep-warm refresh every 10 s: its first turn, the fire's turn, and what keeps its cache warm.
-async fn calls_while_idle_before_a_fire(minutes: u64) -> usize {
+async fn calls_while_idle_before_a_fire(model_id: &'static str, minutes: u64) -> usize {
     let dir = tempfile::tempdir().unwrap();
-    let model = Arc::new(IdleModel::default());
+    let model = Arc::new(IdleModel {
+        id: model_id,
+        calls: Default::default(),
+    });
     let shared = model.clone();
     let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
         let model = shared.clone();
@@ -5813,8 +5878,21 @@ async fn calls_while_idle_before_a_fire(minutes: u64) -> usize {
 /// refreshes 10 s apart), one due in an hour (with 10 s refreshes: 360) is left to expire.
 #[tokio::test(start_paused = true)]
 async fn an_idle_agent_is_kept_warm_until_a_schedule_fires_only_when_that_is_cheaper() {
-    assert_eq!(calls_while_idle_before_a_fire(1).await, 2 + 5);
-    assert_eq!(calls_while_idle_before_a_fire(60).await, 2);
+    assert_eq!(calls_while_idle_before_a_fire("idle", 1).await, 2 + 5);
+    assert_eq!(calls_while_idle_before_a_fire("idle", 60).await, 2);
+}
+
+/// The break-even follows the model's cache lifetime: with refreshes 6x as far apart (60 s for
+/// 10 s), a 5-minute poller on GPT-6 is kept warm (four refreshes) where the same poller on the
+/// 5-minute cache is not (29 would cost more than the rewrite), and a one-minute one needs none.
+#[tokio::test(start_paused = true)]
+async fn a_longer_lived_cache_is_kept_warm_for_longer_gaps() {
+    assert_eq!(calls_while_idle_before_a_fire("idle", 5).await, 2);
+    assert_eq!(
+        calls_while_idle_before_a_fire("openai.gpt-6-astra", 5).await,
+        2 + 4
+    );
+    assert_eq!(calls_while_idle_before_a_fire("openai.gpt-6-astra", 1).await, 2);
 }
 
 /// A free-space reading for the disk guard that counts its reads, so a test waits for the guard

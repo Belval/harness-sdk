@@ -1,6 +1,8 @@
 //! Keep-warm: while a turn waits on a tool call (a `wait`, a slow build), re-send the last model
 //! request every [`SwarmConfig::keep_warm`] and drop it at the first content, so the provider's
 //! 5-minute prompt cache is read (0.1x input) instead of expiring and being rewritten (1.25x).
+//! A model whose cache lives longer ([`cost::cache_lifetime`]: OpenAI's GPT-6 on Bedrock, 30
+//! minutes) is refreshed proportionally less often.
 //! An idle agent whose next schedule fires soon is kept warm the same way until it fires, when
 //! that costs less than the rewrite ([`Swarm::refreshes_until_fire`]).
 
@@ -9,9 +11,10 @@ use strands_agents::types::StopReason;
 
 use super::*;
 
-/// Refresh interval for the 5-minute cache, with margin for the call's own latency.
+/// Refresh interval for the 5-minute cache ([`cost::CACHE_LIFETIME`]), with margin for the call's own latency.
 pub const KEEP_WARM_EVERY: Duration = Duration::from_secs(270);
-/// Refreshes per pause, then the cache is left to expire: 12 × 4.5 min is under an hour.
+/// Refreshes per pause, then the cache is left to expire: 12 × 4.5 min is under an hour (at 0.1x
+/// each, the 12 cost about what one rewrite does).
 pub const KEEP_WARM_MAX: usize = 12;
 
 /// A model request as sent, to send again.
@@ -64,6 +67,7 @@ impl Swarm {
                         },
                     };
                     let stop = context.agent.cancel_token().child_token();
+                    let every = swarm.refresh_every(every, request.model.model_id());
                     let result: StreamAggregatedResult = next.run(context, &events).await?;
                     let cached = result.usage.as_ref().map_or(0, |usage| {
                         usage.cache_read_input_tokens.unwrap_or(0)
@@ -99,13 +103,29 @@ impl Swarm {
         ));
     }
 
+    /// The model named `model`, or the swarm's default model.
+    fn model_name(&self, model: Option<String>) -> String {
+        model
+            .or_else(|| self.inner.config.default_model.clone())
+            .unwrap_or_default()
+    }
+
+    /// The refresh interval for `model`: `every` is for the default 5-minute cache, and a cache
+    /// that lives n times as long is refreshed n times as far apart.
+    fn refresh_every(&self, every: Duration, model: Option<String>) -> Duration {
+        let lifetime = crate::cost::cache_lifetime(&self.model_name(model));
+        every.mul_f64(lifetime.as_secs_f64() / crate::cost::CACHE_LIFETIME.as_secs_f64())
+    }
+
     /// How many refreshes, `every` apart, keep `node`'s cache warm until its next schedule fires;
     /// `None` when none is due, or it is so far off that they cost more than the rewrite.
     ///
     /// With cache reads at 0.1x input and writes at 1.25x, a refresh costs 0.1 of the prefix and
     /// a rewrite instead of a read 1.15, so up to 11 refreshes (49 min at 4.5 min) pay: a 30
     /// minute poller spends 6 x 0.1 = 0.6 against 1.15, ~48% less per fire. Longer gaps are left
-    /// to expire; `--cache-ttl 1h` is the answer for those.
+    /// to expire; `--cache-ttl 1h` is the answer for those. `every` is the model's own interval
+    /// ([`Swarm::refresh_every`]), so a cache that lives longer pays for fewer refreshes per
+    /// minute and is kept warm for correspondingly longer gaps.
     pub(super) fn refreshes_until_fire(
         &self,
         node: &Node,
@@ -114,9 +134,7 @@ impl Swarm {
     ) -> Option<usize> {
         let until = self.next_fire(&node.id)? - self.now();
         let count = (until.to_std().ok()?.as_secs() / every.as_secs().max(1)) as usize;
-        let model = model
-            .or_else(|| self.inner.config.default_model.clone())
-            .unwrap_or_default();
+        let model = self.model_name(model);
         let price = self
             .inner
             .config
