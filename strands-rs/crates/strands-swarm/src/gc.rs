@@ -792,6 +792,8 @@ mod tests {
             task_flag: None,
             max_agents: None,
             max_calls: None,
+            max_load: None,
+            min_free_mem: None,
             commit: None,
             schedules: Vec::new(),
         }

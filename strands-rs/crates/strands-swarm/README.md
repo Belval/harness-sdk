@@ -219,8 +219,9 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     `agents 3/100 · calls 8/8 · load 45/128`. Holds are logged as `host_held` in `events.jsonl`.
   - The host is read from `/proc` at most once a second, and held callers look again each
     second; off Linux nothing is held.
-  - `/max-load N` changes the limit for the running process, `/max-load off` lifts it and
-    `/max-load default` returns to the flag.
+  - `/max-load N` changes the limit for the running swarm, `/max-load off` lifts it and
+    `/max-load default` returns to the flag; `/min-free-mem SIZE|off|default` does the same for
+    memory. Both are kept in `swarm.json` across restarts, ahead of the flags, like `/max-calls`.
 - **Builds.** Agents' shell commands and background jobs (land checks included) get
   `CARGO_BUILD_JOBS` set to `--build-jobs N` (default a quarter of the CPUs, 1 to 16; `0` sets
   none) unless the swarm's own environment sets it. Without it every cargo build starts a
@@ -389,7 +390,7 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
 | `/cancel` | Stop the selected agent and its subtree for good. |
 | `/status` | Each live agent's state, activity, todos, unmerged commits and merge outlook, jobs and schedules, without a model call. |
 | `/cost` | Estimated spend (see [Cost](#cost)); its intro and footnote wrap, its table is clipped on narrow terminals. |
-| `/budget`, `/max-agents`, `/max-calls`, `/max-load` | See [Limits](#limits). |
+| `/budget`, `/max-agents`, `/max-calls`, `/max-load`, `/min-free-mem` | See [Limits](#limits). |
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
 | `/schedules` | All schedules. |
 | `/gc` | Retry reclaiming the disk of cancelled worktree agents. |

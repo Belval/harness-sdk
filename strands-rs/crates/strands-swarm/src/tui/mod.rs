@@ -437,6 +437,18 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             swarm.set_max_load(limit);
             max_load_notice(swarm)
         }),
+        (Command::MinFreeMem(None), _) => Ok(min_free_mem_notice(swarm)),
+        (Command::MinFreeMem(Some(floor)), _) => match floor.as_str() {
+            "default" => Ok(None),
+            "off" => Ok(Some(0)),
+            n => crate::text::parse_bytes(n)
+                .map(Some)
+                .map_err(strands_agents::Error::other),
+        }
+        .map(|floor| {
+            swarm.set_min_free_mem(floor);
+            min_free_mem_notice(swarm)
+        }),
         (Command::Budget(None), _) => Ok(budget_notice(swarm)),
         (Command::Budget(Some(tokens)), _) => match tokens.as_str() {
             "off" | "none" => Ok(None),
@@ -530,6 +542,20 @@ fn max_load_notice(swarm: &Swarm) -> String {
     match swarm.max_load() {
         limit if limit > 0.0 => format!("new model calls and jobs wait above host load {limit:.0}{load}"),
         _ => format!("no host load limit{load}"),
+    }
+}
+
+fn min_free_mem_notice(swarm: &Swarm) -> String {
+    let now = swarm
+        .host()
+        .map(|host| format!(" (now {} available)", crate::gc::human(host.mem_available)))
+        .unwrap_or_default();
+    match swarm.min_free_mem() {
+        0 => format!("no free memory floor{now}"),
+        floor => format!(
+            "new model calls and jobs wait below {} available memory{now}",
+            crate::gc::human(floor)
+        ),
     }
 }
 

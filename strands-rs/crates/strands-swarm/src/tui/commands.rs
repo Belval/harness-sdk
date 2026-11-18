@@ -49,6 +49,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "show or change the host load above which new model calls and jobs wait",
     },
     SlashCommand {
+        name: "/min-free-mem",
+        args: "[SIZE|off|default]",
+        help: "show or change the available memory below which new model calls and jobs wait",
+    },
+    SlashCommand {
         name: "/budget",
         args: "[N|off]",
         help: "show, set or remove the swarm-wide token budget",
@@ -137,6 +142,8 @@ pub enum Command {
     MaxCalls(Option<String>),
     /// `/max-load [N|off|default]`: show or change the host load limit.
     MaxLoad(Option<String>),
+    /// `/min-free-mem [SIZE|off|default]`: show or change the free-memory floor.
+    MinFreeMem(Option<String>),
     /// Add to the user's memory, or show it (`None`).
     Remember(Option<String>),
     /// Drop memory lines containing the text.
@@ -203,6 +210,9 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
     if let Some(limit) = line.strip_prefix("/max-load ") {
         return Some(Command::MaxLoad(Some(limit.trim().to_owned())));
     }
+    if let Some(floor) = line.strip_prefix("/min-free-mem ") {
+        return Some(Command::MinFreeMem(Some(floor.trim().to_owned())));
+    }
     if let Some(budget) = line.strip_prefix("/budget ") {
         return Some(Command::Budget(Some(budget.trim().to_owned())));
     }
@@ -220,6 +230,7 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         "/max-agents" => return Some(Command::MaxAgents(None)),
         "/max-calls" => return Some(Command::MaxCalls(None)),
         "/max-load" => return Some(Command::MaxLoad(None)),
+        "/min-free-mem" => return Some(Command::MinFreeMem(None)),
         "/remember" => return Some(Command::Remember(None)),
         "/gc" => return Some(Command::Gc),
         "/schedules" => return Some(Command::Schedules),
@@ -305,6 +316,14 @@ mod tests {
             })
         );
         assert_eq!(parse_command("/max-load", true), Some(Command::MaxLoad(None)));
+        assert_eq!(
+            parse_command("/min-free-mem", true),
+            Some(Command::MinFreeMem(None))
+        );
+        assert_eq!(
+            parse_command("/min-free-mem 4G", true),
+            Some(Command::MinFreeMem(Some("4G".into())))
+        );
         assert_eq!(
             parse_command("/max-load 96", true),
             Some(Command::MaxLoad(Some("96".into())))

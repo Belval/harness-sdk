@@ -45,6 +45,12 @@ pub struct SwarmState {
     /// Model-call limit set at runtime (`0`: none), overriding `--max-concurrent-calls`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_calls: Option<usize>,
+    /// Host load limit set at runtime (`0`: none), overriding `--max-load`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_load: Option<f64>,
+    /// Free-memory floor set at runtime (`0`: none), overriding `--min-free-mem`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_free_mem: Option<u64>,
     /// Commit of the binary that saved it (`None` for older runs or builds outside git).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,

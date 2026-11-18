@@ -2977,8 +2977,35 @@ async fn low_host_memory_holds_new_work_and_no_limit_holds_nothing() {
     let (swarm, _events) = Swarm::new(config);
     assert_eq!(
         swarm.host_busy().as_deref(),
-        Some("host memory 1.0 GB available, below 8.0 GB")
+        Some("host memory 1.0 GB available, below 8.0 GB (/min-free-mem to change)")
     );
+}
+
+#[tokio::test]
+async fn host_limits_set_at_runtime_survive_a_resume_and_default_returns_to_the_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let map = scripts_of(vec![]);
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.max_load = 10.0;
+    config.min_free_mem = 1 << 30;
+    let (swarm, _events) = Swarm::new(config.clone());
+    assert_eq!((swarm.max_load(), swarm.min_free_mem()), (10.0, 1 << 30));
+    assert_eq!(swarm.snapshot().max_load, None);
+
+    swarm.set_max_load(Some(0.0));
+    swarm.set_min_free_mem(Some(4 << 30));
+    let state = swarm.snapshot();
+    assert_eq!((state.max_load, state.min_free_mem), (Some(0.0), Some(4 << 30)));
+    swarm.shutdown().await;
+
+    // The saved values win over the flags; `None` returns to them.
+    let (swarm, _events) = Swarm::resume(config, state).await.unwrap();
+    assert_eq!((swarm.max_load(), swarm.min_free_mem()), (0.0, 4 << 30));
+    swarm.set_max_load(None);
+    swarm.set_min_free_mem(None);
+    assert_eq!((swarm.max_load(), swarm.min_free_mem()), (10.0, 1 << 30));
+    let state = swarm.snapshot();
+    assert_eq!((state.max_load, state.min_free_mem), (None, None));
 }
 
 /// Delegates to a mock once the test hands out a permit of `gate`.

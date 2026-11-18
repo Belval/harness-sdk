@@ -55,7 +55,9 @@ fn meminfo_bytes(text: &str, key: &str) -> Option<u64> {
 pub(super) struct HostGate {
     reading: Mutex<Option<(Instant, Option<HostStats>)>>,
     /// Set with [`Swarm::set_max_load`]; overrides the config.
-    max_load: Mutex<Option<f64>>,
+    pub(super) max_load: Mutex<Option<f64>>,
+    /// Set with [`Swarm::set_min_free_mem`]; overrides the config.
+    pub(super) min_free_mem: Mutex<Option<u64>>,
     /// Agents held now, with why.
     held: Mutex<BTreeMap<String, String>>,
     /// Why worktree spawns and land jobs wait: space is low ([`Swarm::guard_disk`]).
@@ -86,11 +88,34 @@ impl Swarm {
             .unwrap_or(self.inner.config.max_load)
     }
 
-    /// Change the load limit for this process; `Some(0.0)` lifts it and `None` returns to the
-    /// configured one. Held callers look again within [`HOST_POLL`].
+    /// Change the load limit for this run (kept across restarts, ahead of `--max-load`);
+    /// `Some(0.0)` lifts it and `None` returns to the configured one. Held callers look again
+    /// within [`HOST_POLL`].
     pub fn set_max_load(&self, limit: Option<f64>) {
         *self.inner.host.max_load.lock() = limit;
+        self.persist();
         self.journal_event("max_load", serde_json::json!({ "limit": self.max_load() }));
+    }
+
+    /// The free-memory floor in force, in bytes (`0`: none): the last
+    /// [`Swarm::set_min_free_mem`], else the config's.
+    pub fn min_free_mem(&self) -> u64 {
+        self.inner
+            .host
+            .min_free_mem
+            .lock()
+            .unwrap_or(self.inner.config.min_free_mem)
+    }
+
+    /// Change the free-memory floor for this run (kept across restarts, ahead of
+    /// `--min-free-mem`); `Some(0)` lifts it and `None` returns to the configured one.
+    pub fn set_min_free_mem(&self, floor: Option<u64>) {
+        *self.inner.host.min_free_mem.lock() = floor;
+        self.persist();
+        self.journal_event(
+            "min_free_mem",
+            serde_json::json!({ "bytes": self.min_free_mem() }),
+        );
     }
 
     /// The host's load and memory, read at most once per [`HOST_POLL`].
@@ -116,10 +141,10 @@ impl Swarm {
                 stats.load
             ));
         }
-        let floor = self.inner.config.min_free_mem;
+        let floor = self.min_free_mem();
         (stats.mem_available < floor).then(|| {
             format!(
-                "host memory {} available, below {}",
+                "host memory {} available, below {} (/min-free-mem to change)",
                 crate::gc::human(stats.mem_available),
                 crate::gc::human(floor)
             )
