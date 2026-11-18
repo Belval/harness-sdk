@@ -5744,6 +5744,78 @@ async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_cal
     swarm.shutdown().await;
 }
 
+/// Answers every call with a cached reply, counting calls.
+#[derive(Default)]
+struct IdleModel {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Model for IdleModel {
+    fn model_id(&self) -> Option<String> {
+        Some("idle".into())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _options: &'a strands_agents::models::StreamOptions,
+    ) -> strands_agents::models::ModelEventStream<'a> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let events = strands_agents::testing::events_for_message(
+            &Message::assistant("done"),
+            Some(strands_agents::types::StopReason::EndTurn),
+            Some(usage(10, 990, 5)),
+        );
+        Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+    }
+}
+
+/// Model calls an agent makes while idle between two fires of a schedule `minutes` apart, with a
+/// keep-warm refresh every 10 s: its first turn, the fire's turn, and what keeps its cache warm.
+async fn calls_while_idle_before_a_fire(minutes: u64) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(IdleModel::default());
+    let shared = model.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let model = shared.clone();
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(spec.tools)
+                .no_sandbox()
+                .build()
+        })
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.keep_warm = Some(Duration::from_secs(10));
+    let (swarm, mut events) = Swarm::new(config);
+    let root = spawn_root(&swarm, "go").await;
+    reply_to(&mut events, USER).await;
+    swarm.schedule(USER, every(minutes, &root, "tick")).unwrap();
+    // The fire's turn ends with the next fire `minutes` away.
+    tokio::time::sleep(Duration::from_secs(minutes * 60 + 1)).await;
+    let calls = |model: &IdleModel| model.calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        calls(&model),
+        2,
+        "the first turn ended before the schedule existed"
+    );
+    tokio::time::sleep(Duration::from_secs(minutes * 60 - 6)).await;
+    let calls = calls(&model);
+    swarm.shutdown().await;
+    calls
+}
+
+/// A refresh costs 0.1 of the cached prefix and a rewrite 1.25 instead of 0.1 for a read, so up
+/// to 11 refreshes pay for themselves: a poller due in a minute is kept warm until its fire (five
+/// refreshes 10 s apart), one due in an hour (with 10 s refreshes: 360) is left to expire.
+#[tokio::test(start_paused = true)]
+async fn an_idle_agent_is_kept_warm_until_a_schedule_fires_only_when_that_is_cheaper() {
+    assert_eq!(calls_while_idle_before_a_fire(1).await, 2 + 5);
+    assert_eq!(calls_while_idle_before_a_fire(60).await, 2);
+}
+
 /// A free-space reading for the disk guard that counts its reads, so a test waits for the guard
 /// to have checked again rather than for time to pass.
 struct DiskProbe {

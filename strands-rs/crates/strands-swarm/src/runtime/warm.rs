@@ -1,6 +1,8 @@
 //! Keep-warm: while a turn waits on a tool call (a `wait`, a slow build), re-send the last model
 //! request every [`SwarmConfig::keep_warm`] and drop it at the first content, so the provider's
 //! 5-minute prompt cache is read (0.1x input) instead of expiring and being rewritten (1.25x).
+//! An idle agent whose next schedule fires soon is kept warm the same way until it fires, when
+//! that costs less than the rewrite ([`Swarm::refreshes_until_fire`]).
 
 use strands_agents::models::StreamAggregatedResult;
 use strands_agents::types::StopReason;
@@ -17,6 +19,14 @@ struct Request {
     model: Arc<dyn Model>,
     messages: Vec<Message>,
     options: StreamOptions,
+}
+
+/// How a keep-warm loop runs.
+struct Plan {
+    every: Duration,
+    refreshes: usize,
+    /// Until a schedule fires: stops if none is left.
+    scheduled: bool,
 }
 
 impl Swarm {
@@ -55,12 +65,29 @@ impl Swarm {
                         usage.cache_read_input_tokens.unwrap_or(0)
                             + usage.cache_write_input_tokens.unwrap_or(0)
                     });
-                    if let (StopReason::ToolUse, true, Some(node)) =
-                        (&result.stop_reason, cached > 0, node.upgrade())
-                    {
+                    let node = node.upgrade().filter(|_| cached > 0);
+                    let plan = node.and_then(|node| match result.stop_reason {
+                        StopReason::ToolUse => Some((node, KEEP_WARM_MAX, false)),
+                        StopReason::EndTurn => swarm
+                            .refreshes_until_fire(&node, request.model.model_id(), every)
+                            .map(|n| (node, n, true)),
+                        _ => None,
+                    });
+                    if let Some((node, refreshes, scheduled)) = plan {
+                        // The invocation's token ends with the turn; an idle agent's refreshes
+                        // run on until its next call, the swarm's shutdown or its last schedule.
+                        let stop = match scheduled {
+                            true => swarm.inner.root_cancel.child_token(),
+                            false => stop,
+                        };
                         let usage = result.usage.clone().unwrap_or_default();
                         *refresher.lock() = Some(stop.clone());
-                        tokio::spawn(swarm.keep_warm(node, request, usage, every, stop));
+                        let plan = Plan {
+                            every,
+                            refreshes,
+                            scheduled,
+                        };
+                        tokio::spawn(swarm.keep_warm(node, request, usage, plan, stop));
                     }
                     Ok(result)
                 }
@@ -68,26 +95,72 @@ impl Swarm {
         ));
     }
 
+    /// How many refreshes, `every` apart, keep `node`'s cache warm until its next schedule fires;
+    /// `None` when none is due, or it is so far off that they cost more than the rewrite.
+    ///
+    /// With cache reads at 0.1x input and writes at 1.25x, a refresh costs 0.1 of the prefix and
+    /// a rewrite instead of a read 1.15, so up to 11 refreshes (49 min at 4.5 min) pay: a 30
+    /// minute poller spends 6 x 0.1 = 0.6 against 1.15, ~48% less per fire. Longer gaps are left
+    /// to expire; `--cache-ttl 1h` is the answer for those.
+    pub(super) fn refreshes_until_fire(
+        &self,
+        node: &Node,
+        model: Option<String>,
+        every: Duration,
+    ) -> Option<usize> {
+        let until = self.next_fire(&node.id)? - self.now();
+        let count = (until.to_std().ok()?.as_secs() / every.as_secs().max(1)) as usize;
+        let model = model
+            .or_else(|| self.inner.config.default_model.clone())
+            .unwrap_or_default();
+        let price = self
+            .inner
+            .config
+            .prices
+            .price(&model)
+            .unwrap_or(crate::cost::Price {
+                input: 1.0,
+                output: 0.0,
+                cache_read: None,
+                cache_write: Some(crate::cost::CACHE_WRITE_FACTOR),
+            });
+        (1..=price.warm_refreshes()).contains(&count).then_some(count)
+    }
+
+    /// When the soonest schedule posting to agent `id` next fires.
+    fn next_fire(&self, id: &str) -> Option<DateTime<Utc>> {
+        let list = self.inner.schedules.lock();
+        list.iter().filter(|s| s.to == id).map(|s| s.next).min()
+    }
+
     async fn keep_warm(
         self,
         node: Arc<Node>,
         request: Request,
         usage: Usage,
-        every: Duration,
+        plan: Plan,
         stop: CancellationToken,
     ) {
+        let Plan {
+            every,
+            refreshes,
+            scheduled,
+        } = plan;
         // The whole request was cached by the call it repeats: a refresh reads all of it.
         let prefix = super::actor::usage_counts(&usage).input;
         let options = StreamOptions {
             cancel: Some(stop.clone()),
             ..request.options
         };
-        for _ in 0..KEEP_WARM_MAX {
+        for _ in 0..refreshes {
             // Biased: a refresh whose time comes as the agent's next call starts is not sent.
             tokio::select! {
                 biased;
                 _ = stop.cancelled() => return,
                 _ = tokio::time::sleep(every) => {}
+            }
+            if scheduled && (self.next_fire(&node.id).is_none() || !node.status.lock().is_live()) {
+                return;
             }
             let Ok(_permit) = self.admit_model_call(&node.id, &stop).await else {
                 return;

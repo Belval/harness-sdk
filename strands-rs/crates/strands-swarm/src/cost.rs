@@ -225,6 +225,18 @@ pub struct Price {
 }
 
 impl Price {
+    /// How many keep-warm refreshes (cache reads of the whole prefix) cost less than the one
+    /// rewrite they avoid: a refresh costs `read`, rewriting instead of reading the prefix
+    /// `write - read`, so `n × read < write - read`. 11 at the default 0.1× and 1.25×.
+    pub fn warm_refreshes(&self) -> usize {
+        let read = self.cache_read.unwrap_or(self.input * CACHE_READ_FACTOR);
+        let write = self.cache_write.unwrap_or(self.input * CACHE_WRITE_FACTOR);
+        if read <= 0.0 {
+            return usize::MAX;
+        }
+        (((write - read) / read).ceil().max(1.0) as usize) - 1
+    }
+
     /// Estimated USD for `counts`.
     pub fn cost(&self, counts: &Counts) -> f64 {
         let uncached = counts
@@ -701,6 +713,22 @@ mod tests {
         // 1M uncached at $3, 1M out at $15, 2M read at $0.30, 1M written at $3.75.
         let cost = price.cost(&counts(4_000_000, 1_000_000, 2_000_000, 1_000_000));
         assert!((cost - (3.0 + 15.0 + 0.6 + 3.75)).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn refreshes_pay_while_they_cost_less_than_the_rewrite_they_avoid() {
+        let price = |read, write| Price {
+            input: 4.0,
+            output: 20.0,
+            cache_read: read,
+            cache_write: write,
+        };
+        // 0.1x reads against 1.25x writes: 11 x 0.1 = 1.1 < 1.15, 12 x 0.1 is not.
+        assert_eq!(price(None, Some(5.0)).warm_refreshes(), 11);
+        // Exactly the rewrite's extra is not cheaper.
+        assert_eq!(price(Some(1.0), Some(12.0)).warm_refreshes(), 10);
+        // With the 1h TTL's 2x writes: 19 x 0.1 = 1.9 = 2 - 0.1 is a tie, 18 pay.
+        assert_eq!(price(None, Some(8.0)).warm_refreshes(), 18);
     }
 
     #[test]
