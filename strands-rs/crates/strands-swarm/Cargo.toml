@@ -39,6 +39,8 @@ ratatui-image.workspace = true
 chrono.workspace = true
 image.workspace = true
 nix = { workspace = true, features = ["fs"] }
+# glibc malloc keeps every thread arena at its high-water mark; jemalloc returns freed pages.
+tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 
 [dev-dependencies]
 strands-agents = { path = "../strands-agents", features = ["test-support"] }

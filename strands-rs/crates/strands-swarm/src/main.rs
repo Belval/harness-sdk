@@ -181,6 +181,14 @@ struct Cli {
     prices: Option<PathBuf>,
 }
 
+/// Every model call and conversation save builds a transient copy of an agent's whole
+/// conversation (tens of MB for a long one), on whichever of the runtime's threads it runs on.
+/// glibc's malloc gives each thread an arena and keeps every arena at its high-water mark: a run
+/// with 160 threads held 2.6 GB for 250 MB in use. jemalloc's background threads return freed
+/// pages to the system within seconds.
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();

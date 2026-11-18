@@ -265,6 +265,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     the agent itself may not). Agents it had stopped are told to continue; the message goes
     with that note, so one turn follows. A later `send_message` with a lower value lowers it
     again.
+- **Process memory.** The binary allocates with jemalloc, whose background threads return freed
+  pages to the system within seconds. Each model call and conversation save makes a transient
+  copy of the agent's conversation; under glibc's malloc each of the runtime's threads kept its
+  arena at its high-water mark (2.6 GB resident for 250 MB in use, 56 live agents).
 
 ## Cost
 
