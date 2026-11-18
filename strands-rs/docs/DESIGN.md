@@ -80,6 +80,10 @@ installs the exporter).
   `SnapshotStorage::save_snapshot_json`, which `FileStorage` and `S3SessionStorage` store as is
   (the default parses them for `save_snapshot`). The bytes are TS's pretty form unless
   `SessionManagerOptions::compact` (Rust-only) asks for compact JSON; loading accepts both.
+  Unlike TS, it does not rewrite `snapshot_latest` when all but its `createdAt` is what it last
+  wrote there for that agent (same length and hash; forgotten on a failed save, a restore and
+  `delete_session`), so the save after an invocation that added nothing costs no write.
+  `Agent::session_manager()` returns the manager given to the builder, for explicit saves.
 - Option/result structs that will grow are `#[non_exhaustive]` and built from `Default` plus
   `with_*` setters (`InvokeOptions::default().with_limits(Limits::default().with_turns(2))`);
   public enums that mirror a provider's wire format are `#[non_exhaustive]` too.

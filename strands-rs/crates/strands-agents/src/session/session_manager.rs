@@ -1,5 +1,7 @@
 //! The `SessionManager` plugin (`strands-ts/src/session/session-manager.ts`).
 
+use std::collections::HashMap;
+use std::hash::Hasher;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -63,6 +65,9 @@ struct Inner {
     options: SessionManagerOptions,
     /// Length of the last snapshot serialized, to size the next one's buffer.
     last_len: AtomicUsize,
+    /// Per agent id, the [`fingerprint`] of the latest snapshot this manager wrote. Held across
+    /// each save of the latest snapshot, so saves land in the order they were taken.
+    saved: tokio::sync::Mutex<HashMap<String, (usize, u64)>>,
 }
 
 /// Persists agent state to a [`SnapshotStorage`] so conversations survive across invocations.
@@ -102,6 +107,7 @@ impl SessionManager {
                 storage,
                 options,
                 last_len: AtomicUsize::new(0),
+                saved: Default::default(),
             }),
         })
     }
@@ -125,18 +131,41 @@ impl SessionManager {
         Ok(json)
     }
 
-    /// Saves a snapshot of the agent's current state.
+    /// Saves a snapshot of the agent's current state. The latest snapshot is not rewritten when
+    /// all but its `createdAt` is what this manager last wrote there.
     pub async fn save_snapshot(&self, agent: &Agent, is_latest: bool) -> Result<()> {
+        let location = self.location(agent);
+        if is_latest {
+            let mut saved = self.inner.saved.lock().await;
+            let json = self.snapshot_json(agent)?;
+            return self.save_latest(&mut saved, &location, &json).await;
+        }
         let json = self.snapshot_json(agent)?;
-        let snapshot_id = if is_latest {
-            "latest".to_owned()
-        } else {
-            Uuid::now_v7().to_string()
-        };
+        let snapshot_id = Uuid::now_v7().to_string();
         self.inner
             .storage
-            .save_snapshot_json(&self.location(agent), &snapshot_id, is_latest, &json)
+            .save_snapshot_json(&location, &snapshot_id, false, &json)
             .await
+    }
+
+    /// Writes `json` as `location`'s latest snapshot unless `saved` says it is already there.
+    async fn save_latest(
+        &self,
+        saved: &mut HashMap<String, (usize, u64)>,
+        location: &SnapshotLocation,
+        json: &[u8],
+    ) -> Result<()> {
+        let print = fingerprint(json);
+        if saved.get(&location.scope_id) == Some(&print) {
+            return Ok(());
+        }
+        saved.remove(&location.scope_id);
+        self.inner
+            .storage
+            .save_snapshot_json(location, "latest", true, json)
+            .await?;
+        saved.insert(location.scope_id.clone(), print);
+        Ok(())
     }
 
     /// Loads a snapshot (the latest when `snapshot_id` is `None`) into the agent.
@@ -151,6 +180,8 @@ impl SessionManager {
             return Ok(false);
         };
         load_agent_snapshot(agent, &snapshot)?;
+        // The agent may now differ from what this manager last saved.
+        self.inner.saved.lock().await.remove(agent.id());
         Ok(true)
     }
 
@@ -169,6 +200,8 @@ impl SessionManager {
 
     /// Deletes all snapshots and manifests for this session from storage.
     pub async fn delete_session(&self) -> Result<()> {
+        let mut saved = self.inner.saved.lock().await;
+        saved.clear();
         self.inner.storage.delete_session(&self.inner.session_id).await
     }
 
@@ -200,13 +233,15 @@ impl SessionManager {
 
     /// Captures one snapshot and writes it to both immutable history and `snapshot_latest`.
     async fn save_immutable_and_latest(&self, agent: &Agent) -> Result<()> {
+        let mut saved = self.inner.saved.lock().await;
         let json = self.snapshot_json(agent)?;
         let location = self.location(agent);
         let snapshot_id = Uuid::now_v7().to_string();
-        let storage = &self.inner.storage;
         tokio::try_join!(
-            storage.save_snapshot_json(&location, &snapshot_id, false, &json),
-            storage.save_snapshot_json(&location, "latest", true, &json),
+            self.inner
+                .storage
+                .save_snapshot_json(&location, &snapshot_id, false, &json),
+            self.save_latest(&mut saved, &location, &json),
         )?;
         Ok(())
     }
@@ -239,6 +274,25 @@ impl SessionManager {
         }
         Ok(())
     }
+}
+
+/// What decides whether a snapshot changed: its JSON's length and hash, both without the
+/// `createdAt` value every save renews.
+fn fingerprint(json: &[u8]) -> (usize, u64) {
+    const KEY: &[u8] = b"\"createdAt\":";
+    // It follows only `scope` and `schemaVersion`, near the start.
+    let head = &json[..json.len().min(256)];
+    let value = head.windows(KEY.len()).position(|w| w == KEY).and_then(|at| {
+        let start = at + KEY.len();
+        let open = start + head[start..].iter().position(|&b| b == b'"')?;
+        let close = open + 1 + head[open + 1..].iter().position(|&b| b == b'"')?;
+        Some((start, close + 1))
+    });
+    let (start, end) = value.unwrap_or((json.len(), json.len()));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(&json[..start]);
+    hasher.write(&json[end..]);
+    (json.len() - (end - start), hasher.finish())
 }
 
 #[async_trait]
@@ -1081,6 +1135,102 @@ mod tests {
         let err = agent.hooks().invoke_callbacks(&mut event).await.unwrap_err();
 
         assert_eq!(err.name(), "SessionError");
+    }
+
+    #[tokio::test]
+    async fn rewrites_the_latest_snapshot_only_when_more_than_its_time_changed() {
+        let storage = mock_storage();
+        let manager = new_manager("s", &storage, SessionManagerOptions::default());
+        let agent = test_agent_for_session("test-agent");
+        agent.set_messages(vec![Message::user("one")]);
+
+        manager.save_snapshot(&agent, true).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        manager.save_snapshot(&agent, true).await.unwrap();
+        assert_eq!(storage.saves(), 1, "unchanged but for createdAt");
+
+        agent.with_messages(|m| m.push(Message::assistant("two")));
+        manager.save_snapshot(&agent, true).await.unwrap();
+        agent.state().set("k", json!(1));
+        manager.save_snapshot(&agent, true).await.unwrap();
+        assert_eq!(storage.saves(), 3, "messages, then state");
+        let latest = load_latest(&storage, "s", "test-agent").await.unwrap();
+        assert_eq!(latest.data["state"], json!({ "k": 1 }));
+        assert_eq!(latest.data["messages"].as_array().unwrap().len(), 2);
+
+        // Immutable snapshots are always written; another agent has its own latest.
+        manager.save_snapshot(&agent, false).await.unwrap();
+        manager
+            .save_snapshot(&test_agent_for_session("other"), true)
+            .await
+            .unwrap();
+        assert_eq!(storage.saves(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_turn_saves_once_per_message_and_not_again_after_the_invocation() {
+        use crate::testing::{MockMessageModel, MockResponse};
+        let storage = mock_storage();
+        let manager = new_manager("s", &storage, options(SaveLatestStrategy::Message));
+        let model = MockMessageModel::new(vec![MockResponse::message(Message::assistant("hi"))]);
+        let agent = Agent::builder()
+            .model(model)
+            .session_manager(manager)
+            .build()
+            .unwrap();
+
+        agent.invoke("hello").await.unwrap();
+
+        assert_eq!(storage.saves(), 2, "the user message and the reply");
+        let latest = load_latest(&storage, "s", agent.id()).await.unwrap();
+        assert_eq!(latest.data["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rewrites_an_unchanged_snapshot_after_a_failed_save_a_restore_or_a_delete() {
+        let storage = mock_storage();
+        let manager = new_manager("s", &storage, SessionManagerOptions::default());
+        let agent = test_agent_for_session("test-agent");
+        manager.save_snapshot(&agent, true).await.unwrap();
+
+        agent.state().set("k", json!(1));
+        *storage.should_throw_errors.lock() = true;
+        assert!(manager.save_snapshot(&agent, true).await.is_err());
+        *storage.should_throw_errors.lock() = false;
+        manager.save_snapshot(&agent, true).await.unwrap();
+        assert_eq!(storage.saves(), 2, "the failed save is retried");
+
+        assert!(manager.restore_snapshot(&agent, None).await.unwrap());
+        manager.save_snapshot(&agent, true).await.unwrap();
+        assert_eq!(storage.saves(), 3, "after a restore");
+
+        manager.delete_session().await.unwrap();
+        manager.save_snapshot(&agent, true).await.unwrap();
+        assert_eq!(storage.saves(), 4, "after a delete");
+        assert!(load_latest(&storage, "s", "test-agent").await.is_some());
+    }
+
+    #[test]
+    fn a_fingerprint_leaves_out_only_the_created_at_value() {
+        let mut snapshot = test_snapshot();
+        let print = |snapshot: &crate::session::Snapshot, pretty: bool| {
+            fingerprint(&if pretty {
+                serde_json::to_vec_pretty(snapshot).unwrap()
+            } else {
+                serde_json::to_vec(snapshot).unwrap()
+            })
+        };
+        for pretty in [true, false] {
+            let before = print(&snapshot, pretty);
+            snapshot.created_at = "2030-12-31T23:59:59.999Z".to_owned();
+            assert_eq!(print(&snapshot, pretty), before);
+            snapshot.schema_version = "1.1".to_owned();
+            assert_ne!(print(&snapshot, pretty), before);
+            snapshot = test_snapshot();
+            snapshot.data.insert("state".to_owned(), json!({}));
+            assert_ne!(print(&snapshot, pretty), before);
+            snapshot = test_snapshot();
+        }
     }
 
     #[tokio::test]

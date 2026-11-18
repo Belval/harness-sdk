@@ -153,6 +153,7 @@ pub(crate) struct AgentInner {
     pub(crate) background_tasks: Option<Arc<crate::background_tasks::BackgroundTasks>>,
     pub(crate) continuations: Continuations,
     pub(crate) memory_manager: Option<Arc<crate::memory::MemoryManager>>,
+    pub(crate) session_manager: Option<Arc<crate::session::SessionManager>>,
     pub(crate) tracer: crate::telemetry::Tracer,
     pub(crate) meter: crate::telemetry::Meter,
     pub(crate) interrupt_state: crate::interrupt::SharedInterruptState,
@@ -369,6 +370,11 @@ impl Agent {
         self.inner.memory_manager.clone()
     }
 
+    /// The session manager registered through [`AgentBuilder::session_manager`](crate::agent::AgentBuilder::session_manager), if any.
+    pub fn session_manager(&self) -> Option<Arc<crate::session::SessionManager>> {
+        self.inner.session_manager.clone()
+    }
+
     /// Pin the session id (used by `SessionManager` during initialization).
     pub fn set_session_id(&self, id: impl Into<String>) {
         *self.inner.session_id.write() = Some(id.into());
@@ -536,6 +542,7 @@ pub(crate) mod test_fixtures {
                 sandbox: None,
                 session_id: RwLock::new(None),
                 memory_manager: None,
+                session_manager: None,
                 tracer: crate::telemetry::Tracer::new(crate::telemetry::TelemetryConfig::from_env()),
                 meter: crate::telemetry::Meter::new(),
                 background_tasks: None,

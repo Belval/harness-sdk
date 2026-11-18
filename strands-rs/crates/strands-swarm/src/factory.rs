@@ -1278,4 +1278,32 @@ mod tests {
         assert!(manager.restore_snapshot(&restored, None).await.unwrap());
         assert_eq!(restored.messages(), source.messages());
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unchanged_conversation_is_not_written_again() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Agent::builder()
+            .model(Arc::new(MockMessageModel::new(Vec::new())))
+            .session_manager(agent_session_manager(dir.path(), "a1").unwrap())
+            .build()
+            .unwrap();
+        agent.set_messages(exchange("t1", 50).to_vec());
+        let manager = agent.session_manager().unwrap();
+        let path = dir.path().join(format!(
+            "a1/scopes/agent/{}/snapshots/snapshot_latest.json",
+            agent.id()
+        ));
+        // Each write renames a new file into place.
+        let inode = || std::fs::metadata(&path).unwrap().ino();
+
+        manager.save_snapshot(&agent, true).await.unwrap();
+        let first = inode();
+        manager.save_snapshot(&agent, true).await.unwrap();
+        assert_eq!(inode(), first, "nothing changed");
+        agent.with_messages(|messages| messages.push(Message::user("mail")));
+        manager.save_snapshot(&agent, true).await.unwrap();
+        assert_ne!(inode(), first, "a message was added");
+    }
 }

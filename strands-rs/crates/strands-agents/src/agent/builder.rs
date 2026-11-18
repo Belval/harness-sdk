@@ -333,8 +333,8 @@ impl AgentBuilder {
         if let Some(manager) = context_manager {
             plugins.push(manager);
         }
-        if let Some(manager) = self.session_manager {
-            plugins.push(manager);
+        if let Some(manager) = &self.session_manager {
+            plugins.push(Arc::clone(manager) as Arc<dyn Plugin>);
         }
         if !plugins.iter().any(|p| p.name() == super::delegation::PLUGIN_NAME) {
             plugins.push(Arc::new(super::AgentDelegation::default()));
@@ -378,6 +378,7 @@ impl AgentBuilder {
                 sandbox: self.sandbox,
                 session_id: RwLock::new(None),
                 memory_manager: self.memory_manager,
+                session_manager: self.session_manager,
                 tracer: crate::telemetry::Tracer::new(
                     self.telemetry
                         .unwrap_or_else(crate::telemetry::TelemetryConfig::from_env),
@@ -417,6 +418,24 @@ mod tests {
 
     fn mock(text: &str) -> Arc<MockMessageModel> {
         MockMessageModel::shared(vec![MockResponse::message(Message::assistant(text))])
+    }
+
+    #[test]
+    fn the_session_manager_is_kept_for_explicit_saves() {
+        let storage = Arc::new(crate::session::FileStorage::new("/nonexistent"));
+        let manager = Arc::new(SessionManager::new("s", storage).unwrap());
+        let agent = Agent::builder()
+            .model(mock("hi"))
+            .session_manager(Arc::clone(&manager))
+            .build()
+            .unwrap();
+        assert!(Arc::ptr_eq(&agent.session_manager().unwrap(), &manager));
+        assert!(Agent::builder()
+            .model(mock("hi"))
+            .build()
+            .unwrap()
+            .session_manager()
+            .is_none());
     }
 
     #[tokio::test]

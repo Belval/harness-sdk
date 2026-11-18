@@ -329,12 +329,17 @@ impl Swarm {
     }
 
     /// Save `agent`'s conversation now, after a change the SDK does not save itself (it saves
-    /// when it adds a message).
+    /// when it adds a message). Through the agent's own session manager, which knows what it last
+    /// wrote and so skips a save that would change nothing.
     pub(super) async fn save_session(&self, node: &Node, agent: &Agent) {
         let Some(dir) = self.inner.config.state_dir.as_ref() else {
             return;
         };
-        let saved = match crate::agent_session_manager(&dir.join(SESSIONS_DIR), &node.id) {
+        let manager = match agent.session_manager() {
+            Some(manager) => Ok(manager),
+            None => crate::agent_session_manager(&dir.join(SESSIONS_DIR), &node.id).map(Arc::new),
+        };
+        let saved = match manager {
             Ok(manager) => manager.save_snapshot(agent, true).await,
             Err(error) => Err(error),
         };
