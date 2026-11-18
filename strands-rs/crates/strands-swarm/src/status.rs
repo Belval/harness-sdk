@@ -192,7 +192,7 @@ pub struct AgentReport {
     pub schedules: Vec<String>,
 }
 
-/// The two caps and how full they are.
+/// The caps and how full they are.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Limits {
     /// Agents holding a slot, and the cap (`/max-agents`).
