@@ -1171,7 +1171,6 @@ mod tests {
 
     #[test]
     fn by_default_compacts_at_85_percent_of_the_window() {
-        // A 1M window (Opus 5.5) is used to 850k, not cut at 200k as before.
         assert_eq!(compaction_point(1_000_000, None), 850_000);
         assert!((compaction_utilization(1_000_000, None) - AUTO_SUMMARIZE_UTILIZATION).abs() < 1e-9);
         assert_eq!(compaction_point(200_000, None), 170_000);

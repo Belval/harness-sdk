@@ -514,7 +514,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_point_is_85_percent_of_the_window_unless_compact_at_is_smaller() {
-        // Not the 200k the swarm used to cut every window at.
         for (compact_at, point) in [(None, "850,000"), (Some(300_000), "300,000")] {
             let model = MockMessageModel::shared(vec![
                 call("context", "c1", serde_json::json!({})),
