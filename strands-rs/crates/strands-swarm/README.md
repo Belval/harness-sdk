@@ -276,9 +276,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   a `/model` switch is priced per model.
 - **Prices.**
   - A built-in table holds Claude list prices per 1M tokens by tier (opus, sonnet, haiku, plus older
-    versions) and GPT-6 Astra's, which GPT-6.2 Astra borrows until its own is listed. Cache reads
-    cost 0.1× the input price and cache writes 1.25× (2× with
-    `--cache-ttl 1h`).
+    versions) and OpenAI's GPT-5.4 to GPT-6.1 (Bedrock's global prices; GPT-6.2 Astra borrows
+    GPT-6 Astra's until its own is listed). Cache reads cost 0.1× the input price (0.05× on
+    GPT-6.1) and cache writes 1.25× (2× with `--cache-ttl 1h`; OpenAI's are 1.25× on GPT-5.6 and
+    later whatever the TTL, and plain input, no fee, on GPT-5.5 and earlier).
   - `--prices FILE` adds or overrides entries. It is a JSON object keyed by model-id substring:
     `{"opus": {"input": 5, "output": 25}}`, with optional `cache_read`/`cache_write`.
   - Its keys win over the built-in ones; within each, the longest match wins.
@@ -308,6 +309,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   points, for at least 30 minutes (Bedrock's prompt caching guide: "Cached prefixes remain
   available for reuse for at least 30 minutes"; stated for GPT-5.6 and later, not for earlier
   GPT versions or gpt-oss, which keep the 5-minute assumption); `--cache-ttl` does not apply.
+  Cache writes (also in implicit mode) are billed at 1.25× input on GPT-5.6 and later (guide:
+  "billed at 1.25× the uncached input token rate"; the AWS Price List's `cache_write_tokens_30m`
+  agrees, e.g. GPT-6 Astra $12.50 against $10 input and $1 read per 1M) and carry no fee on
+  earlier versions.
   Bedrock routes their requests by a hash of the prompt prefix (OpenAI's routing), and spills a prefix sent more than ~15 times a
   minute to other servers, where the cache misses. Agents share the swarm's system prompt; in one
   run 230 of 232 calls missed. With a state directory, each agent's calls (keep-warm refreshes

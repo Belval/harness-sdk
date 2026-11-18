@@ -27,6 +27,15 @@ pub const CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
 /// The longest an OpenAI model's implicit cache is kept (30 minutes on GPT-5.6 and later).
 const OPENAI_CACHE_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
+/// The GPT version of an `openai.gpt-N.M-...` model id (lower-cased): `(6, 0)` for
+/// `openai.gpt-6-astra`; `None` for `gpt-oss` and for other providers' models.
+fn openai_gpt_version(model: &str) -> Option<(u32, u32)> {
+    let rest = model.split("openai.gpt-").nth(1)?;
+    let mut parts = rest.split(|c: char| !c.is_ascii_digit() && c != '.');
+    let mut numbers = parts.next()?.split('.').map(|n| n.parse::<u32>().ok());
+    Some((numbers.next()??, numbers.next().flatten().unwrap_or(0)))
+}
+
 /// How long the provider keeps `model`'s cached prefix without a hit, at least: five minutes
 /// ([`CACHE_LIFETIME`]) except for OpenAI's GPT-5.6 and later (GPT-6 Astra, ...) on Bedrock and
 /// Mantle, which cache implicitly for at least 30 minutes ("Cached prefixes remain available for
@@ -34,31 +43,54 @@ const OPENAI_CACHE_LIFETIME: Duration = Duration::from_secs(30 * 60);
 /// GPT versions and `gpt-oss` state no lifetime and keep the default. Keep-warm refreshes at
 /// this pace.
 pub fn cache_lifetime(model: &str) -> Duration {
-    let model = model.to_lowercase();
-    let version = model.split("openai.gpt-").nth(1).and_then(|rest| {
-        let mut parts = rest.split(|c: char| !c.is_ascii_digit() && c != '.');
-        let mut numbers = parts.next()?.split('.').map(|n| n.parse::<u32>().ok());
-        Some((numbers.next()??, numbers.next().flatten().unwrap_or(0)))
-    });
-    match version {
+    match openai_gpt_version(&model.to_lowercase()) {
         Some(version) if version >= (5, 6) => OPENAI_CACHE_LIFETIME,
         _ => CACHE_LIFETIME,
     }
 }
 
-/// Built-in USD list prices per 1M input/output tokens, by model-id substring. Unknown newer
-/// versions fall back to their tier's latest known price.
-const BUILTIN: &[(&str, f64, f64)] = &[
-    ("opus", 5.0, 25.0),
-    ("opus-4-1", 15.0, 75.0),
-    ("opus-4-2", 15.0, 75.0),
-    ("3-opus", 15.0, 75.0),
-    ("sonnet", 3.0, 15.0),
-    ("haiku", 1.0, 5.0),
-    ("3-5-haiku", 0.8, 4.0),
-    ("3-haiku", 0.25, 1.25),
-    // Bedrock's global GPT-6 Astra price (AWS Price List); GPT-6.2 Astra's is unlisted yet.
-    ("-astra", 10.0, 50.0),
+/// What a cache write of `model` costs as a share of its input price, if its provider sets its
+/// own rate: OpenAI's GPT-5.6 and later bill cache writes at 1.25× input whatever the mode
+/// ("Cache write billing — Tokens written to cache are billed at 1.25× the uncached input token
+/// rate", Bedrock user guide, Prompt caching: OpenAI models; the AWS Price List's
+/// `cache_write_tokens_30m` rates are 1.25× input too), so `--cache-ttl 1h`'s 2× does not apply;
+/// earlier GPT versions and `gpt-oss` have no write fee ("Cache writes have no additional
+/// fee on these models"), so a write is plain input. Other providers: `None`.
+fn openai_write_factor(model: &str) -> Option<f64> {
+    let model = model.to_lowercase();
+    if !model.contains("openai.") {
+        return None;
+    }
+    Some(match openai_gpt_version(&model) {
+        Some(version) if version >= (5, 6) => CACHE_WRITE_FACTOR,
+        _ => 1.0,
+    })
+}
+
+/// Built-in USD list prices per 1M input/output tokens, by model-id substring, and the cache
+/// read price where it is not 0.1× input. Unknown newer versions fall back to their tier's
+/// latest known price. OpenAI's are Bedrock's global prices (AWS Price List,
+/// `AmazonBedrockFoundationModels`, us-east-1).
+const BUILTIN: &[(&str, f64, f64, Option<f64>)] = &[
+    ("opus", 5.0, 25.0, None),
+    ("opus-4-1", 15.0, 75.0, None),
+    ("opus-4-2", 15.0, 75.0, None),
+    ("3-opus", 15.0, 75.0, None),
+    ("sonnet", 3.0, 15.0, None),
+    ("haiku", 1.0, 5.0, None),
+    ("3-5-haiku", 0.8, 4.0, None),
+    ("3-haiku", 0.25, 1.25, None),
+    // GPT-6.2 Astra's price is unlisted yet: it borrows GPT-6 Astra's.
+    ("-astra", 10.0, 50.0, None),
+    ("gpt-6-sol", 2.0, 10.0, None),
+    ("gpt-6-luna", 0.1, 0.5, None),
+    ("gpt-6.1-sol", 2.0, 10.0, Some(0.1)),
+    ("gpt-6.1-terra", 1.0, 5.0, Some(0.05)),
+    ("gpt-5.6-sol", 4.0, 20.0, None),
+    ("gpt-5.6-terra", 2.0, 12.0, None),
+    ("gpt-5.6-luna", 0.2, 1.2, None),
+    ("gpt-5.5", 5.0, 30.0, None),
+    ("gpt-5.4", 2.5, 15.0, None),
 ];
 
 /// Tokens of one agent on one model. `input` counts all input, cache reads and writes included.
@@ -261,7 +293,7 @@ impl Price {
         if read <= 0.0 {
             return usize::MAX;
         }
-        (((write - read) / read).ceil().max(1.0) as usize) - 1
+        (((write - read) / read - 1e-9).ceil().max(1.0) as usize) - 1
     }
 
     /// Estimated USD for `counts`.
@@ -292,11 +324,11 @@ impl Default for Prices {
     fn default() -> Self {
         let builtin = BUILTIN
             .iter()
-            .map(|&(key, input, output)| {
+            .map(|&(key, input, output, cache_read)| {
                 let price = Price {
                     input,
                     output,
-                    cache_read: None,
+                    cache_read,
                     cache_write: None,
                 };
                 (key.to_owned(), price)
@@ -347,7 +379,8 @@ impl Prices {
                 .map(|(_, price)| *price)
         };
         let mut price = best(&self.user).or_else(|| best(&self.builtin))?;
-        price.cache_write = price.cache_write.or(Some(price.input * self.write_factor));
+        let factor = openai_write_factor(&model).unwrap_or(self.write_factor);
+        price.cache_write = price.cache_write.or(Some(price.input * factor));
         Some(price)
     }
 }
@@ -770,6 +803,58 @@ mod tests {
         assert_eq!(minutes("openai.gpt-oss-120b"), 5);
         assert_eq!(minutes("us.anthropic.claude-sonnet-4-5"), 5);
         assert_eq!(minutes(""), 5);
+    }
+
+    #[test]
+    fn openai_cache_writes_cost_1_25x_from_gpt_5_6_and_nothing_extra_before() {
+        // Bedrock's guide: 5.6+ "billed at 1.25x the uncached input token rate"; 5.5 and
+        // earlier "no additional fee". The AWS Price List agrees (GPT-6 Astra global: input 10,
+        // cache read 1, cache write 12.5; GPT-5.5 lists no write price).
+        let prices = Prices::default();
+        let astra = prices.price("bedrock-mantle/openai.gpt-6-astra").unwrap();
+        assert_eq!((astra.input, astra.cache_write), (10.0, Some(12.5)));
+        assert_eq!(astra.cache_read, None); // 0.1x: 1.0
+        let sol = prices.price("openai.gpt-5.6-sol").unwrap();
+        assert_eq!((sol.input, sol.cache_write), (4.0, Some(5.0)));
+        let gpt55 = prices.price("openai.gpt-5.5").unwrap();
+        assert_eq!((gpt55.input, gpt55.cache_write), (5.0, Some(5.0)));
+        // A write of 1M tokens costs a plain input token there, and 1.25x on 5.6+.
+        let written = counts(1_000_000, 0, 0, 1_000_000);
+        assert!((gpt55.cost(&written) - 5.0).abs() < 1e-9);
+        assert!((sol.cost(&written) - 5.0).abs() < 1e-9);
+        assert!((astra.cost(&written) - 12.5).abs() < 1e-9);
+        // GPT-6.1 reads cost 0.05x input (Terra 0.05 of 1, Sol 0.1 of 2).
+        let terra = prices.price("openai.gpt-6.1-terra").unwrap();
+        assert_eq!(
+            (terra.input, terra.cache_read, terra.cache_write),
+            (1.0, Some(0.05), Some(1.25))
+        );
+        let sol61 = prices.price("openai.gpt-6.1-sol").unwrap();
+        assert_eq!(
+            (sol61.input, sol61.cache_read, sol61.cache_write),
+            (2.0, Some(0.1), Some(2.5))
+        );
+    }
+
+    #[test]
+    fn the_one_hour_ttl_does_not_change_what_openai_charges_for_writes() {
+        let prices = Prices::default().with_cache_write_factor(CACHE_WRITE_1H_FACTOR);
+        assert_eq!(
+            prices.price("openai.gpt-6-astra").unwrap().cache_write,
+            Some(12.5)
+        );
+        assert_eq!(prices.price("openai.gpt-5.5").unwrap().cache_write, Some(5.0));
+        assert_eq!(prices.price("claude-opus-4-5").unwrap().cache_write, Some(10.0));
+    }
+
+    #[test]
+    fn keep_warm_break_even_follows_each_models_write_price() {
+        let prices = Prices::default();
+        // 0.1x reads: 1.25x writes pay for 11 refreshes, plain input for 8 (9 x 0.1 is a tie).
+        assert_eq!(prices.price("openai.gpt-6-astra").unwrap().warm_refreshes(), 11);
+        assert_eq!(prices.price("openai.gpt-5.5").unwrap().warm_refreshes(), 8);
+        // 0.05x reads: 23 x 0.05 = 1.15 < 1.2.
+        assert_eq!(prices.price("openai.gpt-6.1-terra").unwrap().warm_refreshes(), 23);
     }
 
     #[test]
