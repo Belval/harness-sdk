@@ -50,10 +50,12 @@ fn meminfo_bytes(text: &str, key: &str) -> Option<u64> {
     kb.checked_mul(1024)
 }
 
-/// The cached reading, the runtime load limit and who is held.
+/// The cached reading, the runtime limits and who is held.
 #[derive(Default)]
 pub(super) struct HostGate {
-    reading: Mutex<Option<(Instant, Option<HostStats>)>>,
+    reading: Mutex<Option<(tokio::time::Instant, Option<HostStats>)>>,
+    /// Fired on every fresh reading and limit change: held callers look at the cache again.
+    wake: tokio::sync::Notify,
     /// Set with [`Swarm::set_max_load`]; overrides the config.
     pub(super) max_load: Mutex<Option<f64>>,
     /// Set with [`Swarm::set_min_free_mem`]; overrides the config.
@@ -90,9 +92,10 @@ impl Swarm {
 
     /// Change the load limit for this run (kept across restarts, ahead of `--max-load`);
     /// `Some(0.0)` lifts it and `None` returns to the configured one. Held callers look again
-    /// within [`HOST_POLL`].
+    /// at once.
     pub fn set_max_load(&self, limit: Option<f64>) {
         *self.inner.host.max_load.lock() = limit;
+        self.inner.host.wake.notify_waiters();
         self.persist();
         self.journal_event("max_load", serde_json::json!({ "limit": self.max_load() }));
     }
@@ -111,6 +114,7 @@ impl Swarm {
     /// `--min-free-mem`); `Some(0)` lifts it and `None` returns to the configured one.
     pub fn set_min_free_mem(&self, floor: Option<u64>) {
         *self.inner.host.min_free_mem.lock() = floor;
+        self.inner.host.wake.notify_waiters();
         self.persist();
         self.journal_event(
             "min_free_mem",
@@ -118,14 +122,16 @@ impl Swarm {
         );
     }
 
-    /// The host's load and memory, read at most once per [`HOST_POLL`].
+    /// The host's load and memory, read at most once per [`HOST_POLL`]. A fresh reading wakes the
+    /// held callers, so one caller's poll serves them all.
     pub fn host(&self) -> Option<HostStats> {
         let mut reading = self.inner.host.reading.lock();
         match *reading {
             Some((at, stats)) if at.elapsed() < HOST_POLL => stats,
             _ => {
                 let stats = (self.inner.config.host_probe)();
-                *reading = Some((Instant::now(), stats));
+                *reading = Some((tokio::time::Instant::now(), stats));
+                self.inner.host.wake.notify_waiters();
                 stats
             }
         }
@@ -165,26 +171,28 @@ impl Swarm {
             self.host_busy()
                 .or_else(|| disk.then(|| self.disk_low()).flatten())
         };
-        let Some(mut why) = busy() else {
-            return Ok(());
-        };
         let _held = Held(self, id);
+        let wake = &self.inner.host.wake;
         loop {
+            // Registered before the check, so a reading in between is not missed.
+            let woken = wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            let Some(why) = busy() else {
+                return Ok(());
+            };
             let changed = self.inner.host.held.lock().insert(id.to_owned(), why.clone()) != Some(why.clone());
             if changed {
                 self.emit(SwarmEvent::HostHeld {
                     id: id.to_owned(),
-                    reason: Some(why.clone()),
+                    reason: Some(why),
                 });
             }
             tokio::select! {
+                () = &mut woken => {}
                 () = tokio::time::sleep(HOST_POLL) => {}
                 () = cancel.cancelled() => return Err(Error::Cancelled),
                 () = self.inner.root_cancel.cancelled() => return Err(Error::Cancelled),
-            }
-            match busy() {
-                Some(next) => why = next,
-                None => return Ok(()),
             }
         }
     }

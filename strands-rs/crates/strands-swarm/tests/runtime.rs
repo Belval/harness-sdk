@@ -2960,6 +2960,72 @@ async fn an_overloaded_host_holds_new_model_calls_and_jobs_until_it_recovers() {
     assert_eq!(swarm.waiting_for_call("a1"), None);
 }
 
+/// A reading that finds the host free releases every held caller at once, not each at its own
+/// next poll; a changed limit does too.
+#[tokio::test(start_paused = true)]
+async fn one_reading_of_a_recovered_host_releases_every_held_caller() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let map = scripts_of(vec![
+        ("a1", vec![say("one")]),
+        ("a2", vec![say("two")]),
+        ("a3", vec![say("three")]),
+    ]);
+    let load = Arc::new(AtomicU64::new(50));
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    config.max_load = 10.0;
+    config.host_probe = {
+        let (load, reads) = (load.clone(), reads.clone());
+        Arc::new(move || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            Some(strands_swarm::runtime::HostStats {
+                load: load.load(Ordering::SeqCst) as f64,
+                mem_available: 1 << 40,
+            })
+        })
+    };
+    let (swarm, mut events) = Swarm::new(config);
+
+    // Two callers are held, half a poll apart; the host recovers right after.
+    spawn_root(&swarm, "go").await;
+    assert!(host_held(&mut events, "a1").await.is_some());
+    let start = tokio::time::Instant::now();
+    tokio::time::sleep(strands_swarm::runtime::HOST_POLL / 2).await;
+    spawn_root(&swarm, "go").await;
+    assert!(host_held(&mut events, "a2").await.is_some());
+    load.store(5, Ordering::SeqCst);
+
+    // a1 looks again a poll after its first reading; a2 is released by that very reading
+    // instead of at its own poll half a second later.
+    assert_eq!(host_held(&mut events, "a1").await, None);
+    assert_eq!(host_held(&mut events, "a2").await, None);
+    assert!(
+        start.elapsed() < strands_swarm::runtime::HOST_POLL + strands_swarm::runtime::HOST_POLL / 4,
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "one reading when held, one when recovered"
+    );
+
+    // A changed limit releases a held caller without waiting for its poll.
+    load.store(50, Ordering::SeqCst);
+    tokio::time::sleep(strands_swarm::runtime::HOST_POLL).await;
+    spawn_root(&swarm, "go").await;
+    assert!(host_held(&mut events, "a3").await.is_some());
+    let start = tokio::time::Instant::now();
+    swarm.set_max_load(Some(100.0));
+    assert_eq!(host_held(&mut events, "a3").await, None);
+    assert!(
+        start.elapsed() < strands_swarm::runtime::HOST_POLL / 2,
+        "{:?}",
+        start.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn low_host_memory_holds_new_work_and_no_limit_holds_nothing() {
     let dir = tempfile::tempdir().unwrap();
