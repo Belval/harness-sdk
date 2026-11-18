@@ -45,6 +45,8 @@ aws-smithy-mocks = "0.3"
 regex = "1"
 http = "1"
 tempfile = "3"
+# Peak heap use in the strands-swarm save benchmark (`examples/save_bench.rs`).
+peak_alloc = "0.3"
 # Inline images in the strands-swarm TUI: kitty/iTerm2/sixel when the terminal supports them,
 # unicode halfblocks otherwise.
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }

@@ -43,6 +43,7 @@ nix = { workspace = true, features = ["fs"] }
 tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 
 [dev-dependencies]
+peak_alloc.workspace = true
 strands-agents = { path = "../strands-agents", features = ["test-support"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
