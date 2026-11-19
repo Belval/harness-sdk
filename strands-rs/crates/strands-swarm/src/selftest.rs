@@ -156,6 +156,8 @@ pub async fn run(dir: &Path) -> Result<String> {
     config.state_dir = Some(dir.to_path_buf());
     config.max_agents = usize::MAX;
     config.reclaim_disk = false;
+    // Cancelled agents take no part in the probe: their histories would only fill the channel.
+    config.cancelled_history = false;
     config.cargo_target_dir = None;
     let run_id = config.run_id.clone();
     let (swarm, mut events) = match saved {

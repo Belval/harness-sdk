@@ -344,6 +344,9 @@ pub struct SwarmConfig {
     /// been cancelled this long, on resume and from [`Swarm::guard_disk`] and [`Swarm::gc`];
     /// `None` (the default) keeps them forever ([`Swarm::prune_cancelled_sessions`]).
     pub keep_cancelled: Option<Duration>,
+    /// Publish each cancelled agent's saved conversation on resume ([`SwarmEvent::History`]).
+    /// Off for the self-test, whose probe only involves live agents.
+    pub cancelled_history: bool,
     /// Agents in the priority lane besides the root agents (`--priority`): ids or names, as
     /// `send_message` takes them ([`Swarm::is_priority`]).
     pub priority: Vec<String>,
@@ -386,6 +389,7 @@ impl SwarmConfig {
             disk_reserve: 0,
             stash_prune_every: Some(STASH_PRUNE_EVERY),
             keep_cancelled: None,
+            cancelled_history: true,
             priority: Vec::new(),
         }
     }

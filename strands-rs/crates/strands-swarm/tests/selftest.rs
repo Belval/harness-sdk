@@ -153,6 +153,59 @@ async fn self_test_passes_a_run_whose_agent_had_errored_before_the_restart() {
     assert!(summary.contains("2 live agents replied"), "{summary}");
 }
 
+/// `saved_run` with `a2` cancelled, resumed from its saved state.
+async fn cancelled_child(dir: &Path, config: impl FnOnce(&mut SwarmConfig)) -> Vec<String> {
+    let (state_dir, mut run_config) = saved_run(dir).await;
+    let mut saved = strands_swarm::state::load(&state_dir).await.unwrap().unwrap();
+    for agent in &mut saved.agents {
+        if agent.id == "a2" {
+            agent.status = "cancelled".into();
+        }
+    }
+    config(&mut run_config);
+    let (swarm, mut events) = Swarm::resume(run_config, saved).await.unwrap();
+    let mut with_history = Vec::new();
+    // The root's history proves the replay has run; the cancelled child's comes in the same task.
+    let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+        while let Some(event) = events.recv().await {
+            if let SwarmEvent::History { id, .. } = event {
+                with_history.push(id);
+            }
+        }
+    })
+    .await;
+    swarm.shutdown().await;
+    with_history.sort();
+    with_history
+}
+
+#[tokio::test]
+async fn a_resume_publishes_cancelled_agents_history_unless_told_not_to() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(cancelled_child(dir.path(), |_| ()).await, ["a1", "a2"]);
+    let dir = tempfile::tempdir().unwrap();
+    let only_live = cancelled_child(dir.path(), |config| config.cancelled_history = false).await;
+    assert_eq!(only_live, ["a1"]);
+}
+
+#[tokio::test]
+async fn self_test_passes_a_run_with_cancelled_agents_and_restores_the_live_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state_dir, _config) = saved_run(dir.path()).await;
+    let copy = dir.path().join("copy");
+    selftest::copy_run(&state_dir, &copy).unwrap();
+    let path = copy.join("swarm.json");
+    let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for agent in saved["agents"].as_array_mut().unwrap() {
+        if agent["id"] == "a2" {
+            agent["status"] = json!("cancelled");
+        }
+    }
+    std::fs::write(&path, saved.to_string()).unwrap();
+    let summary = selftest::run(&copy).await.unwrap();
+    assert!(summary.contains("1 live agents replied"), "{summary}");
+}
+
 #[tokio::test]
 async fn self_test_fails_when_a_conversation_cannot_be_restored() {
     let dir = tempfile::tempdir().unwrap();

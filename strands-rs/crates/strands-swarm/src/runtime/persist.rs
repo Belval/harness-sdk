@@ -59,6 +59,9 @@ impl Swarm {
     /// so a viewer still shows what they did. An agent whose session was removed
     /// ([`Swarm::prune_cancelled_sessions`]) publishes [`SwarmEvent::ConversationRemoved`] instead.
     fn publish_cancelled_history(&self) {
+        if !self.inner.config.cancelled_history {
+            return;
+        }
         let Some(dir) = self
             .inner
             .config

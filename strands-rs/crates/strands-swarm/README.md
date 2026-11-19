@@ -773,7 +773,9 @@ swarmctl status
   restored within 20 s. It also renders the TUI into a test backend and checks the deadlock
   watchdog.
 - The copy's agents lose their branches, private env and directories, disk reclamation is off
-  (`SwarmConfig::reclaim_disk`), and the stub calls no tools. The real run is never touched, and
+  (`SwarmConfig::reclaim_disk`), cancelled agents' histories are not replayed
+  (`SwarmConfig::cancelled_history`; 400 of them would only fill the event channel) and the stub
+  calls no tools. The real run is never touched, and
   the copy is deleted after.
 - On failure or after 60 s, `reload_swarm` returns the error with its stderr tail and the swarm
   keeps its binary.
