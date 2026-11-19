@@ -142,6 +142,29 @@ pub struct AgentState {
     /// open batch) was removed by `--keep-cancelled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_removed: Option<u64>,
+    /// Whether nothing can wake it ([`Dormancy`]).
+    #[serde(default, skip_serializing_if = "Dormancy::is_default")]
+    pub dormancy: Dormancy,
+}
+
+/// How long an idle agent has had nothing to wake it, and what its parent was told about that.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dormancy {
+    /// When the swarm first saw it idle with nothing to wake it, unix seconds; 0 if it is not.
+    #[serde(default)]
+    pub since: i64,
+    /// Its parent was told about this spell.
+    #[serde(default)]
+    pub told: bool,
+    /// Its last turn ended with a reply to its parent, and nothing has reached it since.
+    #[serde(default)]
+    pub replied: bool,
+}
+
+impl Dormancy {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Persisted mail.

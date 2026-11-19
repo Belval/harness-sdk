@@ -67,6 +67,7 @@ impl Swarm {
             schedule
         };
         self.journal_event("schedule", serde_json::to_value(&schedule).unwrap_or_default());
+        self.clear_dormancy(&schedule.to);
         self.persist();
         self.start_scheduler();
         // An idle receiver now sleeps on its schedule, which frees its slot.

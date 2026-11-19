@@ -25,6 +25,20 @@ pub const MAX_PAIRS: usize = 45;
 /// How long a running agent may show no sign of progress before `list_agents` and `/status` say so.
 pub const QUIET_AFTER: Duration = Duration::from_secs(15 * 60);
 
+/// How long an agent may be idle with nothing to wake it before `list_agents` and `/status` say
+/// so, and its parent is told.
+pub const DORMANT_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// `dormant: nothing will wake it (idle 3h)` once an agent has been so for [`DORMANT_AFTER`].
+pub fn dormant_note(idle: Duration) -> Option<String> {
+    (idle >= DORMANT_AFTER).then(|| {
+        format!(
+            "dormant: nothing will wake it (idle {})",
+            crate::schedule::human(idle)
+        )
+    })
+}
+
 /// `last progress 3h ago` once `quiet` (time since an agent's newest commit, successful tool call
 /// or model reply) reaches [`QUIET_AFTER`]; nothing before, so healthy lines stay short.
 pub fn quiet_note(quiet: Duration) -> Option<String> {
@@ -186,6 +200,8 @@ pub struct AgentReport {
     /// Time since its last sign of progress, when it is running and that is not recent
     /// ([`quiet_note`]).
     pub quiet: Option<Duration>,
+    /// How long it has been idle with nothing to wake it ([`dormant_note`]).
+    pub dormant: Option<Duration>,
     /// Its todo list.
     pub todos: Vec<TodoItem>,
     /// Running background jobs: `tool (age)`.
@@ -260,6 +276,9 @@ impl StatusReport {
                 head.push_str(&format!(" · {doing}"));
             }
             if let Some(note) = agent.quiet.and_then(quiet_note) {
+                head.push_str(&format!(" · {note}"));
+            }
+            if let Some(note) = agent.dormant.and_then(dormant_note) {
                 head.push_str(&format!(" · {note}"));
             }
             lines.push(String::new());
@@ -631,6 +650,16 @@ mod tests {
     }
 
     #[test]
+    fn the_dormant_note_shows_only_after_the_threshold() {
+        let note = |secs| dormant_note(Duration::from_secs(secs));
+        assert_eq!(note(14 * 60), None);
+        assert_eq!(
+            note(3 * 3600).as_deref(),
+            Some("dormant: nothing will wake it (idle 3h)")
+        );
+    }
+
+    #[test]
     fn the_status_line_of_a_quiet_agent_carries_the_note() {
         let mut agent = AgentReport {
             label: "a (a1)".into(),
@@ -641,6 +670,7 @@ mod tests {
             branch: None,
             git: None,
             quiet: Some(Duration::from_secs(60)),
+            dormant: None,
             todos: vec![],
             background: vec![],
             schedules: vec![],
@@ -682,6 +712,7 @@ mod tests {
                         ..Default::default()
                     }),
                     quiet: None,
+                    dormant: None,
                     todos: vec![
                         todo("Test", TodoStatus::Completed),
                         todo("Commit", TodoStatus::InProgress),
@@ -699,6 +730,7 @@ mod tests {
                     branch: Some("swarm/r/a3".into()),
                     git: Some(BranchState::default()),
                     quiet: None,
+                    dormant: None,
                     todos: vec![],
                     background: vec![],
                     schedules: vec![],
@@ -740,6 +772,7 @@ mod tests {
                 branch: Some("b".into()),
                 git: None,
                 quiet: None,
+                dormant: None,
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],
@@ -906,6 +939,7 @@ mod tests {
                 branch: Some("swarm/r/a7".into()),
                 git: Some(state.clone()),
                 quiet: None,
+                dormant: None,
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],

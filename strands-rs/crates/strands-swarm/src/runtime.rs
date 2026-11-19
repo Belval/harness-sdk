@@ -43,6 +43,7 @@ mod calls;
 mod capacity;
 mod collect;
 mod disk;
+mod dormant;
 mod host;
 mod landing;
 mod mailbox;
@@ -482,6 +483,8 @@ pub struct AgentInfo {
     /// When it last showed a sign of progress (a successful tool call or a model reply), unix
     /// seconds.
     pub progress: i64,
+    /// Since when it has been idle with nothing to wake it, unix seconds ([`Swarm::dormant_for`]).
+    pub dormant_since: Option<i64>,
 }
 
 /// Everything observable that happens in the swarm, in order.
@@ -760,6 +763,10 @@ struct Node {
     turn: Mutex<Option<CancellationToken>>,
     /// Interrupted by the user and not messaged since: a goal agent does not resume on restart.
     paused: AtomicBool,
+    /// Idle with nothing to wake it ([`Swarm::sweep_dormant`]).
+    dormancy: Mutex<crate::state::Dormancy>,
+    /// What each `wait` in progress awaits (empty: its children), for [`Swarm::sweep_dormant`].
+    waiting: Mutex<Vec<Vec<String>>>,
     /// Tool calls of the current turn in flight, by tool use id, with when each started; waiting
     /// tools ([`WAITING_TOOLS`]) left out.
     tool_calls: Mutex<BTreeMap<String, Instant>>,
@@ -808,6 +815,7 @@ impl Node {
             compact_at: self.compact_at,
             budget: *self.budget.lock(),
             progress: self.progress.load(Ordering::Relaxed),
+            dormant_since: Some(self.dormancy.lock().since).filter(|since| *since > 0),
         }
     }
 
@@ -884,6 +892,8 @@ struct Inner {
     jobs: Jobs,
     /// The job watcher has been started.
     watching_jobs: AtomicBool,
+    /// The dormancy sweep has been started ([`Swarm::watch_dormant`]).
+    watching_dormant: AtomicBool,
     /// Jobs whose end report is posted but not yet marked on disk ([`Swarm::jobs`]).
     reports_posted: Mutex<std::collections::BTreeSet<String>>,
     /// Holds new work while the host is overloaded ([`Swarm::wait_for_host`]).
@@ -936,6 +946,7 @@ impl Swarm {
             branches: Mutex::default(),
             jobs: Jobs::new(jobs_dir(&config)),
             watching_jobs: AtomicBool::new(false),
+            watching_dormant: AtomicBool::new(false),
             reports_posted: Mutex::default(),
             host: host::HostGate::default(),
             priority: Mutex::new(None),
@@ -1065,6 +1076,7 @@ impl Swarm {
             node
         };
         self.persist();
+        self.watch_dormant();
         self.emit(SwarmEvent::Spawned {
             id: id.clone(),
             parent: parent.to_owned(),

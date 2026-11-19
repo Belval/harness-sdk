@@ -38,6 +38,7 @@ impl Swarm {
                         .collect()
                 });
                 let quiet = self.quiet_for(&info, cache.branches.get(&node.id).and_then(|b| b.tip));
+                let dormant = self.dormant_for(&info);
                 crate::status::AgentReport {
                     label: node.label(),
                     status: info.status,
@@ -46,6 +47,7 @@ impl Swarm {
                     branch: info.branch,
                     git: cache.branches.get(&node.id).cloned(),
                     quiet,
+                    dormant,
                     todos: todos.unwrap_or_default(),
                     background,
                     schedules: schedules

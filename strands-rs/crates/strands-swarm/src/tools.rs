@@ -803,7 +803,9 @@ fn list_agents(
     let quiet = |info: &AgentInfo| -> String {
         let tip = branches.get(&info.id).and_then(|state| state.tip);
         let note = swarm.quiet_for(info, tip).and_then(crate::status::quiet_note);
-        note.map(|note| format!(", {note}")).unwrap_or_default()
+        let dormant = swarm.dormant_for(info).and_then(crate::status::dormant_note);
+        let notes = note.into_iter().chain(dormant);
+        notes.map(|note| format!(", {note}")).collect::<String>()
     };
     let mut lines = Vec::new();
     for info in &shown {

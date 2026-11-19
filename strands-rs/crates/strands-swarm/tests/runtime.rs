@@ -6813,3 +6813,223 @@ async fn a_job_that_keeps_writing_gets_no_quiet_note() {
         .expect("the job never ended");
     swarm.shutdown().await;
 }
+
+/// Let `minutes` of (paused) time pass in sweep-sized steps, sweeping at each: the background
+/// sweep reads job files on the blocking pool, which a paused clock does not wait for.
+async fn pass_minutes(swarm: &Swarm, minutes: u64) {
+    for _ in 0..minutes * 2 {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        swarm.sweep_dormant().await;
+    }
+}
+
+/// The FYI notes to `to` that have arrived so far.
+fn fyis_to(events: &mut UnboundedReceiver<SwarmEvent>, to: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let SwarmEvent::Mail { to: receiver, mail } = event {
+            if receiver == to && mail.kind == "fyi" {
+                notes.push(mail.text);
+            }
+        }
+    }
+    notes
+}
+
+fn dormant_lines(swarm: &Swarm) -> String {
+    swarm
+        .status()
+        .lines(&|_| None)
+        .into_iter()
+        .filter(|line| line.contains("dormant: nothing will wake it"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Root `a1` has replied and idles; `a2` is its child, whose turn ended with nothing sent.
+async fn root_with_silent_child(
+    dir: &Path,
+    extra: Vec<(&str, Vec<MockResponse>)>,
+) -> (Swarm, UnboundedReceiver<SwarmEvent>, SwarmConfig) {
+    let mut scripts = vec![
+        ("a1", vec![say("ok")]),
+        (
+            "a2",
+            vec![say(strands_swarm::SILENT_REPLY), say(strands_swarm::SILENT_REPLY)],
+        ),
+    ];
+    scripts.extend(extra);
+    let map = scripts_of(scripts);
+    let config = persistent_swarm(&map, dir);
+    let (swarm, mut events) = Swarm::new(config.clone());
+    spawn_root(&swarm, "go").await;
+    reply_to(&mut events, USER).await;
+    spawn_child(&swarm, "a1", "work").await;
+    eventually("a2 idles", || {
+        swarm.agent("a2").unwrap().status == AgentStatus::Idle
+    })
+    .await;
+    (swarm, events, config)
+}
+
+/// An idle agent with no mail, schedule, job or child to wake it is marked after 15 minutes, and
+/// its parent gets one FYI (which wakes nobody) per spell; a message or a schedule ends the spell.
+#[tokio::test(start_paused = true)]
+async fn an_idle_agent_nothing_can_wake_is_marked_dormant_and_its_parent_told_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, _) = root_with_silent_child(dir.path(), vec![]).await;
+    pass_minutes(&swarm, 10).await;
+    assert_eq!(dormant_lines(&swarm), "");
+    assert!(fyis_to(&mut events, "a1").is_empty());
+
+    pass_minutes(&swarm, 7).await;
+    let line = dormant_lines(&swarm);
+    assert!(line.contains("a2") && line.contains("(idle 1"), "{line}");
+    let notes = fyis_to(&mut events, "a1");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("(a2) has been idle 1") && notes[0].contains("with nothing to wake it"),
+        "{notes:?}"
+    );
+    // The FYI wakes nobody, and a1 (replied to the user) is not marked itself.
+    assert_eq!(swarm.agent("a1").unwrap().status, AgentStatus::Idle);
+    assert_eq!(swarm.agent("a1").unwrap().unread, 0);
+    assert!(!line.contains("a1"), "{line}");
+    pass_minutes(&swarm, 60).await;
+    assert!(fyis_to(&mut events, "a1").is_empty(), "told once per spell");
+
+    // A schedule at it clears the mark at once; dropping it starts a new spell, told again.
+    let schedule = swarm
+        .schedule(
+            USER,
+            strands_swarm::ScheduleRequest {
+                to: "a2".into(),
+                message: "check in".into(),
+                at: Some(swarm.now() + chrono::Duration::hours(10)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(dormant_lines(&swarm), "");
+    pass_minutes(&swarm, 30).await;
+    assert_eq!(dormant_lines(&swarm), "");
+    assert!(fyis_to(&mut events, "a1").is_empty());
+    swarm.unschedule(&schedule.id).unwrap();
+    pass_minutes(&swarm, 17).await;
+    assert!(dormant_lines(&swarm).contains("a2"));
+    assert_eq!(fyis_to(&mut events, "a1").len(), 1);
+
+    // A message wakes it; once it idles again with nothing, the spell is new.
+    swarm.send(USER, "a2", "hello").unwrap();
+    eventually("a2 ran", || swarm.agent("a2").unwrap().dormant_since.is_none()).await;
+    eventually("a2 idles", || {
+        swarm.agent("a2").unwrap().status == AgentStatus::Idle
+    })
+    .await;
+    assert_eq!(dormant_lines(&swarm), "");
+    pass_minutes(&swarm, 17).await;
+    assert!(dormant_lines(&swarm).contains("a2"));
+    assert_eq!(fyis_to(&mut events, "a1").len(), 1);
+    swarm.shutdown().await;
+}
+
+/// A child whose reply the parent holds is done, not forgotten: no mark, no FYI.
+#[tokio::test(start_paused = true)]
+async fn an_idle_child_whose_reply_reached_its_parent_is_not_dormant() {
+    let dir = tempfile::tempdir().unwrap();
+    let map = scripts_of(vec![("a1", vec![say("ok")]), ("a2", vec![say("all done")])]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&map, dir.path()));
+    spawn_root(&swarm, "go").await;
+    reply_to(&mut events, USER).await;
+    spawn_child(&swarm, "a1", "work").await;
+    reply_to(&mut events, "a1").await;
+    pass_minutes(&swarm, 120).await;
+    assert_eq!(dormant_lines(&swarm), "");
+    assert!(fyis_to(&mut events, "a1").is_empty());
+    swarm.shutdown().await;
+}
+
+/// A running job, a pending schedule, a child that will act, or a `wait` on it each keep an idle
+/// agent from being marked.
+#[tokio::test(start_paused = true)]
+async fn an_idle_agent_with_a_job_schedule_acting_child_or_waiter_is_not_dormant() {
+    let dir = tempfile::tempdir().unwrap();
+    let silent = || vec![say(strands_swarm::SILENT_REPLY)];
+    let map = scripts_of(vec![
+        ("a1", vec![say("ok")]),
+        (
+            "a2",
+            vec![
+                tool_call("run_background", "r1", json!({ "command": UNTIL_GO })),
+                say(strands_swarm::SILENT_REPLY),
+            ],
+        ),
+        ("a3", silent()),
+        ("a4", silent()),
+        ("a5", silent()),
+        ("a6", silent()),
+        (
+            "a7",
+            vec![
+                tool_call("wait", "w1", json!({ "from": ["a6"], "timeout_seconds": 3600 })),
+                say("a6 never wrote"),
+            ],
+        ),
+    ]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&map, dir.path()));
+    spawn_root(&swarm, "go").await;
+    reply_to(&mut events, USER).await;
+    for _ in 0..3 {
+        spawn_child(&swarm, "a1", "work").await; // a2 (job), a3 (schedule), a4 (parent of a5)
+    }
+    spawn_child(&swarm, "a4", "work").await; // a5 (schedule)
+    spawn_child(&swarm, "a1", "work").await; // a6 (awaited)
+    spawn_child(&swarm, "a1", "wait").await; // a7
+    eventually("all idle but the waiter", || {
+        ["a2", "a3", "a4", "a5", "a6"]
+            .iter()
+            .all(|id| swarm.agent(id).unwrap().status == AgentStatus::Idle)
+    })
+    .await;
+    for to in ["a3", "a5"] {
+        let at = Some(swarm.now() + chrono::Duration::hours(10));
+        let request = strands_swarm::ScheduleRequest {
+            to: to.into(),
+            message: "check".into(),
+            at,
+            ..Default::default()
+        };
+        swarm.schedule(USER, request).unwrap();
+    }
+    pass_minutes(&swarm, 40).await;
+    assert_eq!(dormant_lines(&swarm), "");
+    for to in ["a1", "a4"] {
+        assert!(fyis_to(&mut events, to).is_empty(), "{to} was told");
+    }
+    std::fs::write(dir.path().join("go"), "").unwrap();
+    swarm.shutdown().await;
+}
+
+/// The mark and the one FYI per spell are saved: a resumed swarm shows the mark and does not tell
+/// the parent again.
+#[tokio::test(start_paused = true)]
+async fn the_dormant_mark_and_its_fyi_survive_a_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, config) = root_with_silent_child(dir.path(), vec![]).await;
+    pass_minutes(&swarm, 17).await;
+    assert_eq!(fyis_to(&mut events, "a1").len(), 1);
+    let state = swarm.snapshot();
+    swarm.shutdown().await;
+    let since = state.agents.iter().find(|a| a.id == "a2").unwrap().dormancy.since;
+    assert!(since > 0);
+
+    let (swarm, mut events) = Swarm::resume(config, state).await.unwrap();
+    assert_eq!(swarm.agent("a2").unwrap().dormant_since, Some(since));
+    pass_minutes(&swarm, 40).await;
+    assert!(dormant_lines(&swarm).contains("a2"), "{}", dormant_lines(&swarm));
+    assert!(
+        fyis_to(&mut events, "a1").is_empty(),
+        "told again after the resume"
+    );
+    swarm.shutdown().await;
+}

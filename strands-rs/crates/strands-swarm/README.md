@@ -468,6 +468,17 @@ Other text messages the selected agent, or starts a root agent when there is non
   successfully, or a commit at its branch's tip. It is kept in memory and saved with the agent
   (`progress`), so a restart does not make a stuck agent look fresh. A tool call still in flight
   is not progress, so a long build shows the note while it runs.
+- **Dormant agents.** An idle agent that nothing can wake is a forgotten one. It is woken by
+  unread mail (schedules, job end reports and children's replies all arrive as mail), so it is
+  *dormant* when it has none, no pending schedule aimed at it, no running background job it owns,
+  no child that is working or itself has a way to wake, and no agent is `wait`ing on it. A sweep
+  every 30 s tracks this; once an agent has been dormant 15 minutes, `list_agents` and `/status`
+  say `dormant: nothing will wake it (idle 3h)`, and its parent gets one `fyi` note per spell
+  (non-waking: message the agent to resume it, or cancel it). Not told, not marked: a root agent
+  (the user's own), and an agent whose last reply was delivered to its parent with nothing
+  received since, since it is done and the parent already holds its report. A new message, a
+  schedule at it, or a new turn ends the spell. The spell's start and "told" are saved with the
+  agent (`dormancy`), so a resume neither forgets the mark nor repeats the note.
 - **`/status`:**
   - Unmerged commits are `git log <base>..<branch>`. The base is `--status-base`, else the branch
     checked out where the swarm started (a linked worktree's, if it started in one).

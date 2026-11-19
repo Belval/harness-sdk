@@ -1167,6 +1167,7 @@ mod tests {
             branch: None,
             git: None,
             quiet: None,
+            dormant: None,
             todos: vec![],
             background: vec![],
             schedules: vec![],
@@ -1234,6 +1235,7 @@ mod tests {
                     ..Default::default()
                 }),
                 quiet: None,
+                dormant: None,
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],

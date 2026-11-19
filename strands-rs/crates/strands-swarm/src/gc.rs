@@ -780,6 +780,7 @@ mod tests {
             progress: None,
             cancelled_at: None,
             conversation_removed: None,
+            dormancy: Default::default(),
         }
     }
 

@@ -101,6 +101,7 @@ impl Swarm {
                 .unreachable(node, from)
                 .or_else(|| swarm.stalled_on_queue(node, from))
         };
+        let _waiting = self.node(id).map(|node| dormant::Waiting::new(&node, from));
         self.wait_until(id, from, cancel, take, give_up).await
     }
 

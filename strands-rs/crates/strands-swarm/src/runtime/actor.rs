@@ -226,6 +226,7 @@ impl Swarm {
         let turn = node.cancel.child_token();
         *node.turn.lock() = Some(turn.clone());
         node.paused.store(false, Ordering::SeqCst);
+        *node.dormancy.lock() = Default::default();
         self.set_status(node, AgentStatus::Running);
         self.refresh_memory(agent).await;
         let options = InvokeOptions::default().with_cancel(turn.clone());
@@ -282,6 +283,7 @@ impl Swarm {
         // The user sees replies as streamed text anyway, and headless runs wait for one.
         if node.parent == USER || !is_silent(&reply) {
             let _ = self.post(&node.id, &node.parent, "reply", reply);
+            node.dormancy.lock().replied = true;
         }
         self.set_status(node, AgentStatus::Idle);
         None

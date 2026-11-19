@@ -51,6 +51,7 @@ impl Swarm {
         swarm.collect_in_background();
         swarm.tidy_landings_in_background();
         swarm.watch_jobs();
+        swarm.watch_dormant();
         Ok((swarm, events))
     }
 
@@ -160,6 +161,7 @@ impl Swarm {
             progress: AtomicI64::new(saved.progress.unwrap_or_else(|| self.now().timestamp())),
             cancelled_at: AtomicI64::new(saved.cancelled_at.unwrap_or(0)),
             conversation_removed: AtomicU64::new(saved.conversation_removed.unwrap_or(0)),
+            dormancy: Mutex::new(saved.dormancy),
             ..Node::default()
         });
         agents.insert(saved.id.clone(), node.clone());
@@ -500,6 +502,7 @@ pub(super) fn node_state(node: &Node) -> AgentState {
         cancelled_at: Some(node.cancelled_at.load(Ordering::Relaxed)).filter(|at| *at > 0),
         conversation_removed: Some(node.conversation_removed.load(Ordering::Relaxed))
             .filter(|secs| *secs > 0),
+        dormancy: *node.dormancy.lock(),
     }
 }
 
