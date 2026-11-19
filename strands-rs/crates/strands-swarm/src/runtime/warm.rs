@@ -6,8 +6,12 @@
 //! An idle agent whose next schedule fires soon is kept warm the same way until it fires, when
 //! that costs less than the rewrite ([`Swarm::refreshes_until_fire`]).
 
+use std::borrow::Cow;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
+
 use strands_agents::models::{AgentMetadata, StreamAggregatedResult};
-use strands_agents::types::StopReason;
+use strands_agents::types::{ContentBlock, Role, StopReason};
 
 use super::*;
 
@@ -20,8 +24,91 @@ pub const KEEP_WARM_MAX: usize = 12;
 /// A model request as sent, to send again.
 struct Request {
     model: Arc<dyn Model>,
-    messages: Vec<Message>,
+    held: Held,
     options: StreamOptions,
+}
+
+/// The messages of a [`Request`]. A conversation reaches megabytes and a waiting agent holds its
+/// own, so a copy kept for up to an hour would hold it twice.
+enum Held {
+    /// The agent's first `len` messages as the call sent them: a digest of what its history held
+    /// then, and the per-call blocks that were added after it to the last message. A refresh is
+    /// built from the history when it is sent, so only that is sent again that the call cached;
+    /// an edited history (compaction, pruning) no longer matches and ends the refreshes.
+    History {
+        len: usize,
+        digest: u64,
+        trailing: Vec<ContentBlock>,
+    },
+    /// A request that history cannot rebuild: a hook edited an earlier message for this call only.
+    Copy(Vec<Message>),
+}
+
+impl Held {
+    /// The messages of a call of `agent` that sent `messages`, of which the last `trailing` blocks
+    /// of the last message are per-call.
+    fn capture(agent: &Agent, messages: &[Message], trailing: usize) -> Self {
+        let Some((last, before)) = messages.split_last() else {
+            return Self::Copy(Vec::new());
+        };
+        let keep = last.content.len().saturating_sub(trailing);
+        let same = agent.with_messages(|own| {
+            own.len() == messages.len()
+                && own[..before.len()] == *before
+                && own[before.len()].role == last.role
+                && own[before.len()].content == last.content[..keep]
+        });
+        match same {
+            true => Self::History {
+                len: messages.len(),
+                digest: digest(before, &last.role, &last.content[..keep]),
+                trailing: last.content[keep..].to_vec(),
+            },
+            false => Self::Copy(messages.to_vec()),
+        }
+    }
+
+    /// The messages to send now, `None` when the agent's history is no longer the one the call
+    /// sent: its next call will not read this prefix.
+    fn messages(&self, agent: Option<&Agent>) -> Option<Cow<'_, [Message]>> {
+        match self {
+            Self::Copy(messages) => Some(Cow::Borrowed(messages)),
+            Self::History {
+                len,
+                digest: wanted,
+                trailing,
+            } => agent?.with_messages(|own| {
+                let (last, before) = own.get(..*len)?.split_last()?;
+                if digest(before, &last.role, &last.content) != *wanted {
+                    return None;
+                }
+                let mut messages = own[..*len].to_vec();
+                messages[*len - 1].content.extend(trailing.iter().cloned());
+                Some(Cow::Owned(messages))
+            }),
+        }
+    }
+}
+
+/// A hash of the roles and contents of `before` and of a last message with `role` and `content`:
+/// what the provider reads of a conversation.
+fn digest(before: &[Message], role: &Role, content: &[ContentBlock]) -> u64 {
+    struct Hashing(DefaultHasher);
+    impl std::io::Write for Hashing {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut hashing = Hashing(DefaultHasher::new());
+    for message in before {
+        let _ = serde_json::to_writer(&mut hashing, &(&message.role, &message.content));
+    }
+    let _ = serde_json::to_writer(&mut hashing, &(role, content));
+    hashing.0.finish()
 }
 
 /// How a keep-warm loop runs.
@@ -53,7 +140,11 @@ impl Swarm {
                     }
                     let request = Request {
                         model: context.model.clone(),
-                        messages: context.messages.clone(),
+                        held: Held::capture(
+                            &context.agent,
+                            &context.messages,
+                            context.dynamic_trailing_blocks,
+                        ),
                         options: StreamOptions {
                             system_prompt: context.system_prompt.clone(),
                             tool_specs: context.tool_specs.clone(),
@@ -190,11 +281,16 @@ impl Swarm {
             if stop.is_cancelled() {
                 return;
             }
+            // Built now, from the history the agent's next call will send.
+            let Some(messages) = request.held.messages(node.agent().as_ref()) else {
+                return;
+            };
             let read = tokio::select! {
                 biased;
                 _ = stop.cancelled() => return,
-                read = reads_prefix(request.model.stream(&request.messages, &options)) => read,
+                read = reads_prefix(request.model.stream(&messages, &options)) => read,
             };
+            drop(messages);
             if !read {
                 return;
             }
@@ -227,4 +323,59 @@ async fn reads_prefix(mut events: ModelEventStream<'_>) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use strands_agents::testing::MockMessageModel;
+
+    use super::*;
+
+    fn agent(messages: Vec<Message>) -> Agent {
+        let agent = Agent::builder()
+            .model(Arc::new(MockMessageModel::new(Vec::new())))
+            .no_sandbox()
+            .build()
+            .unwrap();
+        agent.set_messages(messages);
+        agent
+    }
+
+    fn sent(held: &Held, agent: &Agent) -> Option<Vec<Message>> {
+        held.messages(Some(agent)).map(Cow::into_owned)
+    }
+
+    #[test]
+    fn a_request_over_the_agent_s_history_holds_none_of_it() {
+        let history = vec![Message::user("a"), Message::assistant("b"), Message::user("c")];
+        let agent = agent(history.clone());
+        let mut call = history.clone();
+        call[2].content.push(ContentBlock::text("per call"));
+        let held = Held::capture(&agent, &call, 1);
+        let Held::History { len, trailing, .. } = &held else {
+            panic!("the history rebuilds this request");
+        };
+        assert_eq!((*len, trailing.len()), (3, 1));
+        assert_eq!(sent(&held, &agent), Some(call));
+
+        // Later messages are not part of it; an edit of the prefix ends it.
+        agent.with_messages(|own| own.push(Message::assistant("d")));
+        assert_eq!(sent(&held, &agent).map(|m| m.len()), Some(3));
+        agent.with_messages(|own| own[0] = Message::user("edited"));
+        assert_eq!(sent(&held, &agent), None);
+        assert!(held.messages(None).is_none());
+    }
+
+    #[test]
+    fn an_edit_of_an_earlier_message_for_one_call_is_kept_as_a_copy() {
+        let agent = agent(vec![
+            Message::user("a"),
+            Message::assistant("b"),
+            Message::user("c"),
+        ]);
+        let call = vec![Message::user("a!"), Message::assistant("b"), Message::user("c")];
+        let held = Held::capture(&agent, &call, 0);
+        assert!(matches!(held, Held::Copy(_)));
+        assert_eq!(sent(&held, &agent), Some(call));
+    }
 }

@@ -295,6 +295,14 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   has covered it. Saves that each queued a copy of the whole swarm held 1.2 GB behind a burst of
   86 agents answering at once (680 waiting saves) and left the heap fragmented: 2.5 GB resident
   after the burst, 0.8 GB with coalescing.
+- **Keep-warm holds no conversation.** A refresh is built from the agent's own history when it
+  is sent, so the waiting agent's conversation is in memory once: the request keeps a digest of
+  what the call sent and the per-call blocks after the cache point (injected text), and a refresh
+  is sent only while the history still hashes to that digest (an edit by compaction or pruning
+  ends them, the agent's next call would not read that prefix). A request that history cannot
+  rebuild (a hook edited an earlier message for one call) is kept as a copy. Ten agents with 5 MB
+  conversations in a tool call: 211 MB resident with a copy per request, 160 MB without
+  (`tests/keep_warm_memory.rs`, `KEEP_WARM_AGENTS=10 KEEP_WARM_MB=5 KEEP_WARM_ONLY=on`).
 
 ## Cost
 

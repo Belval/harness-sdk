@@ -5907,6 +5907,8 @@ struct CachingModel {
     id: &'static str,
     calls: std::sync::atomic::AtomicUsize,
     repeats: std::sync::atomic::AtomicUsize,
+    /// The messages of every call, as JSON.
+    seen: Mutex<Vec<String>>,
 }
 
 impl CachingModel {
@@ -5915,6 +5917,7 @@ impl CachingModel {
             id,
             calls: Default::default(),
             repeats: Default::default(),
+            seen: Default::default(),
         }
     }
 }
@@ -5933,6 +5936,7 @@ impl Model for CachingModel {
         let answered = messages
             .last()
             .is_some_and(|m| m.content.iter().any(|b| matches!(b, ContentBlock::ToolResult(_))));
+        self.seen.lock().push(serde_json::to_string(messages).unwrap());
         self.calls.fetch_add(1, Ordering::SeqCst);
         if !answered && self.calls.load(Ordering::SeqCst) > 1 {
             self.repeats.fetch_add(1, Ordering::SeqCst);
@@ -6019,6 +6023,81 @@ async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_cal
     );
     assert_eq!(model.calls.load(Ordering::SeqCst), 2 + refreshes);
     swarm.shutdown().await;
+}
+
+/// A turn of a `CachingModel` agent whose tool takes 400 ms (refreshes every 50 ms), with `injected`
+/// text added to the last message of every call, and `edit` run on the agent's history 120 ms in.
+async fn warm_turn(injected: Option<&'static str>, edit: Option<fn(&mut Vec<Message>)>) -> Arc<CachingModel> {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(CachingModel::named("caching"));
+    let shared = model.clone();
+    let built: Arc<Mutex<Option<Agent>>> = Arc::default();
+    let keep = built.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let model = shared.clone();
+        let (keep, history) = (keep.clone(), keep.clone());
+        let pause = strands_agents::tools::FunctionTool::builder("pause")
+            .description("Takes a while.")
+            .handler(move |_input: serde_json::Value, _ctx| {
+                let history = history.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    if let Some(edit) = edit {
+                        history.lock().clone().unwrap().with_messages(edit);
+                    }
+                    tokio::time::sleep(Duration::from_millis(280)).await;
+                    strands_agents::Result::Ok("back".to_owned())
+                }
+            });
+        let mut tools = spec.tools;
+        tools.push(Arc::new(pause));
+        let keep = keep.clone();
+        Box::pin(async move {
+            let mut builder = Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(tools)
+                .no_sandbox();
+            if let Some(text) = injected {
+                builder = builder.plugin(strands_agents::plugins::vended::ContextInjector::inject(text));
+            }
+            let agent = builder.build()?;
+            *keep.lock() = Some(agent.clone());
+            Ok(agent)
+        })
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.keep_warm = Some(Duration::from_millis(50));
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    swarm.shutdown().await;
+    model
+}
+
+/// A refresh sends what the call it repeats sent, byte for byte, though it is built from the
+/// agent's history when it goes out: including the text injected after the cache point.
+#[tokio::test(start_paused = true)]
+async fn a_refresh_sends_the_messages_of_the_call_it_repeats() {
+    for injected in [None, Some("the time is now")] {
+        let model = warm_turn(injected, None).await;
+        let seen = model.seen.lock().clone();
+        let refreshes = model.repeats.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(refreshes >= 7, "{refreshes} refreshes");
+        assert_eq!(seen.len(), 2 + refreshes);
+        for refresh in &seen[1..=refreshes] {
+            assert_eq!(refresh, &seen[0]);
+        }
+        assert_eq!(seen[0].contains("the time is now"), injected.is_some());
+    }
+}
+
+/// Once the history is edited (compaction, pruning) the call after the wait no longer reads the
+/// prefix a refresh would send: they stop, having sent two at 50 and 100 ms.
+#[tokio::test(start_paused = true)]
+async fn refreshes_stop_when_the_history_they_repeat_was_edited() {
+    let model = warm_turn(None, Some(|messages| messages[0] = Message::user("edited"))).await;
+    assert_eq!(model.repeats.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 /// Refreshes sent while a turn waits `wait` on a tool, by an agent on `model_id`, with the
