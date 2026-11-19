@@ -40,3 +40,20 @@ fn the_binary_allocates_with_jemalloc_and_purges_in_the_background() {
     let stats = String::from_utf8_lossy(&output.stderr);
     assert!(stats.contains("opt.background_thread: true"), "{stats}");
 }
+
+/// Few arenas that purge within a second keep the peak of many concurrent conversation copies
+/// from staying resident.
+#[test]
+fn the_binary_uses_few_arenas_that_purge_quickly() {
+    let output = Command::new(env!("CARGO_BIN_EXE_strands-swarm"))
+        .arg("--version")
+        .env("_RJEM_MALLOC_CONF", "stats_print:true")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stats = String::from_utf8_lossy(&output.stderr);
+    assert!(stats.contains("opt.narenas: 8"), "{stats}");
+    assert!(stats.contains("opt.dirty_decay_ms: 1000"), "{stats}");
+    assert!(stats.contains("opt.muzzy_decay_ms: 0"), "{stats}");
+}

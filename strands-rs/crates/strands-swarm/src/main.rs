@@ -202,6 +202,11 @@ struct Cli {
 /// glibc's malloc gives each thread an arena and keeps every arena at its high-water mark: a run
 /// with 160 threads held 2.6 GB for 250 MB in use. jemalloc's background threads return freed
 /// pages to the system within seconds.
+///
+/// Its defaults still suit a small process badly: 4 arenas per core (256 here) each keep their own
+/// dirty pages for 10 s, so 32 concurrent model calls and saves on ~140 threads held 2.4 GB at
+/// the peak where 8 arenas purging after 1 s held 1.4 GB (a copy of a 109-agent run, 0.74 GB in
+/// use afterwards). `.cargo/config.toml` sets that at build time; `_RJEM_MALLOC_CONF` overrides it.
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

@@ -289,7 +289,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     again.
 - **Process memory.** The binary allocates with jemalloc, whose background threads return freed
   pages to the system within seconds, so the transient conversation copies of model calls and
-  saves do not pin each thread's arena at its high-water mark.
+  saves do not pin each thread's arena at its high-water mark. It is
+  built with 8 arenas and a 1 s dirty-page decay (`.cargo/config.toml`; `_RJEM_MALLOC_CONF`
+  overrides it): with the default 256 arenas on 64 cores the same transient copies peaked
+  1 GB higher and stayed resident for 10 s each.
 - **State saves coalesce.** Every model call asks for a save of `swarm.json`, and a save builds its
   state only once it holds the write lock, skipping it when a write that began after the request
   has covered it. Saves that each queued a copy of the whole swarm held 1.2 GB behind a burst of

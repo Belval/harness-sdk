@@ -1,0 +1,5 @@
+# jemalloc's compile-time `malloc_conf` for strands-swarm's allocator (the binary forbids unsafe
+# code, so it cannot export the `malloc_conf` symbol). It is appended to `background_thread:true`.
+# `_RJEM_MALLOC_CONF` at run time overrides it.
+[env]
+JEMALLOC_SYS_WITH_MALLOC_CONF = "narenas:8,dirty_decay_ms:1000,muzzy_decay_ms:0"
