@@ -253,10 +253,13 @@ pub async fn run(dir: &Path) -> Result<String> {
 /// a worktree it owns), a private env, or a working directory outside `dir`.
 fn detach(mut saved: SwarmState, dir: &Path) -> SwarmState {
     saved.cwd = dir.to_path_buf();
+    // The stub costs nothing, and a spent budget would refuse the probe it must answer.
+    saved.budget_tokens = None;
     for agent in &mut saved.agents {
         agent.branch = None;
         agent.env.clear();
         agent.cwd = dir.to_path_buf();
+        agent.budget_tokens = None;
     }
     saved
 }
