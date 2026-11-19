@@ -70,6 +70,7 @@ impl Swarm {
             collected.push(self.collect_node(&node).await);
         }
         collected.extend(self.tidy_landings(true).await);
+        self.prune_cancelled_sessions_announced().await;
         self.emit(SwarmEvent::Reclaimed {
             collected: collected.clone(),
             requested: true,

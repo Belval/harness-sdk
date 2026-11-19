@@ -38,6 +38,7 @@ impl Swarm {
         for agent in state.agents {
             swarm.restore_agent(agent);
         }
+        swarm.prune_cancelled_sessions().await;
         swarm.publish_cancelled_history();
         // Fires missed while the run was down are due now: each fires once.
         if !state.schedules.is_empty() {
@@ -55,7 +56,8 @@ impl Swarm {
 
     /// Cancelled agents get no actor on resume, so nothing restores their session. Read each
     /// one's saved conversation in the background and publish its tail ([`SwarmEvent::History`]),
-    /// so a viewer still shows what they did.
+    /// so a viewer still shows what they did. An agent whose session was removed
+    /// ([`Swarm::prune_cancelled_sessions`]) publishes [`SwarmEvent::ConversationRemoved`] instead.
     fn publish_cancelled_history(&self) {
         let Some(dir) = self
             .inner
@@ -66,13 +68,13 @@ impl Swarm {
         else {
             return;
         };
-        let cancelled: Vec<String> = self
+        let cancelled: Vec<(String, u64)> = self
             .inner
             .agents
             .lock()
             .values()
             .filter(|node| *node.status.lock() == AgentStatus::Cancelled)
-            .map(|node| node.id.clone())
+            .map(|node| (node.id.clone(), node.conversation_removed.load(Ordering::Relaxed)))
             .collect();
         if cancelled.is_empty() {
             return;
@@ -80,7 +82,14 @@ impl Swarm {
         let swarm = self.clone();
         self.track(tokio::spawn(async move {
             let storage = strands_agents::FileStorage::new(dir);
-            for id in cancelled {
+            for (id, removed) in cancelled {
+                if removed > 0 {
+                    swarm.emit(SwarmEvent::ConversationRemoved {
+                        id,
+                        after_secs: removed,
+                    });
+                    continue;
+                }
                 match saved_messages(&storage, &id).await {
                     Ok(messages) => {
                         if let Some(history) = history_event(&id, &messages) {
@@ -146,6 +155,8 @@ impl Swarm {
             paused: AtomicBool::new(saved.paused),
             reclaim_logged: Mutex::new(saved.reclaim_logged),
             progress: AtomicI64::new(saved.progress.unwrap_or_else(|| self.now().timestamp())),
+            cancelled_at: AtomicI64::new(saved.cancelled_at.unwrap_or(0)),
+            conversation_removed: AtomicU64::new(saved.conversation_removed.unwrap_or(0)),
             ..Node::default()
         });
         agents.insert(saved.id.clone(), node.clone());
@@ -483,6 +494,9 @@ pub(super) fn node_state(node: &Node) -> AgentState {
         running_calls,
         reclaim_logged: node.reclaim_logged.lock().clone(),
         progress: Some(node.progress.load(Ordering::Relaxed)).filter(|at| *at > 0),
+        cancelled_at: Some(node.cancelled_at.load(Ordering::Relaxed)).filter(|at| *at > 0),
+        conversation_removed: Some(node.conversation_removed.load(Ordering::Relaxed))
+            .filter(|secs| *secs > 0),
     }
 }
 

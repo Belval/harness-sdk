@@ -546,7 +546,8 @@ Other text messages the selected agent, or starts a root agent when there is non
   restored, rather than leaving `✗ read` alone above it.
 - F2 prints the selected agent's log as plain text into the terminal's scrollback; any key returns.
 - A resumed run shows the last 100 messages of each agent's restored conversation, cancelled
-  agents included (F3 lists them).
+  agents included (F3 lists them); one whose session `--keep-cancelled` removed shows
+  "conversation removed after N days" instead.
 - Drag to select text in the log or tree. Releasing copies it with OSC 52, which works over ssh;
   tmux needs `set -g set-clipboard on`.
 - The wheel and PgUp/PgDn scroll the log, End (on an empty input) jumps to its bottom, and Esc
@@ -588,6 +589,16 @@ messages you.
     session that is missing or does not read as JSON, or a save that fails, keeps the whole
     stash. Each pruning is logged as `stash_pruned` (`entries`, `bytes`, and `id` for one
     agent's).
+  - A cancelled agent's saved session (`sessions/<agent>`: conversation snapshots, stash, open
+    batch) is kept forever by default, which in a long run is most of the sessions' size.
+    `--keep-cancelled DURATION` (e.g. `7d`, `36h`) removes it once the agent has been cancelled
+    that long: on resume, every minute from the disk guard and on `/gc`. The agent's entry in
+    `swarm.json` stays (tree, cost, branch records), marked `conversation_removed`, and the TUI
+    shows "conversation removed after 7 days" where its history would be. Never touched: live
+    agents, cancelled agents that have not stopped yet, and cancelled worktree agents whose
+    worktree is still there. The cancel time is saved as `cancelled_at`; a run saved before that
+    takes the newest modification time in the session directory. Each pass that removes
+    something is logged as `sessions_pruned` (`agents`, `bytes`, `ids`).
   - `mcp-tools.json` is rewritten only when a server lists different tools.
 - **Journal.**
   - A persistent run keeps `journal.jsonl` with every message to and from the user, and
@@ -597,7 +608,7 @@ messages you.
     model switches, compactions (`before`/`after` tokens) and failed ones, side calls
     (`side_call`: purpose, model and tokens of each judge or summarizer call), keep-warm
     refreshes, schedules, jobs, budget and agent-cap changes, resumes, reloads, version
-    `changes`, shutdowns, disk reclaimed (`gc`) and stash entries pruned (`stash_pruned`).
+    `changes`, shutdowns, disk reclaimed (`gc`), stash entries pruned (`stash_pruned`) and cancelled agents' sessions removed (`sessions_pruned`).
   - Both are JSON lines with a UTC `ts`, written by a background thread and rotated to `<file>.1`
     at 16 MB.
 - **Log.** Warnings and errors (or whatever `RUST_LOG` selects) go to `<run dir>/swarm.log` under

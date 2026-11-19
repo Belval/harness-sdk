@@ -102,6 +102,12 @@ struct Cli {
     /// `--budget-tokens` than the last one given.
     #[arg(long, value_parser = strands_swarm::text::parse_tokens)]
     budget_tokens: Option<u64>,
+    /// Remove a cancelled agent's saved conversation, stash and open batch once it has been
+    /// cancelled this long (e.g. `7d`, `36h`); its entry in the tree, its cost and its branch
+    /// record stay. Applied on resume and every minute; live agents and cancelled agents with a
+    /// kept worktree are never touched. Default: keep them forever.
+    #[arg(long, value_name = "DURATION", value_parser = strands_swarm::schedule::parse_duration)]
+    keep_cancelled: Option<std::time::Duration>,
     /// Tell the root agents (and the TUI) once free space on the run's, the worktrees' or the
     /// cargo target dirs' filesystem drops below this (e.g. `20G`, `512M`); `0` turns it off.
     #[arg(long, value_parser = strands_swarm::text::parse_bytes, default_value = "20G")]
@@ -406,6 +412,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
     config.priority = cli.priority.clone();
+    config.keep_cancelled = cli.keep_cancelled;
     config.max_load = cli
         .max_load
         .unwrap_or_else(strands_swarm::runtime::default_max_load);
@@ -639,6 +646,12 @@ fn print_event(event: &SwarmEvent) {
         | SwarmEvent::ModelQueued { .. }
         | SwarmEvent::HeldForReload { .. }
         | SwarmEvent::History { .. } => {}
+        SwarmEvent::ConversationRemoved { id, after_secs } => {
+            eprintln!(
+                "[{id}] conversation removed after {}",
+                strands_swarm::text::span(*after_secs)
+            )
+        }
         SwarmEvent::HostHeld { id, reason } => match reason {
             Some(reason) => eprintln!("[{id}] waiting: {reason}"),
             None => eprintln!("[{id}] no longer held by the host"),

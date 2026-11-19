@@ -50,6 +50,7 @@ mod persist;
 mod priority;
 mod reload;
 mod report;
+mod retention;
 mod scheduler;
 mod spend;
 mod warm;
@@ -339,6 +340,10 @@ pub struct SwarmConfig {
     /// (or the agent started), delete the entries its saved session no longer names
     /// ([`crate::stash_gc::prune_unnamed`]); `None` prunes only on resume.
     pub stash_prune_every: Option<Duration>,
+    /// Remove a cancelled agent's saved session (conversation, stash, open batch) once it has
+    /// been cancelled this long, on resume and from [`Swarm::guard_disk`] and [`Swarm::gc`];
+    /// `None` (the default) keeps them forever ([`Swarm::prune_cancelled_sessions`]).
+    pub keep_cancelled: Option<Duration>,
     /// Agents in the priority lane besides the root agents (`--priority`): ids or names, as
     /// `send_message` takes them ([`Swarm::is_priority`]).
     pub priority: Vec<String>,
@@ -380,6 +385,7 @@ impl SwarmConfig {
             build_jobs: Some(default_build_jobs()),
             disk_reserve: 0,
             stash_prune_every: Some(STASH_PRUNE_EVERY),
+            keep_cancelled: None,
             priority: Vec::new(),
         }
     }
@@ -649,6 +655,14 @@ pub enum SwarmEvent {
         /// ([`crate::version::changes`]); empty when unknown.
         changes: Vec<String>,
     },
+    /// A cancelled agent's saved session was removed after being kept this long
+    /// ([`SwarmConfig::keep_cancelled`]); sent again on resume.
+    ConversationRemoved {
+        /// Id.
+        id: String,
+        /// Seconds it was kept.
+        after_secs: u64,
+    },
     /// The tail of a resumed agent's restored conversation, so a viewer can show its past.
     History {
         /// Id.
@@ -694,6 +708,11 @@ struct Node {
     id: String,
     /// When the agent last showed a sign of progress: unix seconds ([`Node::progressed`]).
     progress: AtomicI64,
+    /// When it was cancelled: unix seconds, 0 if unknown ([`AgentState::cancelled_at`]).
+    cancelled_at: AtomicI64,
+    /// Seconds it was kept once cancelled, when its session was removed; 0 if it was not
+    /// ([`AgentState::conversation_removed`]).
+    conversation_removed: AtomicU64,
     name: String,
     parent: String,
     /// Where it was started: its worktree, if it has one.
@@ -1332,6 +1351,7 @@ impl Swarm {
             node.tool_calls.lock().clear();
         }
         if status == AgentStatus::Cancelled {
+            node.cancelled_at.store(self.now().timestamp(), Ordering::Relaxed);
             // Waits on this agent may now be pointless; let them re-check.
             self.nodes().iter().for_each(|node| node.notify.notify_waiters());
         }

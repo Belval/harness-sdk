@@ -78,6 +78,16 @@ pub fn usage(used: u64, budget: u64) -> String {
     }
 }
 
+/// A whole number of the largest unit that divides `secs` evenly: `7 days`, `36 hours`, `1 minute`.
+pub fn span(secs: u64) -> String {
+    let (unit, name) = [(86_400, "day"), (3600, "hour"), (60, "minute")]
+        .into_iter()
+        .find(|(unit, _)| secs >= *unit && secs % unit == 0)
+        .unwrap_or((1, "second"));
+    let n = secs / unit;
+    format!("{n} {name}{}", if n == 1 { "" } else { "s" })
+}
+
 /// `text` cut to its first `max` chars, with "…" appended when that dropped anything.
 pub fn clip(text: &str, max: usize) -> String {
     match text.chars().count() > max {
@@ -134,6 +144,22 @@ pub fn plain(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_span_is_in_the_largest_whole_unit() {
+        let shown: Vec<String> = [604_800, 86_400, 129_600, 5400, 60, 45].map(span).into();
+        assert_eq!(
+            shown,
+            [
+                "7 days",
+                "1 day",
+                "36 hours",
+                "90 minutes",
+                "1 minute",
+                "45 seconds"
+            ]
+        );
+    }
 
     #[test]
     fn plain_drops_escape_sequences_and_overwritten_progress() {

@@ -778,6 +778,8 @@ mod tests {
             running_calls: Default::default(),
             reclaim_logged: None,
             progress: None,
+            cancelled_at: None,
+            conversation_removed: None,
         }
     }
 

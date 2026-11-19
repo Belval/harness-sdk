@@ -134,6 +134,14 @@ pub struct AgentState {
     /// seconds, so a restart does not make a stuck agent look fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<i64>,
+    /// When it was cancelled, unix seconds; runs saved before this was recorded get it from the
+    /// newest file of its session when `--keep-cancelled` first looks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_at: Option<i64>,
+    /// Seconds it was kept after being cancelled when its session directory (conversation, stash,
+    /// open batch) was removed by `--keep-cancelled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_removed: Option<u64>,
 }
 
 /// Persisted mail.

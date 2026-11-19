@@ -50,6 +50,7 @@ impl Swarm {
         // The last pass over finished agents' target dirs, while space is low.
         let mut reclaimed_at: Option<tokio::time::Instant> = None;
         loop {
+            self.prune_cancelled_sessions_announced().await;
             let paths = self.disk_paths();
             let lowest = {
                 let free = free.clone();

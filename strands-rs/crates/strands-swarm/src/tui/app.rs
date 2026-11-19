@@ -499,6 +499,10 @@ impl App {
                     self.notice = Some(crate::gc::notice(&collected));
                 }
             }
+            SwarmEvent::ConversationRemoved { id, after_secs } => self.with(&id, |view| {
+                let note = format!("conversation removed after {}", crate::text::span(after_secs));
+                view.log.push_back(LogEntry::Note(note));
+            }),
             SwarmEvent::History {
                 id,
                 messages,
@@ -1272,6 +1276,25 @@ mod tests {
             ok: None,
         };
         assert_eq!(log.front(), Some(&first));
+    }
+
+    #[test]
+    fn a_removed_conversation_is_noted_in_the_agents_log() {
+        let mut app = App::default();
+        app.apply(spawned("a1", USER));
+        app.apply(SwarmEvent::Status {
+            id: "a1".into(),
+            status: AgentStatus::Cancelled,
+        });
+        app.apply(SwarmEvent::ConversationRemoved {
+            id: "a1".into(),
+            after_secs: 7 * 86_400,
+        });
+        let view = &app.agents["a1"];
+        assert_eq!(
+            view.log.back(),
+            Some(&LogEntry::Note("conversation removed after 7 days".into()))
+        );
     }
 
     #[test]

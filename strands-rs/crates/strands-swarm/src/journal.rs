@@ -167,6 +167,7 @@ impl Journal {
             | SwarmEvent::HeldForReload { .. }
             | SwarmEvent::Reclaimed { .. }
             | SwarmEvent::ReloadPending { .. }
+            | SwarmEvent::ConversationRemoved { .. }
             | SwarmEvent::History { .. } => return,
         };
         self.event(name, fields);
