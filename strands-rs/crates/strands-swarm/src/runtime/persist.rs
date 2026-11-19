@@ -411,10 +411,10 @@ impl Swarm {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return None;
         }
-        let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let state = self.snapshot();
+        let ticket = persister.request();
+        let swarm = self.clone();
         Some(async move {
-            if let Err(error) = persister.write(generation, &state).await {
+            if let Err(error) = persister.save(ticket, || swarm.snapshot()).await {
                 tracing::warn!(%error, "state save failed");
             }
         })

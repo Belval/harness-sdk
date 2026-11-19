@@ -3,7 +3,9 @@
 //! A run directory holds `swarm.json` (the agent tree, statuses and unread mail) and `sessions/`
 //! (each agent's conversation, written by the SDK's `SessionManager`). `swarm.json` is replaced
 //! atomically; writes carry a generation number so a slow, older write never lands after a newer
-//! one.
+//! one, and a burst of save requests costs one write: a [`Persister::save`] builds its state only
+//! once it holds the write lock, and skips it when a write that began after the request has
+//! covered it already.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -224,6 +226,8 @@ async fn load_saved(dir: &Path) -> Result<Option<SwarmState>> {
 pub struct Persister {
     dir: PathBuf,
     written: tokio::sync::Mutex<Written>,
+    /// Save requests so far ([`Persister::request`]).
+    requested: std::sync::atomic::AtomicU64,
 }
 
 /// The state last written: its generation, and its length and hash.
@@ -239,7 +243,27 @@ impl Persister {
         Self {
             dir: dir.into(),
             written: Default::default(),
+            requested: Default::default(),
         }
+    }
+
+    /// Ask for a save: the ticket to hand to [`Persister::save`], once the change to save is made.
+    pub fn request(&self) -> u64 {
+        self.requested.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// Save the state `snapshot` returns for `ticket`, or nothing when a write that began after
+    /// the ticket was issued has covered it. Waiting saves hold no state: a burst of requests
+    /// (every model call asks for one) must not queue a full copy of the swarm each behind the
+    /// slow write, as a writer that is behind would otherwise let grow without bound.
+    pub async fn save(&self, ticket: u64, snapshot: impl FnOnce() -> SwarmState) -> Result<()> {
+        let mut written = self.written.lock().await;
+        if ticket <= written.generation {
+            return Ok(());
+        }
+        // Every request made so far precedes the snapshot, so this write covers them all.
+        let covered = self.requested.load(std::sync::atomic::Ordering::SeqCst);
+        self.write_locked(&mut written, covered, &snapshot()).await
     }
 
     /// The run directory.
@@ -252,6 +276,10 @@ impl Persister {
     /// the pretty form older runs wrote too.
     pub async fn write(&self, generation: u64, state: &SwarmState) -> Result<()> {
         let mut written = self.written.lock().await;
+        self.write_locked(&mut written, generation, state).await
+    }
+
+    async fn write_locked(&self, written: &mut Written, generation: u64, state: &SwarmState) -> Result<()> {
         if generation <= written.generation {
             return Ok(());
         }
@@ -361,6 +389,48 @@ mod tests {
         );
         persister.write(4, &state).await.unwrap();
         assert_eq!(load(dir.path()).await.unwrap().unwrap().next_id, 4);
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_save_requests_builds_one_state_not_one_each() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let dir = tempfile::tempdir().unwrap();
+        let state = |next_id| -> SwarmState {
+            serde_json::from_value(serde_json::json!({
+                "run_id": "r", "cwd": dir.path(), "next_id": next_id,
+                "agents": [{"id": "a1", "parent": "user", "cwd": dir.path(), "task": "t",
+                            "status": "idle", "mailbox": []}],
+            }))
+            .unwrap()
+        };
+        let persister = Persister::new(dir.path());
+        let built = AtomicUsize::new(0);
+        let snapshot = |next_id| {
+            let built = &built;
+            let state = &state;
+            move || {
+                built.fetch_add(1, SeqCst);
+                state(next_id)
+            }
+        };
+
+        // 200 requests wait for the lock behind one another: the first to run saves for all.
+        let tickets: Vec<u64> = (0..200).map(|_| persister.request()).collect();
+        let saves = tickets.iter().map(|ticket| persister.save(*ticket, snapshot(5)));
+        for result in futures::future::join_all(saves).await {
+            result.unwrap();
+        }
+        assert_eq!(built.load(SeqCst), 1, "one state built for the burst");
+        assert_eq!(load(dir.path()).await.unwrap().unwrap().next_id, 5);
+
+        // A request made after that write began is not covered by it.
+        let ticket = persister.request();
+        persister.save(ticket, snapshot(6)).await.unwrap();
+        assert_eq!(built.load(SeqCst), 2);
+        assert_eq!(load(dir.path()).await.unwrap().unwrap().next_id, 6);
+        // A ticket the last write covered is a no-op.
+        persister.save(ticket, snapshot(7)).await.unwrap();
+        assert_eq!(built.load(SeqCst), 2);
     }
 
     #[tokio::test]

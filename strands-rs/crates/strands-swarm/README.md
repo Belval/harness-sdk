@@ -290,6 +290,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
 - **Process memory.** The binary allocates with jemalloc, whose background threads return freed
   pages to the system within seconds, so the transient conversation copies of model calls and
   saves do not pin each thread's arena at its high-water mark.
+- **State saves coalesce.** Every model call asks for a save of `swarm.json`, and a save builds its
+  state only once it holds the write lock, skipping it when a write that began after the request
+  has covered it. Saves that each queued a copy of the whole swarm held 1.2 GB behind a burst of
+  86 agents answering at once (680 waiting saves) and left the heap fragmented: 2.5 GB resident
+  after the burst, 0.8 GB with coalescing.
 
 ## Cost
 

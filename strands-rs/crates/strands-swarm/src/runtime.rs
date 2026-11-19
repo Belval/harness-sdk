@@ -826,7 +826,6 @@ struct Inner {
     root_cancel: CancellationToken,
     persister: Option<Arc<Persister>>,
     journal: Option<Journal>,
-    generation: AtomicU64,
     shutting_down: AtomicBool,
     actors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     reload: CancellationToken,
@@ -896,7 +895,6 @@ impl Swarm {
             root_cancel: CancellationToken::new(),
             persister: config.state_dir.clone().map(|dir| Arc::new(Persister::new(dir))),
             journal: config.state_dir.clone().map(Journal::open),
-            generation: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             actors: Mutex::new(Vec::new()),
             reload: CancellationToken::new(),
@@ -1190,10 +1188,10 @@ impl Swarm {
     /// Stop every agent without recording them as cancelled, after saving the final state, so
     /// the run can be resumed.
     pub async fn shutdown(&self) {
-        let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         if let Some(persister) = &self.inner.persister {
-            if let Err(error) = persister.write(generation, &self.snapshot()).await {
+            let ticket = persister.request();
+            if let Err(error) = persister.save(ticket, || self.snapshot()).await {
                 tracing::warn!(%error, "final state save failed");
             }
         }
