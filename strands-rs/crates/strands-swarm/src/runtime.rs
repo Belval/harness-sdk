@@ -62,7 +62,8 @@ pub use actor::SILENT_REPLY;
 use background::jobs_dir;
 use capacity::started;
 pub use disk::{
-    free_space, FreeSpace, DISK_CHECK_EVERY, DISK_SENDER, DISK_WARNED_FILE, LOW_DISK_CHECK_EVERY,
+    free_space, inode_floor, FreeSpace, Space, DISK_CHECK_EVERY, DISK_SENDER, DISK_WARNED_FILE,
+    LOW_DISK_CHECK_EVERY, MIN_FREE_INODES,
 };
 pub use host::{default_max_load, default_min_free_mem, host_stats, HostProbe, HostStats, HOST_POLL};
 use persist::history_event;
@@ -337,6 +338,10 @@ pub struct SwarmConfig {
     /// Bytes [`Swarm::guard_disk`] keeps allocated in the run dir ([`crate::reserve`]) for saves
     /// once the disk is full; `0` (the default) keeps none.
     pub disk_reserve: u64,
+    /// The free inodes below which [`Swarm::guard_disk`] treats a filesystem as full, like free
+    /// bytes: `None` is [`inode_floor`]'s default (5% of its inodes, at most a million), `Some(0)`
+    /// turns the check off.
+    pub min_free_inodes: Option<u64>,
     /// Between a live agent's turns, once this long has passed since its stash was last pruned
     /// (or the agent started), delete the entries its saved session no longer names
     /// ([`crate::stash_gc::prune_unnamed`]); `None` prunes only on resume.
@@ -388,6 +393,7 @@ impl SwarmConfig {
             host_probe: Arc::new(host_stats),
             build_jobs: Some(default_build_jobs()),
             disk_reserve: 0,
+            min_free_inodes: None,
             stash_prune_every: Some(STASH_PRUNE_EVERY),
             keep_cancelled: None,
             cancelled_history: true,

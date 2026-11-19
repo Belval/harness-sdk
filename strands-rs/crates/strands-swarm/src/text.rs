@@ -38,6 +38,11 @@ pub fn compact(n: u64) -> String {
     compact_to(n, 1)
 }
 
+/// [`compact`] without a trailing `.0`: `40k`, `1M`, `1.5M`. For inode and file counts.
+pub fn count(n: u64) -> String {
+    compact(n).replace(".0", "")
+}
+
 /// [`compact`] with `decimals` places; beyond one, trailing zeros are dropped (`1.25M`).
 fn compact_to(n: u64, decimals: usize) -> String {
     let (scaled, unit) = match n {

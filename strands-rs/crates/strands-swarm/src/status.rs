@@ -220,10 +220,13 @@ pub struct Limits {
     /// The host's load average and the limit above which new work waits (`/max-load`), when
     /// there is a limit and the load is known.
     pub load: Option<(f64, f64)>,
+    /// The least free bytes and free inodes on the disks the swarm writes to, as the disk guard
+    /// last read them; `None` without a guard.
+    pub disk: Option<(u64, Option<u64>)>,
 }
 
 impl Limits {
-    /// `agents 3/100 · calls 8/8 · load 45/128`.
+    /// `agents 3/100 · calls 8/8 · load 45/128 · disk 120 GB free · 8.2M inodes free`.
     pub fn describe(&self) -> String {
         let (calls, limit) = self.calls;
         let limit = if limit == 0 {
@@ -235,8 +238,14 @@ impl Limits {
             .load
             .map(|(load, max)| format!(" · load {load:.0}/{max:.0}"))
             .unwrap_or_default();
+        let disk = self.disk.map_or(String::new(), |(bytes, inodes)| {
+            let inodes = inodes.map_or(String::new(), |free| {
+                format!(" · {} inodes free", crate::text::count(free))
+            });
+            format!(" · disk {} free{inodes}", crate::gc::human(bytes))
+        });
         format!(
-            "agents {}/{} · calls {calls}/{limit}{load}",
+            "agents {}/{} · calls {calls}/{limit}{load}{disk}",
             self.agents.0, self.agents.1
         )
     }

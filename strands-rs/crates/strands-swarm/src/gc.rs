@@ -384,17 +384,25 @@ async fn size(dir: &Path) -> u64 {
 
 /// Total size of the files under `dir`, without following symlinks.
 pub(crate) fn dir_size(dir: &Path) -> u64 {
+    dir_usage(dir).0
+}
+
+/// `(bytes, entries)` under `dir`, without following symlinks. Every file, symlink and
+/// directory below it is an entry, and costs an inode.
+pub(crate) fn dir_usage(dir: &Path) -> (u64, u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
+        return (0, 0);
     };
     entries
         .flatten()
-        .map(|entry| match entry.metadata() {
-            Ok(meta) if meta.is_dir() => dir_size(&entry.path()),
-            Ok(meta) => meta.len(),
-            Err(_) => 0,
+        .fold((0, 0), |(bytes, count), entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => {
+                let (inner_bytes, inner_count) = dir_usage(&entry.path());
+                (bytes + inner_bytes, count + inner_count + 1)
+            }
+            Ok(meta) => (bytes + meta.len(), count + 1),
+            Err(_) => (bytes, count),
         })
-        .sum()
 }
 
 /// `4.2 GB`, `310 MB`, `12 KB`, `9 B`.

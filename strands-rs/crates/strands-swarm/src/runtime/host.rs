@@ -64,6 +64,8 @@ pub(super) struct HostGate {
     pub(super) held: Mutex<BTreeMap<String, String>>,
     /// Why worktree spawns and land jobs wait: space is low ([`Swarm::guard_disk`]).
     pub(super) disk_low: Mutex<Option<String>>,
+    /// The least free bytes and inodes over the disks the guard watches, as it last read them.
+    pub(super) disk_free: Mutex<Option<(u64, Option<u64>)>>,
 }
 
 /// Clears an agent's hold when its wait ends, however it ends.

@@ -112,6 +112,10 @@ struct Cli {
     /// cargo target dirs' filesystem drops below this (e.g. `20G`, `512M`); `0` turns it off.
     #[arg(long, value_parser = strands_swarm::text::parse_bytes, default_value = "20G")]
     min_free_disk: u64,
+    /// The same for free inodes (e.g. `500k`, `1M`): default 5% of the filesystem's inodes or 1M,
+    /// whichever is smaller; `0` turns only this check off.
+    #[arg(long, value_name = "COUNT", value_parser = parse_inodes)]
+    min_free_inodes: Option<u64>,
     /// Summarize an agent's older turns once a call's input reaches this many tokens (e.g. `300k`,
     /// `1.5M`), or 85% of the model's window if that is smaller. Without it, 85% of the window
     /// (850k tokens for a 1M window). `spawn_agent`'s `compact_at` overrides it for one agent.
@@ -209,6 +213,14 @@ struct Cli {
 /// use afterwards). `.cargo/config.toml` sets that at build time; `_RJEM_MALLOC_CONF` overrides it.
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// `--min-free-inodes`: a count like `500k` or `1M`, or `0`.
+fn parse_inodes(text: &str) -> Result<u64, String> {
+    match text.trim() {
+        "0" => Ok(0),
+        text => strands_swarm::text::parse_tokens(text),
+    }
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -426,6 +438,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         Some(jobs) => Some(jobs),
         None => Some(strands_swarm::runtime::default_build_jobs()),
     };
+    config.min_free_inodes = cli.min_free_inodes;
     if cli.min_free_disk > 0 {
         config.disk_reserve = strands_swarm::reserve::RESERVE_BYTES;
     }
@@ -473,7 +486,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         }
         None => Swarm::new(config),
     };
-    if cli.min_free_disk > 0 {
+    if cli.min_free_disk > 0 || cli.min_free_inodes != Some(0) {
         let free = std::sync::Arc::new(strands_swarm::runtime::free_space);
         let guard =
             swarm

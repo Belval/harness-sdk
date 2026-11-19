@@ -45,7 +45,8 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
               [--priority AGENT]... [--build-jobs N]
               [--budget-tokens N] [--compact-at TOKENS]
               [--allow-land] [--land-into GLOB]... [--gate CMD]...
-              [--notify] [--status-base BRANCH] [--prices FILE] [--min-free-disk SIZE] [--headless]
+              [--notify] [--status-base BRANCH] [--prices FILE] [--min-free-disk SIZE]
+              [--min-free-inodes COUNT] [--headless]
               [--journal | --gc | --cost] [TASK]
 ```
 
@@ -223,7 +224,8 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     the priority lane, below.
   - A held agent says why, like a queued call: `waiting: host load 180/128 (/max-load to
     change)` in its log line, `/status` and `list_agents`; `/status` starts with
-    `agents 3/100 · calls 8/8 · load 45/128`. Holds are logged as `host_held` in `events.jsonl`.
+    `agents 3/100 · calls 8/8 · load 45/128 · disk 120 GB free · 8.2M inodes free` (the least
+    free bytes and inodes over the disks the disk guard watches). Holds are logged as `host_held` in `events.jsonl`.
   - The host is read from `/proc` at most once a second. A held caller looks again each second,
     and every fresh reading (and every `/max-load` or `/min-free-mem` change) wakes all held
     callers, so one reading releases them all; off Linux nothing is held.
@@ -666,6 +668,17 @@ messages you.
     agent, and the land checks' shared one); the TUI shows the first line in its footer. It warns
     again only after the space has recovered to 10% above the threshold, restarts included
     (`<run dir>/disk-warned`).
+  - **Inodes count like bytes.** A filesystem out of inodes fails every file create with `ENOSPC`
+    while terabytes are free (saves, the stash and job logs included), and a cargo target dir is
+    tens of thousands of small files. So the same check reads `statvfs` free inodes
+    (`f_favail`) and, below `--min-free-inodes` (default: 5% of that filesystem's inodes or `1M`,
+    whichever is smaller; `0` turns only this off; filesystems that report no inode count, such as
+    btrfs, are skipped), takes the same path: the warning (`disk inodes low: 40k free on the
+    filesystem of /x (warning below 1M)`, with target dirs ranked by file count), the holds and
+    the reclaim below. The default: a million inodes is twenty-odd cargo target dirs of headroom
+    (~50k files each) in which the guard can still reclaim before saves fail, while 5% keeps a
+    small filesystem from being held on its first build. There is no `/min-free-inodes` TUI
+    command: the limit is a startup option.
   - Meanwhile agents' worktree spawns and land jobs wait, shown like a load hold: `waiting: disk
     space low: 3.0 GB free on the filesystem of /x (below 20 GB; cancel finished worktree agents
     to free some)`. They go on once space has recovered to 10% above the threshold. Spawns
@@ -673,14 +686,17 @@ messages you.
   - **Reserve.** A persistent run keeps 1 GB allocated in `<run dir>/disk-reserve` while space is
     fine. The first save of `swarm.json` or of a conversation that fails with a full disk deletes
     it and tries again, so the run can still be saved and resumed; the guard recreates it once
-    space has recovered.
+    space has recovered. It does not help against a lack of inodes (a save needs a fresh inode
+    however many bytes are reserved), and pre-created empty files would not either: saves write a
+    temporary file and rename it, so they would need their own save path. The early warning and
+    the reclaim are the defence there.
   - Finished worktree agents are never cancelled for you (one may be kept on purpose), but a live
     one that is idle, runs no background job, has a clean worktree and nothing on its branches
     the base lacks is flagged in `list_agents`: `…, idle with nothing left to merge: cancel to
     reclaim its worktree and 12 GB target dir`. When the disk guard warns, it first deletes the
     private target dirs of such agents (never their worktree, branch or conversation; the next
     build recreates it) and says so in the warning: `Deleted the target dirs of idle agents with
-    nothing left to merge (…): 12 GB done (a4)`. While space stays low it does so again every
+    nothing left to merge (…): 12 GB done (a4)` (for low inodes, `300k files done (a4)`). While space stays low it does so again every
     minute, for agents that finished since. Off with `SwarmConfig::reclaim_disk`.
 - **Memory.**
   - One Markdown file is shared by every agent and run: `$XDG_CONFIG_HOME/strands-swarm/memory.md`

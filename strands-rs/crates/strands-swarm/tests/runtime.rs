@@ -6243,13 +6243,19 @@ async fn a_longer_lived_cache_is_kept_warm_for_longer_gaps() {
 /// to have checked again rather than for time to pass.
 struct DiskProbe {
     free: std::sync::atomic::AtomicU64,
+    /// Free inodes of the 100M the fake filesystem has.
+    inodes: std::sync::atomic::AtomicU64,
     reads: std::sync::atomic::AtomicUsize,
 }
+
+/// The inodes a [`DiskProbe`] starts with free: half of its 100M.
+const INODES_FREE: u64 = 50_000_000;
 
 impl DiskProbe {
     fn new(free: u64) -> Arc<Self> {
         Arc::new(Self {
             free: free.into(),
+            inodes: INODES_FREE.into(),
             reads: 0.into(),
         })
     }
@@ -6258,11 +6264,21 @@ impl DiskProbe {
         self.free.store(free, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn set_inodes(&self, free: u64) {
+        self.inodes.store(free, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn check(self: &Arc<Self>) -> strands_swarm::runtime::FreeSpace {
         let probe = self.clone();
         Arc::new(move |_: &Path| {
             probe.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Some(probe.free.load(std::sync::atomic::Ordering::SeqCst))
+            Some(strands_swarm::runtime::Space {
+                bytes: probe.free.load(std::sync::atomic::Ordering::SeqCst),
+                inodes: Some((
+                    probe.inodes.load(std::sync::atomic::Ordering::SeqCst),
+                    100_000_000,
+                )),
+            })
         })
     }
 
@@ -6347,7 +6363,7 @@ async fn a_disk_warning_lists_the_land_checks_target_dir() {
     let (swarm, mut events) = Swarm::new(config);
     spawn_root(&swarm, "root").await;
     reply_to(&mut events, USER).await;
-    let check: strands_swarm::runtime::FreeSpace = Arc::new(|_: &Path| Some(5 << 30));
+    let check: strands_swarm::runtime::FreeSpace = Arc::new(|_: &Path| Some((5u64 << 30).into()));
     tokio::spawn(
         swarm
             .clone()
@@ -6449,6 +6465,104 @@ async fn low_disk_space_holds_worktree_spawns_until_it_recovers() {
     assert_eq!(held.await.unwrap().unwrap(), "a3");
     assert!(swarm.agent("a3").unwrap().branch.is_some());
     swarm.shutdown().await;
+}
+
+/// Free inodes are watched like free bytes: below the floor (here the 1M cap of 5% of 100M) the
+/// roots are warned once per episode and worktree spawns wait, naming inodes, until they recover;
+/// `/status` shows both free amounts.
+#[tokio::test]
+async fn low_free_inodes_warn_and_hold_worktree_spawns_until_they_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[]);
+    let scripts = scripts_of(vec![
+        ("a1", (0..4).map(|_| say("noted")).collect()),
+        ("a2", vec![say("isolated")]),
+    ]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(mock_factory(&scripts), &repo));
+    spawn_root(&swarm, "root").await;
+    reply_to(&mut events, USER).await;
+    let probe = DiskProbe::new(500 << 30);
+    probe.set_inodes(40_000);
+    tokio::spawn(
+        swarm
+            .clone()
+            .guard_disk(20 << 30, Duration::from_millis(1), probe.check()),
+    );
+    probe.settle().await;
+
+    let warnings = disk_warnings(&mut events);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0]
+            .1
+            .starts_with("disk inodes low: 40k free on the filesystem of "),
+        "{}",
+        warnings[0].1
+    );
+    assert!(warnings[0].1.contains("(warning below 1M)"), "{}", warnings[0].1);
+    assert!(warnings[0].1.contains("reserve cannot help"), "{}", warnings[0].1);
+    let limits = swarm.status().limits.unwrap();
+    assert_eq!(limits.disk, Some((500 << 30, Some(40_000))));
+    assert!(
+        limits.describe().ends_with("disk 500 GB free · 40k inodes free"),
+        "{}",
+        limits.describe()
+    );
+
+    let held = tokio::spawn({
+        let swarm = swarm.clone();
+        async move {
+            let request = SpawnRequest {
+                task: "t".into(),
+                worktree: true,
+                ..Default::default()
+            };
+            swarm.spawn("a1", request).await
+        }
+    });
+    let why = host_held(&mut events, "a1").await.unwrap();
+    assert!(
+        why.starts_with("disk inodes low: 40k free on the filesystem of ") && why.contains("(below 1M;"),
+        "{why}"
+    );
+    assert!(swarm.agent("a2").is_none(), "no worktree while inodes are low");
+
+    // Just above the floor is not recovered; a tenth above releases the hold and re-arms.
+    probe.set_inodes(1_050_000);
+    probe.settle().await;
+    assert!(!held.is_finished());
+    probe.set_inodes(INODES_FREE);
+    assert_eq!(host_held(&mut events, "a1").await, None);
+    assert_eq!(held.await.unwrap().unwrap(), "a2");
+    probe.set_inodes(40_000);
+    probe.settle().await;
+    assert_eq!(disk_warnings(&mut events).len(), 1, "a new episode warns again");
+    swarm.shutdown().await;
+}
+
+/// `min_free_inodes` overrides the default floor, and `Some(0)` turns the inode check off.
+#[tokio::test]
+async fn the_inode_floor_can_be_set_or_turned_off() {
+    // 40k of 100M free: low by default, fine below a 30k floor, and not watched at `0`.
+    for (floor, warns) in [(None, true), (Some(30_000), false), (Some(0), false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = scripts_of(vec![("a1", vec![say("noted"), say("noted")])]);
+        let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+        config.min_free_inodes = floor;
+        let (swarm, mut events) = Swarm::new(config);
+        spawn_root(&swarm, "root").await;
+        reply_to(&mut events, USER).await;
+        let probe = DiskProbe::new(500 << 30);
+        probe.set_inodes(40_000);
+        tokio::spawn(
+            swarm
+                .clone()
+                .guard_disk(20 << 30, Duration::from_millis(1), probe.check()),
+        );
+        probe.settle().await;
+        assert_eq!(disk_warnings(&mut events).len(), usize::from(warns), "{floor:?}");
+        swarm.shutdown().await;
+    }
 }
 
 /// A persistent run keeps a disk reserve while space is fine, which a save on a full disk spends
@@ -6592,6 +6706,29 @@ async fn the_task_a_run_was_started_with_is_saved() {
 /// low disk deletes its target dir (only that); one with unmerged work keeps everything.
 #[tokio::test]
 async fn finished_worktree_agents_are_flagged_and_lose_their_target_dir_when_disk_runs_low() {
+    let low_bytes: strands_swarm::runtime::FreeSpace = Arc::new(|_: &Path| {
+        Some(strands_swarm::runtime::Space {
+            bytes: 5 << 30,
+            inodes: Some((50_000_000, 100_000_000)),
+        })
+    });
+    reclaim_finished_targets_under(low_bytes, "disk space low: 5.0 GB free").await;
+}
+
+/// Free inodes below the floor reclaim the same target dirs (thousands of small files each) while
+/// bytes are plentiful, and the warning counts files.
+#[tokio::test]
+async fn finished_worktree_agents_lose_their_target_dir_when_inodes_run_low() {
+    let low_inodes: strands_swarm::runtime::FreeSpace = Arc::new(|_: &Path| {
+        Some(strands_swarm::runtime::Space {
+            bytes: 500 << 30,
+            inodes: Some((40_000, 100_000_000)),
+        })
+    });
+    reclaim_finished_targets_under(low_inodes, "disk inodes low: 40k free").await;
+}
+
+async fn reclaim_finished_targets_under(check: strands_swarm::runtime::FreeSpace, warns: &str) {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path(), &[(".gitignore", "target/\n")]);
     let scripts = scripts_of(vec![
@@ -6651,15 +6788,22 @@ async fn finished_worktree_agents_are_flagged_and_lose_their_target_dir_when_dis
     assert!(line(&done).contains(flag), "{listed}");
     assert!(!line(&busy).contains("cancel to reclaim"), "{listed}");
 
-    let check: strands_swarm::runtime::FreeSpace = Arc::new(|_: &Path| Some(5 << 30));
     tokio::spawn(
         swarm
             .clone()
             .guard_disk(20 << 30, Duration::from_millis(10), check),
     );
     let warning = mail_to(&mut events, &lister, "disk").await;
+    assert!(warning.starts_with(warns), "{warning}");
+    let freed = if warns.contains("inodes") {
+        "2 files"
+    } else {
+        "4.0 KB"
+    };
     assert!(
-        warning.contains("nothing left to merge (their next build rebuilds it): 4.0 KB"),
+        warning.contains(&format!(
+            "nothing left to merge (their next build rebuilds it): {freed}"
+        )),
         "{warning}"
     );
     assert!(!done_target.exists(), "the finished agent's target dir is gone");
