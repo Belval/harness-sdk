@@ -206,7 +206,11 @@ impl Tool for LazyMcpTool {
 
     async fn invoke(&self, ctx: ToolContext) -> Result<ToolResultBlock> {
         match self.server.live_tool(Some(&self.spec.name)).await {
-            Ok(Some(tool)) => tool.invoke(ctx).await,
+            Ok(Some(tool)) => {
+                let mut result = tool.invoke(ctx).await?;
+                crate::text::defang_content(&mut result.content);
+                Ok(result)
+            }
             Ok(None) => unreachable!("a named lookup returns the tool"),
             Err(error) => Ok(create_error_result(error, &ctx.tool_use.tool_use_id)),
         }

@@ -173,6 +173,8 @@ impl Mail {
     }
 
     /// The `<message>` block the receiving model sees (attached images follow as image blocks).
+    /// The text is [defanged](crate::text::defang): it may quote a page, a Slack thread or
+    /// another agent's output, which must not pass for mail of its own.
     pub fn render(&self) -> String {
         let attached: String = self
             .images
@@ -181,7 +183,9 @@ impl Mail {
             .collect();
         format!(
             "<message from=\"{}\" kind=\"{}\">\n{}{attached}\n</message>",
-            self.from_label, self.kind, self.text
+            self.from_label,
+            self.kind,
+            crate::text::defang(&self.text)
         )
     }
 }

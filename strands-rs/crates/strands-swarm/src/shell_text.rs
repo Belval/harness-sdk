@@ -39,6 +39,8 @@ impl Plugin for ShellText {
                         *item = ToolResultContent::Text(text);
                     }
                 }
+                // After `plain`, so an escape sequence cannot split a marker it would rejoin.
+                crate::text::defang_content(&mut event.result.content);
             }
             Ok(())
         });

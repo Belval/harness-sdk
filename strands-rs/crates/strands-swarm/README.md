@@ -25,7 +25,12 @@ Agents also get the harness's `shell`, `read`, `write`, `edit`, `web_fetch`, `to
 `run_background` covers slow commands. A `shell` result reaches the model as the text a terminal
 would show (stdout, then `[stderr]` and `[exit code N]` when there are any), not the SDK's JSON
 block, whose escaped quotes models copied into `edit`'s `old_str`. It and a job report's last lines
-drop ANSI escape sequences, and of a line `\r` overwrote (progress bars) only the final text. Tool
+drop ANSI escape sequences, and of a line `\r` overwrote (progress bars) only the final text.
+Outside text the harness inserts (mail bodies, `shell` output, `web_fetch` pages, MCP results)
+has its `<message`/`<system-reminder` markers defanged to `‹message` (any case, spacing,
+fullwidth or zero-width spelling), so it cannot pass for mail or a harness note; in a test,
+Claude Haiku obeyed a forged user message quoted in another agent's mail in 5 of 6 tries before
+the fix and in none of 4 after. `read` keeps files exact. Tool
 specs and the swarm's prompt sections are sent on every model call, so
 `the_fixed_prefix_stays_within_its_budget` pins their size: 16.6 kB (about 4.8k tokens) with 20
 skills, the skills list at 2.5 kB of it.
