@@ -552,17 +552,19 @@ impl Swarm {
     }
 }
 
-/// A final reply that starts with this (or is only whitespace) is not delivered to an agent
-/// parent. Models often add a line on why after the marker; that still means "nothing to tell".
+/// A final reply that starts with this, ends with it on a line of its own, or is only whitespace,
+/// is not delivered to an agent parent. Models often add a line on why before or after the
+/// marker; that still means "nothing to tell".
 pub const SILENT_REPLY: &str = "[silent]";
 
 /// Whether `reply` ends the turn without a message to the parent ([`SILENT_REPLY`]).
 pub(super) fn is_silent(reply: &str) -> bool {
-    let reply = reply.trim_start();
+    let reply = reply.trim();
+    let marker = |text: &str| text.eq_ignore_ascii_case(SILENT_REPLY);
     reply.is_empty()
-        || reply
-            .get(..SILENT_REPLY.len())
-            .is_some_and(|start| start.eq_ignore_ascii_case(SILENT_REPLY))
+        || reply.get(..SILENT_REPLY.len()).is_some_and(marker)
+        // A note on why, then the marker on its own last line, is just as silent.
+        || reply.lines().last().is_some_and(|last| marker(last.trim()))
 }
 
 pub(super) const RETRY_INITIAL: Duration = Duration::from_secs(15);
@@ -743,6 +745,7 @@ mod tests {
             "",
             "  \n",
             "[silent]\n\n(poll at 07:05: nothing new)",
+            "Nothing new in the inbox or either room.\n\n[silent]\n",
         ] {
             assert!(is_silent(silent), "{silent:?}");
         }
