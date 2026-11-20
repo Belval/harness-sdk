@@ -642,6 +642,7 @@ mod tests {
             content: content.into(),
             active_form: format!("{content}ing"),
             status,
+            due: None,
         }
     }
 

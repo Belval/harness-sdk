@@ -17,11 +17,13 @@ fn items() -> Vec<TodoItem> {
             content: "Run tests".to_owned(),
             active_form: "Running tests".to_owned(),
             status: TodoStatus::InProgress,
+            due: None,
         },
         TodoItem {
             content: "Write docs".to_owned(),
             active_form: "Writing docs".to_owned(),
             status: TodoStatus::Completed,
+            due: None,
         },
     ]
 }
@@ -61,6 +63,78 @@ async fn persists_the_list_to_app_state_and_reports_remaining_count() {
     );
     let stored: Vec<TodoItem> = agent.state().get_as("todos").expect("state written");
     assert_eq!(stored, items());
+}
+
+#[tokio::test]
+async fn a_due_time_is_stored_in_utc_and_shown_with_the_item() {
+    let todos = Todos::default();
+    let agent = agent_with_todos(&todos).await;
+    let before = Utc::now();
+    let input = json!({ "todos": [
+        { "content": "Post the clip", "activeForm": "Posting the clip", "status": "pending", "due": "in 2h" },
+        { "content": "Send the plan", "activeForm": "Sending the plan", "status": "pending", "due": "2026-11-20T04:30-08:00" },
+        { "content": "Reply", "activeForm": "Replying", "status": "completed", "due": "2026-11-20T04:30Z" },
+    ]});
+    let text = call_todo_write(&agent, &todos, input).await;
+    let stored: Vec<TodoItem> = agent.state().get_as("todos").expect("state written");
+    let due = stored[0].due.expect("due kept");
+    let two_hours = chrono::Duration::hours(2);
+    // Stored to the second.
+    let early = before + two_hours - chrono::Duration::seconds(1);
+    assert!(due >= early && due <= Utc::now() + two_hours, "{due}");
+    let plan = "2026-11-20T12:30:00Z";
+    assert_eq!(stored[1].due, Some(plan.parse().unwrap()));
+    let clip = due.to_rfc3339_opts(SecondsFormat::Secs, true);
+    assert_eq!(
+        text,
+        format!(
+            "2 todos remaining\n  [pending] Post the clip (due {clip})\n  [pending] Send the plan (OVERDUE: due {plan})\n  [completed] Reply"
+        )
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_due_time_is_refused() {
+    let todos = Todos::default();
+    let agent = agent_with_todos(&todos).await;
+    let tool = todos.tools().remove(0);
+    for due in [json!("tomorrow"), json!(5)] {
+        let input =
+            json!({ "todos": [{ "content": "x", "activeForm": "x", "status": "pending", "due": due }] });
+        let ctx = ToolContext::new(
+            ToolUse {
+                name: tool.name().to_owned(),
+                tool_use_id: "t1".to_owned(),
+                input,
+            },
+            agent.clone(),
+            InvocationState::default(),
+            CancellationToken::new(),
+        );
+        let refused = match tool.invoke(ctx).await {
+            Err(error) => error.to_string(),
+            Ok(result) => result.text(),
+        };
+        assert!(
+            refused.contains("due") || refused.contains("Not a time"),
+            "{refused}"
+        );
+    }
+    assert!(agent.state().get("todos").is_none());
+}
+
+#[test]
+fn only_an_open_item_past_its_due_time_is_overdue() {
+    let now: DateTime<Utc> = "2026-11-19T19:00:00Z".parse().unwrap();
+    let mut item = items().remove(0);
+    assert!(!item.overdue(now));
+    item.due = Some(now);
+    assert!(item.overdue(now));
+    assert_eq!(item.due_note(now), " (OVERDUE: due 2026-11-19T19:00:00Z)");
+    assert!(!item.overdue(now - chrono::Duration::seconds(1)));
+    item.status = TodoStatus::Completed;
+    assert!(!item.overdue(now));
+    assert_eq!(item.due_note(now), "");
 }
 
 #[tokio::test]

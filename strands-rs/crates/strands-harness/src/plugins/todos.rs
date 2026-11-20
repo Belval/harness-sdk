@@ -8,8 +8,12 @@
 //! The injector fires on every turn, not just user turns: the agent updates the list mid-loop via
 //! `todo_write`, so it should see the refreshed list on the next model call within the same
 //! invocation.
+//!
+//! An item may carry a `due` time (written `in 2h` or ISO 8601, stored as UTC): the reminder
+//! marks an open item past it as overdue, and a host can act on [`TodoItem::overdue`] too.
 
 use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -53,19 +57,71 @@ pub struct TodoItem {
     pub active_form: String,
     /// Current status.
     pub status: TodoStatus,
+    /// When it is due, if it was promised by a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<DateTime<Utc>>,
 }
 
-fn todo_line(todo: &TodoItem) -> String {
+impl TodoItem {
+    /// Still open with its due time at or before `now`.
+    pub fn overdue(&self, now: DateTime<Utc>) -> bool {
+        self.status != TodoStatus::Completed && self.due.is_some_and(|due| due <= now)
+    }
+
+    /// ` (due …)` or ` (OVERDUE: due …)` for an open item with a due time, else nothing.
+    pub fn due_note(&self, now: DateTime<Utc>) -> String {
+        match self.due.filter(|_| self.status != TodoStatus::Completed) {
+            None => String::new(),
+            Some(due) => {
+                let due = due.to_rfc3339_opts(SecondsFormat::Secs, true);
+                match self.overdue(now) {
+                    true => format!(" (OVERDUE: due {due})"),
+                    false => format!(" (due {due})"),
+                }
+            }
+        }
+    }
+}
+
+fn todo_line(todo: &TodoItem, now: DateTime<Utc>) -> String {
     let label = if todo.status == TodoStatus::InProgress && !todo.active_form.is_empty() {
         &todo.active_form
     } else {
         &todo.content
     };
-    format!("  [{}] {}", todo.status.as_str(), label)
+    format!("  [{}] {}{}", todo.status.as_str(), label, todo.due_note(now))
 }
 
-fn render_list(todos: &[TodoItem]) -> String {
-    todos.iter().map(todo_line).collect::<Vec<_>>().join("\n")
+fn render_list(todos: &[TodoItem], now: DateTime<Utc>) -> String {
+    todos
+        .iter()
+        .map(|todo| todo_line(todo, now))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The `todos` of a `todo_write` input, each `due` (`in 2h` or ISO 8601) turned into UTC.
+fn parse_todos(input: &serde_json::Value, now: DateTime<Utc>) -> std::result::Result<Vec<TodoItem>, String> {
+    let mut todos = input.get("todos").cloned().unwrap_or(json!([]));
+    for item in todos.as_array_mut().into_iter().flatten() {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        let due = match item.get("due") {
+            None | Some(serde_json::Value::Null) => continue,
+            Some(serde_json::Value::String(due)) if due.trim().is_empty() => None,
+            Some(serde_json::Value::String(due)) => Some(crate::when::parse_at(due, now)?),
+            Some(_) => return Err("`due` must be a string such as \"in 2h\".".to_owned()),
+        };
+        match due {
+            None => item.remove("due"),
+            Some(due) => item.insert(
+                "due".to_owned(),
+                json!(due.to_rfc3339_opts(SecondsFormat::Secs, true)),
+            ),
+        };
+    }
+    serde_json::from_value(todos).map_err(|e| e.to_string())
 }
 
 /// Configuration for the [`Todos`] plugin.
@@ -115,7 +171,7 @@ impl Todos {
         }
         Some(format!(
             "<system-reminder>\nYour current todo list:\n{}\nKeep it up to date with todo_write as you work.\n</system-reminder>",
-            render_list(&todos)
+            render_list(&todos, Utc::now())
         ))
     }
 }
@@ -141,6 +197,10 @@ fn input_schema() -> serde_json::Value {
                         "status": {
                             "type": "string",
                             "enum": ["pending", "in_progress", "completed"]
+                        },
+                        "due": {
+                            "type": "string",
+                            "description": "Promised by: `in 2h` or ISO 8601."
                         }
                     },
                     "required": ["content", "activeForm", "status"],
@@ -181,15 +241,14 @@ impl Plugin for Todos {
             .handler(move |input, ctx| {
                 let state_key = state_key.clone();
                 async move {
-                    let todos: Vec<TodoItem> =
-                        serde_json::from_value(input.get("todos").cloned().unwrap_or(json!([])))
-                            .map_err(|e| strands_agents::Error::ToolValidation(e.to_string()))?;
+                    let now = Utc::now();
+                    let todos = parse_todos(&input, now).map_err(strands_agents::Error::ToolValidation)?;
                     if todos.is_empty() {
                         ctx.agent.state().delete(&state_key);
                         return Ok("Todo list cleared".to_owned());
                     }
                     let remaining = todos.iter().filter(|t| t.status != TodoStatus::Completed).count();
-                    let rendered = render_list(&todos);
+                    let rendered = render_list(&todos, now);
                     ctx.agent.state().set(state_key, serde_json::to_value(&todos)?);
                     Ok(format!("{remaining} todos remaining\n{rendered}"))
                 }

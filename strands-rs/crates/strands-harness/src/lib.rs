@@ -14,6 +14,7 @@ pub mod plugins;
 pub mod prompt;
 pub mod telemetry;
 pub mod tools;
+pub mod when;
 
 #[cfg(feature = "mcp")]
 pub use agent::McpServersOption;

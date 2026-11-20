@@ -4940,6 +4940,7 @@ name = "strands-harness"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "indexmap 2.14.2",
  "parking_lot",
