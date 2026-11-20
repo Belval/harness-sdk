@@ -66,6 +66,17 @@ const SUMMARY_ATTEMPTS: u32 = 3;
 /// …the first retry after this, each next one after twice the last.
 const SUMMARY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The SDK's summarizer prompt (so [`crate::cost::SidePurpose`] still tells the call apart),
+/// plus the promises still open: a summary that keeps the facts but drops "the clip by 11 AM"
+/// leaves the agent nothing to keep it.
+fn summary_prompt() -> String {
+    format!(
+        "{SUMMARIZATION_SYSTEM_PROMPT}\n\nEnd with a list of every commitment still open: what was \
+         promised, to whom, and by when (the time as written), and whether anything (a schedule, job, \
+         child or todo) will bring it back."
+    )
+}
+
 /// Why automatic compaction is holding off: the input it last failed at, and the calls left.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Backoff {
@@ -469,7 +480,7 @@ async fn summarize(model: &Arc<dyn Model>, content: Vec<ContentBlock>) -> Result
 
 async fn summarize_once(model: &Arc<dyn Model>, messages: &[Message]) -> Result<String> {
     let options = StreamOptions {
-        system_prompt: Some(SystemPrompt::Text(SUMMARIZATION_SYSTEM_PROMPT.to_owned())),
+        system_prompt: Some(SystemPrompt::Text(summary_prompt())),
         ..Default::default()
     };
     let mut stream = model.stream_aggregated(messages, &options);
@@ -715,6 +726,24 @@ mod tests {
             panic!("{reported:?}");
         };
         assert_eq!(before, projected);
+    }
+
+    #[tokio::test]
+    async fn the_summarizer_is_asked_to_keep_open_commitments_and_still_counts_as_one() {
+        let (agent, model) = agent(&["SUMMARY one"]);
+        let (manager, _) = manager(Some(10_000), None);
+        let mut messages = tool_loop(45);
+        let before = heuristic(&messages);
+        pass(&manager, &agent, &mut messages, before, false).await;
+        let calls = model.calls();
+        let Some(SystemPrompt::Text(prompt)) = &calls[0].1.system_prompt else {
+            panic!("no system prompt");
+        };
+        assert!(prompt.contains("every commitment still open"), "{prompt}");
+        assert_eq!(
+            crate::cost::SidePurpose::of(Some(prompt)),
+            crate::cost::SidePurpose::Summarizer
+        );
     }
 
     #[tokio::test]
