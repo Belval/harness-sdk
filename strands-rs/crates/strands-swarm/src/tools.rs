@@ -804,7 +804,8 @@ fn list_agents(
         let tip = branches.get(&info.id).and_then(|state| state.tip);
         let note = swarm.quiet_for(info, tip).and_then(crate::status::quiet_note);
         let dormant = swarm.dormant_for(info).and_then(crate::status::dormant_note);
-        let notes = note.into_iter().chain(dormant);
+        let overdue = crate::status::overdue_note(&swarm.overdue(&info.id));
+        let notes = note.into_iter().chain(dormant).chain(overdue);
         notes.map(|note| format!(", {note}")).collect::<String>()
     };
     let mut lines = Vec::new();

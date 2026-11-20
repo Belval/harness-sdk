@@ -27,7 +27,7 @@ would show (stdout, then `[stderr]` and `[exit code N]` when there are any), not
 block, whose escaped quotes models copied into `edit`'s `old_str`. It and a job report's last lines
 drop ANSI escape sequences, and of a line `\r` overwrote (progress bars) only the final text. Tool
 specs and the swarm's prompt sections are sent on every model call, so
-`the_fixed_prefix_stays_within_its_budget` pins their size: 16.4 kB (about 4.8k tokens) with 20
+`the_fixed_prefix_stays_within_its_budget` pins their size: 16.6 kB (about 4.8k tokens) with 20
 skills, the skills list at 2.5 kB of it.
 
 ## Run
@@ -488,6 +488,12 @@ Other text messages the selected agent, or starts a root agent when there is non
   received since, since it is done and the parent already holds its report. A new message, a
   schedule at it, or a new turn ends the spell. The spell's start and "told" are saved with the
   agent (`dormancy`), so a resume neither forgets the mark nor repeats the note.
+- **Due todos.** A `todo_write` item may carry `due` (`in 2h` or ISO 8601, stored in UTC), so a
+  promise made by a time ("the clip by 11 AM") is not lost between mail-driven turns: once an
+  open item is past it, the 30 s sweep sends its agent one `due` message naming it (again only
+  if its `due` moves later), which starts a turn. Until then the item is a way to wake the agent,
+  so it is not dormant. The todo reminder, `/status` and `list_agents` mark such an item
+  `OVERDUE` / `1 todo overdue: …`.
 - **`/status`:**
   - Unmerged commits are `git log <base>..<branch>`. The base is `--status-base`, else the branch
     checked out where the swarm started (a linked worktree's, if it started in one).

@@ -7077,6 +7077,64 @@ async fn an_idle_agent_nothing_can_wake_is_marked_dormant_and_its_parent_told_on
     swarm.shutdown().await;
 }
 
+/// A todo item with a `due` time keeps its agent from being dormant until then; once it is due
+/// and still open, the agent gets one `due` message naming it, which starts a turn, and
+/// `list_agents` names it as overdue.
+#[tokio::test(start_paused = true)]
+async fn an_open_todo_past_its_due_time_messages_its_agent_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let todos = json!({ "todos": [
+        { "content": "Post the clip", "activeForm": "Posting the clip", "status": "pending", "due": "in 20m" },
+        { "content": "Reply", "activeForm": "Replying", "status": "completed", "due": "in 1m" },
+    ]});
+    let map = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("todo_write", "t1", todos),
+            say("I'll post the clip in 20 minutes."),
+            say("Posting it now."),
+        ],
+    )]);
+    let mut config = persistent_swarm(&map, dir.path());
+    let scripts = map.clone();
+    config.factory = Arc::new(move |spec: AgentSpec| {
+        let model = scripts.lock()[&spec.id].clone();
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(spec.tools)
+                .plugin(strands_harness::plugins::Todos::default())
+                .no_sandbox()
+                .build()
+        })
+    });
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "go").await;
+    reply_to(&mut events, USER).await;
+    pass_minutes(&swarm, 19).await;
+    assert_eq!(dormant_lines(&swarm), "", "a due item will wake it");
+    assert_eq!(swarm.agent("a1").unwrap().status, AgentStatus::Idle);
+
+    pass_minutes(&swarm, 2).await;
+    let due = mail_to(&mut events, "a1", "due").await;
+    assert!(due.contains("- Post the clip (OVERDUE: due "), "{due}");
+    assert!(!due.contains("Reply"), "{due}");
+    assert_eq!(reply_to(&mut events, USER).await, "Posting it now.");
+    let overdue = swarm.overdue("a1");
+    assert_eq!(overdue.len(), 1, "{overdue:?}");
+    assert_eq!(overdue[0].content, "Post the clip");
+
+    // Told once: still open, it is overdue but no longer a way to wake the agent.
+    pass_minutes(&swarm, 30).await;
+    let again = events
+        .try_recv()
+        .into_iter()
+        .any(|event| matches!(event, SwarmEvent::Mail { ref mail, .. } if mail.kind == "due"));
+    assert!(!again, "reminded once per due time");
+    swarm.shutdown().await;
+}
+
 /// A child whose reply the parent holds is done, not forgotten: no mark, no FYI.
 #[tokio::test(start_paused = true)]
 async fn an_idle_child_whose_reply_reached_its_parent_is_not_dormant() {

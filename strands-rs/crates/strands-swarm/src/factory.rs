@@ -201,8 +201,8 @@ const WEB_FETCH_DESCRIPTION: &str = concat!(
 
 /// `todo_write`'s description as facts: the harness's prescribes when and how to use it.
 const TODO_DESCRIPTION: &str = concat!(
-    "Replace your task list with `todos` (empty clears it). It is shown to you before each model ",
-    "call, so you need not restate it, and to the user in `/status`."
+    "Replace your task list with `todos` (empty clears it). You see it before each model call, ",
+    "the user in `/status`; an open item past its `due` comes back to you as a message."
 );
 
 /// `retrieve_context`'s description without the SDK's options list and examples, which repeat
@@ -1235,7 +1235,9 @@ mod tests {
         // ~25 tokens; a real run's 58 skills ~1.5k tokens).
         // Raised from 16,400 for `reload_swarm`'s `check` (~20 tokens a call, ~$0.30 a day on a
         // 250-agent run), which tells a ~$70 prefix-changing reload apart before it happens.
-        const BUDGET_BYTES: usize = 16_500;
+        // Raised from 16,500 for `todo_write`'s `due` (~15 tokens a call): a promise with a time
+        // comes back when it is due instead of being lost between mail-driven turns.
+        const BUDGET_BYTES: usize = 16_600;
         const TOOL_BUDGET_BYTES: usize = 1_100;
         // 20 skill lines of at most ~110 bytes plus the heading.
         const SKILLS_BUDGET_BYTES: usize = 2_500;

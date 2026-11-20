@@ -290,6 +290,16 @@ impl StatusReport {
             if let Some(note) = agent.dormant.and_then(dormant_note) {
                 head.push_str(&format!(" · {note}"));
             }
+            let now = chrono::Utc::now();
+            let overdue: Vec<TodoItem> = agent
+                .todos
+                .iter()
+                .filter(|item| item.overdue(now))
+                .cloned()
+                .collect();
+            if let Some(note) = overdue_note(&overdue) {
+                head.push_str(&format!(" · {note}"));
+            }
             lines.push(String::new());
             lines.push(head);
             lines.extend(agent.todos.iter().map(todo_line));
@@ -312,10 +322,21 @@ impl StatusReport {
     }
 }
 
+/// `2 todos overdue: Post the clip; Send the plan` for an agent's open items past their due time.
+pub fn overdue_note(overdue: &[TodoItem]) -> Option<String> {
+    let names: Vec<&str> = overdue.iter().map(|item| item.content.as_str()).collect();
+    match names.len() {
+        0 => None,
+        1 => Some(format!("1 todo overdue: {}", names[0])),
+        n => Some(format!("{n} todos overdue: {}", names.join("; "))),
+    }
+}
+
 fn todo_line(item: &TodoItem) -> String {
+    let due = item.due_note(chrono::Utc::now());
     match item.status {
-        TodoStatus::Pending => format!("  [ ] {}", item.content),
-        TodoStatus::InProgress => format!("  [>] {}", item.active_form),
+        TodoStatus::Pending => format!("  [ ] {}{due}", item.content),
+        TodoStatus::InProgress => format!("  [>] {}{due}", item.active_form),
         TodoStatus::Completed => format!("  [x] {}", item.content),
     }
 }
@@ -644,6 +665,59 @@ mod tests {
             status,
             due: None,
         }
+    }
+
+    fn todo_report(todos: Vec<TodoItem>) -> StatusReport {
+        StatusReport {
+            base: None,
+            limits: None,
+            agents: vec![AgentReport {
+                label: "a (a1)".into(),
+                id: "a1".into(),
+                status: crate::AgentStatus::Idle,
+                unread: 0,
+                priority: false,
+                branch: None,
+                git: None,
+                quiet: None,
+                dormant: None,
+                todos,
+                background: vec![],
+                schedules: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn overdue_todos_are_named_on_the_agent_line_and_marked_on_their_own() {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut clip = todo("Post the clip", TodoStatus::Pending);
+        clip.due = Some(past);
+        let mut plan = todo("Send the plan", TodoStatus::InProgress);
+        plan.due = Some(past + chrono::Duration::hours(3));
+        let mut sent = todo("Reply", TodoStatus::Completed);
+        sent.due = Some(past);
+        assert_eq!(overdue_note(&[]), None);
+        assert_eq!(
+            overdue_note(std::slice::from_ref(&clip)).as_deref(),
+            Some("1 todo overdue: Post the clip")
+        );
+        let two = overdue_note(&[clip.clone(), clip.clone()]);
+        assert_eq!(
+            two.as_deref(),
+            Some("2 todos overdue: Post the clip; Post the clip")
+        );
+        let lines = todo_report(vec![clip, plan, sent]).lines(&|_| None);
+        assert!(
+            lines[2].ends_with(" · 1 todo overdue: Post the clip"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[3].starts_with("  [ ] Post the clip (OVERDUE: due "),
+            "{lines:?}"
+        );
+        assert!(lines[4].starts_with("  [>] Send the planing (due "), "{lines:?}");
+        assert_eq!(lines[5], "  [x] Reply");
     }
 
     #[test]

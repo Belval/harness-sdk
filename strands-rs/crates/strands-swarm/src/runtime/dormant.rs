@@ -73,9 +73,11 @@ impl Swarm {
         }
     }
 
-    /// Stamp the idle agents that nothing can wake and clear the others; tell the parent of each
-    /// that has been so for [`crate::status::DORMANT_AFTER`], once per spell.
+    /// Remind agents of todo items that have come due ([`Swarm::remind_due`]); then stamp the
+    /// idle agents that nothing can wake and clear the others, and tell the parent of each that
+    /// has been so for [`crate::status::DORMANT_AFTER`], once per spell.
     pub async fn sweep_dormant(&self) {
+        self.remind_due();
         let nodes = self.nodes();
         let running: HashSet<String> = self
             .jobs()
@@ -120,6 +122,7 @@ impl Swarm {
                         || scheduled.contains(&node.id)
                         || running.contains(&node.id)
                         || awaited.contains(node.id.as_str())
+                        || self.due_later(&node.id)
                 }
                 AgentStatus::Cancelled => false,
             })
