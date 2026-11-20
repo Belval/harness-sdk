@@ -307,7 +307,8 @@ pub struct SwarmConfig {
     /// Globs (`*`, `?`) of further branches [`Swarm::land`] may fast-forward besides the root
     /// agent's checked-out branch (`--land-into`).
     pub land_into: Vec<String>,
-    /// Commands [`Swarm::land`] runs when the caller names no checks (`--gate`).
+    /// Commands every [`Swarm::land`] runs before the caller's own checks (`--gate`); a caller
+    /// cannot waive them.
     pub gates: Vec<String>,
     /// The `strands-swarm` binary that carries out a landing (`--land PLAN`) and that
     /// `reload_swarm` compares a new binary's fixed prefix with; `None` is this process's own
@@ -417,8 +418,8 @@ pub struct LandRequest {
     /// Branch to fast-forward; default: the branch the caller's root agent has checked out. Any
     /// other must match [`SwarmConfig::land_into`].
     pub into: Option<String>,
-    /// Shell commands that must pass on the rebased commits; `None` uses
-    /// [`SwarmConfig::gates`].
+    /// Extra shell commands that must pass on the rebased commits, run after
+    /// [`SwarmConfig::gates`] (which always run).
     pub check: Option<Vec<String>>,
 }
 

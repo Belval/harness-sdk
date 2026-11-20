@@ -90,8 +90,8 @@ struct Cli {
     /// checked-out branch (repeatable), e.g. `--land-into 'release/*'`.
     #[arg(long = "land-into", value_name = "GLOB")]
     land_into: Vec<String>,
-    /// Check command `land` runs when the caller names none (repeatable), e.g.
-    /// `--gate 'cargo test'`.
+    /// Check command every `land` runs before the caller's own checks, which cannot waive it
+    /// (repeatable), e.g. `--gate 'cargo test'`.
     #[arg(long = "gate", value_name = "CMD")]
     gates: Vec<String>,
     /// Carry out one landing from a plan file, then exit (how `land` jobs run).

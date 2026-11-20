@@ -50,7 +50,12 @@ pub struct LandPlan {
     pub label: String,
     /// Branch to fast-forward.
     pub into: String,
-    /// Shell commands that must all succeed; none means no checks.
+    /// The swarm's gates (`--gate`): shell commands that must all succeed, run first whatever
+    /// the caller asked for.
+    #[serde(default)]
+    pub gates: Vec<String>,
+    /// The caller's own checks, run after the gates (one that repeats a gate is skipped); none
+    /// and no gates means no checks.
     pub checks: Vec<String>,
     /// Scratch worktree to create (and remove afterwards).
     pub scratch: PathBuf,
@@ -148,16 +153,22 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
         .await
         .map_err(|e| format!("Not landed: {e}"))?;
     let dir = same_subdir(scratch, Path::new(&toplevel), &plan.repo);
+    let gates = plan.gates.iter().map(|check| (true, check));
+    let extra = plan.checks.iter().filter(|check| !plan.gates.contains(check));
     let mut passed = Vec::new();
-    for check in &plan.checks {
+    for (gate, check) in gates.chain(extra.map(|check| (false, check))) {
         let started = Instant::now();
         let log = std::io::stdout()
             .as_fd()
             .try_clone_to_owned()
             .ok()
             .map(std::fs::File::from);
-        check_passes(&dir, check, &plan.target_dir, log.as_ref()).await?;
-        passed.push(format!("  ok `{check}` ({}s)", started.elapsed().as_secs()));
+        check_passes(&dir, check, gate, &plan.target_dir, log.as_ref()).await?;
+        let kind = if gate { "gate" } else { "check" };
+        passed.push(format!(
+            "  ok {kind} `{check}` ({}s)",
+            started.elapsed().as_secs()
+        ));
     }
 
     let _lock = land_lock(&plan.repo).await?;
@@ -182,7 +193,10 @@ async fn land_in_scratch(plan: &LandPlan, old: &str, checkout: Option<&Path>) ->
 
     let checks = match passed.is_empty() {
         true => "No checks ran.".to_owned(),
-        false => format!("Checks passed:\n{}", passed.join("\n")),
+        false => format!(
+            "Checks passed, in order (gate: the swarm's --gate, always run; check: yours):\n{}",
+            passed.join("\n")
+        ),
     };
     Ok(format!(
         "Landed {} commit(s) of {label} on {into} ({}..{}):\n{commits}\n{checks}\n{label} itself \
@@ -401,12 +415,14 @@ pub fn stop_signal() -> impl std::future::Future<Output = String> {
     }
 }
 
-/// Run `check` with `sh` in `dir`; on failure the error carries the tail of its output. The output
+/// Run `check` (a swarm gate when `gate`) with `sh` in `dir`; on failure the error carries the
+/// tail of its output. The output
 /// is kept out of the job's log, but each chunk of it touches `log`'s modification time, so the
 /// swarm can tell a check that still writes from one that hangs ([`crate::jobs::Jobs::stalled`]).
 async fn check_passes(
     dir: &Path,
     check: &str,
+    gate: bool,
     target_dir: &Path,
     log: Option<&std::fs::File>,
 ) -> Result<(), String> {
@@ -449,9 +465,10 @@ async fn check_passes(
     let code = status
         .code()
         .map_or_else(|| "a signal".to_owned(), |code| code.to_string());
+    let kind = if gate { "gate" } else { "check" };
     Err(format!(
-        "Not landed: `{check}` failed (exit {code}) on the rebased commits. Nothing was changed. \
-         Last lines:\n{tail}"
+        "Not landed: {kind} `{check}` failed (exit {code}) on the rebased commits. Nothing was \
+         changed. Last lines:\n{tail}"
     ))
 }
 
@@ -573,7 +590,7 @@ mod tests {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         log.set_modified(old).unwrap();
         let target = dir.path().join("target");
-        check_passes(dir.path(), "true", &target, Some(&log))
+        check_passes(dir.path(), "true", false, &target, Some(&log))
             .await
             .unwrap();
         assert_eq!(
@@ -581,14 +598,14 @@ mod tests {
             old,
             "no output, no touch"
         );
-        check_passes(dir.path(), "echo hi", &target, Some(&log))
+        check_passes(dir.path(), "echo hi", false, &target, Some(&log))
             .await
             .unwrap();
         assert!(
             log.metadata().unwrap().modified().unwrap() > old,
             "output touches the log"
         );
-        let error = check_passes(dir.path(), "echo boom; exit 3", &target, None)
+        let error = check_passes(dir.path(), "echo boom; exit 3", false, &target, None)
             .await
             .unwrap_err();
         assert!(error.contains("exit 3") && error.contains("boom"), "{error}");
@@ -641,6 +658,7 @@ mod tests {
             source: "feature".into(),
             label: "feature".into(),
             into: "main".into(),
+            gates: Vec::new(),
             checks: checks.iter().map(|c| c.to_string()).collect(),
             scratch: fx.land.join("scratch"),
             target_dir: fx.land.join("target"),
@@ -678,7 +696,11 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("add b"), "{report}");
-        assert!(report.contains("ok `test -f b.txt"), "{report}");
+        assert!(report.contains("ok check `test -f b.txt"), "{report}");
+        assert!(
+            !report.contains("ok gate"),
+            "no gates, the caller's checks only: {report}"
+        );
         assert!(fx.main.join("b.txt").is_file(), "the main checkout follows");
         assert_eq!(
             git(&fx.main, &["status", "--porcelain"]).await.unwrap(),
@@ -798,6 +820,33 @@ mod tests {
         assert_eq!(head(&fx.main, "main").await, main_before);
         assert!(!fx.main.join("b.txt").exists());
         assert_eq!(worktrees(&fx.main).await, 2);
+    }
+
+    /// The swarm's gates are not the caller's to waive: they run first whatever `check` says, a
+    /// failing one refuses the landing, and the caller's checks run after them.
+    #[tokio::test]
+    async fn gates_always_run_before_the_callers_checks() {
+        let fx = fixture().await;
+        let order = fx.main.parent().unwrap().join("order");
+        let note = |what: &str| format!("echo {what} >> '{}'", order.display());
+        let main_before = head(&fx.main, "main").await;
+        let mut failing = plan(&fx, &["true"]);
+        failing.gates = vec![note("gate"), "exit 4".into()];
+        let error = run(&failing).await.unwrap_err();
+        assert!(error.contains("gate `exit 4` failed (exit 4)"), "{error}");
+        assert_eq!(head(&fx.main, "main").await, main_before, "nothing landed");
+        assert_eq!(std::fs::read_to_string(&order).unwrap(), "gate\n");
+
+        std::fs::remove_file(&order).unwrap();
+        let mut passing = plan(&fx, &[&note("check"), &note("gate")]);
+        passing.gates = vec![note("gate")];
+        let report = run(&passing).await.unwrap();
+        assert!(report.contains("Landed 1 commit(s)"), "{report}");
+        let ran = std::fs::read_to_string(&order).unwrap();
+        assert_eq!(ran, "gate\ncheck\n", "gates first; a repeated gate runs once");
+        let gate = report.find(&format!("ok gate `{}`", note("gate"))).unwrap();
+        let check = report.find(&format!("ok check `{}`", note("check"))).unwrap();
+        assert!(gate < check, "{report}");
     }
 
     #[tokio::test]

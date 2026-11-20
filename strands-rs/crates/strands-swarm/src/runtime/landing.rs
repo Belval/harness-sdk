@@ -76,7 +76,6 @@ impl Swarm {
         if into == label {
             return Err(Error::other(format!("{label} cannot be landed on itself")));
         }
-        let checks = request.check.unwrap_or_else(|| self.inner.config.gates.clone());
         let dir = jobs_dir(&self.inner.config).join("land");
         let stamp = Utc::now().format("%Y%m%d-%H%M%S%3f");
         let scratch = dir.join(format!("{owner}-{stamp}"));
@@ -86,7 +85,8 @@ impl Swarm {
             source,
             label: label.clone(),
             into: into.clone(),
-            checks,
+            gates: self.inner.config.gates.clone(),
+            checks: request.check.unwrap_or_default(),
             scratch: scratch.clone(),
             target_dir,
         };

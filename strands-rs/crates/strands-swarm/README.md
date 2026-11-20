@@ -421,8 +421,10 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
     match a `--land-into GLOB` (repeatable, `*` and `?`).
 - **How it lands.** As a background job, it:
   1. rebases a scratch worktree at the branch's tip onto `into`;
-  2. runs each check with `sh` from the caller's subdirectory, using a private `CARGO_TARGET_DIR`
-     (default checks: `--gate CMD`, repeatable);
+  2. runs the checks with `sh` from the caller's subdirectory, using a private `CARGO_TARGET_DIR`:
+     first the swarm's gates (`--gate CMD`, repeatable), which `check` cannot waive, then the
+     caller's `check` commands (one that repeats a gate runs once). Without gates the caller's
+     checks are the only ones. The report lists each command that ran, marked `gate` or `check`;
   3. only then fast-forwards `into`: `git merge --ff-only` where it is checked out, else a
      compare-and-swap `update-ref`.
 - **Refusals.**
@@ -440,6 +442,10 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
   - The checks' shared target dir (`$CARGO_TARGET_DIR-land/<run>`, else `jobs/land/target`) stays
     for the next landing's incremental build. `/gc` and `--gc` delete it when no land job runs,
     and a run without `--run` on exit.
+- **What the gates guarantee.** Every `land`, on any `into` (`--land-into` targets too), runs the
+  gates on the rebased commits. They bind `land` only: agents' shells are not sandboxed, so an
+  agent with write access to the repository could still move a branch with plain `git`, and a gate
+  that runs a script from the repository runs the version being landed.
 - Programmatically: `Swarm::land`.
 
 ## TUI

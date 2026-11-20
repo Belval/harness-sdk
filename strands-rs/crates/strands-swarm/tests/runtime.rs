@@ -3952,6 +3952,7 @@ async fn gc_and_resume_remove_a_killed_land_job_s_scratch_once_no_land_job_runs(
         source: "main".into(),
         label: "main".into(),
         into: "main".into(),
+        gates: Vec::new(),
         checks: Vec::new(),
         scratch: scratch.clone(),
         target_dir: dir.path().join("target"),
@@ -5702,11 +5703,17 @@ async fn land_rebases_checks_and_fast_forwards_the_roots_branch_as_a_job() {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "other"]);
 
-    let job = swarm.land(&child, LandRequest::default()).await.unwrap();
+    // `check` cannot waive the gates: they run first, then the caller's own.
+    let request = LandRequest {
+        check: Some(vec!["true".into()]),
+        ..Default::default()
+    };
+    let job = swarm.land(&child, request).await.unwrap();
     assert!(job.label().contains("→ main"), "{}", job.label());
     let report = mail_to(&mut events, &child, "job").await;
     assert!(report.contains("Landed 1 commit(s)"), "{report}");
-    assert!(report.contains("ok `test -f feature.txt`"), "{report}");
+    assert!(report.contains("ok gate `test -f feature.txt`"), "{report}");
+    assert!(report.contains("ok check `true`"), "{report}");
     assert!(
         repo.join("feature.txt").is_file(),
         "the root's checkout was fast-forwarded"

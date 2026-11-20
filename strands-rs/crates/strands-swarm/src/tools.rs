@@ -220,12 +220,11 @@ struct JobsInput {
 const LAND_DESCRIPTION: &str = concat!(
     "Land your commits on the branch your root agent has checked out (others only if the user ",
     "allowed them), instead of asking someone to merge them. You can land your own branch or ",
-    "that of an agent you spawned. In a scratch worktree the branch is ",
-    "rebased onto it, the checks run there (default: the swarm's gate commands) with a private ",
-    "CARGO_TARGET_DIR, and only if all pass is the target fast-forwarded. Runs as a background ",
-    "job; you get a `job` message with the outcome. On a conflict (with the conflicted files), a ",
-    "failing check (with its output tail) or a target checkout with uncommitted changes, nothing ",
-    "is changed. Your own branch is never modified."
+    "that of an agent you spawned. In a scratch worktree the branch is rebased onto it, the ",
+    "swarm's gates (always) then your checks run there with a private CARGO_TARGET_DIR, and only ",
+    "if all pass is the target fast-forwarded. Runs as a background job; you get a `job` message ",
+    "with the outcome. On a conflict, a failing check (with its output tail) or a target checkout ",
+    "with uncommitted changes, nothing is changed. Your own branch is never modified."
 );
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -237,8 +236,8 @@ struct LandInput {
     /// root agent has checked out.
     #[serde(default)]
     into: Option<String>,
-    /// Shell commands that must pass on the rebased commits, run from the same subdirectory as
-    /// your working directory; default: the swarm's gates.
+    /// Extra shell commands that must pass on the rebased commits, after the gates, run from the
+    /// same subdirectory as your working directory.
     #[serde(default)]
     check: Option<Vec<String>>,
 }
