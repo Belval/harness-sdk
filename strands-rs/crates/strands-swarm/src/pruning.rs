@@ -15,10 +15,15 @@
 //! Older ones are cut to their head and tail; the full text stays in the stash under the
 //! `retrieve_context` reference the preview ends with.
 //!
-//! Both edit history, and the provider's prompt cache only matches an unchanged prefix: one edit
+//! Old images: a screenshot (from `read` or an MCP tool) is ~1-2k tokens and ~150 KB of base64 that
+//! every later call re-sends and every save writes, yet the model has used it within a few steps.
+//! Those more than [`KEEP_IMAGE_STEPS`] assistant messages back become a text stub naming where
+//! they came from, so a re-read gets them back; they are not stashed, as that would keep the bytes.
+//!
+//! All three edit history, and the provider's prompt cache only matches an unchanged prefix: one edit
 //! deep in a 150k-token history turns the next call's cache reads (0.1x) into cache writes
 //! (1.25x) for everything after it. Run on every turn, they raised input cost per call by ~80% on
-//! a live run. So [`CachePrune`] runs them only when the prefix is lost anyway, and then both at
+//! a live run. So [`CachePrune`] runs them only when the prefix is lost anyway, and then all at
 //! once: see [`PruneReason`].
 
 use std::collections::hash_map::DefaultHasher;
@@ -33,12 +38,15 @@ use strands_agents::context_manager::strategies::{
     Offload, OffloadConditions, OffloadStrategy, OffloadTarget, TruncateConfig,
 };
 use strands_agents::context_manager::{ContextState, ContextStrategy};
-use strands_agents::types::{ContentBlock, Message, Role, ToolResultBlock, ToolResultContent};
+use strands_agents::types::{
+    ContentBlock, ImageBlock, ImageSource, Message, Role, ToolResultBlock, ToolResultContent, ToolUseBlock,
+};
 use strands_agents::{Agent, Result};
 
 use parking_lot::Mutex;
 
 use crate::compaction::CompactAt;
+use crate::images::dimensions;
 use crate::resume::NOTICE_PREFIX;
 
 /// Stands in for an assistant message that held nothing but reasoning.
@@ -156,6 +164,77 @@ fn trim_old_results() -> OffloadStrategy {
         preserve_recent: Some(KEEP_RECENT_RESULTS as f64),
         ..Default::default()
     })
+}
+
+/// Tool-result images stay whole while fewer than this many assistant messages follow them. A
+/// screenshot is acted on in the next step or two and checked against the following one, so 4
+/// covers that and a retry, while the latest step's images (0 messages after) always stay. Older
+/// ones cost ~1.5k tokens each on every call for little use, and a re-read is cheap.
+const KEEP_IMAGE_STEPS: usize = 4;
+
+/// What an image in the tool result of `tool` (called with `input`) becomes: where it came from,
+/// its size, and how to get it back.
+fn image_stub(tool: &str, input: &serde_json::Value, image: &ImageBlock) -> String {
+    let size = match &image.source {
+        ImageSource::Bytes(bytes) => {
+            dimensions(bytes).map_or("size unknown".into(), |(w, h)| format!("{w}x{h}"))
+        }
+        _ => "size unknown".into(),
+    };
+    match (tool, input.get("path").and_then(|path| path.as_str())) {
+        ("read", Some(path)) => format!("[image omitted: {path}, {size}; read it again if needed]"),
+        _ => format!("[image omitted: {tool} result, {size}; call the tool again if needed]"),
+    }
+}
+
+/// The images in tool results that [`KEEP_IMAGE_STEPS`] assistant messages or more follow, as
+/// (message, block, item, stub, base64 size). Results of tools that are not [`trimmed`] (mail's
+/// attachments arrive in `wait`) keep theirs.
+fn stale_images(messages: &[Message]) -> Vec<(usize, usize, usize, String, usize)> {
+    let uses: HashMap<&str, &ToolUseBlock> = messages
+        .iter()
+        .flat_map(|m| m.tool_uses())
+        .map(|u| (u.tool_use_id.as_str(), u))
+        .collect();
+    let mut stale = Vec::new();
+    let mut steps = 0;
+    for (m, message) in messages.iter().enumerate().rev() {
+        if message.role == Role::Assistant {
+            steps += 1;
+        }
+        if steps < KEEP_IMAGE_STEPS || message.role != Role::User {
+            continue;
+        }
+        for (b, block) in message.content.iter().enumerate() {
+            let ContentBlock::ToolResult(result) = block else {
+                continue;
+            };
+            let Some(call) = uses.get(result.tool_use_id.as_str()).filter(|u| trimmed(&u.name)) else {
+                continue;
+            };
+            for (i, item) in result.content.iter().enumerate() {
+                if let ToolResultContent::Image(image) = item {
+                    let size = match &image.source {
+                        ImageSource::Bytes(bytes) => bytes.len() / 3 * 4,
+                        _ => 0,
+                    };
+                    stale.push((m, b, i, image_stub(&call.name, &call.input, image), size));
+                }
+            }
+        }
+    }
+    stale
+}
+
+/// Replaces [`stale_images`] by their stubs; `true` when any went.
+fn drop_old_images(messages: &mut [Message]) -> bool {
+    let stale = stale_images(messages);
+    for (m, b, i, stub, _) in &stale {
+        if let ContentBlock::ToolResult(result) = &mut messages[*m].content[*b] {
+            result.content[*i] = ToolResultContent::Text(stub.clone());
+        }
+    }
+    !stale.is_empty()
 }
 
 /// How long the provider keeps a cached prompt prefix by default (Anthropic and Bedrock: 5
@@ -299,6 +378,8 @@ impl ContextStrategy for CachePrune {
             (self.gate.sent.lock().as_deref()).and_then(|sent| first_change(sent, ctx.messages, hash));
         let dropped = drop_old_reasoning(ctx.messages);
         let trimmed = self.gate.trim.apply(ctx).await?;
+        // After `before`, so an image going counts as an edit to the prefix like a trimmed result.
+        let trimmed = drop_old_images(ctx.messages) | trimmed;
         // A summary (compaction, or the overflow it answers) rewrites everything before the tail;
         // a new system prompt or tool set precedes all of it, so every thinking block goes.
         let edited = match reason {
@@ -382,7 +463,11 @@ fn removable_share(messages: &[Message]) -> f64 {
         .filter(|chars| *chars > TRIM_ABOVE_CHARS)
         .map(|chars| chars.saturating_sub(preview))
         .sum();
-    (reasoning + results) as f64 / total as f64
+    let images: usize = stale_images(messages)
+        .iter()
+        .map(|(.., stub, size)| size.saturating_sub(stub.len()))
+        .sum();
+    (reasoning + results + images) as f64 / total as f64
 }
 
 fn json_len<T: serde::Serialize>(value: &T) -> usize {
@@ -922,6 +1007,113 @@ mod tests {
         messages[12] = tool_result("t1");
         assert!(pass(&prune, &agent, &mut messages, 0.1).await);
         assert_eq!(reasoned(&messages), Vec::<usize>::new());
+    }
+
+    /// A real PNG of `width` x `height` noise-free pixels, a few KB at most.
+    fn png(width: u32, height: u32) -> ImageBlock {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 13) as u8, (x ^ y) as u8])
+        }));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        ImageBlock {
+            format: strands_agents::types::ImageFormat::Png,
+            source: ImageSource::Bytes(bytes.into_inner()),
+        }
+    }
+
+    /// A reasoned tool loop of `steps` `read` calls, each returning an image: step `i` reads
+    /// `/shots/i.png`, a 40x30 image.
+    fn image_loop(steps: usize) -> Vec<Message> {
+        let mut messages = vec![Message::user("task")];
+        for i in 0..steps {
+            let id = format!("t{i}");
+            let call = ToolUseBlock::new("read", &id, json!({ "path": format!("/shots/{i}.png") }));
+            messages.push(assistant(vec![
+                thinking(&format!("step {i}")),
+                ContentBlock::ToolUse(call),
+            ]));
+            messages.push(Message::new(
+                Role::User,
+                vec![ContentBlock::ToolResult(ToolResultBlock::success(
+                    &id,
+                    vec![ToolResultContent::Image(png(40, 30))],
+                ))],
+            ));
+        }
+        messages
+    }
+
+    /// Whether message `i`'s result still holds its image.
+    fn has_image(messages: &[Message], i: usize) -> bool {
+        messages[i]
+            .tool_results()
+            .flat_map(|r| &r.content)
+            .any(|item| matches!(item, ToolResultContent::Image(_)))
+    }
+
+    #[tokio::test]
+    async fn a_cold_prune_stubs_images_older_than_the_last_steps_and_keeps_the_latest() {
+        let mut messages = image_loop(8);
+        let before = json(&messages).len();
+        assert!(cold_pass(&mut messages).await);
+        // Results at 2, 4, ..., 16; a result stays while fewer than KEEP_IMAGE_STEPS assistant
+        // messages follow it, so the last four steps' images stay.
+        for i in (2..=16).step_by(2) {
+            assert_eq!(
+                has_image(&messages, i),
+                i > 16 - 2 * KEEP_IMAGE_STEPS,
+                "message {i}"
+            );
+        }
+        assert!(
+            has_image(&messages, 16),
+            "the latest step's image is never dropped"
+        );
+        let ToolResultContent::Text(stub) = &messages[2].tool_results().next().unwrap().content[0] else {
+            panic!("a stub")
+        };
+        assert_eq!(
+            stub,
+            "[image omitted: /shots/0.png, 40x30; read it again if needed]"
+        );
+        assert!(json(&messages).len() < before, "the saved conversation shrinks");
+    }
+
+    #[tokio::test]
+    async fn images_stay_on_a_warm_call() {
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+        // A long first message keeps what pruning would save under PRUNE_SHARE of the history.
+        let mut messages = image_loop(8);
+        messages[0] = Message::user("task ".repeat(20_000));
+        let before = messages.clone();
+        assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
+        assert_eq!(messages, before);
+    }
+
+    #[tokio::test]
+    async fn an_image_stub_drops_the_thinking_after_it() {
+        let mut messages = image_loop(8);
+        assert!(cold_pass(&mut messages).await);
+        assert_eq!(reasoned(&messages), Vec::<usize>::new(), "the latest went too");
+    }
+
+    #[tokio::test]
+    async fn an_mcp_image_stub_names_the_tool_and_mail_images_stay() {
+        let mut messages = image_loop(8);
+        let call = ToolUseBlock::new("browser_screenshot", "t0", json!({}));
+        messages[1].content = vec![ContentBlock::ToolUse(call)];
+        let wait = ToolUseBlock::new("wait", "t1", json!({}));
+        messages[3].content = vec![ContentBlock::ToolUse(wait)];
+        assert!(cold_pass(&mut messages).await);
+        let ToolResultContent::Text(stub) = &messages[2].tool_results().next().unwrap().content[0] else {
+            panic!("a stub")
+        };
+        assert_eq!(
+            stub,
+            "[image omitted: browser_screenshot result, 40x30; call the tool again if needed]"
+        );
+        assert!(has_image(&messages, 4), "mail attachments arrive in wait results");
     }
 
     #[tokio::test]

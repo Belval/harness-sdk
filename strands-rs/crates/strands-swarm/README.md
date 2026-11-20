@@ -137,8 +137,12 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     and allows leaving out the newest. Tool results over 2,000 characters (`shell`, `read`, MCP
     listings and the rest, but not `skills`, `wait` or `retrieve_context`) are cut to their head
     and tail (~800 characters) once six newer ones exist; `retrieve_context` with the reference at
-    the end returns the full output.
-  - Both edit history, and the prompt cache only matches an unchanged prefix, so they run only when
+    the end returns the full output. Images in tool results (`read`, MCP screenshots; ~1.5k tokens
+    and 100+ KB of base64 each, re-sent and re-saved on every call) become a text stub
+    (`[image omitted: <path or tool>, WxH; read it again if needed]`) once four newer assistant
+    messages exist, so the latest steps' images always stay. The stub is not stashed (that would
+    keep the bytes); a re-read is cheap. Mail attachments (`wait` results) stay.
+  - All of these edit history, and the prompt cache only matches an unchanged prefix, so they run only when
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
     the `context` tool), after the system prompt or tools changed (a `cd`, a `find_tools` enable;
     then all thinking goes, as it is bound to them), on the first call after the cache's lifetime

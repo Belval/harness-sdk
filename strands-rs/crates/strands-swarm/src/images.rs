@@ -65,7 +65,7 @@ pub fn load(path: &Path) -> Result<ImageBlock, String> {
 }
 
 /// Width and height of an encoded image, read from its header.
-fn dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+pub(crate) fn dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| error.to_string())?
