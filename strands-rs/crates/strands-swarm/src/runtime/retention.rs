@@ -106,7 +106,7 @@ impl Swarm {
 }
 
 /// The newest modification time under `dir` (itself included), unix seconds; 0 when unreadable.
-fn newest(dir: &Path) -> i64 {
+pub(super) fn newest(dir: &Path) -> i64 {
     fn walk(path: &Path, newest: &mut SystemTime) {
         let Ok(meta) = std::fs::symlink_metadata(path) else {
             return;

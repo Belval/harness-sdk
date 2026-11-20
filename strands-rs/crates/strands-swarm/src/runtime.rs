@@ -755,6 +755,9 @@ struct Node {
     usage: Mutex<Tokens>,
     /// Tokens by model and recent calls, for cost estimates; across restarts.
     ledger: Mutex<crate::cost::Ledger>,
+    /// A cancelled agent's whole task is in its session's task file, so `swarm.json` holds only
+    /// the prefix ([`AgentState::task_archived`]).
+    task_archived: AtomicBool,
     /// The actor has exited (or never ran: restored cancelled).
     finished: AtomicBool,
     /// Background disk reclamation has been started for this agent.
@@ -1374,6 +1377,7 @@ impl Swarm {
         }
         if status == AgentStatus::Cancelled {
             node.cancelled_at.store(self.now().timestamp(), Ordering::Relaxed);
+            self.archive_task(node);
             // Waits on this agent may now be pointless; let them re-check.
             self.nodes().iter().for_each(|node| node.notify.notify_waiters());
         }

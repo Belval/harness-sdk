@@ -615,6 +615,18 @@ messages you.
     worktree is still there. The cancel time is saved as `cancelled_at`; a run saved before that
     takes the newest modification time in the session directory. Each pass that removes
     something is logged as `sessions_pruned` (`agents`, `bytes`, `ids`).
+  - `swarm.json` itself grows with the agents ever spawned, so a cancelled agent's entry is cut
+    to what the views need (about 1.2 KB instead of 6 KB on a live run, where 650 of 780 agents
+    were cancelled and the file went from 4.6 MB to 1.8 MB, a save from 8.4 to 3.5 ms). When an
+    agent is cancelled, and once on resume for runs saved before, its task is written whole to
+    `sessions/<agent>/task.md` and `swarm.json` keeps the first 500 characters (marked
+    `task_archived`); a resume reads the file back, so the TUI history shows the whole task, and
+    falls back to the prefix once `--keep-cancelled` has removed the session. Its ledger keeps the
+    per-model and side-call totals, and only the last hour's calls (the ones the cache hit rate
+    still counts) as `recent`; the median input and hit rate of the older ones are folded to
+    `folded`. `/cost`, `list_agents` spend, budgets and subtree totals read the same. Tasks of 500
+    characters or less, live agents, and agents whose file cannot be written stay as they were;
+    saving again changes nothing, and files from before load as they are.
   - `mcp-tools.json` is rewritten only when a server lists different tools.
 - **Journal.**
   - A persistent run keeps `journal.jsonl` with every message to and from the user, and

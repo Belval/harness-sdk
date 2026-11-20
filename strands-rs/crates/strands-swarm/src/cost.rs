@@ -162,11 +162,61 @@ pub struct Ledger {
     #[serde(default)]
     pub by_model: BTreeMap<String, Counts>,
     /// The last [`RECENT_CALLS`] own calls (side calls such as the goal judge left out).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
     pub recent: VecDeque<Call>,
     /// Side calls by purpose ([`SidePurpose`]) and model; also counted in `by_model`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub side: BTreeMap<String, BTreeMap<String, Counts>>,
+    /// The [`CallStats`] of calls [`Ledger::compacted`] left out of `recent`; they are what
+    /// [`Ledger::call_stats`] reports instead of `recent`'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folded: Option<Folded>,
+}
+
+/// What [`Ledger::call_stats`] needs of a set of calls, in the exact terms it computes it from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Folded {
+    /// Calls.
+    pub calls: usize,
+    /// Median input tokens per call.
+    pub median_input: u64,
+    /// Their input tokens, cache included.
+    pub input: u64,
+    /// Of which read from the cache.
+    pub cache_read: u64,
+}
+
+impl Folded {
+    fn of(calls: &VecDeque<Call>) -> Option<Folded> {
+        if calls.is_empty() {
+            return None;
+        }
+        let mut inputs: Vec<u64> = calls.iter().map(|call| call.input).collect();
+        inputs.sort_unstable();
+        let mid = inputs.len() / 2;
+        let median_input = match inputs.len() % 2 {
+            0 => (inputs[mid - 1] + inputs[mid]) / 2,
+            _ => inputs[mid],
+        };
+        Some(Folded {
+            calls: calls.len(),
+            median_input,
+            input: calls.iter().map(|call| call.input).sum(),
+            cache_read: calls.iter().map(|call| call.cache_read).sum(),
+        })
+    }
+
+    fn stats(&self) -> CallStats {
+        CallStats {
+            calls: self.calls,
+            median_input: self.median_input,
+            cache_hit: if self.input == 0 {
+                0.0
+            } else {
+                self.cache_read as f64 / self.input as f64
+            },
+        }
+    }
 }
 
 /// What a side call (one not carrying the agent's own context) was for.
@@ -216,7 +266,7 @@ pub struct CallStats {
 impl Ledger {
     /// Whether nothing was recorded.
     pub fn is_empty(&self) -> bool {
-        self.by_model.is_empty() && self.recent.is_empty()
+        self.by_model.is_empty() && self.recent.is_empty() && self.folded.is_none()
     }
 
     /// Count one side call for `purpose` on `model` (in `by_model` too).
@@ -231,6 +281,7 @@ impl Ledger {
     pub fn record(&mut self, model: &str, counts: Counts, own: Option<i64>) {
         self.by_model.entry(model.to_owned()).or_default().add(&counts);
         if let Some(at) = own {
+            self.folded = None;
             self.recent.push_back(Call {
                 input: counts.input,
                 cache_read: counts.cache_read,
@@ -244,27 +295,31 @@ impl Ledger {
 
     /// Stats over the recent calls; `None` before the first.
     pub fn call_stats(&self) -> Option<CallStats> {
-        if self.recent.is_empty() {
-            return None;
+        self.folded
+            .or_else(|| Folded::of(&self.recent))
+            .as_ref()
+            .map(Folded::stats)
+    }
+
+    /// The smallest ledger every view of it reads the same as this one at `now` (Unix seconds),
+    /// for an agent that will never call a model again. The per-model and side totals stay;
+    /// `recent` keeps only the calls [`CostReport::cache_hit_since`] can still count (those of
+    /// the last [`RECENT_HIT_SECS`], and later queries only look at later times), and their
+    /// [`CallStats`] move to `folded`. Applying it again changes nothing but dropping calls that
+    /// have aged out since.
+    pub fn compacted(&self, now: i64) -> Ledger {
+        let cutoff = now - RECENT_HIT_SECS;
+        Ledger {
+            by_model: self.by_model.clone(),
+            recent: self
+                .recent
+                .iter()
+                .filter(|call| call.at >= cutoff)
+                .copied()
+                .collect(),
+            side: self.side.clone(),
+            folded: self.folded.or_else(|| Folded::of(&self.recent)),
         }
-        let mut inputs: Vec<u64> = self.recent.iter().map(|call| call.input).collect();
-        inputs.sort_unstable();
-        let mid = inputs.len() / 2;
-        let median_input = match inputs.len() % 2 {
-            0 => (inputs[mid - 1] + inputs[mid]) / 2,
-            _ => inputs[mid],
-        };
-        let input: u64 = self.recent.iter().map(|call| call.input).sum();
-        let read: u64 = self.recent.iter().map(|call| call.cache_read).sum();
-        Some(CallStats {
-            calls: self.recent.len(),
-            median_input,
-            cache_hit: if input == 0 {
-                0.0
-            } else {
-                read as f64 / input as f64
-            },
-        })
     }
 }
 
@@ -1077,5 +1132,115 @@ mod tests {
         );
         assert_eq!(short_model("anthropic/claude-sonnet-4-5"), "claude-sonnet-4-5");
         assert_eq!(short_model("gpt-5"), "gpt-5");
+    }
+
+    /// A ledger shaped like a long-running agent's: 171 calls on two models, the last 50 kept
+    /// as `recent` and dated across several hours, some side calls.
+    fn long_ledger(now: i64) -> Ledger {
+        let mut ledger = Ledger::default();
+        for call in 0..171_i64 {
+            let model = if call % 5 == 0 {
+                "claude-haiku-4-5"
+            } else {
+                "global.anthropic.claude-opus-5-5"
+            };
+            let input = 120_000 + call as u64 * 517 % 90_000;
+            ledger.record(
+                model,
+                counts(input, 600 + call as u64, input - 700, 700),
+                Some(now - (170 - call) * 90),
+            );
+        }
+        ledger.record_side(SidePurpose::Judge, "claude-haiku-4-5", counts(9_000, 40, 0, 0));
+        ledger.record_side(
+            SidePurpose::Summarizer,
+            "claude-sonnet-4-5",
+            counts(50_000, 900, 0, 0),
+        );
+        ledger
+    }
+
+    fn report_of(ledgers: &[&Ledger]) -> CostReport {
+        let agents = ledgers
+            .iter()
+            .enumerate()
+            .map(|(n, ledger)| {
+                let totals = ledger.by_model.values().fold(Counts::default(), |mut all, one| {
+                    all.add(one);
+                    all
+                });
+                let parent = if n == 0 {
+                    "user".to_owned()
+                } else {
+                    "a1".to_owned()
+                };
+                agent(&format!("a{}", n + 1), &parent, totals, (*ledger).clone())
+            })
+            .collect();
+        CostReport {
+            agents,
+            prices: Prices::default(),
+        }
+    }
+
+    #[test]
+    fn a_compacted_ledger_gives_every_cost_view_the_same_numbers() {
+        let now = 2_000_000;
+        let live = long_ledger(now);
+        let mut dead = long_ledger(now - 20_000);
+        dead.recent.truncate(RECENT_CALLS);
+        let compact = dead.compacted(now);
+        assert!(compact.recent.is_empty(), "every call is hours old");
+        assert!(
+            serde_json::to_string(&compact).unwrap().len() * 3 < serde_json::to_string(&dead).unwrap().len()
+        );
+
+        let before = report_of(&[&live, &dead]);
+        let after = report_of(&[&live, &compact]);
+        assert_eq!(before.lines(), after.lines());
+        assert_eq!(before.total(), after.total());
+        assert_eq!(before.side_calls(), after.side_calls());
+        for id in ["a1", "a2"] {
+            assert_eq!(before.spend(id), after.spend(id), "{id}");
+        }
+        for since in [now - RECENT_HIT_SECS, now - 60, now + 1] {
+            assert_eq!(before.cache_hit_since(since), after.cache_hit_since(since));
+        }
+        assert_eq!(before.cache_line(now), after.cache_line(now));
+        assert_eq!(dead.call_stats(), compact.call_stats());
+        assert_eq!(dead.by_model, compact.by_model);
+
+        // It reads back from disk the same, and compacting again changes nothing.
+        let json = serde_json::to_string(&compact).unwrap();
+        let back: Ledger = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, compact);
+        assert_eq!(back.compacted(now), compact);
+        assert_eq!(back.call_stats(), dead.call_stats());
+    }
+
+    #[test]
+    fn a_compacted_ledger_keeps_the_calls_of_the_last_hour() {
+        let now = 2_000_000;
+        let ledger = long_ledger(now);
+        let compact = ledger.compacted(now);
+        let hour = ledger
+            .recent
+            .iter()
+            .filter(|call| call.at >= now - RECENT_HIT_SECS)
+            .count();
+        assert!(hour > 0 && hour < ledger.recent.len());
+        assert_eq!(compact.recent.len(), hour);
+        assert_eq!(compact.call_stats(), ledger.call_stats());
+        let (before, after) = (report_of(&[&ledger]), report_of(&[&compact]));
+        assert_eq!(before.lines(), after.lines());
+        // Later, as the hour moves on, the same file answers like the full one.
+        for later in [now + 600, now + 3000] {
+            assert_eq!(
+                before.cache_hit_since(later - RECENT_HIT_SECS),
+                after.cache_hit_since(later - RECENT_HIT_SECS)
+            );
+        }
+        assert_eq!(compact.compacted(now), compact);
+        assert_eq!(Ledger::default().compacted(now), Ledger::default());
     }
 }

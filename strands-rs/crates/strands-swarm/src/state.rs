@@ -17,6 +17,34 @@ use strands_agents::{Error, Result};
 pub const STATE_FILE: &str = "swarm.json";
 /// Directory of per-agent sessions inside a run directory.
 pub const SESSIONS_DIR: &str = "sessions";
+/// A cancelled agent's full task, in its session directory ([`archive_task`]).
+pub const TASK_FILE: &str = "task.md";
+/// Characters of a cancelled agent's task that stay in `swarm.json` once the file holds it all.
+pub const TASK_PREFIX_CHARS: usize = 500;
+
+/// `task` cut to [`TASK_PREFIX_CHARS`] characters, with `…` after a cut one. Cutting the result
+/// again changes nothing.
+pub fn task_prefix(task: &str) -> String {
+    match task.char_indices().nth(TASK_PREFIX_CHARS) {
+        Some((end, _)) => format!("{}…", &task[..end]),
+        None => task.to_owned(),
+    }
+}
+
+/// Keep `task` whole in `sessions/<id>/task.md` (unless [`task_prefix`] is all of it), so that
+/// `swarm.json` can hold only the prefix. Whether it did: a task that is all prefix needs no file.
+pub fn archive_task(sessions: &Path, id: &str, task: &str) -> std::io::Result<bool> {
+    if task_prefix(task) == task {
+        return Ok(false);
+    }
+    crate::files::replace(&sessions.join(id).join(TASK_FILE), task.as_bytes(), false).map(|()| true)
+}
+
+/// The task of an agent saved with `task_archived`: the file's, or `prefix` if it is gone (the
+/// session was removed, [`AgentState::conversation_removed`]).
+pub fn load_task(sessions: &Path, id: &str, prefix: String) -> String {
+    std::fs::read_to_string(sessions.join(id).join(TASK_FILE)).unwrap_or(prefix)
+}
 
 /// Persisted swarm.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,9 +141,14 @@ pub struct AgentState {
     /// The part of `input_tokens` written to the prompt cache.
     #[serde(default)]
     pub cache_write_tokens: u64,
-    /// Tokens by model and recent calls, for cost estimates (empty for runs saved before).
+    /// Tokens by model and recent calls, for cost estimates (empty for runs saved before). A
+    /// cancelled agent's is [`crate::cost::Ledger::compacted`].
     #[serde(default, skip_serializing_if = "crate::cost::Ledger::is_empty")]
     pub ledger: crate::cost::Ledger,
+    /// Whether `task` is only the first [`TASK_PREFIX_CHARS`] of it, the rest being in
+    /// [`TASK_FILE`] ([`archive_task`]). Only cancelled agents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub task_archived: bool,
     /// Context window utilization of the last model call (`0..1+`), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<f64>,

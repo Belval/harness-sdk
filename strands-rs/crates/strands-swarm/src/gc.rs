@@ -769,6 +769,7 @@ mod tests {
             workdir: None,
             branch: branch.map(str::to_owned),
             task: String::new(),
+            task_archived: false,
             model: None,
             goal: None,
             status: status.into(),

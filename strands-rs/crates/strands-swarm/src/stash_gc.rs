@@ -122,8 +122,8 @@ impl Names {
                     }
                     continue;
                 }
-                // Another process's half-written replacement.
-                if name.to_string_lossy().contains(".tmp-") {
+                // Another process's half-written replacement, or a cancelled agent's task.
+                if name.to_string_lossy().contains(".tmp-") || name == crate::state::TASK_FILE {
                     continue;
                 }
                 let json: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;

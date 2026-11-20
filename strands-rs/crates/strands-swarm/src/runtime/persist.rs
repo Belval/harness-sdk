@@ -39,6 +39,7 @@ impl Swarm {
             swarm.restore_agent(agent);
         }
         swarm.prune_cancelled_sessions().await;
+        swarm.archive_old_tasks().await;
         swarm.publish_cancelled_history();
         // Fires missed while the run was down are due now: each fires once.
         if !state.schedules.is_empty() {
@@ -53,6 +54,58 @@ impl Swarm {
         swarm.watch_jobs();
         swarm.watch_dormant();
         Ok((swarm, events))
+    }
+
+    /// Keep the whole task of cancelled `node` in its session directory, so that `swarm.json`
+    /// can hold only its prefix ([`AgentState::task_archived`]). Left as it was if that fails.
+    pub(super) fn archive_task(&self, node: &Node) {
+        let Some(dir) = &self.inner.config.state_dir else {
+            return;
+        };
+        if node.task_archived.load(Ordering::SeqCst) {
+            return;
+        }
+        let sessions = dir.join(SESSIONS_DIR);
+        match crate::state::archive_task(&sessions, &node.id, &node.task) {
+            Ok(archived) => node.task_archived.store(archived, Ordering::SeqCst),
+            Err(error) => tracing::warn!(agent = %node.id, %error, "cannot save a cancelled agent's task"),
+        }
+    }
+
+    /// On resume, [`Swarm::archive_task`] for the cancelled agents of runs saved before. One
+    /// whose session was removed has nothing to keep it in, so it keeps its prefix. A cancel time
+    /// never recorded is taken from the session directory first, as the file would change it.
+    async fn archive_old_tasks(&self) {
+        let nodes: Vec<Arc<Node>> = self
+            .nodes()
+            .into_iter()
+            .filter(|node| {
+                *node.status.lock() == AgentStatus::Cancelled && !node.task_archived.load(Ordering::SeqCst)
+            })
+            .collect();
+        let Some(dir) = self.inner.config.state_dir.clone() else {
+            return;
+        };
+        if nodes.is_empty() {
+            return;
+        }
+        let swarm = self.clone();
+        let now = self.now().timestamp();
+        let _ = tokio::task::spawn_blocking(move || {
+            for node in nodes {
+                if node.conversation_removed.load(Ordering::Relaxed) > 0 {
+                    node.task_archived.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                if node.cancelled_at.load(Ordering::Relaxed) == 0 {
+                    let at = super::retention::newest(&dir.join(SESSIONS_DIR).join(&node.id));
+                    let at = Some(at).filter(|at| *at > 0).unwrap_or(now);
+                    node.cancelled_at.store(at, Ordering::Relaxed);
+                }
+                swarm.archive_task(&node);
+            }
+        })
+        .await;
     }
 
     /// Cancelled agents get no actor on resume, so nothing restores their session. Read each
@@ -129,11 +182,21 @@ impl Swarm {
             true => self.worktree_env(&saved.id),
             false => saved.env,
         };
+        let sessions = self
+            .inner
+            .config
+            .state_dir
+            .as_ref()
+            .map(|dir| dir.join(SESSIONS_DIR));
+        let task = match (&sessions, saved.task_archived) {
+            (Some(sessions), true) => crate::state::load_task(sessions, &saved.id, saved.task),
+            _ => saved.task,
+        };
         let mut agents = self.inner.agents.lock();
         let taken = agents.values().map(|node| node.name.as_str());
         let node = Arc::new(Node {
             id: saved.id.clone(),
-            name: names::choose(saved.name.as_deref(), &saved.task, taken),
+            name: names::choose(saved.name.as_deref(), &task, taken),
             parent: saved.parent,
             workdir: crate::workdir::Workdir::new(saved.workdir.as_ref().unwrap_or(&saved.cwd)),
             cwd: saved.cwd,
@@ -141,7 +204,8 @@ impl Swarm {
             status: Mutex::new(status.clone()),
             mailbox: Mutex::new(mailbox),
             cancel,
-            task: saved.task,
+            task,
+            task_archived: AtomicBool::new(saved.task_archived),
             model: Mutex::new(saved.model),
             goal: saved.goal,
             env,
@@ -466,7 +530,12 @@ pub(super) fn node_state(node: &Node) -> AgentState {
     let model = node.model.lock().clone();
     let status = status_name(&node.status.lock()).to_owned();
     let mailbox = node.mailbox.lock().iter().map(mail_state).collect();
-    let ledger = node.ledger.lock().clone();
+    let cancelled = status == "cancelled";
+    let ledger = match cancelled {
+        true => node.ledger.lock().compacted(chrono::Utc::now().timestamp()),
+        false => node.ledger.lock().clone(),
+    };
+    let task_archived = cancelled && node.task_archived.load(Ordering::SeqCst);
     let context = *node.context.lock();
     let running_calls = node
         .tool_calls
@@ -481,7 +550,11 @@ pub(super) fn node_state(node: &Node) -> AgentState {
         cwd: node.cwd.clone(),
         workdir: Some(node.workdir.get()).filter(|dir| *dir != node.cwd),
         branch: node.branch.clone(),
-        task: node.task.clone(),
+        task: match task_archived {
+            true => crate::state::task_prefix(&node.task),
+            false => node.task.clone(),
+        },
+        task_archived,
         model,
         goal: node.goal.clone(),
         status,
