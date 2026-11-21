@@ -62,6 +62,7 @@ use actor::Start;
 pub use actor::SILENT_REPLY;
 use background::jobs_dir;
 use capacity::started;
+pub use capacity::BudgetChange;
 pub use disk::{
     free_space, inode_floor, FreeSpace, Space, DISK_CHECK_EVERY, DISK_SENDER, DISK_WARNED_FILE,
     LOW_DISK_CHECK_EVERY, MIN_FREE_INODES,

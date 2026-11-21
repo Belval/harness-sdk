@@ -440,8 +440,11 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             tokens => crate::text::parse_tokens(tokens).map(Some),
         }
         .map(|tokens| {
-            swarm.set_budget(tokens);
-            budget_notice(swarm)
+            let change = swarm.set_budget(tokens);
+            match change.applied() {
+                true => budget_notice(swarm),
+                false => change.report("the swarm"),
+            }
         })
         .map_err(strands_agents::Error::other),
         (Command::Remember(Some(text)), _) => swarm

@@ -486,6 +486,7 @@ where
 
 async fn spawn_tool(swarm: Swarm, me: String, input: SpawnInput, _ctx: ToolContext) -> Result<String> {
     let requested = input.name.clone();
+    let input_budget = input.budget_tokens;
     let request = SpawnRequest {
         task: input.task,
         name: Some(input.name),
@@ -504,15 +505,22 @@ async fn spawn_tool(swarm: Swarm, me: String, input: SpawnInput, _ctx: ToolConte
     if let Some(note) = crate::names::renamed(&requested, &info.name) {
         described.push_str(&format!(" ({note})"));
     }
+    // Its budget counts its descendants too, and `send_message` can change it later.
+    let budget = input_budget.map_or_else(String::new, |tokens| {
+        format!(
+            " Budget {} tokens, counting its descendants'.",
+            crate::text::compact(tokens)
+        )
+    });
     if info.status != AgentStatus::Queued {
         return Ok(format!(
-            "Spawned {described}. Its replies will arrive as messages."
+            "Spawned {described}. Its replies will arrive as messages.{budget}"
         ));
     }
     Ok(format!(
         "Queued {described}: the agent limit is reached, so it starts (and its replies \
          arrive as messages) once a slot frees. To free one, cancel an agent you no \
-         longer need, or cancel this one to drop it. {}",
+         longer need, or cancel this one to drop it.{budget} {}",
         idle_agents(&swarm)
     ))
 }
@@ -526,15 +534,20 @@ async fn send_tool(swarm: Swarm, me: String, input: SendInput, _ctx: ToolContext
             to.push(id);
         }
     }
-    let (mut sent, mut failed) = (Vec::new(), Vec::new());
+    let (mut sent, mut failed, mut budgets) = (Vec::new(), Vec::new(), Vec::new());
     for id in &to {
         let message = input.message.clone();
-        let raised = input
-            .budget_tokens
-            .map_or(Ok(()), |tokens| swarm.set_agent_budget(&me, id, Some(tokens)));
-        let posted = raised.and_then(|()| match input.wake {
-            true => swarm.send(&me, id, message),
-            false => swarm.send_fyi(&me, id, message),
+        let raised = input.budget_tokens.map_or(Ok(None), |tokens| {
+            swarm
+                .set_agent_budget(&me, id, Some(tokens))
+                .map(|change| Some(change.report(&swarm.label(id))))
+        });
+        let posted = raised.and_then(|note| {
+            budgets.extend(note);
+            match input.wake {
+                true => swarm.send(&me, id, message),
+                false => swarm.send_fyi(&me, id, message),
+            }
         });
         match posted {
             Ok(()) => sent.push(id),
@@ -552,6 +565,10 @@ async fn send_tool(swarm: Swarm, me: String, input: SendInput, _ctx: ToolContext
     let mut text = format!("Sent to {}.", labels.join(", "));
     if !failed.is_empty() {
         text = format!("{text} Not sent to {}", failed.join(" "));
+    }
+    // A refused budget still delivers the message; the sender learns why it was not set.
+    for note in &budgets {
+        text.push_str(&format!(" {note}."));
     }
     // An agent that reports to its parent mid-turn tends to end the turn by repeating the
     // report, which costs the parent a turn (and often the user a duplicate notification).

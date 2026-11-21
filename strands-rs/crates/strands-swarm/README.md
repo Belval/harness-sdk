@@ -300,6 +300,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     the agent itself may not). Agents it had stopped are told to continue; the message goes
     with that note, so one turn follows. A later `send_message` with a lower value lowers it
     again.
+  - The result of `spawn_agent`/`send_message` and the TUI's `/budget` state the outcome (`budget
+    of a849 set to 54M (41.5M used so far, 12.5M left)`). A budget at or below what is already
+    used is refused (`not set: a849 has already used 41.5M, …`), because it would stop the agent
+    at once, which `cancel_agent` does on purpose; the message is still delivered. This guards
+    against a parent "raising" a budget without knowing it counts the whole subtree's spend.
 - **Process memory.** The binary allocates with jemalloc, whose background threads return freed
   pages to the system within seconds, so the transient conversation copies of model calls and
   saves do not pin each thread's arena at its high-water mark. It is

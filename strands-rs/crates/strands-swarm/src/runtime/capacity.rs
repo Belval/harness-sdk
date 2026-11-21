@@ -2,6 +2,43 @@
 
 use super::*;
 
+/// The outcome of a token-budget change: what was asked for and what is already used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetChange {
+    /// The budget asked for; `None` lifts it.
+    pub requested: Option<u64>,
+    /// Tokens already used by the agent and its descendants (the swarm, for the swarm budget).
+    pub used: u64,
+}
+
+impl BudgetChange {
+    /// Whether the budget was changed. One at or below the tokens already used would stop the
+    /// agents it covers at once, which is what cancelling is for, so it is refused (and a
+    /// caller that wanted to raise a budget, but not knowing how much was spent, got it wrong,
+    /// finds out).
+    pub fn applied(&self) -> bool {
+        self.requested.is_none_or(|tokens| tokens > self.used)
+    }
+
+    /// The outcome in a sentence; `who` is `a849`, or `the swarm`.
+    pub fn report(&self, who: &str) -> String {
+        let used = crate::text::compact(self.used);
+        match self.requested {
+            None => format!("Budget of {who} lifted ({used} used so far)"),
+            Some(tokens) if self.applied() => format!(
+                "Budget of {who} set to {} ({used} used so far, {} left)",
+                crate::text::compact(tokens),
+                crate::text::compact(tokens - self.used)
+            ),
+            Some(tokens) => format!(
+                "Not set: {who} has already used {used}, so a {} budget would stop it at once; \
+                 give a budget above that (e.g. {used} + what {who} may still spend)",
+                crate::text::compact(tokens)
+            ),
+        }
+    }
+}
+
 impl Swarm {
     /// Start queued agents, oldest first, while there are free slots; queued agents in the
     /// priority lane start whatever the cap, and count toward it.
@@ -62,18 +99,29 @@ impl Swarm {
     }
 
     /// Set (or, with `None`, lift) the token budget. If that leaves budget to spend, every agent
-    /// that was stopped for lack of it is told to continue.
-    pub fn set_budget(&self, tokens: Option<u64>) {
+    /// that was stopped for lack of it is told to continue. A budget at or below what the swarm
+    /// has used would stop everyone at once, so it is refused ([`BudgetChange::applied`]).
+    pub fn set_budget(&self, tokens: Option<u64>) -> BudgetChange {
+        let change = BudgetChange {
+            requested: tokens,
+            used: self.tokens_used(),
+        };
+        if !change.applied() {
+            return change;
+        }
         *self.inner.budget.lock() = tokens;
         self.persist();
         self.emit(SwarmEvent::Budget { tokens });
         self.resume_stopped("The token budget", tokens);
+        change
     }
 
     /// Set (or lift) agent `id`'s own token budget, which `by` (an ancestor of `id`, or the
     /// user) is allowed to do; the budget covers `id` and its descendants. Agents it had
-    /// stopped that now have budget left are told to continue.
-    pub fn set_agent_budget(&self, by: &str, id: &str, tokens: Option<u64>) -> Result<()> {
+    /// stopped that now have budget left are told to continue. A budget at or below what `id` and
+    /// its descendants have used would stop it at once, so it is refused and nothing changes
+    /// ([`BudgetChange::applied`]); `cancel_agent` is the way to stop an agent.
+    pub fn set_agent_budget(&self, by: &str, id: &str, tokens: Option<u64>) -> Result<BudgetChange> {
         let node = self.known(id)?;
         let mut parent = node.parent.clone();
         while by != USER && parent != by {
@@ -87,11 +135,18 @@ impl Swarm {
                 }
             };
         }
+        let change = BudgetChange {
+            requested: tokens,
+            used: self.subtree_tokens(id),
+        };
+        if !change.applied() {
+            return Ok(change);
+        }
         *node.budget.lock() = tokens;
         self.persist();
         self.journal_event("agent_budget", serde_json::json!({ "id": id, "tokens": tokens }));
         self.resume_stopped(&format!("The token budget of {id}"), tokens);
-        Ok(())
+        Ok(change)
     }
 
     /// Tell each agent stopped for lack of budget that can run again to continue.

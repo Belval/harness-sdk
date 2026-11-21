@@ -609,6 +609,18 @@ async fn budget_shows_usage_just_over_it_as_over_budget() {
         shown.contains("1.3M tokens used, over the 1.2M budget"),
         "{shown}"
     );
+
+    // A budget at or below the spend would stop everyone at once: refused, the old one stays.
+    screen.type_line(&swarm, &mut app, "/budget 1M").await;
+    let notice = app.notice.clone().unwrap();
+    assert!(
+        notice.starts_with("Not set: the swarm has already used 1.3M") && notice.contains("a 1.0M budget"),
+        "{notice}"
+    );
+    assert_eq!(swarm.budget(), Some(1_240_000));
+    screen.type_line(&swarm, &mut app, "/budget 5M").await;
+    assert_eq!(app.notice.as_deref(), Some("1.3M of 5.0M tokens used"));
+    assert_eq!(swarm.budget(), Some(5_000_000));
     swarm.shutdown().await;
 }
 

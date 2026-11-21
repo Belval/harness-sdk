@@ -3609,6 +3609,89 @@ async fn an_agents_budget_counts_its_descendants_and_stops_them_until_its_parent
     swarm.shutdown().await;
 }
 
+/// A parent who "raises" a child's budget without knowing the subtree's spend so far must not
+/// stop it at once: the change is refused with the numbers, and the message is still delivered.
+#[tokio::test]
+async fn a_budget_at_or_below_spend_is_refused_with_the_numbers_and_the_message_still_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call(
+                        "spawn_agent",
+                        "s1",
+                        json!({"task": "t", "name": "capped", "budget_tokens": 100}),
+                    ),
+                    say("spawned"),
+                    tool_call(
+                        "send_message",
+                        "m1",
+                        json!({"to": "a2", "message": "go on", "budget_tokens": 50}),
+                    ),
+                    tool_call(
+                        "send_message",
+                        "m2",
+                        json!({"to": "a2", "message": "again", "budget_tokens": 2000}),
+                    ),
+                    say("done"),
+                ],
+            ),
+            (
+                "a2",
+                vec![
+                    MockResponse::with_usage(Message::assistant("spent"), usage(40, 0, 10)),
+                    say("heard first"),
+                    say("heard second"),
+                ],
+            ),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "spawned");
+    let spawned = sent_text(&scripts.lock()["a1"], 1);
+    assert!(
+        spawned.contains("Budget 100 tokens, counting its descendants"),
+        "{spawned}"
+    );
+    eventually("the capped agent spent 50", || swarm.subtree_tokens("a2") == 50).await;
+
+    swarm.send(USER, "a1", "raise it").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    let a2 = scripts.lock()["a2"].clone();
+    eventually("a2 heard both messages", || {
+        a2.call_count() >= 2 && sent_text(&a2, a2.call_count() - 1).contains("again")
+    })
+    .await;
+    let a1 = scripts.lock()["a1"].clone();
+    let refused = sent_text(&a1, 3);
+    assert!(
+        refused.contains("Not set: capped (a2) has already used 50")
+            && refused.contains("50 budget would stop it at once")
+            && refused.contains("give a budget above that"),
+        "{refused}"
+    );
+    let heard = sent_text(&a2, a2.call_count() - 1);
+    assert!(heard.contains("go on"), "delivered although refused: {heard}");
+    assert!(
+        heard.contains("again") && !heard.contains("The token budget of"),
+        "an agent that was never stopped is not told about budgets: {heard}"
+    );
+    let set = sent_text(&a1, 4);
+    assert!(
+        set.contains("Budget of capped (a2) set to 2.0k (50 used so far, 1.9k left)"),
+        "{set}"
+    );
+    assert_eq!(swarm.agent("a2").unwrap().budget, Some(2_000));
+    assert!(!matches!(
+        swarm.agent("a2").unwrap().status,
+        AgentStatus::Errored(_)
+    ));
+    swarm.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_spawn_budget_shows_in_list_agents_and_survives_a_resume() {
     let dir = tempfile::tempdir().unwrap();
