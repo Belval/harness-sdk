@@ -35,8 +35,10 @@ fn truncate(output: &str, max_chars: usize, message: &str) -> String {
         .char_indices()
         .nth(max_chars)
         .map_or(output.len(), |(index, _)| index);
-    // `lastIndexOf('\n', maxChars)` also accepts a newline at `max_chars` itself.
-    let window = &output[..(limit + 1).min(output.len())];
+    // `lastIndexOf('\n', maxChars)` also accepts a newline at `max_chars` itself, so the window
+    // takes the whole char at `limit` (which may be several bytes).
+    let at_limit = output[limit..].chars().next().map_or(0, char::len_utf8);
+    let window = &output[..limit + at_limit];
     let end = match window.rfind('\n') {
         Some(cut) if cut > 0 => cut,
         _ => limit,
@@ -329,5 +331,27 @@ mod tests {
             assert!(result.contains("output truncated") && result.contains("{\"key\":\""));
         }
         assert!(!search_content("short\ncontent", &range(1, 2), MAX).contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_cuts_on_char_boundaries() {
+        // A multi-byte char at `max_chars` itself, with no newline: cut before it.
+        let text = format!("{}✓✓✓", "a".repeat(9));
+        assert_eq!(truncate(&text, 10, "cut"), format!("{}✓\n\n[cut]", "a".repeat(9)));
+        // Multi-byte chars on both sides of the boundary, cut at the last newline.
+        let text = "✓✓✓\n✓✓✓✓✓✓✓✓";
+        assert_eq!(truncate(text, 6, "cut"), "✓✓✓\n\n[cut]");
+        // A newline at `max_chars` itself counts, as `lastIndexOf('\n', maxChars)` does.
+        let text = "✓✓✓✓\n✓✓";
+        assert_eq!(truncate(text, 4, "cut"), "✓✓✓✓\n\n[cut]");
+        // Through `search_content`, with '✓' straddling the byte past the char limit.
+        let text = (1..=200)
+            .map(|i| format!("✓ step {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for max in 1..120 {
+            let result = search_content(&text, &range(1, 200), max);
+            assert!(result.contains("output truncated"), "{result}");
+        }
     }
 }
