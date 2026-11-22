@@ -90,7 +90,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   the swarm prints and a name as the spawner wrote it (`Fix-P12` for `fix-p12`).
 - **Replies.** Each agent's final reply per turn goes to its parent. Mail that arrives mid-turn is
   appended to the next tool result. A reply that is empty or just `[silent]` (e.g. a scheduled poll
-  that found nothing) reaches no agent parent; the user's root always replies. A `send_message` to
+  that found nothing) reaches no agent parent. A root's reply to a turn the user started (their
+  message, command or task) is always delivered, even one that says `[silent]`; a root woken by
+  anything else (child mail, a schedule, a job, a due todo) may end with `[silent]` and then
+  nothing reaches the user (no bell, no reply mail), and the TUI shows a dim `(nothing to
+  report)` for it. Roots are told so in their system prompt. A `send_message` to
   an agent's parent says so in its result, as agents that report mid-turn tend to repeat the report
   as their final reply, which costs the parent a turn.
 - **FYI mail.** Every wake costs the receiver a whole turn, its context re-sent. `send_message`

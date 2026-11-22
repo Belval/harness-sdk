@@ -50,6 +50,9 @@ impl Swarm {
             .map(|node| node.mailbox.lock().drain(..).collect())
             .unwrap_or_default();
         if !mail.is_empty() {
+            if let Some(node) = self.node(id).filter(|_| mail.iter().any(|m| m.from == USER)) {
+                node.user_asked.store(true, Ordering::SeqCst);
+            }
             self.persist();
             self.emit(SwarmEvent::MailRead { id: id.to_owned() });
         }

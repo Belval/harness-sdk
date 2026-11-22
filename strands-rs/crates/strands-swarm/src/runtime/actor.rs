@@ -128,8 +128,17 @@ impl Swarm {
         self.emit_model(&node);
 
         let mut input = match start {
-            Start::Fresh(task) => Some(InvokeInput::Text(task)),
-            Start::Resume { interrupted, ran } => self.resume_input(&node, &agent, interrupted, &ran).await,
+            Start::Fresh(task) => {
+                // A root's task is the user's.
+                node.user_asked.store(node.parent == USER, Ordering::SeqCst);
+                Some(InvokeInput::Text(task))
+            }
+            Start::Resume { interrupted, ran } => {
+                let input = self.resume_input(&node, &agent, interrupted, &ran).await;
+                // Whose words the interrupted turn answered is not saved: deliver its reply.
+                node.user_asked.fetch_or(interrupted, Ordering::SeqCst);
+                input
+            }
         };
         let mut backoff = RETRY_INITIAL;
         // Failed turns in a row that the agent retried on its own, and when the first started.
@@ -267,6 +276,7 @@ impl Swarm {
             // Interrupted: the SDK has already closed any open tool call, so the conversation
             // continues cleanly with the next message. No retry, even with a goal.
             node.paused.store(true, Ordering::SeqCst);
+            node.user_asked.store(false, Ordering::SeqCst);
             let _ = self.post(&node.id, &node.parent, "interrupted", INTERRUPTED_TEXT.to_owned());
             self.set_status(node, AgentStatus::Idle);
             return None;
@@ -280,8 +290,10 @@ impl Swarm {
             return Some(message);
         }
         let reply = reply.unwrap_or_default();
-        // The user sees replies as streamed text anyway, and headless runs wait for one.
-        if node.parent == USER || !is_silent(&reply) {
+        // The user's own words always get their reply (headless runs wait for it); a root's turn
+        // that something else started ends quietly when it says so, like an agent's.
+        let asked = node.user_asked.swap(false, Ordering::SeqCst);
+        if (node.parent == USER && asked) || !is_silent(&reply) {
             let _ = self.post(&node.id, &node.parent, "reply", reply);
             node.dormancy.lock().replied = true;
         }
@@ -523,10 +535,13 @@ impl Swarm {
             .get("CARGO_TARGET_DIR")
             .map(|dir| format!(" Your commands run with `CARGO_TARGET_DIR={dir}`, private to this worktree (the first build starts from scratch)."))
             .unwrap_or_default();
-        let silent = match node.parent == USER {
-            true => String::new(),
+        // The user's root has its own wording, so the sentence stays within the pinned prefix.
+        let delivery = match node.parent == USER {
+            true => format!(
+                "Your final reply goes to the user; end a turn they didn't start with just `{SILENT_REPLY}` if nothing is for them."
+            ),
             false => format!(
-                " When there is nothing worth telling them (e.g. a poll found no change), end with just `{SILENT_REPLY}` and nothing is sent."
+                "Your final reply at the end of each turn is delivered to {reports_to}. When there is nothing worth telling them (e.g. a poll found no change), end with just `{SILENT_REPLY}` and nothing is sent."
             ),
         };
         let swarm = format!(
@@ -536,7 +551,7 @@ impl Swarm {
              Within one turn, file, shell, job and agent-tool calls run one after another in your order (an \
              `edit`, then the test that needs it); MCP tools, `web_fetch` and `skills` start at once.\n\
              Messages from other agents reach you as `<message from=\"...\">` blocks, either appended to a \
-             tool result or as a new turn. Your final reply at the end of each turn is delivered to {reports_to}.{silent}",
+             tool result or as a new turn. {delivery}",
             node.workdir.get().display()
         );
         match goal {

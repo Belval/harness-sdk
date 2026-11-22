@@ -435,11 +435,51 @@ async fn a_silent_or_empty_final_reply_reaches_no_agent_parent() {
         prompt.contains("end with just `[silent]` and nothing is sent"),
         "{prompt}"
     );
-    let root = scripts.lock()["a1"].clone();
+    let root = system_prompt(&scripts.lock()["a1"].clone(), 0);
     assert!(
-        !system_prompt(&root, 0).contains("[silent]"),
-        "the user's root has no parent agent"
+        root.contains("a turn they didn't start with just `[silent]`"),
+        "{root}"
     );
+    assert!(!root.contains("and nothing is sent"), "{root}");
+}
+
+#[tokio::test]
+async fn a_root_woken_by_mail_may_end_silent_but_the_users_own_message_always_gets_its_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    say("ok"),
+                    say("[silent]"),
+                    say("[silent] but 2 + 2 is 4"),
+                    say("[silent]"),
+                ],
+            ),
+            (
+                "a2",
+                vec![
+                    tool_call("send_message", "t1", json!({"to": "parent", "message": "ping"})),
+                    say("[silent]"),
+                ],
+            ),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "ok");
+    spawn_child(&swarm, "a1", "work").await;
+    let root = scripts.lock()["a1"].clone();
+    eventually("the root answered the child's mail", || root.call_count() == 2).await;
+    wait_for_status(&swarm, "a1", AgentStatus::Idle).await;
+    wait_for_status(&swarm, "a2", AgentStatus::Idle).await;
+    // Nothing reached the user for the silent turn: the first reply after "ok" is the next one.
+    swarm.send(USER, "a1", "what is 2 + 2?").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "[silent] but 2 + 2 is 4");
+    // A turn the user started that is just the marker still delivers it: never hide an answer.
+    swarm.send(USER, "a1", "anything?").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "[silent]");
 }
 
 #[tokio::test]

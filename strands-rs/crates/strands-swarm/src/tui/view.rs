@@ -726,6 +726,12 @@ pub fn plain_log(view: &AgentView) -> String {
 fn entry_lines(entry: &LogEntry) -> Vec<Line<'static>> {
     match entry {
         LogEntry::Task(task) => block_lines("▶ task", task, Color::Blue),
+        // A turn that ended with just the marker has nothing to say: one dim line, no blank after
+        // it, so a coordinator woken by mail all day does not fill its log. It stays visible
+        // (never hidden) because a turn the user started delivers even that.
+        LogEntry::Text(text) if text.trim() == crate::runtime::SILENT_REPLY => {
+            vec![Line::styled("(nothing to report)", Style::new().dim())]
+        }
         LogEntry::Text(text) => text
             .lines()
             .map(|l| Line::raw(l.to_owned()))
@@ -1214,6 +1220,21 @@ mod tests {
         assert!(!screen.contains('\u{a0}'), "the glue renders as spaces");
         let plain = plain_log(&app.agents["a1"]);
         assert!(plain.contains(&format!("✗ read {path}")), "{plain}");
+    }
+
+    #[test]
+    fn a_turn_that_ended_with_just_the_silent_marker_is_one_dim_line_and_other_text_shows_whole() {
+        let mut app = app_with_an_image(None);
+        let log = &mut app.agents.get_mut("a1").unwrap().log;
+        log.clear();
+        for text in ["[silent]\n", "[silent] but here is the answer"] {
+            log.push_back(LogEntry::Text(text.into()));
+        }
+        let plain = plain_log(&app.agents["a1"]);
+        assert!(
+            plain.ends_with("(nothing to report)\n[silent] but here is the answer\n\n"),
+            "{plain}"
+        );
     }
 
     #[test]

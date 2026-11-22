@@ -779,6 +779,9 @@ struct Node {
     turn: Mutex<Option<CancellationToken>>,
     /// Interrupted by the user and not messaged since: a goal agent does not resume on restart.
     paused: AtomicBool,
+    /// The user's words (a message, a command, the task) reached this agent's model since its
+    /// last reply was settled: that reply is delivered even when it says `[silent]`.
+    user_asked: AtomicBool,
     /// Idle with nothing to wake it ([`Swarm::sweep_dormant`]).
     dormancy: Mutex<crate::state::Dormancy>,
     /// What each `wait` in progress awaits (empty: its children), for [`Swarm::sweep_dormant`].
