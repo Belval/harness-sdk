@@ -804,6 +804,7 @@ mod tests {
             task_flag: None,
             max_agents: None,
             max_calls: None,
+            mail_settle: None,
             max_load: None,
             min_free_mem: None,
             priority: None,

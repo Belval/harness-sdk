@@ -7412,3 +7412,95 @@ async fn the_dormant_mark_and_its_fyi_survive_a_resume() {
     );
     swarm.shutdown().await;
 }
+
+/// A root `a1` that spawns children `c1..c3` and ends its turn, then answers `turns` more times;
+/// `a2`, `a3` and `a4` reply after one, two and three seconds.
+fn settle_scripts(turns: usize) -> Vec<(&'static str, Vec<MockResponse>)> {
+    let spawn = |n: u32| {
+        tool_call(
+            "spawn_agent",
+            &format!("s{n}"),
+            json!({"task": "t", "name": format!("c{n}")}),
+        )
+    };
+    let mut root = vec![spawn(1), spawn(2), spawn(3), say("spawned")];
+    root.extend((0..turns).map(|n| say(&format!("answer {n}"))));
+    vec![
+        ("a1", root),
+        ("a2", slow_child(1, "first")),
+        ("a3", slow_child(2, "second")),
+        ("a4", slow_child(3, "third")),
+    ]
+}
+
+fn settle_swarm(secs: u64, turns: usize, dir: &Path) -> (Swarm, UnboundedReceiver<SwarmEvent>, Scripts) {
+    let scripts = scripts_of(settle_scripts(turns));
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir);
+    config.mail_settle = Duration::from_secs(secs);
+    let (swarm, events) = Swarm::new(config);
+    (swarm, events, scripts)
+}
+
+#[tokio::test(start_paused = true)]
+async fn child_replies_within_the_settle_window_start_one_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, _events, scripts) = settle_swarm(10, 3, dir.path());
+    spawn_root(&swarm, "go").await;
+    let root = scripts.lock()["a1"].clone();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The first reply is in, and the turn it wakes waits for the rest.
+    assert_eq!(root.calls().len(), 4);
+    assert!(swarm.waking_in("a1").is_some());
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(root.calls().len(), 5, "one turn for three replies");
+    assert_eq!(swarm.waking_in("a1"), None);
+    let seen = sent_text(&root, 4);
+    for reply in ["first", "second", "third"] {
+        assert!(seen.contains(reply), "{seen}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_settle_window_wakes_for_every_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, _events, scripts) = settle_swarm(0, 3, dir.path());
+    spawn_root(&swarm, "go").await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(
+        scripts.lock()["a1"].calls().len(),
+        7,
+        "a turn for each of three replies"
+    );
+    assert_eq!(swarm.waking_in("a1"), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_users_mail_ends_the_settle_window_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, _events, scripts) = settle_swarm(30, 3, dir.path());
+    spawn_root(&swarm, "go").await;
+    let root = scripts.lock()["a1"].clone();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(swarm.waking_in("a1").is_some());
+    assert_eq!(root.calls().len(), 4);
+    swarm.send(USER, "a1", "hurry").unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(root.calls().len(), 5, "the user's mail did not wait");
+    let seen = sent_text(&root, 4);
+    assert!(seen.contains("hurry") && seen.contains("first"), "{seen}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn settle_never_delays_the_user_mail_that_wakes_an_idle_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, _events, scripts) = settle_swarm(30, 3, dir.path());
+    spawn_root(&swarm, "go").await;
+    let root = scripts.lock()["a1"].clone();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The children are still working, and the root is idle with nothing unread.
+    assert_eq!(root.calls().len(), 4);
+    swarm.send(USER, "a1", "status?").unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(root.calls().len(), 5);
+    assert_eq!(swarm.waking_in("a1"), None);
+}

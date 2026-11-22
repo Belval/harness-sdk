@@ -16,6 +16,7 @@ impl Swarm {
         swarm.inner.next_id.store(state.next_id, Ordering::SeqCst);
         *swarm.inner.max_agents.lock() = state.max_agents;
         *swarm.inner.max_calls.lock() = state.max_calls;
+        *swarm.inner.mail_settle.lock() = state.mail_settle;
         *swarm.inner.host.max_load.lock() = state.max_load;
         *swarm.inner.host.min_free_mem.lock() = state.min_free_mem;
         *swarm.inner.priority.lock() = state.priority.clone();
@@ -203,6 +204,7 @@ impl Swarm {
             branch: saved.branch,
             status: Mutex::new(status.clone()),
             mailbox: Mutex::new(mailbox),
+            settling: Mutex::new(None),
             cancel,
             task,
             task_archived: AtomicBool::new(saved.task_archived),
@@ -262,6 +264,7 @@ impl Swarm {
             task_flag: self.inner.config.task_flag.clone(),
             max_agents: *self.inner.max_agents.lock(),
             max_calls: *self.inner.max_calls.lock(),
+            mail_settle: *self.inner.mail_settle.lock(),
             max_load: *self.inner.host.max_load.lock(),
             min_free_mem: *self.inner.host.min_free_mem.lock(),
             priority: self.inner.priority.lock().clone(),

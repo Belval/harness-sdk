@@ -48,6 +48,7 @@ impl Swarm {
                     git: cache.branches.get(&node.id).cloned(),
                     quiet,
                     dormant,
+                    waking: self.waking_in(&node.id),
                     todos: todos.unwrap_or_default(),
                     background,
                     schedules: schedules

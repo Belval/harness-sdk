@@ -108,6 +108,67 @@ impl Swarm {
         self.wait_until(id, from, cancel, take, give_up).await
     }
 
+    /// The mail settle window in force: the last [`Swarm::set_mail_settle`], else the config's.
+    pub fn mail_settle(&self) -> Duration {
+        match *self.inner.mail_settle.lock() {
+            Some(secs) => Duration::from_secs(secs),
+            None => self.inner.config.mail_settle,
+        }
+    }
+
+    /// Change the mail settle window in seconds (`None`: back to the config's, `Some(0)`: none).
+    pub fn set_mail_settle(&self, secs: Option<u64>) {
+        *self.inner.mail_settle.lock() = secs;
+        self.persist();
+        self.journal_event(
+            "mail_settle",
+            serde_json::json!({ "secs": self.mail_settle().as_secs() }),
+        );
+    }
+
+    /// Before an idle agent's turn starts on mail: let more agent mail arrive, so that one turn
+    /// answers a burst instead of one report each. The window ([`Swarm::mail_settle`]) is fixed
+    /// from the first mail and only applies while a child is still working, since otherwise
+    /// nothing more is coming. The user's mail ends it (it is never made to wait), as does
+    /// cancelling the agent.
+    pub(super) async fn settle_mail(&self, node: &Node) {
+        let window = self.mail_settle();
+        if window.is_zero() || has_user_mail(node) || !self.has_working_child(&node.id) {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + window;
+        *node.settling.lock() = Some(deadline);
+        loop {
+            let notified = node.notify.notified();
+            if has_user_mail(node) {
+                break;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = node.cancel.cancelled() => break,
+            }
+        }
+        node.settling.lock().take();
+    }
+
+    /// How long until `id`'s turn starts, while it lets mail settle ([`Swarm::settle_mail`]).
+    pub fn waking_in(&self, id: &str) -> Option<Duration> {
+        let deadline = (*self.node(id)?.settling.lock())?;
+        Some(deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    /// Whether one of `id`'s children is starting, queued or running: more of its mail may come.
+    fn has_working_child(&self, id: &str) -> bool {
+        let agents = self.inner.agents.lock();
+        agents.values().filter(|node| node.parent == id).any(|node| {
+            matches!(
+                *node.status.lock(),
+                AgentStatus::Starting | AgentStatus::Queued | AgentStatus::Running
+            )
+        })
+    }
+
     /// Whether `id` has unread mail from one of `from` (from anyone when empty).
     pub fn has_mail_from(&self, id: &str, from: &[String]) -> bool {
         self.node(id).is_some_and(|node| has_matching_mail(&node, from))
@@ -319,6 +380,13 @@ impl Swarm {
                 Ok(())
             });
     }
+}
+
+fn has_user_mail(node: &Node) -> bool {
+    node.mailbox
+        .lock()
+        .iter()
+        .any(|mail| mail.wakes() && mail.from == USER)
 }
 
 pub(super) fn has_matching_mail(node: &Node, filter: &[String]) -> bool {

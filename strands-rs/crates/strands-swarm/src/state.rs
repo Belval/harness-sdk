@@ -75,6 +75,9 @@ pub struct SwarmState {
     /// Model-call limit set at runtime (`0`: none), overriding `--max-concurrent-calls`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_calls: Option<usize>,
+    /// Mail settle window in seconds set at runtime (`0`: none), overriding `--mail-settle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail_settle: Option<u64>,
     /// Host load limit set at runtime (`0`: none), overriding `--max-load`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_load: Option<f64>,

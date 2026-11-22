@@ -145,6 +145,8 @@ pub enum Command {
     MaxAgents(Option<String>),
     /// `/max-calls [N|default]`: show or change the model-call limit (`0`: none).
     MaxCalls(Option<String>),
+    /// `/mail-settle [SECS|default]`: show or change the mail settle window (`0`: none).
+    MailSettle(Option<String>),
     /// `/max-load [N|off|default]`: show or change the host load limit.
     MaxLoad(Option<String>),
     /// `/min-free-mem [SIZE|off|default]`: show or change the free-memory floor.
@@ -212,9 +214,10 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         });
     }
     // The limits: alone they show the limit, with an argument they set it.
-    let limits: [(&str, LimitCommand); 6] = [
+    let limits: [(&str, LimitCommand); 7] = [
         ("/max-agents", Command::MaxAgents),
         ("/max-calls", Command::MaxCalls),
+        ("/mail-settle", Command::MailSettle),
         ("/max-load", Command::MaxLoad),
         ("/min-free-mem", Command::MinFreeMem),
         ("/priority", Command::Priority),
@@ -253,6 +256,18 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_the_mail_settle_command() {
+        assert_eq!(
+            parse_command("/mail-settle", true),
+            Some(Command::MailSettle(None))
+        );
+        assert_eq!(
+            parse_command("/mail-settle 30", true),
+            Some(Command::MailSettle(Some("30".into())))
+        );
+    }
 
     #[test]
     fn parses_the_image_command() {

@@ -411,6 +411,14 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             swarm.set_max_calls(limit);
             max_calls_notice(swarm)
         }),
+        (Command::MailSettle(None), _) => Ok(mail_settle_notice(swarm)),
+        (Command::MailSettle(Some(arg)), _) => limit_arg(&arg, None, |n| {
+            n.parse().map_err(|_| format!("Not a number of seconds: {n}"))
+        })
+        .map(|secs| {
+            swarm.set_mail_settle(secs);
+            mail_settle_notice(swarm)
+        }),
         (Command::MaxLoad(None), _) => Ok(max_load_notice(swarm)),
         (Command::MaxLoad(Some(arg)), _) => limit_arg(&arg, Some(0.0), |n| {
             let load = n.parse().ok().filter(|load: &f64| *load >= 0.0);
@@ -537,6 +545,13 @@ fn max_calls_notice(swarm: &Swarm) -> String {
     match swarm.max_calls() {
         0 => format!("model calls unlimited ({calls} in flight)"),
         limit => format!("up to {limit} model calls at once ({calls} in flight)"),
+    }
+}
+
+fn mail_settle_notice(swarm: &Swarm) -> String {
+    match swarm.mail_settle().as_secs() {
+        0 => "agents start a turn at once on agent mail".to_owned(),
+        secs => format!("agents with working children wait up to {secs}s for more mail before a turn"),
     }
 }
 

@@ -202,6 +202,8 @@ pub struct AgentReport {
     pub quiet: Option<Duration>,
     /// How long it has been idle with nothing to wake it ([`dormant_note`]).
     pub dormant: Option<Duration>,
+    /// Time until its turn starts, while it lets mail settle ([`crate::Swarm::mail_settle`]).
+    pub waking: Option<Duration>,
     /// Its todo list.
     pub todos: Vec<TodoItem>,
     /// Running background jobs: `tool (age)`.
@@ -286,6 +288,9 @@ impl StatusReport {
             }
             if let Some(note) = agent.quiet.and_then(quiet_note) {
                 head.push_str(&format!(" · {note}"));
+            }
+            if let Some(waking) = agent.waking {
+                head.push_str(&format!(" · waking in {}", crate::schedule::human(waking)));
             }
             if let Some(note) = agent.dormant.and_then(dormant_note) {
                 head.push_str(&format!(" · {note}"));
@@ -681,6 +686,7 @@ mod tests {
                 git: None,
                 quiet: None,
                 dormant: None,
+                waking: None,
                 todos,
                 background: vec![],
                 schedules: vec![],
@@ -755,6 +761,7 @@ mod tests {
             git: None,
             quiet: Some(Duration::from_secs(60)),
             dormant: None,
+            waking: None,
             todos: vec![],
             background: vec![],
             schedules: vec![],
@@ -797,6 +804,7 @@ mod tests {
                     }),
                     quiet: None,
                     dormant: None,
+                    waking: None,
                     todos: vec![
                         todo("Test", TodoStatus::Completed),
                         todo("Commit", TodoStatus::InProgress),
@@ -815,6 +823,7 @@ mod tests {
                     git: Some(BranchState::default()),
                     quiet: None,
                     dormant: None,
+                    waking: None,
                     todos: vec![],
                     background: vec![],
                     schedules: vec![],
@@ -857,6 +866,7 @@ mod tests {
                 git: None,
                 quiet: None,
                 dormant: None,
+                waking: None,
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],
@@ -1024,6 +1034,7 @@ mod tests {
                 git: Some(state.clone()),
                 quiet: None,
                 dormant: None,
+                waking: None,
                 todos: vec![],
                 background: vec![],
                 schedules: vec![],

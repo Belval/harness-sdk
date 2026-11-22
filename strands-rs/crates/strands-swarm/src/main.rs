@@ -56,6 +56,11 @@ struct Cli {
     /// Maximum number of model calls in flight across the swarm; more queue. 0 means no limit.
     #[arg(long, default_value_t = 32)]
     max_concurrent_calls: usize,
+    /// Seconds an idle agent with working children waits after agent mail (child replies, job
+    /// ends, schedules, messages) wakes it, so a burst is answered in one turn. The user's mail
+    /// never waits. 0 starts the turn at once.
+    #[arg(long, value_name = "SECS", default_value_t = 20)]
+    mail_settle: u64,
     /// New model calls, background jobs and agents' spawns wait while the host's 1-minute load
     /// average is above this (default: twice the CPUs; `0` turns it off; TUI `/max-load`).
     #[arg(long, value_name = "LOAD")]
@@ -428,6 +433,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.models = Some(models);
     config.max_agents = cli.max_agents;
     config.max_concurrent_calls = cli.max_concurrent_calls;
+    config.mail_settle = Duration::from_secs(cli.mail_settle);
     config.priority = cli.priority.clone();
     config.keep_cancelled = cli.keep_cancelled;
     config.max_load = cli

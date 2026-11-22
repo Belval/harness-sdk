@@ -204,9 +204,17 @@ impl Swarm {
         if let Some(task) = initial {
             return Some(task);
         }
-        let mail = self
-            .wait_for_mail(&node.id, &[], &CancellationToken::new())
-            .await?;
+        // Peek, so the mail stays in the mailbox (and `swarm.json`) while it settles.
+        let cancel = CancellationToken::new();
+        match self.wait_until(&node.id, &[], &cancel, false, |_, _| None).await {
+            WaitOutcome::Mail(_) => {}
+            _ => return None,
+        }
+        self.settle_mail(node).await;
+        if node.cancel.is_cancelled() {
+            return None;
+        }
+        let mail = self.drain(&node.id);
         let text = render_mail(&mail);
         Some(match mail.iter().any(|m| !m.images.is_empty()) {
             true => InvokeInput::Blocks(images::input_blocks(text, &mail)),

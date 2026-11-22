@@ -218,6 +218,15 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     32 never queues the default 16 agents (each has at most one call in flight, plus side calls)
     and still bounds a 100-agent swarm to a third of its agents. Lower it with `/max-calls` if
     your account throttles.
+- **Mail settle.** `--mail-settle SECS` (20, `0` = off) is how long an idle agent that has a
+  working child waits, once agent mail (a child's reply, a job end, a schedule or another agent's
+  message) wakes it, before starting its turn, so a burst of reports is answered in one turn
+  instead of one each. The window is fixed from the first mail. The user's mail never waits and
+  ends a window in progress; a `wait` returning is not a wake; an agent with no working child
+  starts at once. `/status` shows "waking in 12s"; `/mail-settle SECS|default` changes it and is
+  kept across restarts, ahead of the flag. Why 20: over 4.8 h of a 30-child coordinator's log,
+  replies came 2-3 s apart in bursts, and a 20 s window would have cut its turns by about 60 %
+  (10 s: 43 %, 30 s: 68 %, 60 s: 80 %) for at most 20 s of added latency.
 - **Model errors.**
   - Throttling, server errors (5xx, Bedrock's `InternalServerException` and the like) and dropped
     connections are retried with backoff, up to 10 attempts (about eight minutes). A rejected
@@ -477,7 +486,7 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
 | `/cancel` | Stop the selected agent and its subtree for good. |
 | `/status` | Each live agent's state, activity, todos, unmerged commits and merge outlook, jobs and schedules, without a model call. |
 | `/cost` | Estimated spend (see [Cost](#cost)); its intro and footnote wrap, its table is clipped on narrow terminals. |
-| `/budget`, `/max-agents`, `/max-calls`, `/max-load`, `/min-free-mem`, `/priority` | See [Limits](#limits). |
+| `/budget`, `/mail-settle`, `/max-agents`, `/max-calls`, `/max-load`, `/min-free-mem`, `/priority` | See [Limits](#limits). |
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
 | `/schedules` | All schedules. |
 | `/gc` | Retry reclaiming the disk of cancelled worktree agents. |

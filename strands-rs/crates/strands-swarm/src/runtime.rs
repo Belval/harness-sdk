@@ -267,6 +267,9 @@ pub struct SwarmConfig {
     /// Upper bound on model calls in flight across the swarm; further calls queue. `0` means no
     /// limit.
     pub max_concurrent_calls: usize,
+    /// How long an idle agent with live children waits, once agent mail wakes it, for more mail
+    /// to arrive before its turn starts ([`Swarm::mail_settle`]); `ZERO` starts at once.
+    pub mail_settle: Duration,
     /// Swarm-wide token budget (input + output over all agents); once spent, model calls fail
     /// until [`Swarm::set_budget`] raises it. A resumed run keeps the budget it was saved with.
     pub budget_tokens: Option<u64>,
@@ -373,6 +376,7 @@ impl SwarmConfig {
             cwd: cwd.into(),
             max_agents: 16,
             max_concurrent_calls: 32,
+            mail_settle: Duration::ZERO,
             budget_tokens: None,
             task_flag: None,
             run_id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
@@ -742,6 +746,9 @@ struct Node {
     branch: Option<String>,
     status: Mutex<AgentStatus>,
     mailbox: Mutex<VecDeque<Mail>>,
+    /// While the idle agent lets mail settle before its turn ([`Swarm::mail_settle`]): when the
+    /// turn starts.
+    settling: Mutex<Option<tokio::time::Instant>>,
     notify: Notify,
     cancel: CancellationToken,
     /// The built agent while its actor runs; released once it is cancelled and stopped, so a long
@@ -891,6 +898,9 @@ struct Inner {
     calls: Arc<calls::CallGate>,
     /// Model-call limit set at runtime with [`Swarm::set_max_calls`]; overrides the config.
     max_calls: Mutex<Option<usize>>,
+    /// Mail settle window in seconds set at runtime with [`Swarm::set_mail_settle`]; overrides
+    /// the config.
+    mail_settle: Mutex<Option<u64>>,
     budget: Mutex<Option<u64>>,
     /// Live-agent limit set at runtime with [`Swarm::set_max_agents`]; overrides the config.
     max_agents: Mutex<Option<usize>>,
@@ -955,6 +965,7 @@ impl Swarm {
             reload_installed: tokio::sync::Mutex::new(false),
             calls: Arc::default(),
             max_calls: Mutex::new(None),
+            mail_settle: Mutex::new(None),
             budget: Mutex::new(config.budget_tokens),
             max_agents: Mutex::new(None),
             over_budget: Mutex::new(Vec::new()),
