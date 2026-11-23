@@ -890,33 +890,30 @@ async fn spawns_beyond_the_agent_limit_queue_and_start_when_a_slot_frees() {
         ("a2", vec![say("two done")]),
         ("a3", vec![say("three done"), say("got mail")]),
     ]);
-    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    // `two` stays mid-turn, so with the spawning root the cap of 2 is full.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut config = SwarmConfig::new(gated_mock_factory(&scripts, &["a2"], &gate), dir.path());
     config.max_agents = 2;
     let (swarm, mut events) = Swarm::new(config);
 
     spawn_root(&swarm, "one").await;
     assert_eq!(reply_to(&mut events, USER).await, "spawned");
-    assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Queued);
-    assert_eq!(status_saved(&swarm, "a3"), "queued");
     let a1 = scripts.lock()["a1"].clone();
     let queued = sent_text(&a1, 2);
     assert!(
         queued.contains("Queued three (a3): queued") && queued.contains("agent limit"),
         "{queued}"
     );
+    // The root's turn ended, which freed its slot: `three` starts while `two` still works.
+    assert_eq!(reply_to(&mut events, "a1").await, "three done");
     swarm.send(USER, "a3", "hello").unwrap();
-
-    swarm.cancel("a2").unwrap();
-    // a2's own reply ("two done") may land in between.
-    let mut replies = Vec::new();
-    while replies.last().map(String::as_str) != Some("got mail") {
-        replies.push(reply_to(&mut events, "a1").await);
-    }
-    replies.retain(|reply| reply != "two done");
-    assert_eq!(replies, ["three done", "got mail"]);
+    assert_eq!(reply_to(&mut events, "a1").await, "got mail");
     let a3 = scripts.lock()["a3"].clone();
     assert!(sent_text(&a3, 0).contains("three"));
     assert!(sent_text(&a3, 1).contains("hello"));
+    gate.add_permits(1);
+    assert_eq!(reply_to(&mut events, "a1").await, "two done");
+    swarm.shutdown().await;
 }
 
 #[tokio::test]
@@ -927,13 +924,15 @@ async fn cancelling_a_queued_agent_drops_it() {
         ("a2", vec![say("two")]),
         ("a4", vec![say("four")]),
     ]);
-    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
-    config.max_agents = 2;
+    // `two` stays mid-turn and holds the only slot.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut config = SwarmConfig::new(gated_mock_factory(&map, &["a2"], &gate), dir.path());
+    config.max_agents = 1;
     let (swarm, mut events) = Swarm::new(config);
     spawn_root(&swarm, "one").await;
     assert_eq!(reply_to(&mut events, USER).await, "one");
+    wait_for_status(&swarm, "a1", AgentStatus::Idle).await;
     spawn_child(&swarm, "a1", "two").await;
-    assert_eq!(reply_to(&mut events, "a1").await, "two");
     spawn_child(&swarm, "a1", "three").await;
     assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Queued);
     swarm.cancel("a3").unwrap();
@@ -944,39 +943,63 @@ async fn cancelling_a_queued_agent_drops_it() {
     spawn_child(&swarm, "a1", "four").await;
     assert_eq!(reply_to(&mut events, "a1").await, "four");
     assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Cancelled);
+    swarm.shutdown().await;
+}
+
+/// A saved run with `a1` about to work on the user's mail, `a2` queued behind it and `idle` more
+/// idle agents (`a3`, `a4`, …).
+fn queued_behind_one_working(dir: &Path, idle: usize) -> strands_swarm::state::SwarmState {
+    let agent = |id: &str, parent: &str, status: &str, mailbox: serde_json::Value| {
+        json!({"id": id, "parent": parent, "cwd": dir, "branch": null, "task": format!("task of {id}"),
+               "model": null, "goal": null, "status": status, "mailbox": mailbox})
+    };
+    let mail = json!([{"from": "user", "from_label": "user", "kind": "message", "text": "go"}]);
+    let mut agents = vec![
+        agent("a1", "user", "idle", mail),
+        agent("a2", "a1", "queued", json!([])),
+    ];
+    agents.extend((3..3 + idle).map(|n| agent(&format!("a{n}"), "a1", "idle", json!([]))));
+    serde_json::from_value(json!({
+        "run_id": "old", "cwd": dir, "next_id": 3 + idle, "agents": agents,
+    }))
+    .unwrap()
+}
+
+/// Scripts for [`queued_behind_one_working`]: `a1`'s turn waits for the gate.
+fn queued_scripts(idle: usize) -> Scripts {
+    let map = scripts_of(vec![
+        ("a1", vec![say("ok"), say("ok")]),
+        ("a2", vec![say("late start")]),
+    ]);
+    for n in 3..3 + idle {
+        map.lock()
+            .insert(format!("a{n}"), MockMessageModel::shared(Vec::new()));
+    }
+    map
 }
 
 #[tokio::test]
 async fn a_queued_agent_stays_queued_across_a_resume_until_there_is_room() {
     let dir = tempfile::tempdir().unwrap();
-    let saved = || -> strands_swarm::state::SwarmState {
-        serde_json::from_value(json!({
-            "run_id": "old",
-            "cwd": dir.path(),
-            "next_id": 3,
-            "agents": [
-                {"id": "a1", "parent": "user", "cwd": dir.path(), "branch": null, "task": "one",
-                 "model": null, "goal": null, "status": "idle", "mailbox": []},
-                {"id": "a2", "parent": "a1", "cwd": dir.path(), "branch": null, "task": "late",
-                 "model": null, "goal": null, "status": "queued", "mailbox": []},
-            ],
-        }))
-        .unwrap()
-    };
-    let map = scripts_of(vec![("a1", vec![say("ok")]), ("a2", vec![say("late start")])]);
-
-    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    let map = queued_scripts(0);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut config = SwarmConfig::new(gated_mock_factory(&map, &["a1"], &gate), dir.path());
     config.max_agents = 1;
-    let (swarm, _events) = Swarm::resume(config.clone(), saved()).await.unwrap();
+    let (swarm, _events) = Swarm::resume(config.clone(), queued_behind_one_working(dir.path(), 0))
+        .await
+        .unwrap();
     assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
     assert_eq!(status_saved(&swarm, "a2"), "queued");
     swarm.shutdown().await;
 
     config.max_agents = 2;
-    let (swarm, mut events) = Swarm::resume(config, saved()).await.unwrap();
+    let (swarm, mut events) = Swarm::resume(config, queued_behind_one_working(dir.path(), 0))
+        .await
+        .unwrap();
     assert_eq!(reply_to(&mut events, "a1").await, "late start");
     wait_for_status(&swarm, "a2", AgentStatus::Idle).await;
-    assert!(sent_text(&map.lock()["a2"].clone(), 0).contains("late"));
+    assert!(sent_text(&map.lock()["a2"].clone(), 0).contains("task of a2"));
+    swarm.shutdown().await;
 }
 
 #[tokio::test]
@@ -1125,28 +1148,29 @@ async fn a_live_agents_stash_is_pruned_between_its_turns_never_during_one() {
 #[tokio::test]
 async fn raising_the_agent_limit_at_runtime_starts_queued_agents_and_survives_a_resume() {
     let dir = tempfile::tempdir().unwrap();
-    let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({
-        "run_id": "old",
-        "cwd": dir.path(),
-        "next_id": 3,
-        "agents": [
-            {"id": "a1", "parent": "user", "cwd": dir.path(), "branch": null, "task": "one",
-             "model": null, "goal": null, "status": "idle", "mailbox": []},
-            {"id": "a2", "parent": "a1", "cwd": dir.path(), "branch": null, "task": "late",
-             "model": null, "goal": null, "status": "queued", "mailbox": []},
-        ],
-    }))
-    .unwrap();
-    let map = scripts_of(vec![("a1", vec![say("ok")]), ("a2", vec![say("late start")])]);
-    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    // Many idle agents and one working: idle ones hold no slot, so raising the cap to 2 is room.
+    let map = queued_scripts(8);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut config = SwarmConfig::new(gated_mock_factory(&map, &["a1"], &gate), dir.path());
     config.max_agents = 1;
-    let (swarm, mut events) = Swarm::resume(config.clone(), saved).await.unwrap();
+    let (swarm, mut events) = Swarm::resume(config.clone(), queued_behind_one_working(dir.path(), 8))
+        .await
+        .unwrap();
     assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
+    assert_eq!(swarm.agent_slots(), (1, 1));
+    assert_eq!(swarm.queued_agents(), 1);
     assert!(swarm.set_max_agents(Some(0)).is_err());
 
-    swarm.set_max_agents(Some(2)).unwrap();
+    assert_eq!(
+        swarm.set_max_agents(Some(2)).unwrap(),
+        1,
+        "started the queued agent"
+    );
     assert_eq!(swarm.max_agents(), 2);
     assert_eq!(reply_to(&mut events, "a1").await, "late start");
+    assert_eq!(swarm.queued_agents(), 0);
+    assert_eq!(swarm.set_max_agents(Some(3)).unwrap(), 0, "nothing left to start");
+    swarm.set_max_agents(Some(2)).unwrap();
     let state = swarm.snapshot();
     assert_eq!(state.max_agents, Some(2));
     swarm.shutdown().await;
@@ -1157,6 +1181,7 @@ async fn raising_the_agent_limit_at_runtime_starts_queued_agents_and_survives_a_
     swarm.set_max_agents(None).unwrap();
     assert_eq!(swarm.max_agents(), 1);
     assert_eq!(swarm.snapshot().max_agents, None);
+    swarm.shutdown().await;
 }
 
 #[tokio::test]
@@ -1265,42 +1290,36 @@ async fn wait_returns_at_once_when_the_awaited_agents_are_cancelled() {
 }
 
 #[tokio::test]
-async fn wait_returns_when_the_awaited_agents_are_queued_behind_idle_ones() {
+async fn wait_returns_when_the_awaited_agent_is_queued_behind_the_waiter() {
     let dir = tempfile::tempdir().unwrap();
-    let wait_all = tool_call(
-        "wait",
-        "w1",
-        json!({"from": ["two", "three"], "all": true, "timeout_seconds": 600}),
-    );
     let scripts = scripts_of(vec![
         (
             "a1",
             vec![
                 tool_call("spawn_agent", "t1", json!({"task": "two", "name": "two"})),
-                tool_call("spawn_agent", "t2", json!({"task": "three", "name": "three"})),
-                wait_all,
+                tool_call("wait", "w1", json!({"from": ["two"], "timeout_seconds": 600})),
                 say("done"),
+                say("ok"),
             ],
         ),
         ("a2", vec![say("two done")]),
-        ("a3", vec![say("three done")]),
     ]);
     let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
-    config.max_agents = 2;
+    config.max_agents = 1;
     let (swarm, mut events) = Swarm::new(config);
 
     spawn_root(&swarm, "one").await;
-    // Only a1 could free a slot for `three`, and it is the one waiting.
+    // The waiter holds the only slot, so `two` starts only once its turn ends.
     assert_eq!(reply_to(&mut events, USER).await, "done");
     let a1 = scripts.lock()["a1"].clone();
-    let waited = sent_text(&a1, 3);
-    assert!(waited.contains("two done"), "{waited}");
+    let waited = sent_text(&a1, 2);
     assert!(
-        waited.contains("three (a3) queued at the agent limit (2)")
-            && waited.contains("Idle agents holding slots: two (a2)."),
+        waited.contains("two (a2) queued at the agent limit (1)")
+            && waited.contains("the only agent slot in use is yours"),
         "{waited}"
     );
-    assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Queued);
+    assert_eq!(reply_to(&mut events, "a1").await, "two done");
+    swarm.shutdown().await;
 }
 
 #[tokio::test]
@@ -3451,40 +3470,45 @@ async fn a_priority_agent_skips_the_host_hold_and_a_full_call_cap_while_others_w
 async fn the_priority_lane_skips_the_agent_cap_and_survives_a_resume() {
     let dir = tempfile::tempdir().unwrap();
     let map = scripts_of(vec![
-        ("a1", vec![say("lead"), say("ok")]),
-        ("a2", vec![say("hi")]),
+        ("a1", vec![say("lead"), say("ok"), say("ok")]),
+        ("a2", vec![say("busy"), say("busy")]),
+        ("a3", vec![say("hi")]),
     ]);
-    let mut config = SwarmConfig::new(mock_factory(&map), dir.path());
+    // `busy` stays mid-turn and holds the only slot.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut config = SwarmConfig::new(gated_mock_factory(&map, &["a2"], &gate), dir.path());
     config.max_agents = 1;
     config.priority = vec!["flagged".into()];
     let (swarm, mut events) = Swarm::new(config.clone());
     assert_eq!(swarm.priority(), ["flagged"]);
     spawn_root(&swarm, "lead").await;
     assert_eq!(reply_to(&mut events, USER).await, "lead");
+    wait_for_status(&swarm, "a1", AgentStatus::Idle).await;
+    spawn_child(&swarm, "a1", "busy").await;
     spawn_child(&swarm, "a1", "late").await;
-    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
+    assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Queued);
 
     // Put in the lane, a queued agent starts past the cap; unknown agents are refused.
-    let unknown = swarm.set_priority(Some(vec!["a2".into(), "nobody".into()]));
+    let unknown = swarm.set_priority(Some(vec!["a3".into(), "nobody".into()]));
     assert!(unknown
         .unwrap_err()
         .to_string()
         .contains("No agent with id or name `nobody`"));
-    assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
-    swarm.set_priority(Some(vec!["late (a2)".into()])).unwrap();
+    assert_eq!(swarm.agent("a3").unwrap().status, AgentStatus::Queued);
+    swarm.set_priority(Some(vec!["late (a3)".into()])).unwrap();
     assert_eq!(reply_to(&mut events, "a1").await, "hi");
-    assert_eq!(swarm.priority(), ["a2"]);
+    assert_eq!(swarm.priority(), ["a3"]);
     let state = swarm.snapshot();
-    assert_eq!(state.priority, Some(vec!["a2".to_owned()]));
+    assert_eq!(state.priority, Some(vec!["a3".to_owned()]));
     swarm.shutdown().await;
 
     // The saved lane wins over the flag after a resume; `None` returns to the flag.
     let (swarm, _events) = Swarm::resume(config, state).await.unwrap();
-    assert_eq!(swarm.priority(), ["a2"]);
-    assert!(swarm.is_priority("a2"));
+    assert_eq!(swarm.priority(), ["a3"]);
+    assert!(swarm.is_priority("a3"));
     swarm.set_priority(Some(Vec::new())).unwrap();
     assert!(
-        !swarm.is_priority("a2") && swarm.is_priority("a1"),
+        !swarm.is_priority("a3") && swarm.is_priority("a1"),
         "roots stay in it"
     );
     swarm.set_priority(None).unwrap();
@@ -5235,35 +5259,60 @@ async fn a_recurring_schedule_wakes_its_agent_until_it_is_cancelled() {
 }
 
 #[tokio::test]
-async fn an_idle_agent_waiting_on_a_schedule_holds_no_agent_slot() {
+async fn idle_agents_hold_no_agent_slot_but_working_ones_do() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = scripts_of(vec![
-        ("a1", vec![say("root"), say("ok"), say("ok")]),
+        ("a1", (0..8).map(|_| say("ok")).collect()),
         ("a2", vec![say("idle now")]),
-        ("a3", vec![say("hi")]),
+        ("a3", vec![say("idle too")]),
+        ("a4", vec![say("hi")]),
+        ("a5", vec![say("busy")]),
+        ("a6", vec![say("busy")]),
+        ("a7", vec![say("last")]),
     ]);
-    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut config = SwarmConfig::new(gated_mock_factory(&scripts, &["a5", "a6"], &gate), dir.path());
     config.max_agents = 2;
     let (swarm, mut events) = Swarm::new(config);
     let root = spawn_root(&swarm, "lead").await;
     reply_to(&mut events, USER).await;
+    for task in ["first", "second"] {
+        let child = spawn_child(&swarm, &root, task).await;
+        reply_to(&mut events, &root).await;
+        wait_for_status(&swarm, &child, AgentStatus::Idle).await;
+    }
+    eventually("everyone is idle", || swarm.agent_slots() == (0, 2)).await;
+
+    // Three idle agents against a cap of 2 block nothing.
+    let more = spawn_child(&swarm, &root, "more").await;
+    assert_ne!(swarm.agent(&more).unwrap().status, AgentStatus::Queued);
+    assert_eq!(reply_to(&mut events, &root).await, "hi");
+    eventually("everyone is idle again", || swarm.agent_slots() == (0, 2)).await;
+
+    // Two working agents fill it: the next spawn queues until one ends its turn.
+    for task in ["busy one", "busy two"] {
+        spawn_child(&swarm, &root, task).await;
+    }
+    let last = spawn_child(&swarm, &root, "last").await;
+    assert_eq!(swarm.agent(&last).unwrap().status, AgentStatus::Queued);
+    assert_eq!(swarm.agent_slots(), (2, 2));
+    gate.add_permits(1);
+    assert_eq!(reply_to(&mut events, &root).await, "busy");
+    assert_eq!(reply_to(&mut events, &root).await, "last");
+    gate.add_permits(1);
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelling_an_agent_drops_the_schedules_it_receives() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("root")]), ("a2", vec![say("idle now")])]);
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(mock_factory(&scripts), dir.path()));
+    let root = spawn_root(&swarm, "lead").await;
+    reply_to(&mut events, USER).await;
     let monitor = spawn_child(&swarm, &root, "monitor").await;
-    reply_to(&mut events, &root).await;
-    eventually("the monitor is idle", || {
-        swarm.agent(&monitor).unwrap().status == AgentStatus::Idle
-    })
-    .await;
-
-    let queued = spawn_child(&swarm, &root, "more").await;
-    assert_eq!(swarm.agent(&queued).unwrap().status, AgentStatus::Queued);
     swarm.schedule(&monitor, every(60, &monitor, "poll")).unwrap();
-    assert_eq!(
-        reply_to(&mut events, &root).await,
-        "hi",
-        "the queued agent started"
-    );
-
-    // Cancelling the receiver drops its schedules.
+    assert_eq!(swarm.schedules().len(), 1);
     swarm.cancel(&monitor).unwrap();
     assert!(swarm.schedules().is_empty());
     swarm.shutdown().await;

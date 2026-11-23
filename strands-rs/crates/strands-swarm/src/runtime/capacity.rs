@@ -41,15 +41,14 @@ impl BudgetChange {
 
 impl Swarm {
     /// Start queued agents, oldest first, while there are free slots; queued agents in the
-    /// priority lane start whatever the cap, and count toward it.
-    pub(super) fn start_queued(&self) {
+    /// priority lane start whatever the cap, and count toward it. Returns how many started.
+    pub(super) fn start_queued(&self) -> usize {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
-            return;
+            return 0;
         }
-        let scheduled = self.scheduled_targets();
         let ready: Vec<Arc<Node>> = {
             let agents = self.inner.agents.lock();
-            let mut free = self.max_agents().saturating_sub(started(&agents, &scheduled));
+            let mut free = self.max_agents().saturating_sub(working(&agents));
             let mut ready = Vec::new();
             for node in agents.values() {
                 let priority = self.priority_of(&node.id, &node.name, &node.parent);
@@ -69,8 +68,9 @@ impl Swarm {
             ready
         };
         if ready.is_empty() {
-            return;
+            return 0;
         }
+        let started = ready.len();
         self.persist();
         for node in ready {
             self.emit(SwarmEvent::Status {
@@ -80,6 +80,7 @@ impl Swarm {
             let task = node.task.clone();
             self.start_actor(node, Start::Fresh(task));
         }
+        started
     }
 
     /// Tokens (input + output) used by every agent so far, saved runs included.
@@ -175,16 +176,31 @@ impl Swarm {
     }
 
     /// Change the live-agent limit for this run (kept across restarts, ahead of `--max-agents`);
-    /// `None` returns to the configured one. Raising it starts queued agents at once.
-    pub fn set_max_agents(&self, limit: Option<usize>) -> Result<()> {
+    /// `None` returns to the configured one. Raising it starts queued agents at once; returns how
+    /// many it started.
+    pub fn set_max_agents(&self, limit: Option<usize>) -> Result<usize> {
         if limit == Some(0) {
             return Err(Error::other("The agent limit must be at least 1."));
         }
         *self.inner.max_agents.lock() = limit;
         self.persist();
         self.journal_event("max_agents", serde_json::json!({ "limit": self.max_agents() }));
-        self.start_queued();
-        Ok(())
+        Ok(self.start_queued())
+    }
+
+    /// Agent slots in use (agents working: starting, mid-turn, or idle with waking mail) and the
+    /// limit. Idle agents hold none.
+    pub fn agent_slots(&self) -> (usize, usize) {
+        (working(&self.inner.agents.lock()), self.max_agents())
+    }
+
+    /// Agents waiting for a slot.
+    pub fn queued_agents(&self) -> usize {
+        let agents = self.inner.agents.lock();
+        agents
+            .values()
+            .filter(|node| *node.status.lock() == AgentStatus::Queued)
+            .count()
     }
 
     /// Tokens (input + output) used by `id` and its descendants.
@@ -255,15 +271,20 @@ impl Swarm {
     }
 }
 
-/// Agents holding a slot under [`SwarmConfig::max_agents`]: live and not queued. An idle agent
-/// that a schedule will wake (`scheduled` lists their ids) holds none while it sleeps.
-pub(super) fn started(agents: &IndexMap<String, Arc<Node>>, scheduled: &[String]) -> usize {
-    agents
-        .values()
-        .filter(|node| match *node.status.lock() {
-            AgentStatus::Cancelled | AgentStatus::Queued => false,
-            AgentStatus::Idle => !scheduled.contains(&node.id),
-            _ => true,
-        })
-        .count()
+/// Agents holding a slot under [`SwarmConfig::max_agents`]: the working ones, starting, mid-turn,
+/// or idle with waking mail they are about to start a turn on. An idle agent holds none, so the
+/// cap bounds agents starting new work at once, not how many exist.
+pub(super) fn working(agents: &IndexMap<String, Arc<Node>>) -> usize {
+    agents.values().filter(|node| holds_slot(node)).count()
+}
+
+/// Whether `node` holds a slot ([`working`]).
+pub(super) fn holds_slot(node: &Node) -> bool {
+    // The status lock is let go before the mailbox is read.
+    let status = node.status.lock().clone();
+    match status {
+        AgentStatus::Starting | AgentStatus::Running => true,
+        AgentStatus::Idle | AgentStatus::Errored(_) => node.mailbox.lock().iter().any(Mail::wakes),
+        AgentStatus::Queued | AgentStatus::Cancelled => false,
+    }
 }

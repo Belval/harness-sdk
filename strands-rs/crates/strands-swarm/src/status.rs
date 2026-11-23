@@ -228,7 +228,8 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// `agents 3/100 · calls 8/8 · load 45/128 · disk 120 GB free · 8.2M inodes free`.
+    /// `3 of 100 agent slots in use · calls 8/8 · load 45/128 · disk 120 GB free · 8.2M inodes
+    /// free`.
     pub fn describe(&self) -> String {
         let (calls, limit) = self.calls;
         let limit = if limit == 0 {
@@ -247,7 +248,7 @@ impl Limits {
             format!(" · disk {} free{inodes}", crate::gc::human(bytes))
         });
         format!(
-            "agents {}/{} · calls {calls}/{limit}{load}{disk}",
+            "{} of {} agent slots in use · calls {calls}/{limit}{load}{disk}",
             self.agents.0, self.agents.1
         )
     }

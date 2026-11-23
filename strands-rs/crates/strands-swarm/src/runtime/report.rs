@@ -60,8 +60,7 @@ impl Swarm {
                 }
             })
             .collect();
-        let scheduled = self.scheduled_targets();
-        let started = started(&self.inner.agents.lock(), &scheduled);
+        let started = working(&self.inner.agents.lock());
         crate::status::StatusReport {
             limits: Some(crate::status::Limits {
                 agents: (started, self.max_agents()),

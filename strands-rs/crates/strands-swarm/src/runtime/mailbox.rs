@@ -249,10 +249,10 @@ impl Swarm {
     }
 
     /// Why `node` cannot get mail from `from` (without `from`, its children) until it acts: every
-    /// one still live is queued at the agent limit, which only a cancel frees, and no other agent
-    /// is running (or has mail to run on) that could cancel one.
+    /// one still live is queued at the agent limit, and the only slot in use is `node`'s own
+    /// (it is working while it waits), so nothing else will end a turn and free one.
     pub(super) fn stalled_on_queue(&self, node: &Node, from: &[String]) -> Option<String> {
-        let (limit, scheduled) = (self.max_agents(), self.scheduled_targets());
+        let limit = self.max_agents();
         let agents = self.inner.agents.lock();
         let awaited: Vec<&Arc<Node>> = match from.is_empty() {
             true => agents.values().filter(|n| n.parent == node.id).collect(),
@@ -267,34 +267,16 @@ impl Swarm {
                 _ => return None,
             }
         }
-        let mut holding = Vec::new();
-        for other in agents.values().filter(|n| n.id != node.id) {
-            let status = other.status.lock().clone();
-            match status {
-                AgentStatus::Running | AgentStatus::Starting => return None,
-                AgentStatus::Idle | AgentStatus::Errored(_)
-                    if other.mailbox.lock().iter().any(Mail::wakes) =>
-                {
-                    return None
-                }
-                AgentStatus::Idle | AgentStatus::Errored(_) if !scheduled.contains(&other.id) => {
-                    holding.push(format!("{} ({})", other.name, other.id))
-                }
-                _ => {}
-            }
-        }
-        if queued.is_empty() {
+        // Another working agent frees a slot when its turn ends; below the limit the queue moves.
+        let mut others = agents.values().filter(|n| n.id != node.id);
+        if queued.is_empty() || others.any(|n| capacity::holds_slot(n)) || capacity::working(&agents) < limit
+        {
             return None;
         }
-        let holding = match holding.is_empty() {
-            true => String::new(),
-            false => format!(" Idle agents holding slots: {}.", holding.join(", ")),
-        };
         Some(format!(
-            "No messages will come yet: {} queued at the agent limit ({limit}). A queued agent \
-             starts only once a live one is cancelled, and no other agent is running to do that.\
-             {holding} Cancel agents you are done with (or ask the user to raise /max-agents), \
-             then wait again.",
+            "No messages will come yet: {} queued at the agent limit ({limit}), and the only agent \
+             slot in use is yours while you wait. End your turn to free it (or ask the user to \
+             raise /max-agents).",
             queued.join(", "),
         ))
     }

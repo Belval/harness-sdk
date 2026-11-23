@@ -195,21 +195,29 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
 
 ## Limits
 
-- **Agents.** `--max-agents N` (16) caps live agents.
-  - Spawns beyond the cap are `queued` and start oldest first as slots free (the priority lane,
-    below, never queues).
+- **Agents.** `--max-agents N` (16) caps working agents: those starting, mid-turn, or idle with
+  waking mail they are about to start a turn on. An idle agent holds no slot, however many exist,
+  so the cap means "agents doing work at once"; model calls are bounded separately by
+  `--max-concurrent-calls` and the host by the host holds, below.
+  - Spawns beyond the cap are `queued` and start oldest first as slots free, i.e. as working
+    agents end their turns (the priority lane, below, never queues).
+  - Waking an idle agent is never blocked by the cap: mail to it starts its turn at once, even
+    when that takes the swarm past the cap for a while, and the queue waits until it is back
+    below. Holding the wake instead would stall a coordinator on its own children's replies and
+    could deadlock a parent and child waiting on each other; the cap gates new spawns only.
   - A queued agent can already be messaged; cancelling it drops it.
-  - A `wait` for queued agents returns at once, naming the idle agents that hold slots, when no
-    other agent is running that could cancel one: only the waiter can free a slot for them.
-  - An idle agent that is only waiting on a schedule holds no slot.
-  - `/max-agents N` changes the cap for the running swarm and is kept across restarts.
+  - A `wait` for queued agents returns at once when the only slot in use is the waiter's own
+    (a cap of 1): only ending its turn frees one.
+  - `/max-agents N` changes the cap for the running swarm, starts as many queued agents as the
+    new cap allows and says how many it started; it is kept across restarts. `/max-agents`
+    alone shows "N of M agent slots in use", as do `/status` and the TUI header.
     `/max-agents default` returns to the flag.
 - **Model calls.** `--max-concurrent-calls N` (32, `0` = unlimited) caps model calls in flight
   across the swarm, separately from `--max-agents`; extra calls queue oldest first instead of
   tripping provider throttling.
   - A waiting agent says which cap is full: "queued for a model slot (8/8 calls in flight;
     /max-calls to raise)", in its log line, in `/status` and in `list_agents`. `/status` also
-    starts with both caps and their usage, e.g. `agents 3/100 · calls 8/8`.
+    starts with both caps and their usage, e.g. `3 of 100 agent slots in use · calls 8/8`.
   - `/max-calls N` changes the cap for the running swarm and is kept across restarts, ahead of the
     flag, like `/max-agents`; `/max-calls default` returns to the flag and `/max-calls 0` lifts
     it. Raising it lets queued calls through at once; lowering it cancels nothing in flight.

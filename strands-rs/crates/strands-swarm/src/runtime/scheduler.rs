@@ -70,8 +70,6 @@ impl Swarm {
         self.clear_dormancy(&schedule.to);
         self.persist();
         self.start_scheduler();
-        // An idle receiver now sleeps on its schedule, which frees its slot.
-        self.start_queued();
         Ok(schedule)
     }
 

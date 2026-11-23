@@ -166,12 +166,16 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, run_id: &str) {
         .budget
         .map(|budget| format!(" · budget {}", compact(budget)))
         .unwrap_or_default();
+    let slots = app
+        .slots
+        .map(|(working, limit)| format!(" · {working} of {limit} agent slots in use"))
+        .unwrap_or_default();
     let tokens = format!(" · in {}{cached} · out {}", compact(input), compact(output));
     let header = |tokens: &str| {
         let mut line = Line::from(vec![
             Span::styled(" strands-swarm ", Style::new().bold().reversed()),
             Span::raw(format!(
-                "  run {run_id} · {} agents · {running} running{waiting}{tokens}{spend}{budget}{hidden}",
+                "  run {run_id} · {} agents · {running} running{waiting}{slots}{tokens}{spend}{budget}{hidden}",
                 app.agents.len(),
             )),
         ]);

@@ -61,7 +61,7 @@ pub(crate) use actor::summarize_input;
 use actor::Start;
 pub use actor::SILENT_REPLY;
 use background::jobs_dir;
-use capacity::started;
+use capacity::working;
 pub use capacity::BudgetChange;
 pub use disk::{
     free_space, inode_floor, FreeSpace, Space, DISK_CHECK_EVERY, DISK_SENDER, DISK_WARNED_FILE,
@@ -1070,15 +1070,13 @@ impl Swarm {
             .map_or(&self.inner.root_cancel, |node| &node.cancel)
             .child_token();
 
-        let scheduled = self.scheduled_targets();
         let node = {
             let mut agents = self.inner.agents.lock();
             let taken = agents.values().map(|node| node.name.as_str());
             let name = names::choose(request.name.as_deref(), &request.task, taken);
             // Decided under the lock, so concurrent spawns cannot overshoot the limit; the
             // priority lane is never queued.
-            let queued =
-                !self.priority_of(&id, &name, parent) && started(&agents, &scheduled) >= self.max_agents();
+            let queued = !self.priority_of(&id, &name, parent) && working(&agents) >= self.max_agents();
             let node = Arc::new(Node {
                 id: id.clone(),
                 name,
@@ -1403,7 +1401,11 @@ impl Swarm {
             self.nodes().iter().for_each(|node| node.notify.notify_waiters());
         }
         self.persist();
-        let freed = status == AgentStatus::Cancelled;
+        // Only working agents hold a slot: one that stops working frees it.
+        let freed = matches!(
+            status,
+            AgentStatus::Cancelled | AgentStatus::Idle | AgentStatus::Errored(_)
+        );
         self.emit(SwarmEvent::Status {
             id: node.id.clone(),
             status,

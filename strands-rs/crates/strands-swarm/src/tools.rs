@@ -349,8 +349,8 @@ struct ScheduleInput {
 }
 
 const SCHEDULE_DESCRIPTION: &str = concat!(
-    "Post `message` later and/or repeatedly; a fire wakes an idle recipient. An agent ",
-    "idle on a schedule holds no agent slot, unlike one in `wait`. Survives restarts (a missed fire is ",
+    "Post `message` later and/or repeatedly; a fire wakes an idle recipient. An idle agent ",
+    "holds no agent slot, unlike one in `wait`. Survives restarts (a missed fire is ",
     "delivered once)."
 );
 

@@ -392,6 +392,8 @@ pub struct App {
     pub completion: usize,
     /// Swarm-wide token budget, if any.
     pub budget: Option<u64>,
+    /// Agent slots in use and the limit ([`crate::Swarm::agent_slots`]), for the header.
+    pub slots: Option<(usize, usize)>,
     /// Tool calls an installed reload waits for ([`SwarmEvent::ReloadPending`]).
     pub reload_pending: Option<usize>,
     /// Decoded image thumbnails for [`LogEntry::Image`].

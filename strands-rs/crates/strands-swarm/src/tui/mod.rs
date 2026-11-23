@@ -82,6 +82,7 @@ pub async fn run(
         if app.status.is_some() {
             app.status = Some(swarm.status());
         }
+        app.slots = Some(swarm.agent_slots());
         let tokens = app.total_tokens();
         if app.cost.is_some() || spent != Some(tokens) {
             let report = swarm.cost();
@@ -186,6 +187,7 @@ async fn on_terminal_event(swarm: &Swarm, app: &mut App, event: Event, screen: &
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if let Some(command) = on_key(app, key) {
                 submit(swarm, app, command).await;
+                app.slots = Some(swarm.agent_slots());
             }
             app.status_scroll = app.status_scroll.min(view::popup_scroll_limit(app, screen.area));
         }
@@ -405,7 +407,10 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
         (Command::MaxAgents(None), _) => Ok(max_agents_notice(swarm)),
         (Command::MaxAgents(Some(arg)), _) => limit_arg(&arg, None, number)
             .and_then(|limit| swarm.set_max_agents(limit))
-            .map(|()| max_agents_notice(swarm)),
+            .map(|started| match started {
+                0 => max_agents_notice(swarm),
+                n => format!("{}; started {n} queued", max_agents_notice(swarm)),
+            }),
         (Command::MaxCalls(None), _) => Ok(max_calls_notice(swarm)),
         (Command::MaxCalls(Some(arg)), _) => limit_arg(&arg, None, number).map(|limit| {
             swarm.set_max_calls(limit);
@@ -537,7 +542,12 @@ fn number(arg: &str) -> Result<usize, String> {
 }
 
 fn max_agents_notice(swarm: &Swarm) -> String {
-    format!("up to {} agents at once", swarm.max_agents())
+    let (working, limit) = swarm.agent_slots();
+    let queued = match swarm.queued_agents() {
+        0 => String::new(),
+        n => format!(", {n} queued"),
+    };
+    format!("{working} of {limit} agent slots in use (working agents; idle ones hold none){queued}")
 }
 
 fn max_calls_notice(swarm: &Swarm) -> String {

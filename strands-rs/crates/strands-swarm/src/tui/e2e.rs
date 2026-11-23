@@ -439,7 +439,7 @@ async fn max_calls_shows_and_changes_the_model_call_cap_and_status_shows_both_ca
     screen.type_line(&swarm, &mut app, "/status").await;
     let shown = screen.draw(&mut app);
     for expected in [
-        "agents 3/16 · calls 1/1",
+        "3 of 16 agent slots in use · calls 1/1",
         "queued for a model slot (1/1 calls in flight; /max-calls to raise)",
     ] {
         assert!(shown.contains(expected), "missing {expected:?}\n{shown}");
@@ -458,11 +458,21 @@ async fn max_calls_shows_and_changes_the_model_call_cap_and_status_shows_both_ca
         .until(&mut app, &mut events, "3 agents · 2 running · 1 waiting")
         .await;
     assert_eq!(swarm.calls_in_flight(), 2);
+    // The header counts working agents against the agent cap; `/max-agents` says so too.
+    assert!(shown_header(&screen.draw(&mut app)).contains("3 of 16 agent slots in use"));
+    screen.type_line(&swarm, &mut app, "/max-agents").await;
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("3 of 16 agent slots in use (working agents; idle ones hold none)")
+    );
     screen.type_line(&swarm, &mut app, "/max-calls 0").await;
     assert_eq!(app.notice.as_deref(), Some("model calls unlimited (2 in flight)"));
     screen.type_line(&swarm, &mut app, "/status").await;
     let shown = screen.draw(&mut app);
-    assert!(shown.contains("agents 3/16 · calls 2/unlimited"), "{shown}");
+    assert!(
+        shown.contains("3 of 16 agent slots in use · calls 2/unlimited"),
+        "{shown}"
+    );
     screen.press(&swarm, &mut app, KeyCode::Char('x')).await;
     screen.type_line(&swarm, &mut app, "/max-calls default").await;
     assert_eq!(
@@ -770,4 +780,9 @@ async fn arrows_fold_the_tree_with_an_empty_input_and_edit_it_otherwise() {
     let shown = screen.until(&mut app, &mut events, "parser: all green").await;
     assert!(shown.contains("  ● parser"), "{shown}");
     swarm.shutdown().await;
+}
+
+/// The header line of a drawn screen.
+fn shown_header(shown: &str) -> &str {
+    shown.lines().next().unwrap_or_default()
 }
