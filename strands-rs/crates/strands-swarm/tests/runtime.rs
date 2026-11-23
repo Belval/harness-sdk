@@ -7683,14 +7683,29 @@ async fn a_restart_job_mails_each_end_starts_again_backs_off_when_it_keeps_exiti
     let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
     spawn_root(&swarm, "watch").await;
 
-    assert_eq!(reply_to(&mut events, USER).await, "started");
-    for _ in 0..2 {
-        let report = mail_to(&mut events, "a1", "job").await;
+    // The first ends may be mailed before the agent's first reply is seen (a slow turn on a busy
+    // host), so take the reply and the three reports from one pass over the events, in any order.
+    let (mut started, mut reports) = (false, Vec::new());
+    let wait = async {
+        while !started || reports.len() < 3 {
+            match events.recv().await.expect("event stream closed") {
+                SwarmEvent::Mail { to, mail } if to == USER && mail.text == "started" => started = true,
+                SwarmEvent::Mail { to, mail } if to == "a1" && mail.kind == "job" => {
+                    reports.push(mail.text);
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), wait)
+        .await
+        .expect("the reply and three job ends arrive");
+    let third = reports.pop().unwrap();
+    for report in &reports {
         assert!(report.contains("Job j1 (watch) exited 0"), "{report}");
         assert!(report.contains("tick"), "{report}");
         assert!(report.contains("restarting it (restart: true)"), "{report}");
     }
-    let third = mail_to(&mut events, "a1", "job").await;
     assert!(third.contains("restarts 2"), "{third}");
     assert!(
         third.contains("within 10s 3 times in a row; restarting it in 1m"),
