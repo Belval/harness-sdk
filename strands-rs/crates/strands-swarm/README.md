@@ -205,20 +205,23 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
 
 - **Agents.** `--max-agents N` (16) caps working agents: those starting, mid-turn, or idle with
   waking mail they are about to start a turn on. An idle agent holds no slot, however many exist,
-  so the cap means "agents doing work at once"; model calls are bounded separately by
-  `--max-concurrent-calls` and the host by the host holds, below.
+  nor does one whose only tool calls in flight are `wait`s, so the cap means "agents doing work
+  at once"; model calls are bounded separately by `--max-concurrent-calls` and the host by the
+  host holds, below.
   - Spawns beyond the cap are `queued` and start oldest first as slots free, i.e. as working
-    agents end their turns (the priority lane, below, never queues).
+    agents end their turns or enter a `wait` (the priority lane, below, never queues). So a
+    parent waiting for its queued children lets them start, even at a cap of 1.
   - Waking an idle agent is never blocked by the cap: mail to it starts its turn at once, even
     when that takes the swarm past the cap for a while, and the queue waits until it is back
     below. Holding the wake instead would stall a coordinator on its own children's replies and
     could deadlock a parent and child waiting on each other; the cap gates new spawns only.
+  - For the same reason a `wait` returning is never held either: the agent takes its slot back
+    at once, past the cap if need be, since the children it waited on hold the others.
   - A queued agent can already be messaged; cancelling it drops it.
-  - A `wait` for queued agents returns at once when the only slot in use is the waiter's own
-    (a cap of 1): only ending its turn frees one.
   - `/max-agents N` changes the cap for the running swarm, starts as many queued agents as the
     new cap allows and says how many it started; it is kept across restarts. `/max-agents`
-    alone shows "N of M agent slots in use", as do `/status` and the TUI header.
+    alone shows "N of M agent slots in use, K waiting" (waiting: mid-`wait`, holding none), as
+    do `/status`, `list_agents` and the TUI header.
     `/max-agents default` returns to the flag.
 - **Model calls.** `--max-concurrent-calls N` (32, `0` = unlimited) caps model calls in flight
   across the swarm, separately from `--max-agents`; extra calls queue oldest first instead of

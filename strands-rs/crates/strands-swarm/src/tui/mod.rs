@@ -542,12 +542,14 @@ fn number(arg: &str) -> Result<usize, String> {
 }
 
 fn max_agents_notice(swarm: &Swarm) -> String {
-    let (working, limit) = swarm.agent_slots();
     let queued = match swarm.queued_agents() {
         0 => String::new(),
         n => format!(", {n} queued"),
     };
-    format!("{working} of {limit} agent slots in use (working agents; idle ones hold none){queued}")
+    format!(
+        "{} (working agents; idle and waiting ones hold none){queued}",
+        swarm.agent_slots()
+    )
 }
 
 fn max_calls_notice(swarm: &Swarm) -> String {

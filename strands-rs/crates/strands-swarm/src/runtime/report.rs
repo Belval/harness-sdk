@@ -60,10 +60,9 @@ impl Swarm {
                 }
             })
             .collect();
-        let started = working(&self.inner.agents.lock());
         crate::status::StatusReport {
             limits: Some(crate::status::Limits {
-                agents: (started, self.max_agents()),
+                agents: self.agent_slots(),
                 calls: (self.calls_in_flight(), self.max_calls()),
                 load: Some(self.max_load())
                     .filter(|max| *max > 0.0)

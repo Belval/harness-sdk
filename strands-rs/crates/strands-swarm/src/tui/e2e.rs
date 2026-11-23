@@ -439,7 +439,7 @@ async fn max_calls_shows_and_changes_the_model_call_cap_and_status_shows_both_ca
     screen.type_line(&swarm, &mut app, "/status").await;
     let shown = screen.draw(&mut app);
     for expected in [
-        "3 of 16 agent slots in use · calls 1/1",
+        "2 of 16 agent slots in use, 1 waiting · calls 1/1",
         "queued for a model slot (1/1 calls in flight; /max-calls to raise)",
     ] {
         assert!(shown.contains(expected), "missing {expected:?}\n{shown}");
@@ -458,19 +458,20 @@ async fn max_calls_shows_and_changes_the_model_call_cap_and_status_shows_both_ca
         .until(&mut app, &mut events, "3 agents · 2 running · 1 waiting")
         .await;
     assert_eq!(swarm.calls_in_flight(), 2);
-    // The header counts working agents against the agent cap; `/max-agents` says so too.
-    assert!(shown_header(&screen.draw(&mut app)).contains("3 of 16 agent slots in use"));
+    // The header counts working agents against the agent cap, the root in `wait` apart;
+    // `/max-agents` says so too.
+    assert!(shown_header(&screen.draw(&mut app)).contains("2 of 16 agent slots in use, 1 waiting"));
     screen.type_line(&swarm, &mut app, "/max-agents").await;
     assert_eq!(
         app.notice.as_deref(),
-        Some("3 of 16 agent slots in use (working agents; idle ones hold none)")
+        Some("2 of 16 agent slots in use, 1 waiting (working agents; idle and waiting ones hold none)")
     );
     screen.type_line(&swarm, &mut app, "/max-calls 0").await;
     assert_eq!(app.notice.as_deref(), Some("model calls unlimited (2 in flight)"));
     screen.type_line(&swarm, &mut app, "/status").await;
     let shown = screen.draw(&mut app);
     assert!(
-        shown.contains("3 of 16 agent slots in use · calls 2/unlimited"),
+        shown.contains("2 of 16 agent slots in use, 1 waiting · calls 2/unlimited"),
         "{shown}"
     );
     screen.press(&swarm, &mut app, KeyCode::Char('x')).await;

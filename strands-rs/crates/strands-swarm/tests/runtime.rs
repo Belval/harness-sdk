@@ -1157,7 +1157,7 @@ async fn raising_the_agent_limit_at_runtime_starts_queued_agents_and_survives_a_
         .await
         .unwrap();
     assert_eq!(swarm.agent("a2").unwrap().status, AgentStatus::Queued);
-    assert_eq!(swarm.agent_slots(), (1, 1));
+    assert_eq!(slots(&swarm), (1, 1, 0));
     assert_eq!(swarm.queued_agents(), 1);
     assert!(swarm.set_max_agents(Some(0)).is_err());
 
@@ -1289,8 +1289,34 @@ async fn wait_returns_at_once_when_the_awaited_agents_are_cancelled() {
     assert!(sent_text(&a1, 4).contains("No agent with id or name `nobody`"));
 }
 
+/// `(in use, limit, waiting)` of [`Swarm::agent_slots`].
+fn slots(swarm: &Swarm) -> (usize, usize, usize) {
+    let slots = swarm.agent_slots();
+    (slots.in_use, slots.limit, slots.waiting)
+}
+
+/// [`mock_factory`] with each agent's model calls let through one permit at a time by its gate.
+fn gated_each(scripts: &Scripts, gates: HashMap<&'static str, Arc<tokio::sync::Semaphore>>) -> AgentFactory {
+    let scripts = scripts.clone();
+    Arc::new(move |spec: AgentSpec| {
+        let model: Arc<dyn Model> = Arc::new(GatedModel {
+            inner: scripts.lock()[&spec.id].clone(),
+            gate: gates[spec.id.as_str()].clone(),
+        });
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .system_prompt(spec.instructions)
+                .tools(spec.tools)
+                .no_sandbox()
+                .build()
+        })
+    })
+}
+
 #[tokio::test]
-async fn wait_returns_when_the_awaited_agent_is_queued_behind_the_waiter() {
+async fn a_parent_in_wait_holds_no_slot_so_its_queued_child_starts_and_its_wake_is_never_held() {
     let dir = tempfile::tempdir().unwrap();
     let scripts = scripts_of(vec![
         (
@@ -1302,23 +1328,88 @@ async fn wait_returns_when_the_awaited_agent_is_queued_behind_the_waiter() {
                 say("ok"),
             ],
         ),
-        ("a2", vec![say("two done")]),
+        (
+            "a2",
+            vec![
+                tool_call("send_message", "m1", json!({"to": "parent", "message": "hello"})),
+                say("two done"),
+            ],
+        ),
     ]);
-    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    let (parent, child) = (
+        Arc::new(tokio::sync::Semaphore::new(2)),
+        Arc::new(tokio::sync::Semaphore::new(0)),
+    );
+    let gates = HashMap::from([("a1", parent.clone()), ("a2", child.clone())]);
+    let mut config = SwarmConfig::new(gated_each(&scripts, gates), dir.path());
     config.max_agents = 1;
     let (swarm, mut events) = Swarm::new(config);
+    let a1 = scripts.lock()["a1"].clone();
 
     spawn_root(&swarm, "one").await;
-    // The waiter holds the only slot, so `two` starts only once its turn ends.
-    assert_eq!(reply_to(&mut events, USER).await, "done");
-    let a1 = scripts.lock()["a1"].clone();
-    let waited = sent_text(&a1, 2);
+    // The spawning parent holds the only slot, so `two` queues; once the parent waits, it starts.
+    eventually("two starts", || {
+        swarm
+            .agent("a2")
+            .is_some_and(|info| info.status == AgentStatus::Running)
+    })
+    .await;
+    assert!(sent_text(&a1, 1).contains("Queued"), "{}", sent_text(&a1, 1));
+    assert_eq!(slots(&swarm), (1, 1, 1), "the waiting parent holds no slot");
+    let limits = swarm.status().limits.unwrap().describe();
     assert!(
-        waited.contains("two (a2) queued at the agent limit (1)")
-            && waited.contains("the only agent slot in use is yours"),
-        "{waited}"
+        limits.starts_with("1 of 1 agent slots in use, 1 waiting · calls"),
+        "{limits}"
     );
+
+    // The child's message ends the wait at once, though both now work against a cap of 1.
+    child.add_permits(1);
+    eventually("the parent works again", || slots(&swarm) == (2, 1, 0)).await;
+    assert!(sent_text(&a1, 2).contains("hello"), "{}", sent_text(&a1, 2));
+
+    parent.add_permits(2);
+    child.add_permits(1);
+    assert_eq!(reply_to(&mut events, USER).await, "done");
     assert_eq!(reply_to(&mut events, "a1").await, "two done");
+    wait_for_status(&swarm, "a1", AgentStatus::Idle).await;
+    eventually("every slot is free", || slots(&swarm) == (0, 1, 0)).await;
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_interrupted_or_cancelled_wait_leaves_no_waiting_count_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let forever = json!({"from": ["user"], "timeout_seconds": 600});
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("wait", "w1", forever.clone()),
+            tool_call("wait", "w2", forever),
+        ],
+    )]);
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let config = SwarmConfig::new(
+        gated_each(&scripts, HashMap::from([("a1", gate.clone())])),
+        dir.path(),
+    );
+    let (swarm, _events) = Swarm::new(config);
+    let limit = swarm.max_agents();
+
+    spawn_root(&swarm, "go").await;
+    eventually("it waits", || slots(&swarm) == (0, limit, 1)).await;
+    swarm.interrupt("a1").unwrap();
+    wait_for_status(&swarm, "a1", AgentStatus::Idle).await;
+    assert_eq!(slots(&swarm), (0, limit, 0));
+
+    // Its next turn, mid model call, holds a slot: the interrupted wait is not counted.
+    swarm.send(USER, "a1", "again").unwrap();
+    wait_for_status(&swarm, "a1", AgentStatus::Running).await;
+    assert_eq!(slots(&swarm), (1, limit, 0));
+    gate.add_permits(1);
+    eventually("it waits again", || slots(&swarm) == (0, limit, 1)).await;
+
+    swarm.cancel("a1").unwrap();
+    eventually("the cancelled wait is gone", || slots(&swarm) == (0, limit, 0)).await;
     swarm.shutdown().await;
 }
 
@@ -5281,13 +5372,13 @@ async fn idle_agents_hold_no_agent_slot_but_working_ones_do() {
         reply_to(&mut events, &root).await;
         wait_for_status(&swarm, &child, AgentStatus::Idle).await;
     }
-    eventually("everyone is idle", || swarm.agent_slots() == (0, 2)).await;
+    eventually("everyone is idle", || slots(&swarm) == (0, 2, 0)).await;
 
     // Three idle agents against a cap of 2 block nothing.
     let more = spawn_child(&swarm, &root, "more").await;
     assert_ne!(swarm.agent(&more).unwrap().status, AgentStatus::Queued);
     assert_eq!(reply_to(&mut events, &root).await, "hi");
-    eventually("everyone is idle again", || swarm.agent_slots() == (0, 2)).await;
+    eventually("everyone is idle again", || slots(&swarm) == (0, 2, 0)).await;
 
     // Two working agents fill it: the next spawn queues until one ends its turn.
     for task in ["busy one", "busy two"] {
@@ -5295,7 +5386,7 @@ async fn idle_agents_hold_no_agent_slot_but_working_ones_do() {
     }
     let last = spawn_child(&swarm, &root, "last").await;
     assert_eq!(swarm.agent(&last).unwrap().status, AgentStatus::Queued);
-    assert_eq!(swarm.agent_slots(), (2, 2));
+    assert_eq!(slots(&swarm), (2, 2, 0));
     gate.add_permits(1);
     assert_eq!(reply_to(&mut events, &root).await, "busy");
     assert_eq!(reply_to(&mut events, &root).await, "last");
@@ -6078,6 +6169,8 @@ async fn list_agents_shows_each_agents_estimated_spend_and_its_subtrees() {
         "{listed}"
     );
     assert!(listed.contains("est. $10.00 / 100.0k tokens"), "{listed}");
+    let slots = format!("1 of {} agent slots in use.", swarm.max_agents());
+    assert!(listed.contains(&slots), "only the lister works: {listed}");
     assert!(
         listed.contains("Swarm total: est. $15.00 / 150.0k tokens"),
         "{listed}"

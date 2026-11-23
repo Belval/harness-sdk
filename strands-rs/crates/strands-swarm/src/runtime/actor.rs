@@ -343,7 +343,10 @@ impl Swarm {
                 _ => {}
             },
             AgentStreamEvent::BeforeToolCall(call) => {
-                if !WAITING_TOOLS.contains(&call.tool_use.name.as_str()) {
+                let waits = WAITING_TOOLS.contains(&call.tool_use.name.as_str());
+                if waits {
+                    *node.waits.lock() += 1;
+                } else {
                     let id = call.tool_use.tool_use_id.clone();
                     node.tool_calls.lock().insert(id, Instant::now());
                 }
@@ -351,10 +354,23 @@ impl Swarm {
                     id,
                     name: call.tool_use.name.clone(),
                     summary: summarize_input(&call.tool_use.input),
-                })
+                });
+                // Its slot frees while it only waits, so a queued child it waits for can start.
+                if waits && !capacity::holds_slot(node) {
+                    self.start_queued();
+                }
             }
             AgentStreamEvent::AfterToolCall(call) => {
+                if WAITING_TOOLS.contains(&call.tool_use.name.as_str()) {
+                    // Never below zero: a turn's end may already have reset it.
+                    let mut waits = node.waits.lock();
+                    *waits = waits.saturating_sub(1);
+                }
                 node.tool_calls.lock().remove(&call.tool_use.tool_use_id);
+                // A call ending beside a wait leaves the agent only waiting.
+                if !capacity::holds_slot(node) {
+                    self.start_queued();
+                }
                 if call.result.status == ToolResultStatus::Success {
                     self.mark_progress(node);
                 }

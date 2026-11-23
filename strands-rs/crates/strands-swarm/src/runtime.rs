@@ -88,7 +88,8 @@ pub const RELOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// turns (the default of [`SwarmConfig::stash_prune_every`]).
 pub const STASH_PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
-/// Tool calls that only wait, so a reload does not wait for them ([`Swarm::tool_calls_in_flight`]).
+/// Tool calls that only wait: a reload does not wait for them ([`Swarm::tool_calls_in_flight`]),
+/// and an agent in one holds no agent slot ([`capacity::holds_slot`]).
 const WAITING_TOOLS: &[&str] = &["wait"];
 
 /// When [`Swarm::reload`] restarts the swarm into the installed binary.
@@ -796,6 +797,9 @@ struct Node {
     /// Tool calls of the current turn in flight, by tool use id, with when each started; waiting
     /// tools ([`WAITING_TOOLS`]) left out.
     tool_calls: Mutex<BTreeMap<String, Instant>>,
+    /// Calls of waiting tools ([`WAITING_TOOLS`]) of the current turn in flight: while these are
+    /// all it has in flight, it holds no agent slot ([`capacity::holds_slot`]).
+    waits: Mutex<usize>,
     /// The tool batch in progress, also kept on disk ([`resume::OpenBatch`]).
     batch: Mutex<Option<resume::OpenBatch>>,
 }
@@ -1393,6 +1397,7 @@ impl Swarm {
         // A turn that ended or was cancelled has nothing in flight, finished events or not.
         if status != AgentStatus::Running {
             node.tool_calls.lock().clear();
+            *node.waits.lock() = 0;
         }
         if status == AgentStatus::Cancelled {
             node.cancelled_at.store(self.now().timestamp(), Ordering::Relaxed);
@@ -1401,7 +1406,8 @@ impl Swarm {
             self.nodes().iter().for_each(|node| node.notify.notify_waiters());
         }
         self.persist();
-        // Only working agents hold a slot: one that stops working frees it.
+        // Only working agents hold a slot: one that stops working frees it. (One entering a wait
+        // frees it too: [`Swarm::forward`].)
         let freed = matches!(
             status,
             AgentStatus::Cancelled | AgentStatus::Idle | AgentStatus::Errored(_)

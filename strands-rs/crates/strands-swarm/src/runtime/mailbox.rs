@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// How often a `wait` re-checks whether it can still get mail ([`Swarm::stalled_on_queue`]).
+/// How often a `wait` re-checks whether it can still get mail ([`Swarm::unreachable`]).
 const GIVE_UP_RECHECK: Duration = Duration::from_secs(1);
 
 impl Swarm {
@@ -99,11 +99,7 @@ impl Swarm {
         cancel: &CancellationToken,
         take: bool,
     ) -> WaitOutcome {
-        let give_up = |swarm: &Self, node: &Node| {
-            swarm
-                .unreachable(node, from)
-                .or_else(|| swarm.stalled_on_queue(node, from))
-        };
+        let give_up = |swarm: &Self, node: &Node| swarm.unreachable(node, from);
         let _waiting = self.node(id).map(|node| dormant::Waiting::new(&node, from));
         self.wait_until(id, from, cancel, take, give_up).await
     }
@@ -245,39 +241,6 @@ impl Swarm {
                     .map_or(id.clone(), |n| format!("{} ({id})", n.name)))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ))
-    }
-
-    /// Why `node` cannot get mail from `from` (without `from`, its children) until it acts: every
-    /// one still live is queued at the agent limit, and the only slot in use is `node`'s own
-    /// (it is working while it waits), so nothing else will end a turn and free one.
-    pub(super) fn stalled_on_queue(&self, node: &Node, from: &[String]) -> Option<String> {
-        let limit = self.max_agents();
-        let agents = self.inner.agents.lock();
-        let awaited: Vec<&Arc<Node>> = match from.is_empty() {
-            true => agents.values().filter(|n| n.parent == node.id).collect(),
-            // The user and job reports can come at any time.
-            false => from.iter().map(|id| agents.get(id)).collect::<Option<_>>()?,
-        };
-        let mut queued = Vec::new();
-        for other in awaited {
-            match other.status.lock().clone() {
-                AgentStatus::Queued => queued.push(format!("{} ({})", other.name, other.id)),
-                AgentStatus::Cancelled => {}
-                _ => return None,
-            }
-        }
-        // Another working agent frees a slot when its turn ends; below the limit the queue moves.
-        let mut others = agents.values().filter(|n| n.id != node.id);
-        if queued.is_empty() || others.any(|n| capacity::holds_slot(n)) || capacity::working(&agents) < limit
-        {
-            return None;
-        }
-        Some(format!(
-            "No messages will come yet: {} queued at the agent limit ({limit}), and the only agent \
-             slot in use is yours while you wait. End your turn to free it (or ask the user to \
-             raise /max-agents).",
-            queued.join(", "),
         ))
     }
 

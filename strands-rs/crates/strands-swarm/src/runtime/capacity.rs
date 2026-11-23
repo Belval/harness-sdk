@@ -188,10 +188,16 @@ impl Swarm {
         Ok(self.start_queued())
     }
 
-    /// Agent slots in use (agents working: starting, mid-turn, or idle with waking mail) and the
-    /// limit. Idle agents hold none.
-    pub fn agent_slots(&self) -> (usize, usize) {
-        (working(&self.inner.agents.lock()), self.max_agents())
+    /// Agent slots in use (agents working: starting, mid-turn, or idle with waking mail), the
+    /// limit, and the mid-turn agents that hold none because they only wait. Idle agents hold none
+    /// either.
+    pub fn agent_slots(&self) -> crate::status::AgentSlots {
+        let agents = self.inner.agents.lock();
+        crate::status::AgentSlots {
+            in_use: working(&agents),
+            limit: self.max_agents(),
+            waiting: agents.values().filter(|node| only_waits(node)).count(),
+        }
     }
 
     /// Agents waiting for a slot.
@@ -272,8 +278,9 @@ impl Swarm {
 }
 
 /// Agents holding a slot under [`SwarmConfig::max_agents`]: the working ones, starting, mid-turn,
-/// or idle with waking mail they are about to start a turn on. An idle agent holds none, so the
-/// cap bounds agents starting new work at once, not how many exist.
+/// or idle with waking mail they are about to start a turn on. An idle agent holds none, nor does
+/// one mid-turn whose only calls in flight are waits ([`only_waits`]), so the cap bounds agents
+/// doing work at once, not how many exist.
 pub(super) fn working(agents: &IndexMap<String, Arc<Node>>) -> usize {
     agents.values().filter(|node| holds_slot(node)).count()
 }
@@ -283,8 +290,18 @@ pub(super) fn holds_slot(node: &Node) -> bool {
     // The status lock is let go before the mailbox is read.
     let status = node.status.lock().clone();
     match status {
-        AgentStatus::Starting | AgentStatus::Running => true,
+        AgentStatus::Starting => true,
+        AgentStatus::Running => !only_waits(node),
         AgentStatus::Idle | AgentStatus::Errored(_) => node.mailbox.lock().iter().any(Mail::wakes),
         AgentStatus::Queued | AgentStatus::Cancelled => false,
     }
+}
+
+/// Whether `node` is mid-turn with only waiting tools ([`WAITING_TOOLS`]) in flight: it holds no
+/// slot until one returns, so a parent waiting for its queued children lets them start.
+pub(super) fn only_waits(node: &Node) -> bool {
+    // One lock at a time.
+    let running = *node.status.lock() == AgentStatus::Running;
+    let other_calls = !node.tool_calls.lock().is_empty();
+    running && !other_calls && *node.waits.lock() > 0
 }

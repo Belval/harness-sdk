@@ -4,6 +4,7 @@
 //! jobs and schedules. The git part runs in the background and is cached for [`TTL`].
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -212,11 +213,34 @@ pub struct AgentReport {
     pub schedules: Vec<String>,
 }
 
+/// Agent slots under `/max-agents` ([`crate::Swarm::agent_slots`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentSlots {
+    /// Agents holding a slot: starting, mid-turn and not only waiting, or idle with waking mail.
+    pub in_use: usize,
+    /// The cap.
+    pub limit: usize,
+    /// Mid-turn agents holding none because all they have in flight is a `wait`.
+    pub waiting: usize,
+}
+
+impl fmt::Display for AgentSlots {
+    /// `12 of 64 agent slots in use, 30 waiting` (without waiting agents: `12 of 64 agent slots
+    /// in use`).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} of {} agent slots in use", self.in_use, self.limit)?;
+        match self.waiting {
+            0 => Ok(()),
+            n => write!(f, ", {n} waiting"),
+        }
+    }
+}
+
 /// The caps and how full they are.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Limits {
     /// Agents holding a slot, and the cap (`/max-agents`).
-    pub agents: (usize, usize),
+    pub agents: AgentSlots,
     /// Model calls in flight, and the cap (`/max-calls`; `0` is none).
     pub calls: (usize, usize),
     /// The host's load average and the limit above which new work waits (`/max-load`), when
@@ -247,10 +271,7 @@ impl Limits {
             });
             format!(" · disk {} free{inodes}", crate::gc::human(bytes))
         });
-        format!(
-            "{} of {} agent slots in use · calls {calls}/{limit}{load}{disk}",
-            self.agents.0, self.agents.1
-        )
+        format!("{} · calls {calls}/{limit}{load}{disk}", self.agents)
     }
 }
 

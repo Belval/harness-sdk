@@ -846,6 +846,11 @@ fn list_agents(
         ));
     }
     let tokens: u64 = cost.agents.iter().map(|a| a.totals.input + a.totals.output).sum();
+    let queued = match swarm.queued_agents() {
+        0 => String::new(),
+        n => format!(", {n} queued"),
+    };
+    lines.push(format!("{}{queued}.", swarm.agent_slots()));
     lines.push(format!(
         "Swarm total: est. {} / {} tokens (estimates from list prices).",
         cost.total().render(),
