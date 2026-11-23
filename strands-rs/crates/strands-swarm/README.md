@@ -718,6 +718,10 @@ messages you.
     applied unless landed). Otherwise it stays, e.g. `kept branch swarm/r/a3 (2 commits not on
     main)`, until a later pass (resume, `/gc`, `--gc`) finds it merged. The ref is deleted only
     if it still points at the commit checked.
+  - That base is the swarm's only for worktrees of the swarm's own repository. A worktree of
+    another repository (an agent spawned with a `cwd` there) is compared with that repository's
+    base: the branch its main checkout has out, else its default branch (`origin/HEAD`), else
+    `main` or `master`.
   - `cancel_agent` waits up to 10 s for this and its result says what was removed and kept.
     `list_agents` with `include_cancelled` shows it later: `cwd … (removed)`, `branch … (deleted)`
     or `branch … (kept: 2 not on main, merges cleanly)`.

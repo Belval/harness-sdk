@@ -120,7 +120,7 @@ impl Swarm {
     /// Where the base branch is checked out: a root agent without a worktree of its own (a
     /// cancelled worktree root's checkout is gone, a live one has its own branch checked out),
     /// else the swarm's directory. Not necessarily the repository's main worktree.
-    fn base_root(&self) -> PathBuf {
+    pub(super) fn base_root(&self) -> PathBuf {
         let nodes = self.inner.agents.lock();
         let root = nodes
             .values()

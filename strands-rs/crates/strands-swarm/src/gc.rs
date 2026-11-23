@@ -136,20 +136,104 @@ pub fn notice(collected: &[Collected]) -> String {
     }
 }
 
-/// Reclaim the directories of every cancelled agent of a saved run (`--gc`, offline).
+/// The branch agents' branches are compared with before they are deleted, and the repository it
+/// is a branch of: a swarm's base (the branch at its root agent's checkout) says nothing about a
+/// worktree of another repository, which is compared with that repository's own base
+/// ([`repo_base`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Base {
+    /// The branch, e.g. `main`.
+    pub branch: String,
+    /// The repository's git common dir, shared by all its worktrees.
+    git_dir: PathBuf,
+}
+
+impl Base {
+    /// `branch` (default: the branch checked out at `dir`) of the repository at `dir`; `None`
+    /// when `dir` is not in a repository or has no branch checked out.
+    pub async fn at(dir: &Path, branch: Option<&str>) -> Option<Base> {
+        let git_dir = git_dir(dir).await?;
+        let branch = match branch {
+            Some(branch) => branch.to_owned(),
+            None => crate::status::current_branch(dir).await?,
+        };
+        Some(Base { branch, git_dir })
+    }
+}
+
+/// The git common dir of the repository at `dir`, resolved, so worktrees of one repository agree.
+async fn git_dir(dir: &Path) -> Option<PathBuf> {
+    let out = git(dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await;
+    let dir = PathBuf::from(out.ok()?);
+    Some(std::fs::canonicalize(&dir).unwrap_or(dir))
+}
+
+/// The base of the repository at `repo` when the swarm has none for it: the branch its checkout
+/// has out, else its default branch (`origin/HEAD`), else `main` or `master`.
+pub async fn repo_base(repo: &Path) -> Option<String> {
+    if let Some(branch) = crate::status::current_branch(repo).await {
+        return Some(branch);
+    }
+    let exists = |name: String| async move {
+        git(
+            repo,
+            &["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")],
+        )
+        .await
+        .is_ok()
+        .then_some(name)
+    };
+    let remote = git(
+        repo,
+        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .await;
+    if let Ok(remote) = remote {
+        // The local branch it names, if there is one: agents branch off and land on that.
+        let local = remote.strip_prefix("origin/").map(str::to_owned);
+        if let Some(local) = local.filter(|name| !name.is_empty()) {
+            if let Some(local) = exists(local).await {
+                return Some(local);
+            }
+        }
+        return exists(remote).await;
+    }
+    for name in ["main", "master"] {
+        if let Some(name) = exists(name.to_owned()).await {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// The base to compare an agent's branch with in the repository at `dir` (its worktree, else its
+/// main checkout): the swarm's `base` if it is of that repository, else the [`repo_base`] of the
+/// repository's main checkout.
+async fn base_in(dir: &Path, base: Option<&Base>) -> Option<String> {
+    let git_dir = match dir.is_dir() {
+        true => git_dir(dir).await?,
+        false => return None,
+    };
+    match base {
+        Some(base) if base.git_dir == git_dir => Some(base.branch.clone()),
+        // The main checkout holds the common dir (`<repo>/.git`); a bare repository is its own.
+        _ => match git_dir.file_name().is_some_and(|name| name == ".git") {
+            true => repo_base(git_dir.parent()?).await,
+            false => repo_base(&git_dir).await,
+        },
+    }
+}
+
+/// Reclaim the directories of every cancelled agent of a saved run (`--gc`, offline). `base` is
+/// the branch to compare with (default: the one at the root agent's checkout), in its repository.
 pub async fn collect_run(state: &crate::state::SwarmState, base: Option<&str>) -> Vec<Collected> {
     // The base as the running swarm has it: the branch at the root agent's own checkout.
-    let base = match base {
-        Some(base) => Some(base.to_owned()),
-        None => {
-            let root = state
-                .agents
-                .iter()
-                .find(|a| a.parent == crate::USER && a.branch.is_none());
-            let root = root.map_or(&state.cwd, |agent| &agent.cwd);
-            crate::status::current_branch(root).await
-        }
-    };
+    let root = state
+        .agents
+        .iter()
+        .find(|a| a.parent == crate::USER && a.branch.is_none());
+    let root = root.map_or(&state.cwd, |agent| &agent.cwd);
+    let base = Base::at(root, base).await;
     let mut out = Vec::new();
     for agent in state.agents.iter().filter(|agent| agent.status == "cancelled") {
         let branch = agent.branch.as_deref();
@@ -159,7 +243,7 @@ pub async fn collect_run(state: &crate::state::SwarmState, base: Option<&str>) -
             branch,
             &agent.cwd,
             &agent.env,
-            base.as_deref(),
+            base.as_ref(),
         );
         out.push(collected.await);
     }
@@ -168,15 +252,15 @@ pub async fn collect_run(state: &crate::state::SwarmState, base: Option<&str>) -
 
 /// Reclaim the directories and branch cancelled agent `id` of run `run_id` owns. Only worktree
 /// agents (`branch` set) own any; `cwd` is where the agent worked, `env` its command environment.
-/// The branch must be merged into `base` (default: the branch the repository's main worktree
-/// has out; the swarm passes the root agent's branch, which may be another worktree's).
+/// The branch must be merged into `base` when the worktree is of `base`'s repository, else into
+/// that repository's own base ([`repo_base`]).
 pub async fn collect(
     run_id: &str,
     id: &str,
     branch: Option<&str>,
     cwd: &Path,
     env: &BTreeMap<String, String>,
-    base: Option<&str>,
+    base: Option<&Base>,
 ) -> Collected {
     let mut out = Collected {
         id: id.to_owned(),
@@ -191,10 +275,9 @@ pub async fn collect(
     let Some((root, repo)) = layout(run_id, id, cwd) else {
         return out;
     };
-    let base = match base {
-        Some(base) => Some(base.to_owned()),
-        None if repo.is_dir() => crate::status::current_branch(&repo).await,
-        None => None,
+    let base = match root.is_dir() {
+        true => base_in(&root, base).await,
+        false => base_in(&repo, base).await,
     };
     if root.exists() {
         if worktree_root(run_id, id, &root).await.as_ref() != Some(&root) {
@@ -572,7 +655,8 @@ mod tests {
                 "swarm/r1/a2",
             ],
         );
-        let busy = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, Some(&base)).await;
+        let base = Base::at(&repo, Some(&base)).await;
+        let busy = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, base.as_ref()).await;
         let why = ("swarm/r1/a2".to_owned(), "checked out in a worktree".to_owned());
         assert_eq!(busy.kept_branch, Some(why));
         run(&repo, &["worktree", "remove", elsewhere.to_str().unwrap()]);
@@ -866,6 +950,100 @@ mod tests {
         let deleted = ("swarm/r1/a2".to_owned(), "merged".to_owned());
         assert_eq!(collected[0].deleted_branch, Some(deleted), "{collected:?}");
         assert!(!branch_exists(&repo, "swarm/r1/a2"));
+    }
+
+    /// A worktree of another repository than the swarm's base is compared with that repository's
+    /// own base, not with a branch of the swarm's name it does not have.
+    #[tokio::test]
+    async fn a_worktree_of_another_repo_is_compared_with_that_repos_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let swarm_repo = tmp.path().join("swarm");
+        fs::create_dir_all(&swarm_repo).unwrap();
+        run(&swarm_repo, &["init", "-q", "-b", "swarm-self"]);
+        run(&swarm_repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let swarm_base = Base::at(&swarm_repo, None).await.unwrap();
+        assert_eq!(swarm_base.branch, "swarm-self");
+
+        let (repo, worktree) = repo_with_worktree(&tmp.path().join("other"));
+        run(&repo, &["branch", "-M", "main"]);
+        fs::write(worktree.join("work.txt"), "done").unwrap();
+        run(&worktree, &["add", "."]);
+        run(&worktree, &["commit", "-qm", "work"]);
+        let none = BTreeMap::new();
+        let kept = collect(
+            "r1",
+            "a2",
+            Some("swarm/r1/a2"),
+            &worktree,
+            &none,
+            Some(&swarm_base),
+        )
+        .await;
+        let why = ("swarm/r1/a2".to_owned(), "1 commit not on main".to_owned());
+        assert_eq!(kept.kept_branch, Some(why), "{kept:?}");
+
+        // Cherry-picked onto the other repo's base (moved on, so the copy is a new commit): every
+        // patch is upstream, so it goes.
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "moved on"]);
+        run(&repo, &["cherry-pick", "swarm/r1/a2"]);
+        let gone = collect(
+            "r1",
+            "a2",
+            Some("swarm/r1/a2"),
+            &worktree,
+            &none,
+            Some(&swarm_base),
+        )
+        .await;
+        let deleted = ("swarm/r1/a2".to_owned(), "all applied".to_owned());
+        assert_eq!(gone.deleted_branch, Some(deleted), "{gone:?}");
+        assert!(!branch_exists(&repo, "swarm/r1/a2"));
+    }
+
+    /// The swarm's base still applies to worktrees of its own repository, whatever is checked
+    /// out in the main checkout.
+    #[tokio::test]
+    async fn the_swarms_base_applies_to_its_own_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, worktree) = repo_with_worktree(tmp.path());
+        fs::write(worktree.join("work.txt"), "done").unwrap();
+        run(&worktree, &["add", "."]);
+        run(&worktree, &["commit", "-qm", "work"]);
+        run(&repo, &["branch", "integration", "swarm/r1/a2"]);
+        let base = Base::at(&worktree, Some("integration")).await;
+        let none = BTreeMap::new();
+        let gone = collect("r1", "a2", Some("swarm/r1/a2"), &worktree, &none, base.as_ref()).await;
+        let deleted = ("swarm/r1/a2".to_owned(), "merged".to_owned());
+        assert_eq!(gone.deleted_branch, Some(deleted), "{gone:?}");
+    }
+
+    #[tokio::test]
+    async fn a_repos_base_falls_back_to_its_default_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "trunk"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        assert_eq!(repo_base(&repo).await.as_deref(), Some("trunk"), "checked out");
+        run(&repo, &["checkout", "-q", "--detach"]);
+        assert_eq!(repo_base(&repo).await, None, "no default to fall back to");
+        run(&repo, &["branch", "master"]);
+        assert_eq!(repo_base(&repo).await.as_deref(), Some("master"));
+        run(&repo, &["branch", "main"]);
+        assert_eq!(repo_base(&repo).await.as_deref(), Some("main"), "main first");
+        // `origin/HEAD` wins over the guesses: its local branch, else the remote one.
+        run(&repo, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        run(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        assert_eq!(repo_base(&repo).await.as_deref(), Some("trunk"));
+        run(&repo, &["branch", "-D", "trunk"]);
+        assert_eq!(repo_base(&repo).await.as_deref(), Some("origin/trunk"));
     }
 
     #[test]
