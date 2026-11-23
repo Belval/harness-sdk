@@ -12,6 +12,7 @@
 //! The runtime enforces only resource limits (live agents, concurrent model calls, a token budget)
 //! and cancellation, which cascades down the spawn tree.
 
+pub mod aging;
 pub mod catalog;
 pub mod compaction;
 pub mod cost;

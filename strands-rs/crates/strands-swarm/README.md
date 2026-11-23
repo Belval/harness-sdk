@@ -153,6 +153,14 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     (`[image omitted: <path or tool>, WxH; read it again if needed]`) once four newer assistant
     messages exist, so the latest steps' images always stay. The stub is not stashed (that would
     keep the bytes); a re-read is cheap. Mail attachments (`wait` results) stay.
+  - **Old mail and replies.** Once 20 newer turns exist, an agent mail body (in a turn's prompt
+    or appended to a tool result) or the agent's own text over 1,500 characters keeps its first
+    ~600 and `[Stashed: N more chars] [ref: …]`; `retrieve_context` returns the whole text. The
+    user's mail is never cut. Why: over a day, a 30-child coordinator's context was 41% its own
+    replies (2.4k characters each, half restating the last ten), 37% its children's mail and 5%
+    tool results, and it compacted every 1.5 h. Replayed on that history, aging keeps 3.3k
+    instead of 5.5k characters per turn (-39%; about 180k to 110k tokens of growth an hour) and
+    compacts every ~450 turns instead of ~270.
   - All of these edit history, and the prompt cache only matches an unchanged prefix, so they run only when
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
     the `context` tool), after the system prompt or tools changed (a `cd`, a `find_tools` enable;

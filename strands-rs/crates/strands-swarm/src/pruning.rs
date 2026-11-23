@@ -20,7 +20,9 @@
 //! Those more than [`KEEP_IMAGE_STEPS`] assistant messages back become a text stub naming where
 //! they came from, so a re-read gets them back; they are not stashed, as that would keep the bytes.
 //!
-//! All three edit history, and the provider's prompt cache only matches an unchanged prefix: one edit
+//! Old mail and replies: see [`crate::aging`].
+//!
+//! All four edit history, and the provider's prompt cache only matches an unchanged prefix: one edit
 //! deep in a 150k-token history turns the next call's cache reads (0.1x) into cache writes
 //! (1.25x) for everything after it. Run on every turn, they raised input cost per call by ~80% on
 //! a live run. So [`CachePrune`] runs them only when the prefix is lost anyway, and then all at
@@ -55,10 +57,13 @@ const REASONING_DROPPED: &str = "[reasoning dropped]";
 /// Where the current turn starts: the last user message that carries no tool results.
 /// A restart notice is not a new turn: the turn it interrupted goes on.
 fn turn_start(messages: &[Message]) -> usize {
-    messages
-        .iter()
-        .rposition(|m| m.role == Role::User && m.tool_results().next().is_none() && !is_restart_notice(m))
-        .unwrap_or(0)
+    messages.iter().rposition(starts_turn).unwrap_or(0)
+}
+
+/// Whether `message` starts a turn: a user message that carries no tool results and is no
+/// restart notice.
+fn starts_turn(message: &Message) -> bool {
+    message.role == Role::User && message.tool_results().next().is_none() && !is_restart_notice(message)
 }
 
 fn is_restart_notice(message: &Message) -> bool {
@@ -331,7 +336,7 @@ impl CachePrune {
         if idle {
             return Some(PruneReason::Idle);
         }
-        (removable_share(ctx.messages) >= PRUNE_SHARE).then_some(PruneReason::Large)
+        (removable_share(ctx.messages, ctx.stash.is_some()) >= PRUNE_SHARE).then_some(PruneReason::Large)
     }
 
     fn edited(&self, messages: &[Message]) -> bool {
@@ -380,6 +385,10 @@ impl ContextStrategy for CachePrune {
         let trimmed = self.gate.trim.apply(ctx).await?;
         // After `before`, so an image going counts as an edit to the prefix like a trimmed result.
         let trimmed = drop_old_images(ctx.messages) | trimmed;
+        let trimmed = match ctx.stash.clone() {
+            Some(stash) => crate::aging::age(ctx.messages, starts_turn, &stash).await | trimmed,
+            None => trimmed,
+        };
         // A summary (compaction, or the overflow it answers) rewrites everything before the tail;
         // a new system prompt or tool set precedes all of it, so every thinking block goes.
         let edited = match reason {
@@ -442,8 +451,9 @@ fn hash(message: &Message) -> u64 {
     hasher.finish()
 }
 
-/// The share of the history (JSON characters) that pruning would remove now.
-fn removable_share(messages: &[Message]) -> f64 {
+/// The share of the history (JSON characters) that pruning would remove now; with a stash, old
+/// mail and replies ([`crate::aging`]) count too.
+fn removable_share(messages: &[Message], stash: bool) -> f64 {
     let total: usize = messages.iter().map(json_len).sum();
     if total == 0 {
         return 0.0;
@@ -467,7 +477,11 @@ fn removable_share(messages: &[Message]) -> f64 {
         .iter()
         .map(|(.., stub, size)| size.saturating_sub(stub.len()))
         .sum();
-    (reasoning + results + images) as f64 / total as f64
+    let aged = match stash {
+        true => crate::aging::removable(messages, starts_turn),
+        false => 0,
+    };
+    (reasoning + results + images + aged) as f64 / total as f64
 }
 
 fn json_len<T: serde::Serialize>(value: &T) -> usize {
@@ -767,9 +781,9 @@ mod tests {
         second[0] = Message::user("second task");
         messages.extend(second);
         assert!(
-            removable_share(&messages) < PRUNE_SHARE,
+            removable_share(&messages, true) < PRUNE_SHARE,
             "{}",
-            removable_share(&messages)
+            removable_share(&messages, true)
         );
         messages
     }
@@ -888,10 +902,67 @@ mod tests {
             messages.push(assistant(vec![tool_call(&id)]));
             messages.push(result(&id, "y".repeat(6_000)));
         }
-        assert!(removable_share(&messages) >= PRUNE_SHARE);
+        assert!(removable_share(&messages, true) >= PRUNE_SHARE);
         assert!(pass(&prune, &agent, &mut messages, 0.1).await);
         assert!(pruned(&messages));
-        assert!(removable_share(&messages) < 0.01);
+        assert!(removable_share(&messages, true) < 0.01);
+    }
+
+    /// A coordinator's turns: a child's long report, then a long reply of its own.
+    fn coordinator(turns: usize) -> Vec<Message> {
+        let mut messages = Vec::new();
+        for t in 0..turns {
+            let report = format!(
+                "<message from=\"parser (a2)\" kind=\"reply\">\n{}\n</message>",
+                "r".repeat(6_000)
+            );
+            messages.push(Message::user(report).with_tracking_id(format!("u{t}")));
+            messages.push(Message::assistant("a".repeat(6_000)));
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn old_mail_and_replies_age_only_when_the_gate_prunes() {
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+        let keep = crate::aging::KEEP_TURNS;
+        let mut messages = coordinator(keep);
+        assert!(
+            !pass(&prune, &agent, &mut messages, 0.1).await,
+            "every turn is recent"
+        );
+        // Old turns past a few: some to age, but under PRUNE_SHARE of the history.
+        messages.splice(0..0, coordinator(3));
+        prune
+            .mark()
+            .apply(&mut ctx(&mut messages, &agent, 0.1))
+            .await
+            .unwrap();
+        assert!(removable_share(&messages, true) < PRUNE_SHARE);
+        assert!(
+            !pass(&prune, &agent, &mut messages, 0.1).await,
+            "warm, not worth a rewrite"
+        );
+        assert_eq!(
+            removable_share(&messages, false),
+            0.0,
+            "without a stash nothing ages"
+        );
+        // As many old turns as recent ones: well over PRUNE_SHARE.
+        messages.splice(0..0, coordinator(keep));
+        prune
+            .mark()
+            .apply(&mut ctx(&mut messages, &agent, 0.1))
+            .await
+            .unwrap();
+        assert!(removable_share(&messages, true) >= PRUNE_SHARE);
+        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
+        let aged = messages
+            .iter()
+            .take_while(|m| m.text().contains("[Stashed:"))
+            .count();
+        assert_eq!(aged, 2 * (keep + 3), "every old turn's report and reply aged");
+        assert!(removable_share(&messages, true) < 0.01);
     }
 
     #[tokio::test]
