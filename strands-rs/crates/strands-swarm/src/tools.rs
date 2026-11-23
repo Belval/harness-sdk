@@ -193,9 +193,8 @@ async fn reload_tool(swarm: Swarm, _me: String, input: ReloadInput, _ctx: ToolCo
 }
 
 const RUN_BACKGROUND_DESCRIPTION: &str = concat!(
-    "Run a shell command in your cwd, detached and with no timeout (survives restarts); returns ",
-    "its job id at once. When it ends you get a message from `jobs` with the exit code and last 40 ",
-    "output lines, waking you if idle."
+    "Run a shell command in your cwd, detached, no timeout, survives restarts. At its end you ",
+    "get a `jobs` message with the exit code and last 40 output lines, waking you if idle."
 );
 
 const JOBS_DESCRIPTION: &str =
@@ -203,11 +202,13 @@ const JOBS_DESCRIPTION: &str =
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RunBackgroundInput {
-    /// Run with `sh -c`.
     command: String,
-    /// Short label, e.g. `gates`.
+    /// Label, e.g. `gates`.
     #[serde(default)]
     name: Option<String>,
+    /// Rerun each time it ends, until killed.
+    #[serde(default)]
+    restart: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -262,7 +263,9 @@ async fn run_background_tool(
     input: RunBackgroundInput,
     _ctx: ToolContext,
 ) -> Result<String> {
-    let job = swarm.start_job(&me, &input.command, input.name).await?;
+    let job = swarm
+        .start_job(&me, &input.command, input.name, input.restart)
+        .await?;
     Ok(format!(
         "Started job {} in {}; output: {}. You will get a message when it ends.",
         job.label(),
@@ -300,7 +303,7 @@ fn render_jobs(
     jobs.sort_by_key(|job| job.meta.owner != me);
     let (shown, others_ended): (Vec<Job>, Vec<Job>) = jobs
         .into_iter()
-        .partition(|job| job.meta.owner == me || job.state == JobState::Running);
+        .partition(|job| job.meta.owner == me || job.live());
     let mut lines: Vec<String> = shown
         .iter()
         .map(|job| {
@@ -689,7 +692,7 @@ async fn has_unreported_jobs(swarm: &Swarm, me: &str) -> bool {
         .jobs()
         .await
         .iter()
-        .any(|job| job.meta.owner == me && (job.state == JobState::Running || !job.reported))
+        .any(|job| job.meta.owner == me && (job.live() || !job.reported))
 }
 
 async fn list_tool(swarm: Swarm, _me: String, input: ListInput, _ctx: ToolContext) -> Result<String> {
@@ -960,6 +963,9 @@ mod tests {
                 cwd: "/w".into(),
                 pid: 1,
                 started: 0,
+                restart: false,
+                restarts: 0,
+                quick: 0,
             },
             state,
             reported: true,

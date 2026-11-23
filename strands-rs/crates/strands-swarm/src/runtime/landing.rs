@@ -106,7 +106,7 @@ impl Swarm {
         );
         // Its checks build into a target dir of their own: not while space is low.
         self.wait_for_host(owner, true, &node.turn_token()).await?;
-        self.start_job(owner, &command, Some(format!("land {label} → {into}")))
+        self.start_job(owner, &command, Some(format!("land {label} → {into}")), false)
             .await
     }
 

@@ -47,7 +47,7 @@ impl Swarm {
         let swarm = self.clone();
         tokio::spawn(async move {
             for job in swarm.jobs().await {
-                if job.state == jobs::JobState::Running && owners.contains(&job.meta.owner) {
+                if job.live() && owners.contains(&job.meta.owner) {
                     let _ = swarm.kill_job(&job.meta.id).await;
                 }
             }
@@ -57,8 +57,16 @@ impl Swarm {
     /// Start `command` as a background job of agent `owner`: in its working directory and
     /// environment, detached from this process so a restart does not stop it. When it ends, the
     /// owner gets a `job` message with its exit code and the tail of its output. Waits first
-    /// while the host is overloaded ([`Swarm::host_busy`]).
-    pub async fn start_job(&self, owner: &str, command: &str, name: Option<String>) -> Result<Job> {
+    /// while the host is overloaded ([`Swarm::host_busy`]). With `restart`, each time it ends the
+    /// harness also starts it again (same id, fresh log, after a back-off when it keeps exiting
+    /// at once) until it is killed: see [`Swarm::restart_job`].
+    pub async fn start_job(
+        &self,
+        owner: &str,
+        command: &str,
+        name: Option<String>,
+        restart: bool,
+    ) -> Result<Job> {
         let node = self.known(owner)?;
         self.wait_for_host(owner, false, &node.turn_token()).await?;
         let job = self
@@ -70,6 +78,7 @@ impl Swarm {
                 command,
                 &node.workdir.get(),
                 &self.with_build_jobs(node.env.clone()),
+                restart,
             )
             .await?;
         self.journal_event(
@@ -112,6 +121,10 @@ impl Swarm {
         }
         let swarm = self.clone();
         tokio::spawn(async move {
+            // Restarts that were waiting when the swarm went down.
+            for (id, wait) in swarm.inner.jobs.pending_restarts().await {
+                swarm.restart_later(id, wait);
+            }
             let mut ticks: u64 = 0;
             loop {
                 if swarm.inner.shutting_down.load(Ordering::SeqCst) {
@@ -162,13 +175,25 @@ impl Swarm {
             true => empty_output(&job.meta.command),
             false => format!("last lines:\n{tail}"),
         };
-        let text = format!(
+        let mut text = format!(
             "Job {} {}: `{}`\nlog: {}\n{output}",
             job.label(),
             job.status(),
             job.meta.command,
             self.job_log(id).display()
         );
+        let wait = job.meta.restart.then(|| jobs::restart_delay(job.quick_after()));
+        if let Some(wait) = wait {
+            text.push_str(&match wait.is_zero() {
+                true => "\nrestarting it (restart: true); `jobs` kill stops it.".to_owned(),
+                false => format!(
+                    "\nit exited within {}s {} times in a row; restarting it in {} (restart: true); `jobs` kill stops it.",
+                    jobs::QUICK_EXIT,
+                    job.quick_after(),
+                    schedules::human(wait)
+                ),
+            });
+        }
         // Posted and saved before it is marked: a crash in between repeats the report rather than
         // lose it. An owner that is gone (cancelled) cannot be told; the job counts as reported.
         self.inner.reports_posted.lock().insert(id.clone());
@@ -181,6 +206,52 @@ impl Swarm {
             tracing::warn!(job = %id, %error, "could not mark the job reported");
         }
         self.inner.reports_posted.lock().remove(id);
+        if let Some(wait) = wait {
+            self.restart_later(id.clone(), wait);
+        }
+    }
+
+    /// Start restarting job `id` again in `wait`, then keep trying until it has started, was
+    /// killed, or its owner is gone (which kills it). Waits for the host like a new job.
+    fn restart_later(&self, id: String, wait: Duration) {
+        let swarm = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = swarm.inner.root_cancel.cancelled() => return,
+            }
+            while let Err(error) = swarm.restart_job(&id).await {
+                if swarm.inner.shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
+                tracing::warn!(job = %id, %error, "could not restart the job; trying again in a minute");
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    () = swarm.inner.root_cancel.cancelled() => return,
+                }
+            }
+        });
+    }
+
+    /// Start the ended restarting job `id` again, as [`Swarm::start_job`] would: in its owner's
+    /// working directory and environment, once the host allows. A job whose owner is cancelled is
+    /// killed instead.
+    async fn restart_job(&self, id: &str) -> Result<()> {
+        let job = self.inner.jobs.get(id).await?;
+        let Some(node) = self.node(&job.meta.owner).filter(|n| n.status.lock().is_live()) else {
+            self.kill_job(id).await?;
+            return Ok(());
+        };
+        self.wait_for_host(&job.meta.owner, false, &node.turn_token())
+            .await?;
+        let env = self.with_build_jobs(node.env.clone());
+        if let Some(job) = self.inner.jobs.restart(id, &env).await? {
+            self.journal_event(
+                "job_restart",
+                serde_json::json!({ "id": id, "restarts": job.meta.restarts }),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -386,6 +457,9 @@ mod tests {
                 cwd: dir.path().into(),
                 pid: 0,
                 started: n,
+                restart: false,
+                restarts: 0,
+                quick: 0,
             };
             std::fs::write(
                 files.join(format!("j{n}.json")),

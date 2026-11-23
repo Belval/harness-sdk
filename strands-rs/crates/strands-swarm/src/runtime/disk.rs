@@ -181,9 +181,7 @@ impl Swarm {
             let done = branches
                 .get(&node.id)
                 .is_some_and(|state| state.integrated() && state.others.is_empty());
-            let busy = jobs
-                .iter()
-                .any(|job| job.meta.owner == node.id && job.state == jobs::JobState::Running);
+            let busy = jobs.iter().any(|job| job.meta.owner == node.id && job.live());
             if node.branch.is_none() || !done || busy || !self.is_idle(&node.id) {
                 continue;
             }

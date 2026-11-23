@@ -1764,7 +1764,7 @@ async fn shells_and_jobs_get_capped_cargo_build_jobs_unless_the_environment_sets
         inherited.is_none().then_some(&expected)
     );
     swarm
-        .start_job("a1", "echo $CARGO_BUILD_JOBS > jobs.txt", None)
+        .start_job("a1", "echo $CARGO_BUILD_JOBS > jobs.txt", None, false)
         .await
         .unwrap();
     mail_to(&mut events, "a1", "job").await;
@@ -3102,7 +3102,7 @@ async fn an_overloaded_host_holds_new_model_calls_and_jobs_until_it_recovers() {
     swarm.set_max_load(None);
     let start = tokio::spawn({
         let swarm = swarm.clone();
-        async move { swarm.start_job("a2", "true", None).await }
+        async move { swarm.start_job("a2", "true", None, false).await }
     });
     assert_eq!(host_held(&mut events, "a2").await.as_deref(), Some(why));
     assert!(swarm.jobs().await.is_empty(), "no job starts while held");
@@ -4102,7 +4102,7 @@ async fn gc_and_resume_remove_a_killed_land_job_s_scratch_once_no_land_job_runs(
 
     // Another land job is running: it might be using the directory.
     let job = swarm
-        .start_job("a1", "sleep 30 # --land plan", None)
+        .start_job("a1", "sleep 30 # --land plan", None, false)
         .await
         .unwrap();
     let collected = swarm.gc().await;
@@ -7503,4 +7503,189 @@ async fn settle_never_delays_the_user_mail_that_wakes_an_idle_agent() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(root.calls().len(), 5);
     assert_eq!(swarm.waking_in("a1"), None);
+}
+
+/// Wait for `done`; a `paused` clock moves on by itself only when the runtime is idle, which
+/// the job commands (real processes) never let it be, so each check also advances it a little.
+async fn until_jobs(swarm: &Swarm, paused: bool, done: impl Fn(&[strands_swarm::jobs::Job]) -> bool) {
+    for _ in 0..1000 {
+        if done(&swarm.jobs().await) {
+            return;
+        }
+        if paused {
+            tokio::time::advance(Duration::from_millis(600)).await;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        tokio::task::yield_now().await;
+    }
+    panic!("jobs never reached the state: {:?}", swarm.jobs().await);
+}
+
+fn restart_script(command: &str, wakes: usize) -> Scripts {
+    let mut script = vec![
+        tool_call(
+            "run_background",
+            "r1",
+            json!({ "command": command, "name": "watch", "restart": true }),
+        ),
+        say("started"),
+    ];
+    script.extend((0..wakes).map(|i| say(&format!("woken {i}"))));
+    scripts_of(vec![("a1", script)])
+}
+
+#[tokio::test]
+async fn a_restart_job_mails_each_end_starts_again_backs_off_when_it_keeps_exiting_and_stops_when_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = restart_script("echo tick", 8);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    spawn_root(&swarm, "watch").await;
+
+    assert_eq!(reply_to(&mut events, USER).await, "started");
+    for _ in 0..2 {
+        let report = mail_to(&mut events, "a1", "job").await;
+        assert!(report.contains("Job j1 (watch) exited 0"), "{report}");
+        assert!(report.contains("tick"), "{report}");
+        assert!(report.contains("restarting it (restart: true)"), "{report}");
+    }
+    let third = mail_to(&mut events, "a1", "job").await;
+    assert!(third.contains("restarts 2"), "{third}");
+    assert!(
+        third.contains("within 10s 3 times in a row; restarting it in 1m"),
+        "{third}"
+    );
+    let jobs = swarm.jobs().await;
+    assert_eq!(jobs.len(), 1, "the same job id throughout");
+    assert_eq!(jobs[0].meta.restarts, 2);
+    let listed = strands_swarm::jobs::Job::status(&jobs[0]);
+    assert!(listed.ends_with("restarts 2"), "{listed}");
+
+    // Held by the back-off until a minute has passed.
+    std::thread::sleep(Duration::from_millis(1200));
+    tokio::task::yield_now().await;
+    assert_eq!(swarm.jobs().await[0].meta.restarts, 2);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(swarm.jobs().await[0].meta.restarts, 2, "still held at 30s");
+    tokio::time::advance(Duration::from_secs(31)).await;
+    until_jobs(&swarm, true, |jobs| jobs[0].meta.restarts == 3).await;
+    let mut fourth = None;
+    for _ in 0..1000 {
+        while let Ok(event) = events.try_recv() {
+            match event {
+                SwarmEvent::Mail { mail, .. } if mail.kind == "job" => fourth = Some(mail.text),
+                _ => {}
+            }
+        }
+        if fourth.is_some() {
+            break;
+        }
+        tokio::time::advance(Duration::from_millis(600)).await;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let fourth = fourth.expect("the fourth end is mailed");
+    assert!(
+        fourth.contains("4 times in a row; restarting it in 2m"),
+        "{fourth}"
+    );
+
+    // Killed while it waits: never again, and no end report.
+    swarm.kill_job("j1").await.unwrap();
+    for _ in 0..50 {
+        tokio::time::advance(Duration::from_secs(100)).await;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let jobs = swarm.jobs().await;
+    assert_eq!(jobs[0].state, strands_swarm::jobs::JobState::Killed);
+    assert_eq!(jobs[0].meta.restarts, 3);
+    while let Ok(event) = events.try_recv() {
+        if let SwarmEvent::Mail { mail, .. } = event {
+            assert_ne!(mail.kind, "job", "a killed job is not reported: {}", mail.text);
+        }
+    }
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn killing_a_running_restart_job_through_the_tool_stops_it_for_good() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call(
+                "run_background",
+                "r1",
+                json!({ "command": "sleep 30", "restart": true }),
+            ),
+            tool_call("jobs", "j1", json!({ "kill": "j1" })),
+            say("done"),
+        ],
+    )]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "done");
+    std::thread::sleep(Duration::from_millis(1500));
+    tokio::task::yield_now().await;
+    let jobs = swarm.jobs().await;
+    assert_eq!(jobs[0].state, strands_swarm::jobs::JobState::Killed);
+    assert_eq!(jobs[0].meta.restarts, 0);
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_without_restart_ends_once_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call("run_background", "r1", json!({ "command": "echo once" })),
+            say("started"),
+            say("saw it"),
+            say("spurious"),
+        ],
+    )]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    spawn_root(&swarm, "go").await;
+    let [report] = mails_to(&mut events, [("a1", "job")]).await;
+    assert!(!report.contains("restart"), "{report}");
+    std::thread::sleep(Duration::from_millis(1500));
+    tokio::task::yield_now().await;
+    let jobs = swarm.jobs().await;
+    assert_eq!((jobs.len(), jobs[0].meta.restarts), (1, 0));
+    assert!(!jobs[0].status().contains("restarts"), "{}", jobs[0].status());
+    while let Ok(event) = events.try_recv() {
+        if let SwarmEvent::Mail { mail, .. } = event {
+            assert_ne!(mail.kind, "job", "ended once: {}", mail.text);
+        }
+    }
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_restart_job_that_ended_while_the_swarm_was_down_is_reported_and_started_again_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = restart_script(&format!("{UNTIL_GO}; echo finished"), 0);
+    let config = persistent_swarm(&scripts, dir.path());
+    let (swarm, mut events) = Swarm::new(config.clone());
+    spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "started");
+    swarm.shutdown().await;
+    std::fs::write(dir.path().join("go"), "").unwrap();
+
+    let saved = strands_swarm::state::load(&dir.path().join("run"))
+        .await
+        .unwrap()
+        .expect("state saved");
+    scripts.lock().insert(
+        "a1".into(),
+        MockMessageModel::shared(vec![say("noted"), say("again")]),
+    );
+    let (resumed, mut events) = Swarm::resume(config, saved).await.unwrap();
+    let report = mail_to(&mut events, "a1", "job").await;
+    assert!(report.contains("Job j1 (watch) exited 0"), "{report}");
+    assert!(report.contains("restarting it"), "{report}");
+    until_jobs(&resumed, false, |jobs| jobs[0].meta.restarts >= 1).await;
+    assert_eq!(resumed.jobs().await.len(), 1);
+    resumed.shutdown().await;
 }

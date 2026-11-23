@@ -54,8 +54,37 @@ pub struct JobMeta {
     pub cwd: PathBuf,
     /// Process id of the wrapper, which leads the job's process group.
     pub pid: u32,
-    /// Start time, seconds since the Unix epoch.
+    /// Start time (of the latest run), seconds since the Unix epoch.
     pub started: u64,
+    /// Run it again each time it ends, under this id, until it is killed (the watcher pattern).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restart: bool,
+    /// How many times it has been started again.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub restarts: u32,
+    /// Runs in a row that ended within [`QUICK_EXIT`], up to the latest restart.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub quick: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// A restarting job that ends within this many seconds counts as a quick exit.
+pub const QUICK_EXIT: u64 = 10;
+
+/// Quick exits in a row after which restarts back off.
+const QUICK_EXITS_FREE: u32 = 3;
+
+/// The wait before the next restart after `quick` quick exits in a row: none for the first
+/// [`QUICK_EXITS_FREE`] - 1, then a minute, doubling up to 30 minutes.
+pub fn restart_delay(quick: u32) -> std::time::Duration {
+    let seconds = match quick.checked_sub(QUICK_EXITS_FREE) {
+        None => 0,
+        Some(n) => (60u64 << n.min(5)).min(30 * 60),
+    };
+    std::time::Duration::from_secs(seconds)
 }
 
 /// Where a job is.
@@ -85,6 +114,24 @@ pub struct Job {
 }
 
 impl Job {
+    /// Ended, to be started again ([`JobMeta::restart`]); a killed job never is.
+    pub fn restarting(&self) -> bool {
+        self.meta.restart && matches!(self.state, JobState::Exited(_) | JobState::Lost)
+    }
+
+    /// Running, or waiting to be started again.
+    pub fn live(&self) -> bool {
+        self.state == JobState::Running || self.restarting()
+    }
+
+    /// Quick exits in a row once this run is over: the count the next restart is delayed by.
+    pub fn quick_after(&self) -> u32 {
+        match self.seconds < QUICK_EXIT {
+            true => self.meta.quick.saturating_add(1),
+            false => 0,
+        }
+    }
+
     /// `j3 (gates)`.
     pub fn label(&self) -> String {
         match &self.meta.name {
@@ -96,11 +143,15 @@ impl Job {
     /// `running 2m05s`, `exited 0 after 41s`, `killed after 3s`.
     pub fn status(&self) -> String {
         let time = duration(self.seconds);
-        match self.state {
+        let status = match self.state {
             JobState::Running => format!("running {time}"),
             JobState::Exited(code) => format!("exited {code} after {time}"),
             JobState::Killed => format!("killed after {time}"),
             JobState::Lost => "ended without an exit code".to_owned(),
+        };
+        match self.meta.restarts {
+            0 => status,
+            n => format!("{status}, restarts {n}"),
         }
     }
 }
@@ -174,41 +225,103 @@ impl Jobs {
         command: &str,
         cwd: &Path,
         env: &BTreeMap<String, String>,
+        restart: bool,
     ) -> Result<Job> {
         let _guard = self.start.lock().await;
         tokio::fs::create_dir_all(&self.dir).await?;
         let id = self.next_id().await?;
-        let mut child = quiet(&mut session_command("sh"))
-            .arg("-c")
-            .arg(WRAPPER)
-            .arg("job")
-            .arg(command)
-            .arg(self.log_path(&id))
-            .arg(self.file(&id, "exit"))
-            .current_dir(cwd)
-            .envs(env)
-            .spawn()
-            .map_err(|e| Error::other(format!("Could not start the job: {e}")))?;
         let meta = JobMeta {
             id: id.clone(),
             owner: owner.to_owned(),
             name: name.filter(|n| !n.trim().is_empty()),
             command: command.to_owned(),
             cwd: cwd.to_path_buf(),
-            pid: child.id().unwrap_or_default(),
+            pid: self.spawn(&id, command, cwd, env)?,
             started: now(),
+            restart,
+            restarts: 0,
+            quick: 0,
         };
-        // Reap the wrapper once it ends; the job reports through its files, not this handle.
-        tokio::spawn(async move { child.wait().await });
-        // A crash mid-write must not leave a half `.json`, which no listing could read.
-        let json = serde_json::to_vec_pretty(&meta)?;
-        crate::files::replace_async(&self.file(&id, "json"), json, false).await?;
+        self.describe(&meta).await?;
         Ok(Job {
             meta,
             state: JobState::Running,
             reported: false,
             seconds: 0,
         })
+    }
+
+    /// Spawn the wrapper for job `id`; its process id.
+    fn spawn(&self, id: &str, command: &str, cwd: &Path, env: &BTreeMap<String, String>) -> Result<u32> {
+        let mut child = quiet(&mut session_command("sh"))
+            .arg("-c")
+            .arg(WRAPPER)
+            .arg("job")
+            .arg(command)
+            .arg(self.log_path(id))
+            .arg(self.file(id, "exit"))
+            .current_dir(cwd)
+            .envs(env)
+            .spawn()
+            .map_err(|e| Error::other(format!("Could not start the job: {e}")))?;
+        let pid = child.id().unwrap_or_default();
+        // Reap the wrapper once it ends; the job reports through its files, not this handle.
+        tokio::spawn(async move { child.wait().await });
+        Ok(pid)
+    }
+
+    /// Write `<id>.json`. A crash mid-write must not leave a half one, which no listing could read.
+    async fn describe(&self, meta: &JobMeta) -> Result<()> {
+        let json = serde_json::to_vec_pretty(meta)?;
+        crate::files::replace_async(&self.file(&meta.id, "json"), json, false).await?;
+        Ok(())
+    }
+
+    /// Start restarting job `id` again, under the same id and with a fresh log, if it is still
+    /// waiting for it: reported ended (or its process gone after a crash between the steps
+    /// here) and not killed. `None` when it is not. The report mark goes last, so the watcher
+    /// never reports the old run again nor misses the new one.
+    pub async fn restart(&self, id: &str, env: &BTreeMap<String, String>) -> Result<Option<Job>> {
+        let _guard = self.start.lock().await;
+        let job = self.get(id).await?;
+        let gone = job.state == JobState::Running && !alive(job.meta.pid);
+        if !job.meta.restart || !job.reported || !(job.restarting() || gone) {
+            return Ok(None);
+        }
+        for ext in ["exit", "stalled"] {
+            let _ = tokio::fs::remove_file(self.file(id, ext)).await;
+        }
+        tokio::fs::write(self.log_path(id), b"").await?;
+        let mut meta = job.meta.clone();
+        meta.pid = self.spawn(id, &meta.command, &meta.cwd, env)?;
+        meta.started = now();
+        meta.restarts += 1;
+        meta.quick = match gone {
+            true => 0,
+            false => job.quick_after(),
+        };
+        self.describe(&meta).await?;
+        let _ = tokio::fs::remove_file(self.file(id, "reported")).await;
+        Ok(Some(self.read(meta).await))
+    }
+
+    /// The restarting jobs whose owner was told they ended but which have not started again
+    /// (the swarm went down meanwhile), with how long each still waits.
+    pub async fn pending_restarts(&self) -> Vec<(String, std::time::Duration)> {
+        let mut pending = Vec::new();
+        for job in self.list().await {
+            let gone = job.state == JobState::Running && !alive(job.meta.pid);
+            if !job.meta.restart || !job.reported || !(job.restarting() || gone) {
+                continue;
+            }
+            let ended = modified(&self.file(&job.meta.id, "exit"))
+                .await
+                .unwrap_or_else(now);
+            let waited = std::time::Duration::from_secs(now().saturating_sub(ended));
+            let wait = restart_delay(job.quick_after()).saturating_sub(waited);
+            pending.push((job.meta.id, wait));
+        }
+        pending
     }
 
     /// One more than the highest job number on disk. Any file counts, not just a job's `.json`:
@@ -393,7 +506,15 @@ impl Jobs {
 
     /// Kill job `id`'s process group, mark it killed and reported (whoever kills it knows).
     pub async fn kill(&self, id: &str) -> Result<Job> {
+        // Not while it is being started again.
+        let _guard = self.start.lock().await;
         let job = self.get(id).await?;
+        if job.restarting() {
+            // Waiting to start again: never will.
+            self.mark_reported(id).await?;
+            tokio::fs::write(self.file(id, "exit"), "killed").await?;
+            return self.get(id).await;
+        }
         if job.state != JobState::Running {
             return Ok(job);
         }
@@ -407,11 +528,13 @@ impl Jobs {
     /// bytes, and delete the files of all but the newest `jobs` reported jobs.
     pub async fn tidy(&self, max: u64, keep: u64, jobs: usize) {
         let all = self.list().await;
-        let reported = all.iter().filter(|job| job.reported).count();
+        // A job waiting to start again is not done with, though its end was reported.
+        let done = |job: &Job| job.reported && !job.restarting();
+        let reported = all.iter().filter(|job| done(job)).count();
         let mut old = reported.saturating_sub(jobs);
         for job in &all {
             let id = &job.meta.id;
-            if job.reported && old > 0 {
+            if done(job) && old > 0 {
                 old -= 1;
                 // The `.json` last: a job is listed while it exists.
                 for ext in ["log", "exit", "reported", "stalled", "json"] {
@@ -513,7 +636,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let jobs = Jobs::new(dir.path().join("jobs"));
         let command = r"printf '\033[1m\033[32mok\033[0m\n 10%%\r 90%%\r100%%\r\nend\n'";
-        jobs.start("a1", None, command, dir.path(), &BTreeMap::new())
+        jobs.start("a1", None, command, dir.path(), &BTreeMap::new(), false)
             .await
             .unwrap();
         until_ended(&jobs, "j1").await;
@@ -533,6 +656,7 @@ mod tests {
                 "pwd; echo $JOB_TEST_VAR; seq 1 100; exit 3",
                 dir.path(),
                 &env,
+                false,
             )
             .await
             .unwrap();
@@ -554,7 +678,9 @@ mod tests {
         jobs.mark_reported("j1").await.unwrap();
         assert!(jobs.unreported(true).await.is_empty());
 
-        let next = jobs.start("a2", None, "true", dir.path(), &BTreeMap::new()).await;
+        let next = jobs
+            .start("a2", None, "true", dir.path(), &BTreeMap::new(), false)
+            .await;
         assert_eq!(next.unwrap().meta.id, "j2", "ids continue after those on disk");
     }
 
@@ -574,7 +700,7 @@ mod tests {
         assert!(jobs.list().await.is_empty(), "nothing half-written is listed");
 
         let job = jobs
-            .start("a1", None, "true", dir.path(), &BTreeMap::new())
+            .start("a1", None, "true", dir.path(), &BTreeMap::new(), false)
             .await
             .unwrap();
         assert_eq!(job.meta.id, "j3", "no new job writes into a dead one's files");
@@ -600,7 +726,7 @@ mod tests {
             "(until [ -e go ] || [ ! -e \"$PWD\" ]; do sleep 0.01; done; touch {}) & wait",
             marker.display()
         );
-        jobs.start("a1", None, &command, dir.path(), &BTreeMap::new())
+        jobs.start("a1", None, &command, dir.path(), &BTreeMap::new(), false)
             .await
             .unwrap();
         let killed = jobs.kill("j1").await.unwrap();
@@ -622,7 +748,7 @@ mod tests {
             echo \"$group $session\"
             if (: > /dev/tty) 2>/dev/null; then echo tty; else echo no tty; fi";
         let job = jobs
-            .start("a1", None, command, dir.path(), &BTreeMap::new())
+            .start("a1", None, command, dir.path(), &BTreeMap::new(), false)
             .await
             .unwrap();
         until_ended(&jobs, "j1").await;
@@ -643,6 +769,9 @@ mod tests {
             cwd: dir.path().into(),
             pid: u32::MAX / 2,
             started: now(),
+            restart: false,
+            restarts: 0,
+            quick: 0,
         };
         tokio::fs::write(dir.path().join("j7.json"), serde_json::to_vec(&meta).unwrap())
             .await
@@ -668,6 +797,9 @@ mod tests {
                 cwd: dir.path().into(),
                 pid: u32::MAX / 2,
                 started: now(),
+                restart: false,
+                restarts: 0,
+                quick: 0,
             };
             std::fs::write(
                 dir.path().join(format!("{id}.json")),
@@ -694,7 +826,10 @@ mod tests {
         let jobs = Jobs::new(dir.path());
         let none = BTreeMap::new();
         for _ in 0..3 {
-            let job = jobs.start("a1", None, "true", dir.path(), &none).await.unwrap();
+            let job = jobs
+                .start("a1", None, "true", dir.path(), &none, false)
+                .await
+                .unwrap();
             until_ended(&jobs, &job.meta.id).await;
             jobs.mark_reported(&job.meta.id).await.unwrap();
         }
@@ -702,7 +837,9 @@ mod tests {
         // line.
         let command = "head -c 3000 /dev/zero | tr '\\0' x; echo; touch written; \
                        until [ -e go ] || [ ! -e \"$PWD\" ]; do sleep 0.01; done; echo last";
-        jobs.start("a1", None, command, dir.path(), &none).await.unwrap();
+        jobs.start("a1", None, command, dir.path(), &none, false)
+            .await
+            .unwrap();
         let written = dir.path().join("written");
         tokio::time::timeout(Duration::from_secs(10), async {
             while !written.exists() {
@@ -728,8 +865,95 @@ mod tests {
             "appends continue after the cut: {log:?}"
         );
         assert_eq!(jobs.tail("j4", 1).await, "last");
-        let next = jobs.start("a1", None, "true", dir.path(), &none).await.unwrap();
+        let next = jobs
+            .start("a1", None, "true", dir.path(), &none, false)
+            .await
+            .unwrap();
         assert_eq!(next.meta.id, "j5");
+    }
+
+    #[test]
+    fn restarts_back_off_after_three_quick_exits_in_a_row_up_to_half_an_hour() {
+        let secs = |quick| restart_delay(quick).as_secs();
+        assert_eq!([secs(0), secs(1), secs(2)], [0, 0, 0]);
+        assert_eq!([secs(3), secs(4), secs(5)], [60, 120, 240]);
+        assert_eq!([secs(8), secs(9), secs(100)], [1800, 1800, 1800]);
+    }
+
+    #[tokio::test]
+    async fn a_restarting_job_starts_again_under_its_id_with_a_fresh_log_and_only_once_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path().join("jobs"));
+        let none = BTreeMap::new();
+        jobs.start("a1", None, "echo run; exit 4", dir.path(), &none, true)
+            .await
+            .unwrap();
+        until_ended(&jobs, "j1").await;
+        assert!(
+            jobs.restart("j1", &none).await.unwrap().is_none(),
+            "its end is not reported yet"
+        );
+
+        jobs.mark_reported("j1").await.unwrap();
+        let pending = jobs.pending_restarts().await;
+        assert_eq!(
+            pending,
+            vec![("j1".to_owned(), Duration::ZERO)],
+            "found again after a restart"
+        );
+        let again = jobs.restart("j1", &none).await.unwrap().expect("restarted");
+        assert_eq!(
+            (again.meta.id.as_str(), again.meta.restarts, again.meta.quick),
+            ("j1", 1, 1)
+        );
+        assert!(!again.reported, "its next end is reported anew");
+        let ended = until_ended(&jobs, "j1").await;
+        assert_eq!(ended.state, JobState::Exited(4));
+        assert!(ended.status().ends_with("restarts 1"), "{}", ended.status());
+        assert_eq!(jobs.tail("j1", 10).await, "run", "a fresh log, not two runs");
+        assert_eq!(jobs.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_killed_restarting_job_never_starts_again_and_one_that_was_not_asked_to_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path().join("jobs"));
+        let none = BTreeMap::new();
+        jobs.start("a1", None, "true", dir.path(), &none, true)
+            .await
+            .unwrap();
+        jobs.start("a1", None, "true", dir.path(), &none, false)
+            .await
+            .unwrap();
+        let (first, second) = (until_ended(&jobs, "j1").await, until_ended(&jobs, "j2").await);
+        assert!(first.restarting() && !second.restarting());
+        jobs.mark_reported("j1").await.unwrap();
+        jobs.mark_reported("j2").await.unwrap();
+        assert!(jobs.restart("j2", &none).await.unwrap().is_none());
+        assert_eq!(jobs.pending_restarts().await.len(), 1);
+
+        assert_eq!(
+            jobs.kill("j1").await.unwrap().state,
+            JobState::Killed,
+            "while waiting to restart"
+        );
+        assert!(jobs.restart("j1", &none).await.unwrap().is_none());
+        assert!(jobs.pending_restarts().await.is_empty());
+        assert!(!jobs.get("j1").await.unwrap().live());
+    }
+
+    #[tokio::test]
+    async fn a_job_waiting_to_restart_is_kept_by_tidy() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path().join("jobs"));
+        let none = BTreeMap::new();
+        jobs.start("a1", None, "true", dir.path(), &none, true)
+            .await
+            .unwrap();
+        until_ended(&jobs, "j1").await;
+        jobs.mark_reported("j1").await.unwrap();
+        jobs.tidy(LOG_MAX, LOG_KEEP, 0).await;
+        assert_eq!(jobs.list().await.len(), 1);
     }
 
     #[test]

@@ -83,7 +83,7 @@ impl Swarm {
             .jobs()
             .await
             .into_iter()
-            .filter(|job| job.state == jobs::JobState::Running)
+            .filter(jobs::Job::live)
             .map(|job| job.meta.owner)
             .collect();
         let scheduled: HashSet<String> = self.scheduled_targets().into_iter().collect();

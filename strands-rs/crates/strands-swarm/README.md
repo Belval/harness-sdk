@@ -12,7 +12,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to a mailbox (default: your own) later and/or repeatedly (`every: "30m"`, at least a minute); list or cancel schedules. |
-| `run_background` | Run a shell command as a background job; its owner gets the exit code and last 40 output lines when it ends. |
+| `run_background` | Run a shell command as a background job; its owner gets the exit code and last 40 output lines when it ends. `restart` runs it again each time it ends. |
 | `jobs` | List your background jobs and other agents' running ones (status, log path; other agents' ended jobs only counted), or kill one with everything it started. |
 | `context` | The agent's context dashboard: size against the compaction point, the biggest items, the stash; offload results or summarize now. |
 | `land` | With `--allow-land`: rebase a branch onto the root's branch, run the checks, fast-forward. |
@@ -410,6 +410,12 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     A job whose process vanished without an exit code (a reboot) is reported as such. When the
     log is empty and the command redirected its output (`> build.log 2>&1`), the report names the
     files it redirected to instead of only "(no output)".
+  - `restart: true` is the watcher pattern: a cheap script that loops and exits when something
+    happens wakes its owner with the usual end report, and the harness then starts it again, so
+    no one has to remember to. Same job id, fresh log, `restarts N` in `jobs`; it goes on until
+    `jobs {kill}` or the owner's cancellation. A command that exits within 10 s three times in a
+    row is held back 1 min, doubling up to 30 min (the report says so). Restarts wait for the host like a job start
+    and survive a swarm restart (one that was due meanwhile starts on resume).
   - A killed job is not reported. Cancelling an agent kills its whole subtree's jobs.
   - A `shell` call that sleeps 30 s or more (`sleep 240; tail job.log`) while its agent has a job
     running gets one line appended to its result: the job is still running, and `wait` with
