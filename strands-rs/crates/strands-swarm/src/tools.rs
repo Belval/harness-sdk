@@ -349,9 +349,8 @@ struct ScheduleInput {
 }
 
 const SCHEDULE_DESCRIPTION: &str = concat!(
-    "Post `message` later and/or repeatedly; a fire wakes an idle recipient. An idle agent ",
-    "holds no agent slot, unlike one in `wait`. Survives restarts (a missed fire is ",
-    "delivered once)."
+    "Post `message` later and/or repeatedly; a fire wakes an idle recipient. Survives ",
+    "restarts (a missed fire is delivered once)."
 );
 
 async fn schedule_tool(swarm: Swarm, me: String, input: ScheduleInput, _ctx: ToolContext) -> Result<String> {
