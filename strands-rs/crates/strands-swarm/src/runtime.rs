@@ -1259,6 +1259,12 @@ impl Swarm {
     /// Stop every agent without recording them as cancelled, after saving the final state, so
     /// the run can be resumed.
     pub async fn shutdown(&self) {
+        self.shutdown_because("unspecified").await;
+    }
+
+    /// [`Swarm::shutdown`], recording `reason` (say `tui-ctrl-c`, `signal:SIGTERM`, `reload`) in
+    /// the `shutdown` event.
+    pub async fn shutdown_because(&self, reason: &str) {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         if let Some(persister) = &self.inner.persister {
             let ticket = persister.request();
@@ -1281,7 +1287,7 @@ impl Swarm {
             self.collect_on_exit().await;
         }
         if let Some(journal) = &self.inner.journal {
-            journal.event("shutdown", serde_json::json!({}));
+            journal.event("shutdown", serde_json::json!({ "reason": reason }));
             journal.flush().await;
         }
     }

@@ -245,6 +245,7 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(Exit::Quit) => ExitCode::SUCCESS,
         Ok(Exit::Reload) => ExitCode::from(RELOAD_EXIT_CODE),
+        Ok(Exit::Signal(name)) => ExitCode::from(strands_swarm::signals::exit_code(name)),
         Err(error) => {
             eprintln!("strands-swarm: {error}");
             ExitCode::FAILURE
@@ -543,8 +544,9 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         None => {}
     }
     strands_swarm::watchdog::ready();
-    let exit = run_headless(&swarm, events, expect_reply).await;
-    swarm.shutdown().await;
+    let (exit, reason) = run_headless(&swarm, events, expect_reply).await;
+    swarm.shutdown_because(reason).await;
+    eprintln!("strands-swarm: stopped ({reason})");
     exit
 }
 
@@ -631,7 +633,8 @@ async fn run_headless(
     swarm: &Swarm,
     mut events: UnboundedReceiver<SwarmEvent>,
     expect_reply: bool,
-) -> Result<Exit, Box<dyn std::error::Error>> {
+) -> (Result<Exit, Box<dyn std::error::Error>>, &'static str) {
+    let mut terminate = strands_swarm::signals::Terminate::new();
     let mut replied = !expect_reply;
     let mut failed = false;
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
@@ -647,16 +650,24 @@ async fn run_headless(
                 print_event(&event);
             }
             _ = ticker.tick() => {}
-            _ = tokio::signal::ctrl_c() => return Ok(Exit::Quit),
-            _ = swarm.reload_requested() => return Ok(Exit::Reload),
+            _ = tokio::signal::ctrl_c() => return (Ok(Exit::Quit), "signal:SIGINT"),
+            name = terminate.next() => return (Ok(Exit::Signal(name)), signal_reason(name)),
+            _ = swarm.reload_requested() => return (Ok(Exit::Reload), "reload"),
         }
         let all_stopped = swarm.agents().iter().all(|agent| !agent.status.is_live());
         if all_stopped || (replied && !swarm.is_busy()) {
             return match failed {
-                true => Err("the root agent's last turn failed".into()),
-                false => Ok(Exit::Quit),
+                true => (Err("the root agent's last turn failed".into()), "headless-failed"),
+                false => (Ok(Exit::Quit), "headless-done"),
             };
         }
+    }
+}
+
+fn signal_reason(name: &str) -> &'static str {
+    match name {
+        "SIGHUP" => "signal:SIGHUP",
+        _ => "signal:SIGTERM",
     }
 }
 

@@ -549,7 +549,8 @@ time, whatever tool an agent commits or lands with.
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
 | `/schedules` | All schedules. |
 | `/gc` | Retry reclaiming the disk of cancelled worktree agents. |
-| `/quit` (`/q`, Ctrl-C) | Quit. |
+| `/quit` (`/q`) | Stop the swarm at once (every agent stops; the run is saved, and under `swarmctl` the supervisor restarts it). An explicit command, so it does not ask. |
+| Ctrl-C | Asks first: "Press Ctrl-C again within 3 s to stop the swarm". A second Ctrl-C within 3 s quits like `/quit`; any other key withdraws the question. To leave the swarm running, detach from tmux (`C-b d`). Headless runs are unaffected. |
 
 Other text messages the selected agent, or starts a root agent when there is none.
 
@@ -736,7 +737,7 @@ messages you.
     model switches, compactions (`before`/`after` tokens) and failed ones, side calls
     (`side_call`: purpose, model and tokens of each judge or summarizer call), keep-warm
     refreshes, schedules, jobs, budget and agent-cap changes, resumes, reloads, version
-    `changes`, shutdowns, disk reclaimed (`gc`), stash entries pruned (`stash_pruned`) and cancelled agents' sessions removed (`sessions_pruned`).
+    `changes`, shutdowns (`shutdown` with a `reason`: `tui-ctrl-c`, `tui-quit-command`, `signal:SIGTERM`, `signal:SIGHUP`, `signal:SIGINT` (headless), `reload`, `headless-done`, `headless-failed`; also printed to stderr as `strands-swarm: stopped (REASON)`), disk reclaimed (`gc`), stash entries pruned (`stash_pruned`) and cancelled agents' sessions removed (`sessions_pruned`).
   - Both are JSON lines with a UTC `ts`, written by a background thread and rotated to `<file>.1`
     at 16 MB.
 - **Log.** Warnings and errors (or whatever `RUST_LOG` selects) go to `<run dir>/swarm.log` under
@@ -858,7 +859,7 @@ messages you.
 
 ## Operate 24/7
 
-`scripts/swarmctl` keeps a run alive in tmux. It restarts the run whenever it exits (after 5 s,
+`scripts/swarmctl` keeps a run alive in tmux (`stop` and `restart` send Ctrl-C twice, as the TUI asks for a second one). It restarts the run whenever it exits (after 5 s,
 `SWARMCTL_RESTART_DELAY`), a normal quit included, until `swarmctl stop`, and restarts into the
 new binary at once on `reload_swarm`. The swarm's stderr goes to `<run dir>/stderr.log` and the
 supervisor's notes to `supervisor.log`, each rotated to `<log>.1` at 8 MB (`SWARMCTL_LOG_MAX`).

@@ -33,6 +33,9 @@ pub enum Exit {
     /// An agent installed a new binary; the host should exit with
     /// [`crate::RELOAD_EXIT_CODE`].
     Reload,
+    /// SIGTERM or SIGHUP (named) arrived; the host should exit as a process killed by it would
+    /// ([`crate::signals::exit_code`]).
+    Signal(&'static str),
 }
 
 /// Run the TUI until the user quits, then cancel every agent. `root`, when given, is spawned
@@ -68,6 +71,7 @@ pub async fn run(
         app.notice = outcome.err().map(|error| format!("error: {error}"));
     }
     let mut keys = EventStream::new();
+    let mut terminate = crate::signals::Terminate::new();
     // Ticks advance spinners only while something animates; an idle screen is drawn on events.
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -123,8 +127,9 @@ pub async fn run(
             },
             _ = ticker.tick(), if app.animating() => tick = tick.wrapping_add(1),
             _ = swarm.reload_requested() => break Ok(Exit::Reload),
+            name = terminate.next() => break Ok(Exit::Signal(name)),
         }
-        if app.quit {
+        if app.quit.is_some() {
             break Ok(Exit::Quit);
         }
         if std::mem::take(&mut app.show_plain) {
@@ -137,8 +142,20 @@ pub async fn run(
 
     set_mouse_capture(false);
     ratatui::restore();
-    swarm.shutdown().await;
+    let reason = shutdown_reason(&outcome, app.quit);
+    swarm.shutdown_because(&reason).await;
+    eprintln!("strands-swarm: stopped ({reason})");
     outcome
+}
+
+/// Why the swarm stops, for its `shutdown` journal event.
+fn shutdown_reason(outcome: &Result<Exit>, quit: Option<&str>) -> String {
+    match (outcome, quit) {
+        (Ok(Exit::Reload), _) => "reload".to_owned(),
+        (Ok(Exit::Signal(name)), _) => format!("signal:{name}"),
+        (Ok(Exit::Quit), Some(reason)) => reason.to_owned(),
+        _ => "tui-error".to_owned(),
+    }
 }
 
 fn terminal_error(error: std::io::Error) -> strands_agents::Error {
@@ -271,6 +288,9 @@ fn on_mouse(app: &mut App, mouse: MouseEvent, screen: &Buffer) -> Option<String>
 /// Two Esc presses this close together stop the selected agent's turn.
 const DOUBLE_ESC: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// A second Ctrl-C this soon after the first quits; any other key cancels the first.
+const QUIT_CONFIRM: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Columns one Alt-←/→ press resizes the agent tree by.
 const TREE_STEP: i16 = 4;
 
@@ -280,6 +300,27 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let up_down = |code: KeyCode| if code == KeyCode::Up { -1 } else { 1 };
+    // Ctrl-C stops every agent, so one press only asks (a stray one, say from a copy habit,
+    // must not stop the swarm); any other key withdraws the question.
+    let armed = app.quit_armed.take();
+    if ctrl && key.code == KeyCode::Char('c') {
+        let now = std::time::Instant::now();
+        match armed {
+            Some(at) if now.duration_since(at) <= QUIT_CONFIRM => app.quit = Some("tui-ctrl-c"),
+            _ => {
+                app.quit_armed = Some(now);
+                app.notice = Some(
+                    "Press Ctrl-C again within 3 s to stop the swarm (all agents stop; the \
+                     supervisor may restart it). Detach with C-b d instead."
+                        .to_owned(),
+                );
+            }
+        }
+        return None;
+    }
+    if armed.is_some() {
+        app.notice = None;
+    }
     if app.status.is_some() || app.cost.is_some() {
         // The status and cost popups are modal: they scroll, any other key closes them.
         match key.code {
@@ -287,13 +328,11 @@ fn on_key(app: &mut App, key: KeyEvent) -> Option<Command> {
             KeyCode::Down => app.status_scroll = app.status_scroll.saturating_add(1),
             KeyCode::PageUp => app.status_scroll = app.status_scroll.saturating_sub(10),
             KeyCode::PageDown => app.status_scroll = app.status_scroll.saturating_add(10),
-            KeyCode::Char('c') if ctrl => app.quit = true,
             _ => (app.status, app.cost, app.notice) = (None, None, None),
         }
         return None;
     }
     match key.code {
-        KeyCode::Char('c') if ctrl => app.quit = true,
         KeyCode::Char('a') if ctrl => app.home(),
         KeyCode::Char('e') if ctrl => app.end(),
         KeyCode::Char('w') if ctrl => app.delete_word(),
@@ -374,7 +413,7 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
     let selected = app.selected_id();
     let outcome = match (command, selected) {
         (Command::Quit, _) => {
-            app.quit = true;
+            app.quit = Some("tui-quit-command");
             Ok(String::new())
         }
         (Command::NewRoot(task), _) => start_root(swarm, task, None).await,
@@ -1133,10 +1172,74 @@ mod tests {
         assert_eq!(app.scroll, WHEEL_STEP);
     }
 
+    fn ctrl_c(app: &mut App) {
+        on_key(app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
     #[test]
-    fn ctrl_c_quits() {
+    fn one_ctrl_c_only_asks() {
         let mut app = App::default();
-        on_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(app.quit);
+        ctrl_c(&mut app);
+        assert_eq!(app.quit, None);
+        let notice = app.notice.clone().unwrap();
+        assert!(notice.contains("Ctrl-C again within 3 s"), "{notice}");
+        assert!(notice.contains("C-b d"), "{notice}");
+    }
+
+    #[test]
+    fn a_second_ctrl_c_within_the_window_quits() {
+        let mut app = App::default();
+        ctrl_c(&mut app);
+        ctrl_c(&mut app);
+        assert_eq!(app.quit, Some("tui-ctrl-c"));
+    }
+
+    #[test]
+    fn another_key_between_two_ctrl_c_cancels_the_quit() {
+        let mut app = App::default();
+        ctrl_c(&mut app);
+        on_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.notice, None, "the question is withdrawn");
+        ctrl_c(&mut app);
+        assert_eq!(app.quit, None);
+        ctrl_c(&mut app);
+        assert_eq!(app.quit, Some("tui-ctrl-c"), "the second of a new pair quits");
+    }
+
+    #[test]
+    fn ctrl_c_over_a_popup_asks_too() {
+        let mut app = App {
+            status: Some(Default::default()),
+            ..Default::default()
+        };
+        ctrl_c(&mut app);
+        assert_eq!(app.quit, None);
+        assert!(app.status.is_some(), "the popup stays");
+        ctrl_c(&mut app);
+        assert_eq!(app.quit, Some("tui-ctrl-c"));
+    }
+
+    #[test]
+    fn the_shutdown_reason_names_what_ended_the_tui() {
+        assert_eq!(shutdown_reason(&Ok(Exit::Quit), Some("tui-ctrl-c")), "tui-ctrl-c");
+        assert_eq!(shutdown_reason(&Ok(Exit::Reload), None), "reload");
+        assert_eq!(
+            shutdown_reason(&Ok(Exit::Signal("SIGHUP")), None),
+            "signal:SIGHUP"
+        );
+        let failed = Err(strands_agents::Error::other("boom"));
+        assert_eq!(shutdown_reason(&failed, None), "tui-error");
+    }
+
+    #[test]
+    fn the_window_expires() {
+        let mut app = App::default();
+        ctrl_c(&mut app);
+        app.quit_armed = app.quit_armed.map(|at| at - 2 * QUIT_CONFIRM);
+        ctrl_c(&mut app);
+        assert_eq!(app.quit, None, "a late second press asks again");
+        assert!(app.quit_armed.is_some());
+        ctrl_c(&mut app);
+        assert_eq!(app.quit, Some("tui-ctrl-c"));
     }
 }

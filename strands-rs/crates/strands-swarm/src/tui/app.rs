@@ -376,8 +376,8 @@ pub struct App {
     pub scroll: u16,
     /// Last error or notice, shown in the footer.
     pub notice: Option<String>,
-    /// Set when the user asked to quit.
-    pub quit: bool,
+    /// Set to the journal reason (`tui-ctrl-c`, `tui-quit-command`) once the user asked to quit.
+    pub quit: Option<&'static str>,
     /// Set when the user asked to read the selected log as plain text in the terminal's own
     /// scrollback (for native scrolling, search and copy-paste).
     pub show_plain: bool,
@@ -419,6 +419,8 @@ pub struct App {
     pub selection: Option<super::select::Selection>,
     /// When Esc was last pressed on an empty input; a second press soon after stops the turn.
     pub last_esc: Option<std::time::Instant>,
+    /// When Ctrl-C was last pressed; a second press within [`super::QUIT_CONFIRM`] quits.
+    pub quit_armed: Option<std::time::Instant>,
 }
 
 impl App {

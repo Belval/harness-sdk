@@ -787,3 +787,40 @@ async fn arrows_fold_the_tree_with_an_empty_input_and_edit_it_otherwise() {
 fn shown_header(shown: &str) -> &str {
     shown.lines().next().unwrap_or_default()
 }
+
+/// Ctrl-C twice, or `/quit`, ends the loop with a reason, and the swarm's `shutdown` event in
+/// `events.jsonl` carries it.
+#[tokio::test]
+async fn a_tui_quit_records_why_in_the_shutdown_event() {
+    for (keys, reason) in [("^C^C", "tui-ctrl-c"), ("/quit", "tui-quit-command")] {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("run");
+        let mut config = SwarmConfig::new(factory(HashMap::new(), &Sinks::default()), dir.path());
+        config.state_dir = Some(state_dir.clone());
+        let (swarm, _events) = Swarm::new(config);
+        let mut app = App::default();
+        let mut screen = Screen::new();
+        match keys {
+            "^C^C" => {
+                for _ in 0..2 {
+                    let key = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+                    on_terminal_event(&swarm, &mut app, key, &screen.buffer).await;
+                }
+            }
+            line => screen.type_line(&swarm, &mut app, line).await,
+        }
+        assert_eq!(app.quit, Some(reason));
+        swarm
+            .shutdown_because(&shutdown_reason(&Ok(Exit::Quit), app.quit))
+            .await;
+        let events = std::fs::read_to_string(state_dir.join(crate::journal::EVENTS_FILE)).unwrap();
+        let shutdown = events
+            .lines()
+            .find(|l| l.contains("\"event\":\"shutdown\""))
+            .unwrap();
+        assert!(
+            shutdown.contains(&format!("\"reason\":\"{reason}\"")),
+            "{shutdown}"
+        );
+    }
+}

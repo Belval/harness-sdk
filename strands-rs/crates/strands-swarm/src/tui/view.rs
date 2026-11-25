@@ -42,7 +42,14 @@ const KEYS: &[(&str, &str)] = &[
     ("f3", "show or hide cancelled agents"),
     ("esc", "clear the input and selection, close this"),
     ("esc esc", "stop the selected agent's turn (it stays alive)"),
-    ("ctrl-c", "quit"),
+    (
+        "ctrl-c ctrl-c",
+        "stop the swarm (once more within 3 s; any other key cancels)",
+    ),
+    (
+        "/quit",
+        "stop the swarm at once; detach with C-b d (tmux) to leave it running",
+    ),
 ];
 
 /// Where each part of the screen goes.

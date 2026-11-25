@@ -39,6 +39,7 @@ pub mod runtime;
 pub mod schedule;
 pub mod selftest;
 pub mod shell_text;
+pub mod signals;
 pub mod skills;
 pub mod stash_gc;
 pub mod state;

@@ -210,7 +210,10 @@ stop() {
   local n; n=$(clients "$run")
   (( n == 0 )) || echo "$n client(s) attached to $(session "$run") will be detached"
   # Ctrl-C quits the TUI (and headless mode) cleanly: state is saved and agents stop.
+  # The TUI asks for a second Ctrl-C within 3 s before it stops the swarm.
   tmux send-keys -t "$(session "$run")" C-c
+  sleep 0.5
+  tmux send-keys -t "$(session "$run")" C-c 2>/dev/null || true
   for _ in $(seq 30); do running "$run" || { echo "run $run stopped"; return; }; sleep 1; done
   tmux kill-session -t "$(session "$run")"
   echo "run $run killed after 30s (state is saved continuously)"
@@ -248,6 +251,8 @@ do_restart() {
   touch "$dir/stop"
   tmux set-option -w -t "$pane" remain-on-exit on
   tmux send-keys -t "$pane" C-c
+  sleep 0.5
+  tmux send-keys -t "$pane" C-c 2>/dev/null || true
   local waited=killed
   for _ in $(seq 150); do
     [[ "$(tmux display-message -p -t "$pane" '#{pane_dead}')" == 1 ]] && { waited=stopped; break; }
