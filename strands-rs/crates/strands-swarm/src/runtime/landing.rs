@@ -86,6 +86,9 @@ impl Swarm {
             label: label.clone(),
             into: into.clone(),
             gates: self.inner.config.gates.clone(),
+            commit_rules: (self.inner.config.commit_hooks.as_ref())
+                .map(|hooks| hooks.rules.clone())
+                .unwrap_or_default(),
             checks: request.check.unwrap_or_default(),
             scratch: scratch.clone(),
             target_dir,

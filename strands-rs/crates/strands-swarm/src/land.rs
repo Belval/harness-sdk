@@ -54,6 +54,9 @@ pub struct LandPlan {
     /// the caller asked for.
     #[serde(default)]
     pub gates: Vec<String>,
+    /// The swarm's commit rules (`--commit-rule`): the commits landed must keep them.
+    #[serde(default)]
+    pub commit_rules: Vec<crate::commit_rule::CommitRule>,
     /// The caller's own checks, run after the gates (one that repeats a gate is skipped); none
     /// and no gates means no checks.
     pub checks: Vec<String>,
@@ -94,6 +97,12 @@ pub async fn run_until(
         return Ok(format!(
             "Nothing to land: {} has no commits that are not on {into}.",
             plan.label
+        ));
+    }
+    let range = format!("{old}..{}", plan.source);
+    if let Err(why) = crate::commit_rule::check_range(repo, &plan.commit_rules, &range).await {
+        return Err(format!(
+            "Not landed: {why}. Reword it (`git rebase -i`) and land again. Nothing was changed."
         ));
     }
     let _ = tokio::fs::remove_dir_all(&plan.scratch).await;
@@ -659,6 +668,7 @@ mod tests {
             label: "feature".into(),
             into: "main".into(),
             gates: Vec::new(),
+            commit_rules: Vec::new(),
             checks: checks.iter().map(|c| c.to_string()).collect(),
             scratch: fx.land.join("scratch"),
             target_dir: fx.land.join("target"),
@@ -903,6 +913,28 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("no branch nope"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_breaks_a_commit_rule_is_not_landed() {
+        let fx = fixture().await;
+        let before = head(&fx.main, "main").await;
+        let repo = fx.main.canonicalize().unwrap().display().to_string();
+        let mut plan = plan(&fx, &[]);
+        plan.commit_rules = vec![crate::commit_rule::CommitRule {
+            glob: format!("{repo}*"),
+            regex: r"\(V24[0-9]{6,}\)".into(),
+        }];
+        let error = run(&plan).await.unwrap_err();
+        assert!(
+            error.contains("add b") && error.contains("--commit-rule") && error.contains("Not landed"),
+            "{error}"
+        );
+        assert_eq!(head(&fx.main, "main").await, before);
+        assert!(!plan.scratch.exists(), "refused before any scratch worktree");
+        sh(&fx.feature, "git commit -q --amend -m 'add b (V24123456)'").await;
+        let report = run(&plan).await.unwrap();
+        assert!(report.starts_with("Landed 1 commit(s)"), "{report}");
     }
 
     #[tokio::test]

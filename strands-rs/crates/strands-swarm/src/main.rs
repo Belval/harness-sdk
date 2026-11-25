@@ -99,6 +99,12 @@ struct Cli {
     /// (repeatable), e.g. `--gate 'cargo test'`.
     #[arg(long = "gate", value_name = "CMD")]
     gates: Vec<String>,
+    /// Commits in a repository whose path (a worktree's: its main repository's) matches the glob
+    /// need a message line matching the `grep -E` regex (repeatable), e.g.
+    /// `--commit-rule '/work/quickpdf*=\(V24[0-9]{6,}\)'`. Enforced by a `commit-msg` hook in
+    /// every agent shell, job and land check, and by `land`.
+    #[arg(long = "commit-rule", value_name = "PATH_GLOB=REGEX")]
+    commit_rules: Vec<strands_swarm::commit_rule::CommitRule>,
     /// Carry out one landing from a plan file, then exit (how `land` jobs run).
     #[arg(long, value_name = "PLAN", hide = true)]
     land: Option<PathBuf>,
@@ -478,6 +484,20 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+    if !cli.commit_rules.is_empty() {
+        let base = config.state_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("strands-swarm-hooks")
+                .join(&config.run_id)
+        });
+        let events = (config.state_dir.as_ref()).map(|dir| dir.join(strands_swarm::journal::EVENTS_FILE));
+        let hooks = strands_swarm::commit_rule::CommitHooks::install(
+            &base.join("git-hooks"),
+            cli.commit_rules.clone(),
+            events.as_deref(),
+        )?;
+        config.commit_hooks = Some(Arc::new(hooks));
+    }
     let resumed = saved.is_some();
     let last_task = saved.as_ref().and_then(|saved| saved.task_flag.clone());
     let (swarm, events) = match saved {

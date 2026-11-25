@@ -319,6 +319,9 @@ pub struct SwarmConfig {
     /// Commands every [`Swarm::land`] runs before the caller's own checks (`--gate`); a caller
     /// cannot waive them.
     pub gates: Vec<String>,
+    /// Commit rules (`--commit-rule`): agents' shells, jobs and land checks get git config that
+    /// runs these hooks, and [`Swarm::land`] checks the commits it lands against them.
+    pub commit_hooks: Option<Arc<crate::commit_rule::CommitHooks>>,
     /// The `strands-swarm` binary that carries out a landing (`--land PLAN`) and that
     /// `reload_swarm` compares a new binary's fixed prefix with; `None` is this process's own
     /// executable.
@@ -395,6 +398,7 @@ impl SwarmConfig {
             allow_land: false,
             land_into: Vec::new(),
             gates: Vec::new(),
+            commit_hooks: None,
             exe: None,
             prices: Arc::default(),
             default_model: None,
@@ -1291,13 +1295,17 @@ impl Swarm {
     /// Environment for a new worktree agent: a private `CARGO_TARGET_DIR` when the swarm has a
     /// shared one.
     /// `env` plus `CARGO_BUILD_JOBS` ([`SwarmConfig::build_jobs`]) unless `env` or this
-    /// process's environment sets it already.
+    /// process's environment sets it already, plus the git config of the commit rules
+    /// ([`SwarmConfig::commit_hooks`]).
     fn with_build_jobs(&self, mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
         const VAR: &str = "CARGO_BUILD_JOBS";
         if let Some(jobs) = self.inner.config.build_jobs {
             if !env.contains_key(VAR) && std::env::var_os(VAR).is_none() {
                 env.insert(VAR.to_owned(), jobs.to_string());
             }
+        }
+        if let Some(hooks) = &self.inner.config.commit_hooks {
+            hooks.add_env(&mut env);
         }
         env
     }

@@ -1882,6 +1882,39 @@ async fn shells_and_jobs_get_capped_cargo_build_jobs_unless_the_environment_sets
     assert_eq!(written.trim(), expected);
 }
 
+#[tokio::test]
+async fn shells_and_jobs_commit_through_the_commit_rule_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let map = scripts_of(vec![("a1", vec![say("ok"), say("seen")])]);
+    let envs: Arc<Mutex<Vec<std::collections::BTreeMap<String, String>>>> = Arc::default();
+    let inner = mock_factory(&map);
+    let recorded = envs.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        recorded.lock().push(spec.env.clone());
+        inner(spec)
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    let rules = vec!["/nowhere/*=X-[0-9]+".parse().unwrap()];
+    let hooks =
+        strands_swarm::commit_rule::CommitHooks::install(&dir.path().join("hooks"), rules, None).unwrap();
+    let hooks_dir = hooks.dir.display().to_string();
+    config.commit_hooks = Some(Arc::new(hooks));
+    let (swarm, mut events) = Swarm::new(config);
+    spawn_root(&swarm, "t").await;
+    reply_to(&mut events, USER).await;
+    let env = envs.lock()[0].clone();
+    let n = env["GIT_CONFIG_COUNT"].parse::<usize>().unwrap() - 1;
+    assert_eq!(env[&format!("GIT_CONFIG_KEY_{n}")], "core.hooksPath");
+    assert_eq!(env[&format!("GIT_CONFIG_VALUE_{n}")], hooks_dir);
+    swarm
+        .start_job("a1", "git config core.hooksPath > hooks.txt", None, false)
+        .await
+        .unwrap();
+    mail_to(&mut events, "a1", "job").await;
+    let written = std::fs::read_to_string(dir.path().join("hooks.txt")).unwrap();
+    assert_eq!(written.trim(), hooks_dir);
+}
+
 /// A factory like [`mock_factory`] whose agents persist their conversation under `sessions`.
 fn session_factory(scripts: &Scripts, sessions: std::path::PathBuf) -> AgentFactory {
     let scripts = scripts.clone();
@@ -4191,6 +4224,7 @@ async fn gc_and_resume_remove_a_killed_land_job_s_scratch_once_no_land_job_runs(
         label: "main".into(),
         into: "main".into(),
         gates: Vec::new(),
+        commit_rules: Vec::new(),
         checks: Vec::new(),
         scratch: scratch.clone(),
         target_dir: dir.path().join("target"),

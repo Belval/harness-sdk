@@ -494,7 +494,41 @@ an integrator. `{branch?, into?, check?: [commands]}` lands `branch` on `into`.
   gates on the rebased commits. They bind `land` only: agents' shells are not sandboxed, so an
   agent with write access to the repository could still move a branch with plain `git`, and a gate
   that runs a script from the repository runs the version being landed.
+- **Commit rules.** `land` also refuses, before it starts, a commit that breaks a
+  [commit rule](#commit-rules) of the repository.
 - Programmatically: `Swarm::land`.
+
+## Commit rules
+
+`--commit-rule 'PATH_GLOB=REGEX'` (repeatable) makes commits in matching repositories cite
+something, e.g. a ticket: `--commit-rule '/work/quickpdf*=\(V24[0-9]{6,}\)'`. It holds at commit
+time, whatever tool an agent commits or lands with.
+
+- **How.** Every agent shell, job and land check gets git config through the environment
+  (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n`, `GIT_CONFIG_VALUE_n`, after any entries already passed)
+  setting `core.hooksPath` to `<run dir>/git-hooks` (without `--run`, a temp dir), which the swarm
+  rewrites at every start.
+- **The check.** Its `commit-msg` hook takes the repository's top level and main checkout (a
+  worktree's main repository, from `git rev-parse --git-common-dir`). If a rule's glob (`*`, `?`)
+  matches either, the commit is refused unless some line of the message (comments and a
+  `commit -v` diff aside) matches the `grep -E` regex: `commit refused: this repo needs a ticket id
+  matching REGEX in the message (--commit-rule)`. In a persistent run a refusal appends a
+  `commit_refused` event (`repo`, `agent`, `regex`) to `events.jsonl`.
+- **Chaining.** Every hook then runs the repository's own hook of the same name, from its
+  configured `core.hooksPath`, else `hooks/` in its common git dir. A repository no rule matches
+  behaves as before.
+- **What is checked.**
+  - Merge commits are exempt (`MERGE_HEAD` is set): they record no work of their own.
+  - `git commit --amend` without `-m` checks the message it keeps, so amending a commit that
+    lacks the ticket needs one added.
+  - `git revert`'s default message quotes the reverted subject, so it passes when the ticket is
+    in the subject; else give the ticket with `-m` or the editor.
+  - `git rebase`, `cherry-pick` and `am` copy messages without running `commit-msg` (only a
+    `reword` or `--edit` does), so landing tools that rebase or squash fixups keep working.
+- **The backstop.** `git commit --no-verify` (or `-n`) skips the hook, and an agent could unset
+  the config. `land` checks the commits it lands against the same rules (merges aside) and
+  refuses a breaking one before it starts. A repository's own landing tool needs its own check for
+  that.
 
 ## TUI
 
