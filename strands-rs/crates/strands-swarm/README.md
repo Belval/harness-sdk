@@ -425,6 +425,11 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     and `CARGO_BUILD_JOBS` ([Limits](#limits)) included. Each runs in a session of its own, so neither a reload nor Ctrl-C stops it.
   - Each job is `<id>.json`, `<id>.log`, `<id>.exit` and, once its owner was told, `<id>.reported`
     in `<run>/jobs` (a temp directory without `--run`).
+  - **Waiting on a job from a script:** `<run>/jobs/<id>.exit` holds the exit code (`killed` or
+    `lost` when there is none) once the job ends, and stays after the owner was told, until the
+    job is pruned with its log (below). `jobs` shows the same status. A restarting job's marker is
+    cleared when its next run starts. A script that polls it should also stop when the file and
+    `<id>.json` are both gone (pruned).
   - The swarm polls jobs and mails the owner when one ends, also for jobs started before a restart.
     A job whose process vanished without an exit code (a reboot) is reported as such. When the
     log is empty and the command redirected its output (`> build.log 2>&1`), the report names the

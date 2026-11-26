@@ -3,7 +3,8 @@
 //!
 //! Everything lives on disk under one directory (`<run>/jobs`): `<id>.json` describes the job,
 //! `<id>.log` takes its output, a small `sh` wrapper writes the exit code to `<id>.exit`, and
-//! `<id>.reported` marks a job whose end was told to its owner. A restarted swarm reads the same
+//! `<id>.reported` marks a job whose end was told to its owner. `<id>.exit` stays after that, until
+//! the job is pruned ([`Jobs::tidy`]), so a script can wait on it. A restarted swarm reads the same
 //! files, so jobs started before a reload still report.
 
 use std::collections::BTreeMap;
@@ -940,6 +941,64 @@ mod tests {
         assert!(jobs.restart("j1", &none).await.unwrap().is_none());
         assert!(jobs.pending_restarts().await.is_empty());
         assert!(!jobs.get("j1").await.unwrap().live());
+    }
+
+    /// The contract scripts wait on: `<id>.exit` holds the code once the job ends and stays.
+    #[tokio::test]
+    async fn the_exit_marker_outlives_the_report_and_a_resume_and_goes_with_the_pruned_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path().join("jobs"));
+        let none = BTreeMap::new();
+        for _ in 0..2 {
+            jobs.start("a1", None, "exit 3", dir.path(), &none, false)
+                .await
+                .unwrap();
+        }
+        until_ended(&jobs, "j1").await;
+        until_ended(&jobs, "j2").await;
+        let marker = |id: &str| std::fs::read_to_string(dir.path().join(format!("jobs/{id}.exit")));
+        assert_eq!(jobs.unreported(true).await.len(), 2);
+
+        jobs.mark_reported("j1").await.unwrap();
+        jobs.mark_reported("j2").await.unwrap();
+        jobs.tidy(LOG_MAX, LOG_KEEP, KEEP_JOBS).await;
+        assert_eq!(
+            (marker("j1").unwrap().trim(), marker("j2").unwrap().trim()),
+            ("3", "3")
+        );
+
+        // A resumed swarm reads the same files: nothing is delivered again.
+        let resumed = Jobs::new(dir.path().join("jobs"));
+        assert!(resumed.unreported(true).await.is_empty());
+        assert_eq!(resumed.get("j1").await.unwrap().state, JobState::Exited(3));
+
+        // Pruning takes the marker with the rest of the job's files.
+        resumed.tidy(LOG_MAX, LOG_KEEP, 1).await;
+        assert!(marker("j1").is_err() && !dir.path().join("jobs/j1.json").exists());
+        assert_eq!(marker("j2").unwrap().trim(), "3");
+    }
+
+    #[tokio::test]
+    async fn a_restart_clears_the_previous_runs_exit_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(dir.path().join("jobs"));
+        let none = BTreeMap::new();
+        let go = dir.path().join("go");
+        let command = format!("if [ -e {} ]; then sleep 30; else exit 4; fi", go.display());
+        jobs.start("a1", None, &command, dir.path(), &none, true)
+            .await
+            .unwrap();
+        until_ended(&jobs, "j1").await;
+        jobs.mark_reported("j1").await.unwrap();
+        let marker = dir.path().join("jobs/j1.exit");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "4");
+
+        std::fs::write(&go, "").unwrap();
+        let again = jobs.restart("j1", &none).await.unwrap().expect("restarted");
+        assert_eq!(again.state, JobState::Running, "the old marker is not this run's");
+        assert!(!marker.exists());
+        assert_eq!(jobs.get("j1").await.unwrap().state, JobState::Running);
+        jobs.kill("j1").await.unwrap();
     }
 
     #[tokio::test]
