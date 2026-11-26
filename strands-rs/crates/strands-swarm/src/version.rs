@@ -37,19 +37,20 @@ pub const SOURCE: &str = env!("CARGO_MANIFEST_DIR");
 pub const MAX_CHANGES: usize = 30;
 
 /// Why this binary is stale, if it is: it embeds `commit` but the checkout at `source` it was
-/// built from is at another one. Cargo reuses a build script's output while the files it watched
-/// look unchanged, and a target dir shared by worktrees shares that verdict (the package hashes
-/// the same in each), so a build can embed an older commit than the checkout's HEAD. `None` when
-/// the binary is current, has no commit, or `source` is gone or no git checkout.
+/// built from is at another one. The usual cause is that this path was not rebuilt at all: a
+/// build run with another `CARGO_TARGET_DIR` (one left exported in the shell, say) writes its
+/// binary elsewhere. `None` when the binary is current, has no commit, or `source` is gone or no
+/// git checkout.
 pub async fn stale(commit: Option<&str>, source: &Path) -> Option<String> {
     let commit = commit?;
     let head = crate::worktree::git(source, &["rev-parse", "HEAD"]).await.ok()?;
     (head != commit).then(|| {
         format!(
-            "this binary embeds commit {commit} but its checkout {} is at {head}: the build script \
-             did not rerun (cargo reused its output). Rebuild with \
+            "this binary embeds commit {commit} but its checkout {} is at {head}: it was not \
+             rebuilt since. Check that the build wrote this path (a different `CARGO_TARGET_DIR` \
+             puts the binary elsewhere), rebuild with \
              `STRANDS_SWARM_BUILD_HEAD=$(git rev-parse HEAD) cargo build --release -p strands-swarm`, \
-             which always reruns it when the head moved, then retry.",
+             then retry.",
             source.display()
         )
     })
