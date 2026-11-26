@@ -7880,3 +7880,154 @@ async fn a_restart_job_that_ended_while_the_swarm_was_down_is_reported_and_start
     assert_eq!(resumed.jobs().await.len(), 1);
     resumed.shutdown().await;
 }
+
+/// A swarm saving to a state dir, so that digests have a stash to put long notes in.
+fn saving_swarm(
+    scripts: Vec<(&str, Vec<MockResponse>)>,
+    dir: &Path,
+) -> (Swarm, UnboundedReceiver<SwarmEvent>, Scripts) {
+    let map = scripts_of(scripts);
+    let mut config = SwarmConfig::new(mock_factory(&map), dir);
+    config.state_dir = Some(dir.join("run"));
+    let (swarm, events) = Swarm::new(config);
+    (swarm, events, map)
+}
+
+/// What `agent`'s stash holds under `key`.
+fn stashed(dir: &Path, agent: &str, key: &str) -> String {
+    let path = dir.join("run/sessions").join(agent).join("stash").join(key);
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value.as_str().unwrap().to_owned()
+}
+
+/// The stash keys named by `[ref: …]` in `text`.
+fn refs_in(text: &str) -> Vec<String> {
+    text.split("[ref: ")
+        .skip(1)
+        .map(|rest| rest.split(']').next().unwrap().to_owned())
+        .collect()
+}
+
+/// A saving swarm with an idle `a1` (which has said "ready") and an idle `a2`, both roots.
+async fn idle_pair(dir: &Path, a1: Vec<MockResponse>) -> (Swarm, UnboundedReceiver<SwarmEvent>, Scripts) {
+    let (swarm, mut events, scripts) = saving_swarm(vec![("a1", a1), ("a2", vec![say("quiet")])], dir);
+    spawn_root(&swarm, "lead").await;
+    assert_eq!(reply_to(&mut events, USER).await, "ready");
+    spawn_root(&swarm, "other").await;
+    assert_eq!(reply_to(&mut events, USER).await, "quiet");
+    (swarm, events, scripts)
+}
+
+#[tokio::test]
+async fn a_burst_of_fyis_reaches_an_idle_agent_as_one_digest_behind_the_waking_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = idle_pair(dir.path(), vec![say("ready"), say("read")]).await;
+    let long = format!("first line\n{}", "details ".repeat(60));
+    swarm.send_fyi("a2", "a1", "one").unwrap();
+    swarm.send_fyi(USER, "a1", &long).unwrap();
+    swarm.send_fyi("a2", "a1", "two").unwrap();
+    swarm.send_fyi(USER, "a1", "three").unwrap();
+    swarm.send_fyi("a2", "a1", "four").unwrap();
+    swarm.send(USER, "a1", "now act").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "read");
+
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 1);
+    assert_eq!(sent.matches("kind=\\\"digest\\\"").count(), 1, "{sent}");
+    assert_eq!(sent.matches("kind=\\\"fyi\\\"").count(), 0, "{sent}");
+    assert!(sent.contains("5 notes since your last turn"), "{sent}");
+    assert!(
+        sent.find("now act").unwrap() < sent.find("kind=\\\"digest\\\"").unwrap(),
+        "the user's message stays separate and first: {sent}"
+    );
+    let refs = refs_in(&sent);
+    assert_eq!(refs.len(), 1, "only the long note needs a reference: {sent}");
+    assert_eq!(stashed(dir.path(), "a1", &refs[0]), long.trim());
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_fyis_are_delivered_as_they_always_were() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = idle_pair(dir.path(), vec![say("ready"), say("read")]).await;
+    swarm.send_fyi("a2", "a1", "one").unwrap();
+    swarm.send_fyi(USER, "a1", "two").unwrap();
+    swarm.send(USER, "a1", "now act").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "read");
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 1);
+    assert_eq!(sent.matches("kind=\\\"fyi\\\"").count(), 2, "{sent}");
+    assert!(!sent.contains("digest"), "{sent}");
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn fyis_that_arrive_mid_turn_are_appended_as_a_digest_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = saving_swarm(
+        vec![(
+            "a1",
+            vec![tool_call("list_agents", "t1", json!({})), say("noted")],
+        )],
+        dir.path(),
+    );
+    let long = "long note ".repeat(40);
+    // Queued before the agent's first tool call completes.
+    spawn_root(&swarm, "work").await;
+    for text in ["one", long.as_str(), "three"] {
+        swarm.send_fyi(USER, "a1", text).unwrap();
+    }
+    assert_eq!(reply_to(&mut events, USER).await, "noted");
+    let second = sent_text(&scripts.lock()["a1"].clone(), 1);
+    assert!(second.contains("New messages arrived"), "{second}");
+    assert!(second.contains("3 notes since your last turn"), "{second}");
+    assert_eq!(second.matches("kind=\\\"fyi\\\"").count(), 0, "{second}");
+    let refs = refs_in(&second);
+    assert_eq!(refs.len(), 1, "{second}");
+    assert_eq!(stashed(dir.path(), "a1", &refs[0]), long.trim());
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn fyis_saved_in_a_mailbox_arrive_as_a_digest_after_a_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = |text: &str| json!({"from": "user", "from_label": "user", "kind": "fyi", "text": text});
+    let long = "saved details ".repeat(30);
+    let saved: strands_swarm::state::SwarmState = serde_json::from_value(json!({
+        "run_id": "old",
+        "cwd": dir.path(),
+        "next_id": 2,
+        "agents": [
+            {"id": "a1", "name": "lead", "parent": "user", "cwd": dir.path(), "branch": null, "task": "lead",
+             "model": null, "goal": null, "status": "idle",
+             "mailbox": [note("one"), note(&long), note("three")]},
+        ],
+    }))
+    .unwrap();
+    let scripts = scripts_of(vec![("a1", vec![say("read")])]);
+    let mut config = SwarmConfig::new(mock_factory(&scripts), dir.path());
+    config.state_dir = Some(dir.path().join("run"));
+    let (swarm, mut events) = Swarm::resume(config, saved).await.unwrap();
+    swarm.send(USER, "a1", "now act").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "read");
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 0);
+    assert!(sent.contains("3 notes since your last turn"), "{sent}");
+    let refs = refs_in(&sent);
+    assert_eq!(refs.len(), 1, "{sent}");
+    assert_eq!(stashed(dir.path(), "a1", &refs[0]), long.trim());
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn without_a_state_dir_a_burst_of_fyis_is_delivered_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(vec![("a1", vec![say("ready"), say("read")])], dir.path());
+    spawn_root(&swarm, "lead").await;
+    assert_eq!(reply_to(&mut events, USER).await, "ready");
+    for text in ["one", "two", "three"] {
+        swarm.send_fyi(USER, "a1", text).unwrap();
+    }
+    swarm.send(USER, "a1", "now act").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "read");
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 1);
+    assert_eq!(sent.matches("kind=\\\"fyi\\\"").count(), 3, "{sent}");
+    swarm.shutdown().await;
+}

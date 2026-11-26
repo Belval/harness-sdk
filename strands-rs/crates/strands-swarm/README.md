@@ -102,6 +102,17 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   later): an idle receiver is not woken but gets it with its next waking mail, a busy one after
   its current tool call as usual. It ends no `wait` (`all` included), counts as no unread mail
   in `list_agents` and `/status`, keeps no headless run alive, and is saved like other mail.
+  Notes arrive in bursts, each in a `<message>` wrapper of its own, so a drain (a turn's start or
+  a mid-turn append) holding three or more of them renders them as one block,
+  `<message from="swarm" kind="digest">N notes since your last turn:` and a line per note
+  (`- <sender>: <first line, ≤160 chars> [ref: fyi-…_0]`), grouped by sender with the latest
+  writer last. A note longer than its line is stashed whole in the receiver's stash, where
+  `retrieve_context` reads it by the ref (bodies are [defanged](src/text.rs) as ever). Waking
+  mail, the user's and replies stay separate messages, ahead of the digest, as do notes with
+  images; fewer than three notes, and runs without a state dir (no stash on disk), are unchanged.
+  On a coordinator's saved history 19 of its 41 FYIs sat in such bursts, which saves about 3.6 kB
+  of 1.26 MB (0.3%): little, as FYIs are 1% of that history, but each digest is one block and a
+  line per note instead of a wrapper per note. See [`digest`](src/digest.rs).
 - **Working directory.** An agent works where its spawner does unless `spawn_agent` gets a `cwd`
   (absolute or relative), e.g. another repository; with `worktree` the worktree is cut from the
   repository there. An agent moves itself with a `shell` call that is only `cd DIR` (one word or

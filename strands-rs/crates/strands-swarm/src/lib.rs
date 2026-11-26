@@ -18,6 +18,7 @@ pub mod commit_rule;
 pub mod compaction;
 pub mod cost;
 pub mod dashboard;
+pub mod digest;
 pub mod factory;
 pub mod files;
 pub mod gc;

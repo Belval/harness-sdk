@@ -215,7 +215,7 @@ impl Swarm {
             return None;
         }
         let mail = self.drain(&node.id);
-        let text = render_mail(&mail);
+        let text = self.render_taken(&node.id, &mail).await;
         Some(match mail.iter().any(|m| !m.images.is_empty()) {
             true => InvokeInput::Blocks(images::input_blocks(text, &mail)),
             false => InvokeInput::Text(text),

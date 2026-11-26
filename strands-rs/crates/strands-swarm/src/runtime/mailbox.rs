@@ -312,18 +312,55 @@ impl Swarm {
         let id = id.to_owned();
         agent
             .hooks()
-            .add_sync_callback(move |event: &mut AfterToolCallEvent| {
-                let mail = swarm.drain(&id);
-                if !mail.is_empty() {
-                    let text = format!(
-                        "\n\n[New messages arrived while this tool ran]\n{}",
-                        render_mail(&mail)
-                    );
-                    event.result.content.push(ToolResultContent::Text(text));
-                    event.result.content.extend(images::result_content(&mail));
-                }
-                Ok(())
+            .add_callback_boxed(move |event: &mut AfterToolCallEvent| {
+                let (swarm, id) = (swarm.clone(), id.clone());
+                Box::pin(async move {
+                    let mail = swarm.drain(&id);
+                    if !mail.is_empty() {
+                        let text = format!(
+                            "\n\n[New messages arrived while this tool ran]\n{}",
+                            swarm.render_taken(&id, &mail).await
+                        );
+                        event.result.content.push(ToolResultContent::Text(text));
+                        event.result.content.extend(images::result_content(&mail));
+                    }
+                    Ok(())
+                })
             });
+    }
+
+    /// `mail`, just drained from `id`'s mailbox, as its receiver reads it: [`render_mail`], but
+    /// with a burst of FYIs as one [`digest`](crate::digest) whose long bodies go to `id`'s
+    /// stash, where `retrieve_context` reads them. Without a stash on disk (an unsaved run), or
+    /// when a body cannot be written, every note is rendered whole.
+    pub(super) async fn render_taken(&self, id: &str, mail: &[Mail]) -> String {
+        let Some(digest) = crate::digest::render(mail) else {
+            return render_mail(mail);
+        };
+        let Some(dir) = self.inner.config.state_dir.as_ref() else {
+            return render_mail(mail);
+        };
+        let stash = strands_agents::context_manager::stash::Stash::new(
+            strands_agents::storage::namespace(
+                Arc::new(strands_agents::storage::LocalFileStorage::new(
+                    dir.join(SESSIONS_DIR).join(id).to_string_lossy(),
+                )),
+                "stash",
+            ),
+            id,
+            id,
+            true,
+        );
+        for (key, index, body) in digest.stash {
+            if stash
+                .store(&key, index, &strands_agents::types::JsonValue::String(body))
+                .await
+                .is_err()
+            {
+                return render_mail(mail);
+            }
+        }
+        digest.text
     }
 }
 
