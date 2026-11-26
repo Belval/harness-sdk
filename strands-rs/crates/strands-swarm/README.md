@@ -68,6 +68,18 @@ or every agent has stopped, with a non-zero status when that reply is an error. 
 TASK or `--goal`. Without a terminal, the TUI refuses to start (before resuming anything) and
 points to `--headless`.
 
+**llama.cpp.** Set `LLAMACPP_BASE_URL` to your server URL and pass the model ID from
+`GET /v1/models` after the `llamacpp/` prefix. The endpoint defaults to
+`http://127.0.0.1:8080` and accepts a URL ending in `/v1`. Set `LLAMACPP_API_KEY` if the
+server requires a bearer token. Prompt-prefix reuse follows the llama.cpp server settings.
+
+```sh
+LLAMACPP_BASE_URL=http://127.0.0.1:8080 strands-swarm --model llamacpp/my-model
+```
+
+The Rust harness accepts the same specifier as a `ModelOption`. Enable the harness's
+`openai` feature when building with default features disabled.
+
 **AWS credentials.** Every process the swarm starts (agent shells, `run_background` jobs, land
 checks, MCP servers) inherits its environment, `AWS_*` included, untouched. To call Bedrock (and Bedrock Mantle, whose
 bearer tokens it mints from the same credentials) under settings of its own without handing them

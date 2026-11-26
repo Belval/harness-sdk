@@ -4,10 +4,9 @@
 //! id, or `None` for the harness default. The [`Effort`] level is mapped to each provider's own
 //! request fields here, so the caller sets one value regardless of provider.
 //!
-//! `bedrock`, `bedrock-mantle`, `anthropic` and `openai` are built by this port (each behind the
-//! matching crate feature); `google`, `litellm` and `ollama` are still recognised (so
-//! effort/caching validation errors match) but building one fails with a clear message — pass a
-//! pre-built [`Model`] instead.
+//! Built providers are `bedrock`, `bedrock-mantle`, `anthropic`, `openai`, and `llamacpp`.
+//! The latter uses the `openai` feature. For `google`, `litellm`, and `ollama`, pass a
+//! pre-built [`Model`].
 
 use std::collections::HashSet;
 use std::fmt;
@@ -26,6 +25,8 @@ use strands_agents::{Error, Result};
 use crate::agent::CachingOption;
 use crate::defaults::DEFAULT_MODEL;
 
+#[cfg(feature = "openai")]
+use strands_agents::models::openai::OpenAIApi;
 #[cfg(feature = "anthropic")]
 use strands_agents::models::{
     AnthropicCacheConfig, AnthropicCacheStrategy, AnthropicModel, AnthropicModelConfig,
@@ -246,6 +247,13 @@ const PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "litellm",
+        recommended: None,
+        levels: NO_THINKING_LEVELS,
+        web_search: false,
+        caching: true,
+    },
+    Provider {
+        name: "llamacpp",
         recommended: None,
         levels: NO_THINKING_LEVELS,
         web_search: false,
@@ -526,7 +534,7 @@ fn bedrock_builder(
     builder
 }
 
-/// An `openai/...` or `bedrock-mantle/...` model, the latter under `aws`.
+/// An OpenAI-compatible model, with `aws` applied to Bedrock Mantle.
 #[cfg(feature = "openai")]
 async fn connect_openai(
     spec: &str,
@@ -666,7 +674,7 @@ pub async fn resolve_model(options: ResolveModelOptions) -> Result<Arc<dyn Model
     match provider_name {
         "bedrock" => build_bedrock(&spec, effort, web_search, caching, caching_explicit, ttl, aws).await,
         "anthropic" => build_anthropic(&spec, effort, web_search, caching, caching_explicit, ttl),
-        "openai" | "bedrock-mantle" => {
+        "openai" | "bedrock-mantle" | "llamacpp" => {
             build_openai(&spec, effort, web_search, caching, caching_explicit, aws).await
         }
         _ => {
@@ -802,6 +810,16 @@ pub(crate) fn openai_config_for(
     caching_explicit: bool,
 ) -> Result<OpenAIModelConfig> {
     let resolved = resolve_spec(spec, effort, web_search, caching, caching_explicit)?;
+    if resolved.provider == "llamacpp" {
+        // llama.cpp reuses prompt prefixes in its own KV cache.
+        let endpoint =
+            std::env::var("LLAMACPP_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        return Ok(llamacpp_config(
+            resolved.name,
+            &endpoint,
+            std::env::var("LLAMACPP_API_KEY").ok(),
+        ));
+    }
     let mantle = match resolved.provider {
         "openai" => None,
         "bedrock-mantle" => Some(BedrockMantleConfig::default()),
@@ -826,6 +844,36 @@ pub(crate) fn openai_config_for(
         cache_config: resolved.caching.then(OpenAICacheConfig::default),
         ..OpenAIModelConfig::default()
     })
+}
+
+#[cfg(feature = "openai")]
+fn llamacpp_config(model_id: &str, endpoint: &str, api_key: Option<String>) -> OpenAIModelConfig {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let base_url = if endpoint.ends_with("/v1") {
+        endpoint.to_string()
+    } else {
+        format!("{endpoint}/v1")
+    };
+    OpenAIModelConfig {
+        api: OpenAIApi::Chat,
+        api_key: Some(api_key.unwrap_or_else(|| "llamacpp".to_string())),
+        base_url: Some(base_url),
+        model_id: Some(model_id.to_string()),
+        ..OpenAIModelConfig::default()
+    }
+}
+
+#[cfg(all(test, feature = "openai"))]
+#[test]
+fn llamacpp_uses_chat_completions_and_preserves_model_ids() {
+    let model_id = "/models/inkling.gguf";
+    for endpoint in ["http://localhost:8080/", "http://localhost:8080/v1/"] {
+        let config = llamacpp_config(model_id, endpoint, None);
+        assert_eq!(config.api, OpenAIApi::Chat);
+        assert_eq!(config.base_url.as_deref(), Some("http://localhost:8080/v1"));
+        assert_eq!(config.model_id.as_deref(), Some(model_id));
+        assert_eq!(config.api_key.as_deref(), Some("llamacpp"));
+    }
 }
 
 /// Unwrap a JSON object literal into the map shape the provider configs take.
@@ -861,7 +909,7 @@ pub(crate) fn bedrock_config_for(
 
 fn unsupported_provider(provider_name: &str) -> Error {
     Error::model(format!(
-        "Provider {} is not built by the Rust harness yet; built providers: anthropic, bedrock, bedrock-mantle, openai (recognised providers: {}). Pass a pre-built Model instance for anything else.",
+        "Provider {} is not built by the Rust harness yet; built providers: anthropic, bedrock, bedrock-mantle, llamacpp, openai (recognised providers: {}). Pass a pre-built Model instance for anything else.",
         quote(provider_name),
         provider_names()
     ))
@@ -1343,7 +1391,7 @@ mod tests {
         let error = resolve("mistral/whatever", Effort::Auto).expect_err("rejects");
         assert_eq!(
             error.to_string(),
-            "Unknown model provider \"mistral\" in \"mistral/whatever\". Supported providers: anthropic, bedrock, bedrock-mantle, google, litellm, ollama, openai. Pass a Model instance for anything else."
+            "Unknown model provider \"mistral\" in \"mistral/whatever\". Supported providers: anthropic, bedrock, bedrock-mantle, google, litellm, llamacpp, ollama, openai. Pass a Model instance for anything else."
         );
     }
 
@@ -1596,7 +1644,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Provider \"ollama\" does not support prompt caching. Providers with caching: anthropic, bedrock, bedrock-mantle, google, litellm, openai."),
+                .contains("Provider \"ollama\" does not support prompt caching. Providers with caching: anthropic, bedrock, bedrock-mantle, google, litellm, llamacpp, openai."),
             "{error}"
         );
         resolve_caching("ollama/llama3", Effort::Auto, true, false).expect_err("rejects");
