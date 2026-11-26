@@ -2,8 +2,33 @@
 
 use std::path::Path;
 
-/// The git commit this binary was built from (`build.rs`); `None` when built outside git.
-pub const COMMIT: Option<&str> = option_env!("STRANDS_SWARM_COMMIT");
+/// The git commit this binary was built from: `STRANDS_SWARM_BUILD_HEAD` when the build sets it,
+/// else what `build.rs` found; `None` when built outside git. The variable is read here, by the
+/// crate itself, because rustc tracks it: a changed value recompiles the crate, whatever cargo
+/// decided about the build script's cached output.
+pub const COMMIT: Option<&str> = commit(
+    option_env!("STRANDS_SWARM_BUILD_HEAD"),
+    option_env!("STRANDS_SWARM_COMMIT"),
+);
+
+const fn commit(build_head: Option<&'static str>, found: Option<&'static str>) -> Option<&'static str> {
+    match build_head {
+        Some(head) if !head.is_empty() => Some(head),
+        _ => found,
+    }
+}
+
+/// `--version`: the package version plus the short [`COMMIT`], e.g. `0.1.0 (82a78268e)`.
+pub fn display() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        let version = env!("CARGO_PKG_VERSION");
+        match COMMIT {
+            Some(commit) => format!("{version} ({})", commit.get(..9).unwrap_or(commit)),
+            None => version.to_owned(),
+        }
+    })
+}
 
 /// The checkout this binary was built from, where [`changes`] looks commits up.
 pub const SOURCE: &str = env!("CARGO_MANIFEST_DIR");
@@ -116,6 +141,18 @@ mod tests {
         assert_eq!(stale(Some(&old), &dir.path().join("gone")).await, None);
         let plain = tempfile::tempdir_in("/tmp").unwrap();
         assert_eq!(stale(Some(&old), plain.path()).await, None);
+    }
+
+    #[test]
+    fn a_build_head_overrides_what_the_build_script_found() {
+        assert_eq!(commit(Some("new"), Some("old")), Some("new"));
+        assert_eq!(commit(Some("new"), None), Some("new"));
+        assert_eq!(commit(Some(""), Some("old")), Some("old"));
+        assert_eq!(commit(None, Some("old")), Some("old"));
+        assert_eq!(commit(None, None), None);
+        let shown = display();
+        assert!(shown.starts_with(env!("CARGO_PKG_VERSION")), "{shown}");
+        assert_eq!(shown.contains('('), COMMIT.is_some());
     }
 
     #[test]

@@ -23,7 +23,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 /// Run a swarm of cooperating coding agents. The root agent decides whether and how to spawn
 /// others.
 #[derive(Parser, Debug)]
-#[command(version = env!("STRANDS_SWARM_VERSION"))]
+#[command(version = strands_swarm::version::display())]
 struct Cli {
     /// Task for the root agent. Optional in the TUI, where you can type it.
     task: Option<String>,
