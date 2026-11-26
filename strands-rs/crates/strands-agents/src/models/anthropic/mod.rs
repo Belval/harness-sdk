@@ -361,6 +361,10 @@ impl Model for AnthropicModel {
         get_context_window_limit(&self.model_id)
     }
 
+    fn max_output_tokens(&self) -> Option<u64> {
+        Some(self.max_tokens)
+    }
+
     fn stream<'a>(&'a self, messages: &'a [Message], options: &'a StreamOptions) -> ModelEventStream<'a> {
         Box::pin(async_stream::try_stream! {
             let mut request = self.format_request(messages, options)?;

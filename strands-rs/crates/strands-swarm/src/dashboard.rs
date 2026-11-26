@@ -16,7 +16,7 @@ use strands_agents::tools::{FunctionTool, ToolContext, ToolRef};
 use strands_agents::types::{ContentBlock, Message, Role, ToolResultContent};
 use strands_agents::{Agent, Result};
 
-use crate::compaction::{compaction_point, window_of};
+use crate::compaction::point_of;
 
 /// Items the dashboard lists.
 const TOP_ITEMS: usize = 10;
@@ -102,7 +102,7 @@ impl ContextControl {
         let messages = agent.messages();
         let items = items(&messages);
         let estimate: usize = items.iter().map(|item| item.tokens).sum();
-        let point = compaction_point(window_of(agent.model().as_ref()), self.compact_at);
+        let point = point_of(agent.model().as_ref(), self.compact_at);
         let measured = agent.meter().metrics().latest_context_size;
         let tokens = measured.unwrap_or(estimate as u64);
         let source = match measured {

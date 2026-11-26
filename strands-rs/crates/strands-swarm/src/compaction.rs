@@ -23,16 +23,29 @@ use strands_agents::types::{ContentBlock, Message, Role, SystemPrompt};
 use strands_agents::{Error, Model, Result};
 
 /// The input size (tokens) at which older turns are summarized: the context manager's own 85%
-/// mark of `window`, or `compact_at` when given and smaller.
-pub fn compaction_point(window: u64, compact_at: Option<u64>) -> u64 {
+/// mark of `window`, or `compact_at` when given and smaller, and never so high that the input
+/// plus `max_output` (the model's `max_tokens`, which providers count against the window) would
+/// no longer fit: a 200k window with 64k of output takes 136k of input, below 85%.
+pub fn compaction_point(window: u64, max_output: u64, compact_at: Option<u64>) -> u64 {
     let auto = (window as f64 * AUTO_SUMMARIZE_UTILIZATION) as u64;
+    // Never below a quarter of the window, however large the output claims to be.
+    let fits = window.saturating_sub(max_output).max(window / 4);
+    let auto = auto.min(fits);
     compact_at.map_or(auto, |at| auto.min(at)).max(1)
 }
 
-/// The utilization (share of `window`) at which to summarize:
-/// `min(AUTO_SUMMARIZE_UTILIZATION, compact_at / window)`.
-pub fn compaction_utilization(window: u64, compact_at: Option<u64>) -> f64 {
-    compaction_point(window, compact_at) as f64 / window.max(1) as f64
+/// The utilization (share of `window`) at which to summarize: [`compaction_point`] over `window`.
+pub fn compaction_utilization(window: u64, max_output: u64, compact_at: Option<u64>) -> f64 {
+    compaction_point(window, max_output, compact_at) as f64 / window.max(1) as f64
+}
+
+/// [`compaction_point`] for `model`'s window and output limit.
+pub fn point_of(model: &dyn Model, compact_at: Option<u64>) -> u64 {
+    compaction_point(
+        window_of(model),
+        model.max_output_tokens().unwrap_or(0),
+        compact_at,
+    )
 }
 
 /// The window the context manager assumes for `model`: its own, else the same default.
@@ -178,8 +191,10 @@ impl CompactAt {
     /// unless a recent failure is being backed off from.
     fn due(&self, ctx: &ContextState<'_>) -> Option<bool> {
         let requested = self.control.as_ref().is_some_and(|c| c.take_summarize_request());
-        let window = window_of(ctx.agent.model().as_ref());
-        let at_point = ctx.utilization >= compaction_utilization(window, self.compact_at)
+        let model = ctx.agent.model();
+        let window = window_of(model.as_ref());
+        let max_output = model.max_output_tokens().unwrap_or(0);
+        let at_point = ctx.utilization >= compaction_utilization(window, max_output, self.compact_at)
             && !self.backing_off(input_tokens(ctx, window));
         (requested || ctx.overflow || at_point).then_some(requested)
     }
@@ -238,8 +253,9 @@ impl CompactAt {
             return Ok(false);
         }
         let requested = armed == Some(true) || due == Some(true);
-        let window = window_of(ctx.agent.model().as_ref());
-        let point = compaction_point(window, self.compact_at);
+        let model = ctx.agent.model();
+        let window = window_of(model.as_ref());
+        let point = point_of(model.as_ref(), self.compact_at);
         let before = self.tokens(ctx, window);
         let reached = self.reached.lock().take().map_or(before, |r| r.max(before));
         let target = if requested { 0 } else { point / 2 };
@@ -896,10 +912,12 @@ mod tests {
 
     /// `inner` behind a context window, as a provider enforces it: a call whose input (system
     /// prompt included) estimates over `rejects_over` tokens fails with an overflow and uses no
-    /// response. It reports `window` as its window, which may be larger than what it accepts.
+    /// response. It reports `window` as its window, which may be larger than what it accepts, and
+    /// like Bedrock rejects an input that with `max_output` does not fit the window.
     struct Windowed {
         inner: Arc<MockMessageModel>,
         window: u64,
+        max_output: u64,
         rejects_over: u64,
         /// Each call's input, in estimated tokens, rejected or not.
         inputs: Mutex<Vec<u64>>,
@@ -910,7 +928,17 @@ mod tests {
             Self::rejecting(responses, window, window)
         }
 
+        fn with_output(responses: &[&str], window: u64, max_output: u64) -> Arc<Self> {
+            let mut model = Self::build(responses, window, window);
+            Arc::get_mut(&mut model).unwrap().max_output = max_output;
+            model
+        }
+
         fn rejecting(responses: &[&str], window: u64, rejects_over: u64) -> Arc<Self> {
+            Self::build(responses, window, rejects_over)
+        }
+
+        fn build(responses: &[&str], window: u64, rejects_over: u64) -> Arc<Self> {
             let responses = responses
                 .iter()
                 .map(|text| MockResponse::message(Message::assistant(*text)))
@@ -918,6 +946,7 @@ mod tests {
             Arc::new(Self {
                 inner: MockMessageModel::shared(responses),
                 window,
+                max_output: 0,
                 rejects_over,
                 inputs: Mutex::default(),
             })
@@ -937,6 +966,10 @@ mod tests {
             Some(self.window)
         }
 
+        fn max_output_tokens(&self) -> Option<u64> {
+            Some(self.max_output)
+        }
+
         fn stream<'a>(&'a self, messages: &'a [Message], options: &'a StreamOptions) -> ModelEventStream<'a> {
             let count = CountTokensOptions {
                 system_prompt: options.system_prompt.clone(),
@@ -944,10 +977,11 @@ mod tests {
             };
             let input = estimate_tokens_heuristic(messages, &count);
             self.inputs.lock().push(input);
-            if input > self.rejects_over {
+            if input > self.rejects_over || input + self.max_output > self.window {
                 let error = Error::ContextWindowOverflow(format!(
-                    "Input is too long for requested model: {input} > {}",
-                    self.rejects_over
+                    "Input is too long for requested model: {input} + {} > {}",
+                    self.max_output,
+                    self.rejects_over.min(self.window)
                 ));
                 return Box::pin(futures::stream::iter([Err(error)]));
             }
@@ -1057,6 +1091,65 @@ mod tests {
         let messages = agent.messages();
         assert!(messages[0].text().starts_with("the task"));
         assert!(messages[0].text().contains("SUMMARY"));
+        assert!(matches!(events.lock()[..], [Compaction::Done { .. }]));
+    }
+
+    /// An agent on `model` that summarizes with `summarizer`, over `history` and `compact`.
+    fn agent_over(
+        model: &Arc<Windowed>,
+        summarizer: &Arc<Windowed>,
+        history: Vec<Message>,
+    ) -> (Agent, Events) {
+        let (compact, events) = compact(None, None);
+        let config = ContextManagerConfig {
+            strategies: Some(vec![compact]),
+            ..Default::default()
+        };
+        let agent = Agent::builder()
+            .model(Arc::clone(model))
+            .aux_model(Arc::clone(summarizer))
+            .messages(history)
+            .context_manager(ContextManagerOption::Config(config))
+            .build()
+            .unwrap();
+        (agent, events)
+    }
+
+    #[tokio::test]
+    async fn near_the_edge_it_compacts_before_the_output_would_not_fit() {
+        // 200k window, 64k of output: 150k is under 85% (170k) but over the 136k that fits.
+        let summarizer = Windowed::new(&["SUMMARY"], 1_000_000);
+        let model = Windowed::with_output(&["done"], 200_000, 64_000);
+        let mut history = tool_loop_of(70, 2_000);
+        history.push(Message::assistant("next"));
+        assert!((140_000..170_000).contains(&heuristic(&history)));
+        let (agent, events) = agent_over(&model, &summarizer, history);
+
+        agent.invoke("go on").await.unwrap();
+
+        // One call, accepted: compaction came first and no overflow was needed.
+        let inputs = model.inputs();
+        assert_eq!(inputs.len(), 1, "{inputs:?}");
+        assert!(inputs[0] + 64_000 <= 200_000, "{inputs:?}");
+        assert!(matches!(events.lock()[..], [Compaction::Done { .. }]));
+    }
+
+    #[tokio::test]
+    async fn a_too_long_error_compacts_and_retries_once() {
+        // The model claims 200k but takes 100k: the point (170k) is not reached, the call fails.
+        let summarizer = Windowed::new(&["SUMMARY"], 1_000_000);
+        let model = Windowed::rejecting(&["done"], 200_000, 100_000);
+        let mut history = tool_loop_of(60, 2_000);
+        history.push(Message::assistant("next"));
+        assert!((100_000..170_000).contains(&heuristic(&history)));
+        let (agent, events) = agent_over(&model, &summarizer, history);
+
+        agent.invoke("go on").await.unwrap();
+
+        let inputs = model.inputs();
+        assert_eq!(inputs.len(), 2, "{inputs:?}");
+        assert!(inputs[0] > 100_000 && inputs[1] <= 100_000, "{inputs:?}");
+        assert_eq!(summarizer.inner.call_count(), 1);
         assert!(matches!(events.lock()[..], [Compaction::Done { .. }]));
     }
 
@@ -1200,19 +1293,33 @@ mod tests {
 
     #[test]
     fn by_default_compacts_at_85_percent_of_the_window() {
-        assert_eq!(compaction_point(1_000_000, None), 850_000);
-        assert!((compaction_utilization(1_000_000, None) - AUTO_SUMMARIZE_UTILIZATION).abs() < 1e-9);
-        assert_eq!(compaction_point(200_000, None), 170_000);
-        assert_eq!(compaction_point(0, None), 1);
+        assert_eq!(compaction_point(1_000_000, 0, None), 850_000);
+        assert!((compaction_utilization(1_000_000, 0, None) - AUTO_SUMMARIZE_UTILIZATION).abs() < 1e-9);
+        assert_eq!(compaction_point(200_000, 0, None), 170_000);
+        assert_eq!(compaction_point(0, 0, None), 1);
     }
 
     #[test]
     fn compacts_at_the_smaller_of_compact_at_and_85_percent() {
-        assert_eq!(compaction_point(1_000_000, Some(200_000)), 200_000);
-        assert!((compaction_utilization(1_000_000, Some(200_000)) - 0.2).abs() < 1e-9);
-        assert_eq!(compaction_point(200_000, Some(200_000)), 170_000);
-        assert!((compaction_utilization(200_000, Some(200_000)) - AUTO_SUMMARIZE_UTILIZATION).abs() < 1e-9);
-        assert_eq!(compaction_point(200_000, Some(1_500_000)), 170_000);
-        assert_eq!(compaction_point(1_000_000, Some(50_000)), 50_000);
+        assert_eq!(compaction_point(1_000_000, 0, Some(200_000)), 200_000);
+        assert!((compaction_utilization(1_000_000, 0, Some(200_000)) - 0.2).abs() < 1e-9);
+        assert_eq!(compaction_point(200_000, 0, Some(200_000)), 170_000);
+        assert!(
+            (compaction_utilization(200_000, 0, Some(200_000)) - AUTO_SUMMARIZE_UTILIZATION).abs() < 1e-9
+        );
+        assert_eq!(compaction_point(200_000, 0, Some(1_500_000)), 170_000);
+        assert_eq!(compaction_point(1_000_000, 0, Some(50_000)), 50_000);
+    }
+
+    #[test]
+    fn leaves_room_for_the_output_in_the_window() {
+        // 1M with 128k of output: 85% (850k) + 128k fits, so the point stays.
+        assert_eq!(compaction_point(1_000_000, 128_000, None), 850_000);
+        // 200k with 64k of output takes at most 136k of input.
+        assert_eq!(compaction_point(200_000, 64_000, None), 136_000);
+        assert!((compaction_utilization(200_000, 64_000, None) - 0.68).abs() < 1e-9);
+        // A smaller compact_at still wins; an output the size of the window leaves a quarter.
+        assert_eq!(compaction_point(200_000, 64_000, Some(100_000)), 100_000);
+        assert_eq!(compaction_point(200_000, 200_000, None), 50_000);
     }
 }

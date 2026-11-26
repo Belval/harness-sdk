@@ -145,6 +145,12 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Most output tokens one call may ask for (`max_tokens`), if set. Providers count it
+    /// against the window: input plus this must fit.
+    fn max_output_tokens(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether the provider keeps conversation state server-side.
     fn stateful(&self) -> bool {
         false
@@ -204,6 +210,10 @@ impl<M: Model + ?Sized> Model for std::sync::Arc<M> {
 
     fn context_window_limit(&self) -> Option<u64> {
         (**self).context_window_limit()
+    }
+
+    fn max_output_tokens(&self) -> Option<u64> {
+        (**self).max_output_tokens()
     }
 
     fn stateful(&self) -> bool {

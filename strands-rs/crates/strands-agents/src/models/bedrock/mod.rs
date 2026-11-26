@@ -502,6 +502,13 @@ impl Model for BedrockModel {
             .or_else(|| get_context_window_limit(&self.model_id_or_default(&config)))
     }
 
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.config
+            .read()
+            .max_tokens
+            .and_then(|tokens| u64::try_from(tokens).ok())
+    }
+
     fn stream<'a>(
         &'a self,
         messages: &'a [Message],

@@ -481,8 +481,8 @@ impl Swarm {
         // next call; the window is the one the context manager assumes. A side call's input is
         // not the agent's context.
         if let Some(agent) = node.agent().filter(|_| own_call) {
-            let window = crate::compaction::window_of(agent.model().as_ref());
-            let point = crate::compaction::compaction_point(window, node.compact_at(&self.inner.config));
+            let point =
+                crate::compaction::point_of(agent.model().as_ref(), node.compact_at(&self.inner.config));
             *node.context.lock() = Some(counts.input as f64 / point as f64);
         }
         self.emit_usage(node);
@@ -681,6 +681,10 @@ impl Model for SideModel {
 
     fn context_window_limit(&self) -> Option<u64> {
         self.current()?.context_window_limit()
+    }
+
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.current()?.max_output_tokens()
     }
 
     fn stream<'a>(&'a self, messages: &'a [Message], options: &'a StreamOptions) -> ModelEventStream<'a> {

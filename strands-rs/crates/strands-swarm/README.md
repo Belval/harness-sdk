@@ -134,6 +134,14 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     85% of the model's window (850k tokens for a 1M window), or `--compact-at TOKENS` if that
     is smaller. `spawn_agent`'s `compact_at` sets one agent's point instead, saved with the agent
     across restarts; an agent spawned without one follows `--compact-at` as the run is started.
+  - Providers count the call's `max_tokens` against the window (Bedrock: "input length and
+    `max_tokens` exceed context limit"), so the point is also at most `window − max_tokens`, at
+    least a quarter of the window. It matters on 200k models (Opus/Sonnet 4.5: 64k of output, so
+    136k of input, below 85%); at 1M with 128k of output, 850k + 128k still fits. The swarm sends
+    each Claude model its tier's `max_tokens`. The projection is of the *next* call's input, so
+    the check runs before it. A "too long" error that still gets through compacts at once and
+    retries the call, up to three times in a row (the SDK's overflow recovery). No overflow
+    error was found in `events.jsonl` (all calls ran on 1M-window models, at most 128k of output).
   - The point follows the window on a `/model` switch. The log notes 90%.
   - A summary brings the input down to half the point: how many of the oldest turns go into it
     follows their token counts. The task message stays verbatim, and so do the latest four
