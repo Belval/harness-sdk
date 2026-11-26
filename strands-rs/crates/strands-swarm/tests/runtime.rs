@@ -8031,3 +8031,160 @@ async fn without_a_state_dir_a_burst_of_fyis_is_delivered_whole() {
     assert_eq!(sent.matches("kind=\\\"fyi\\\"").count(), 3, "{sent}");
     swarm.shutdown().await;
 }
+
+/// A swarm whose agents have the harness's `edit` and `write` besides the swarm's tools.
+fn editing_swarm(
+    scripts: Vec<(&str, Vec<MockResponse>)>,
+    cwd: &Path,
+) -> (Swarm, UnboundedReceiver<SwarmEvent>, Scripts) {
+    let map = scripts_of(scripts);
+    let inner = mock_factory(&map);
+    let factory: AgentFactory = Arc::new(move |mut spec: AgentSpec| {
+        spec.tools.push(Arc::new(strands_harness::tools::edit()));
+        spec.tools.push(Arc::new(strands_harness::tools::write()));
+        inner(spec)
+    });
+    let (swarm, events) = Swarm::new(SwarmConfig::new(factory, cwd));
+    (swarm, events, map)
+}
+
+fn edit_call(id: &str, path: &Path, old: &str, new: &str) -> MockResponse {
+    tool_call(
+        "edit",
+        id,
+        json!({"path": path.display().to_string(), "old_str": old, "new_str": new}),
+    )
+}
+
+async fn spawn_worktree(swarm: &Swarm, repo: &Path) -> String {
+    let request = SpawnRequest {
+        task: "t".into(),
+        worktree: true,
+        cwd: Some(repo.to_owned()),
+        ..Default::default()
+    };
+    swarm.spawn(USER, request).await.unwrap()
+}
+
+const NOTE: &str = "is also being changed by";
+
+#[tokio::test]
+async fn agents_in_two_worktrees_of_one_repo_learn_who_else_is_on_a_file_once_per_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[("a.rs", "x")]);
+    let (swarm, mut events, scripts) = editing_swarm(vec![], &repo);
+    let tree = |id: &str| {
+        dir.path()
+            .join("repo.swarm")
+            .join(swarm.run_id())
+            .join(id)
+            .join("a.rs")
+    };
+    for (id, script) in [
+        ("a1", vec![edit_call("e1", &tree("a1"), "x", "one"), say("one")]),
+        (
+            "a2",
+            vec![
+                edit_call("e1", &tree("a2"), "x", "two"),
+                edit_call("e2", &tree("a2"), "two", "two!"),
+                say("two"),
+                edit_call("e3", &tree("a2"), "two!", "two!!"),
+                say("again"),
+            ],
+        ),
+    ] {
+        scripts.lock().insert(id.into(), MockMessageModel::shared(script));
+    }
+
+    let first = spawn_worktree(&swarm, &repo).await;
+    assert_eq!(reply_to(&mut events, USER).await, "one");
+    let sent = scripts.lock()["a1"].clone();
+    assert!(!sent_text(&sent, 1).contains(NOTE), "nobody else is on a.rs yet");
+    let report = swarm.claims_report().await;
+    assert_eq!(
+        report[&first], ", editing: 1 file",
+        "an idle agent's uncommitted change stays claimed"
+    );
+
+    let second = spawn_worktree(&swarm, &repo).await;
+    assert_eq!(reply_to(&mut events, USER).await, "two");
+    let model = scripts.lock()["a2"].clone();
+    let note = format!("note: a.rs {NOTE}");
+    assert!(sent_text(&model, 1).contains(&note), "{}", sent_text(&model, 1));
+    assert!(sent_text(&model, 1).contains(&format!("({first});")));
+    assert_eq!(sent_text(&model, 2).matches(NOTE).count(), 1, "once per turn");
+
+    let report = swarm.claims_report().await;
+    assert!(
+        report[&first].starts_with(", editing: 1 file; shares a.rs with "),
+        "{report:?}"
+    );
+    assert!(report[&first].ends_with(&format!("({second})")), "{report:?}");
+    assert!(report[&second].ends_with(&format!("({first})")), "{report:?}");
+
+    swarm.send(USER, &second, "more").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "again");
+    assert_eq!(
+        sent_text(&model, 4).matches(NOTE).count(),
+        2,
+        "a new turn notes again"
+    );
+
+    swarm.cancel(&first).unwrap();
+    let report = swarm.claims_report().await;
+    assert_eq!(report.get(&first), None);
+    assert_eq!(report[&second], ", editing: 1 file", "{report:?}");
+}
+
+#[tokio::test]
+async fn agents_in_different_repos_never_share_a_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = init_repo(&dir.path().join("one"), &[("a.rs", "x")]);
+    let two = init_repo(&dir.path().join("two"), &[("a.rs", "x")]);
+    let (swarm, mut events, scripts) = editing_swarm(vec![], dir.path());
+    let tree = |repo: &str, id: &str| {
+        dir.path()
+            .join(repo)
+            .join("repo.swarm")
+            .join(swarm.run_id())
+            .join(id)
+            .join("a.rs")
+    };
+    for (id, repo) in [("a1", "one"), ("a2", "two")] {
+        let script = vec![edit_call("e1", &tree(repo, id), "x", id), say(id)];
+        scripts.lock().insert(id.into(), MockMessageModel::shared(script));
+    }
+    spawn_worktree(&swarm, &one).await;
+    reply_to(&mut events, USER).await;
+    spawn_worktree(&swarm, &two).await;
+    reply_to(&mut events, USER).await;
+    let model = scripts.lock()["a2"].clone();
+    assert!(!sent_text(&model, 1).contains(NOTE));
+    let report = swarm.claims_report().await;
+    assert_eq!(report["a1"], ", editing: 1 file");
+    assert_eq!(report["a2"], ", editing: 1 file");
+}
+
+#[tokio::test]
+async fn an_agent_that_committed_its_change_no_longer_claims_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path(), &[("a.rs", "x")]);
+    let (swarm, mut events, scripts) = editing_swarm(vec![], &repo);
+    let path = dir
+        .path()
+        .join("repo.swarm")
+        .join(swarm.run_id())
+        .join("a1")
+        .join("a.rs");
+    let script = vec![edit_call("e1", &path, "x", "one"), say("one")];
+    scripts
+        .lock()
+        .insert("a1".into(), MockMessageModel::shared(script));
+    let id = spawn_worktree(&swarm, &repo).await;
+    reply_to(&mut events, USER).await;
+    assert_eq!(swarm.claims_report().await[&id], ", editing: 1 file");
+    let tree = swarm.agent(&id).unwrap().cwd;
+    git(&tree, &["commit", "-qam", "one"]);
+    tokio::time::sleep(strands_swarm::claims::TTL + Duration::from_millis(100)).await;
+    assert_eq!(swarm.claims_report().await.get(&id), None);
+}

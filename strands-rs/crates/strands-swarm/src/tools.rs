@@ -711,6 +711,7 @@ async fn list_tool(swarm: Swarm, _me: String, input: ListInput, _ctx: ToolContex
         };
         finished.insert(id, bytes);
     }
+    let claims = swarm.claims_report().await;
     let text = list_agents(
         &swarm,
         input.include_cancelled,
@@ -718,6 +719,7 @@ async fn list_tool(swarm: Swarm, _me: String, input: ListInput, _ctx: ToolContex
         &branches,
         &left,
         &finished,
+        &claims,
     );
     Ok(text)
 }
@@ -755,7 +757,8 @@ fn resolve(swarm: &Swarm, me: &str, who: &str) -> Result<String> {
 /// behind, merges cleanly), jobs j3 (gates), model claude-sonnet-4-5, compacts at 300.0k, est.
 /// $1.20 / 3.4M tokens` (the compaction point only when spawned with its own).
 /// One line per agent; cancelled ones are only counted unless `include_cancelled`; then the
-/// swarm's total. `finished`: the [`Swarm::finished_agents`], with their target dirs' sizes.
+/// swarm's total. `finished`: the [`Swarm::finished_agents`], with their target dirs' sizes;
+/// `claims`: [`Swarm::claims_report`] (`, editing: 2 files; shares a.rs with b (a12)`).
 fn list_agents(
     swarm: &Swarm,
     include_cancelled: bool,
@@ -763,6 +766,7 @@ fn list_agents(
     (base, branches): &(Option<String>, HashMap<String, BranchState>),
     cancelled: &HashMap<String, Option<BranchState>>,
     finished: &HashMap<String, Option<u64>>,
+    claims: &HashMap<String, String>,
 ) -> String {
     let agents = swarm.agents();
     let (shown, hidden): (Vec<_>, Vec<_>) = agents
@@ -831,6 +835,7 @@ fn list_agents(
         let line = describe(swarm, info)
             + &quiet(info)
             + &merge(&info.id)
+            + claims.get(&info.id).map_or("", String::as_str)
             + &reclaim(&info.id)
             + &running(&info.id)
             + &spend(info);

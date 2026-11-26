@@ -117,6 +117,7 @@ impl Swarm {
         self.install_mail_hook(&agent, &node.id);
         self.install_cd_hook(&agent, &node);
         self.install_poll_hint(&agent, &node.id);
+        self.install_claims_hook(&agent, &node.id);
         self.install_model_gate(&agent, &node);
         self.install_keep_warm(&agent, &node);
         agent.set_aux_model(Some(Arc::new(SideModel {

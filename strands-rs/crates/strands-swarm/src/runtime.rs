@@ -41,6 +41,7 @@ mod actor;
 mod background;
 mod calls;
 mod capacity;
+mod claims;
 mod collect;
 mod disk;
 mod dormant;
@@ -925,6 +926,8 @@ struct Inner {
     epoch: (DateTime<Utc>, tokio::time::Instant),
     /// Branch commits for [`Swarm::status`], refreshed in the background.
     branches: Mutex<crate::status::BranchCache>,
+    /// What agents changed this turn and each checkout's uncommitted files ([`crate::claims`]).
+    claims: Mutex<crate::claims::Claims>,
     /// Background shell jobs ([`Swarm::start_job`]).
     jobs: Jobs,
     /// The job watcher has been started.
@@ -982,6 +985,7 @@ impl Swarm {
             scheduler: AtomicBool::new(false),
             epoch: (Utc::now(), tokio::time::Instant::now()),
             branches: Mutex::default(),
+            claims: Mutex::default(),
             jobs: Jobs::new(jobs_dir(&config)),
             watching_jobs: AtomicBool::new(false),
             watching_dormant: AtomicBool::new(false),
@@ -1408,6 +1412,7 @@ impl Swarm {
             }
             *current = status.clone();
         }
+        self.claims_turn(&node.id, &status);
         // A turn that ended or was cancelled has nothing in flight, finished events or not.
         if status != AgentStatus::Running {
             node.tool_calls.lock().clear();

@@ -624,6 +624,16 @@ Other text messages the selected agent, or starts a root agent when there is non
     merges are cached by commit, so only a branch that moved is looked at again; pairs without a
     shared file cost nothing; at most 45 new trial merges run per refresh (later pairs read
     `overlaps`).
+  - **Path claims** (advisory, derived, no tool): an agent claims the files it changed through
+    `edit`/`write` (kept until a `git status` later than the edit shows them clean, so they drop
+    once committed or landed, and the agent's claims drop when it is cancelled) and, when it
+    has its checkout to itself, every file uncommitted there. Claims are keyed by the repo's
+    common git dir and the repo-relative path, so worktrees of one repo collide and repos never
+    do. When an `edit`/`write` touches a file another live agent claims, its result ends with
+    `note: a.rs is also being changed by b (a12); coordinate or message them.`, once per
+    (file, agent) per turn. `list_agents` adds `, editing: 2 files; shares a.rs with b (a12)` to
+    each agent's line (after its branch). One `git status` per checkout, at most every 5 s and
+    only when an edit or `list_agents` asks. Nothing blocks.
   - It refreshes while open; git runs in the background and is cached for 5 s.
   - Programmatically: `Swarm::status`.
 

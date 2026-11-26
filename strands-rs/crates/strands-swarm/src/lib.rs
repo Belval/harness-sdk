@@ -14,6 +14,7 @@
 
 pub mod aging;
 pub mod catalog;
+pub mod claims;
 pub mod commit_rule;
 pub mod compaction;
 pub mod cost;
