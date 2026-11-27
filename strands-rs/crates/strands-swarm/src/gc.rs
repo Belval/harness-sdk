@@ -883,6 +883,7 @@ mod tests {
             cwd: cwd.to_path_buf(),
             next_id: agents.len() as u64 + 1,
             agents,
+            order: Vec::new(),
             budget_tokens: None,
             budget_flag: None,
             task_flag: None,

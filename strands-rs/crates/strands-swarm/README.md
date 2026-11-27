@@ -760,7 +760,8 @@ messages you.
 ## Persistence
 
 - **Run dir.** `swarm.json` (agent tree, statuses, unread mail, token counts, schedules, budget,
-  agent cap; replaced atomically), `sessions/` (each agent's conversation and context stash),
+  agent cap; replaced atomically), `cancelled.json` (the cancelled agents' records, kept out of
+  `swarm.json`), `sessions/` (each agent's conversation and context stash),
   `jobs/`, `journal.jsonl`, `events.jsonl`, `swarm.log`, `logs/` (MCP servers), `mcp-tools.json`
   and `bin/` (installed binaries). `swarmctl` adds `args`, `env`, `stderr.log`, `supervisor.log`,
   `supervisor.notice` and the `stop` marker.
@@ -772,6 +773,17 @@ messages you.
   saves (mail folded into an open turn, a restored tool batch) go through it too. `swarm.json`
   is written the same way, compact and from one buffer, and not at all when it would hold the
   same bytes as the file already does.
+- **Cancelled agents apart.** Cancelled agents' records go to `cancelled.json`, rewritten only
+  when one of them changes (a cancel, `--keep-cancelled` removing a session, the one-time fold of
+  its last hour's calls an hour after the cancel), and `swarm.json`, rewritten many times a
+  minute, keeps the rest plus every agent's id in spawn order (`order`), which a load restores.
+  On the live run 1,848 of 1,966 agents were cancelled: `swarm.json` went from 3.35 MB to
+  0.72 MB. `cancelled.json` is written first, so a crash between the two leaves an agent in both
+  (`swarm.json`'s record wins) and never in neither; one in `cancelled.json` only goes back by id
+  number, and `next_id` stays above every id. A `swarm.json` from before, with every agent in
+  it, loads as it is and is split on the next save; so does one an older binary (a rollback)
+  wrote, which cannot see the cancelled agents but leaves `cancelled.json` for the next upgrade.
+  A copy of a run (the self-test) needs both files to show its cancelled agents.
 - **Bounds.** A run dir grows with the live agents' work since the last resume and with unreported
   jobs, not with the run's age:
   - `journal.jsonl` and `events.jsonl` are rotated to `<file>.1` at 16 MB, so each takes at most

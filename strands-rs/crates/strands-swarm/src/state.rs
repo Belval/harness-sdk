@@ -6,8 +6,14 @@
 //! one, and a burst of save requests costs one write: a [`Persister::save`] builds its state only
 //! once it holds the write lock, and skips it when a write that began after the request has
 //! covered it already.
+//!
+//! Cancelled agents' records, most of a long run's agents and of its state, are kept in
+//! `cancelled.json` instead: they hardly change once cancelled, while `swarm.json` is rewritten
+//! many times a minute. `swarm.json` lists every agent's id in spawn order (`order`), so a load
+//! puts them back in place; `cancelled.json` is written before it, and only when a cancelled
+//! record changed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +21,8 @@ use strands_agents::{Error, Result};
 
 /// File name of the swarm state inside a run directory.
 pub const STATE_FILE: &str = "swarm.json";
+/// File name of the cancelled agents' records inside a run directory, kept out of [`STATE_FILE`].
+pub const CANCELLED_FILE: &str = "cancelled.json";
 /// Directory of per-agent sessions inside a run directory.
 pub const SESSIONS_DIR: &str = "sessions";
 /// A cancelled agent's full task, in its session directory ([`archive_task`]).
@@ -57,6 +65,11 @@ pub struct SwarmState {
     pub next_id: u64,
     /// Agents in spawn order.
     pub agents: Vec<AgentState>,
+    /// On disk only (empty once loaded): every agent's id in spawn order, cancelled ones too,
+    /// whose records are in [`CANCELLED_FILE`] while `agents` holds the rest. Absent in runs
+    /// saved before, whose `agents` hold them all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
     /// Swarm-wide token budget (input + output), as last set; `None` for no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u64>,
@@ -275,8 +288,61 @@ fn ran_on_after_save(dir: &Path) -> std::time::Duration {
 }
 
 async fn load_saved(dir: &Path) -> Result<Option<SwarmState>> {
-    let path = dir.join(STATE_FILE);
-    let text = match tokio::fs::read_to_string(&path).await {
+    let Some(mut state) = read_json::<SwarmState>(&dir.join(STATE_FILE)).await? else {
+        return Ok(None);
+    };
+    let cancelled = read_json::<CancelledState>(&dir.join(CANCELLED_FILE))
+        .await?
+        .map_or_else(Vec::new, |file| file.agents);
+    let order = match state.order.is_empty() {
+        true => state.agents.iter().map(|agent| agent.id.clone()).collect(),
+        false => std::mem::take(&mut state.order),
+    };
+    // `swarm.json` wins: written second, it is the newer record of an agent in both (a crash
+    // between the two writes of a cancel).
+    let mut records: HashMap<String, AgentState> = cancelled
+        .iter()
+        .cloned()
+        .chain(std::mem::take(&mut state.agents))
+        .map(|agent| (agent.id.clone(), agent))
+        .collect();
+    let mut seen = HashSet::new();
+    state.agents = order
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .filter_map(|id| records.remove(&id))
+        .collect();
+    // Without `order`, `swarm.json` was written by a binary that kept every agent in it: one from
+    // before this file, or one rolled back to since, which dropped the cancelled agents it did
+    // not know of. Those go back in by number, which is how ids are handed out, as does one
+    // spawned and cancelled within a save that a crash cut between the two files.
+    for agent in cancelled.iter().filter_map(|agent| records.remove(&agent.id)) {
+        let at = state
+            .agents
+            .iter()
+            .position(|other| id_number(&other.id) > id_number(&agent.id));
+        state.agents.insert(at.unwrap_or(state.agents.len()), agent);
+    }
+    // Never hand out an id again.
+    let last = state
+        .agents
+        .iter()
+        .map(|agent| id_number(&agent.id))
+        .filter(|n| *n < u64::MAX);
+    state.next_id = state.next_id.max(last.max().map_or(0, |n| n + 1));
+    Ok(Some(state))
+}
+
+/// The number in agent id `a<n>`, for ordering.
+fn id_number(id: &str) -> u64 {
+    id.strip_prefix('a')
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// The JSON file at `path`, or `None` when there is none.
+async fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let text = match tokio::fs::read_to_string(path).await {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -291,6 +357,12 @@ async fn load_saved(dir: &Path) -> Result<Option<SwarmState>> {
         .map_err(|error| Error::other(format!("Failed to parse {}: {error}", path.display())))
 }
 
+/// [`CANCELLED_FILE`]: the cancelled agents' records, in spawn order.
+#[derive(Debug, Serialize, Deserialize)]
+struct CancelledState {
+    agents: Vec<AgentState>,
+}
+
 /// Serializes writes of `swarm.json` and drops any older than the last one written.
 #[derive(Debug)]
 pub struct Persister {
@@ -298,13 +370,17 @@ pub struct Persister {
     written: tokio::sync::Mutex<Written>,
     /// Save requests so far ([`Persister::request`]).
     requested: std::sync::atomic::AtomicU64,
+    /// Writes of [`CANCELLED_FILE`] so far.
+    cancelled_writes: std::sync::atomic::AtomicU64,
 }
 
-/// The state last written: its generation, and its length and hash.
+/// The state last written: its generation, the length and hash of `swarm.json`, and the
+/// cancelled agents' records in [`CANCELLED_FILE`].
 #[derive(Debug, Default)]
 struct Written {
     generation: u64,
     print: Option<(usize, u64)>,
+    cancelled: Option<Vec<AgentState>>,
 }
 
 impl Persister {
@@ -314,12 +390,18 @@ impl Persister {
             dir: dir.into(),
             written: Default::default(),
             requested: Default::default(),
+            cancelled_writes: Default::default(),
         }
     }
 
     /// Ask for a save: the ticket to hand to [`Persister::save`], once the change to save is made.
     pub fn request(&self) -> u64 {
         self.requested.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// How many times [`CANCELLED_FILE`] was written.
+    pub fn cancelled_writes(&self) -> u64 {
+        self.cancelled_writes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Save the state `snapshot` returns for `ticket`, or nothing when a write that began after
@@ -333,7 +415,7 @@ impl Persister {
         }
         // Every request made so far precedes the snapshot, so this write covers them all.
         let covered = self.requested.load(std::sync::atomic::Ordering::SeqCst);
-        self.write_locked(&mut written, covered, &snapshot()).await
+        self.write_locked(&mut written, covered, snapshot()).await
     }
 
     /// The run directory.
@@ -346,16 +428,39 @@ impl Persister {
     /// the pretty form older runs wrote too.
     pub async fn write(&self, generation: u64, state: &SwarmState) -> Result<()> {
         let mut written = self.written.lock().await;
-        self.write_locked(&mut written, generation, state).await
+        self.write_locked(&mut written, generation, state.clone()).await
     }
 
-    async fn write_locked(&self, written: &mut Written, generation: u64, state: &SwarmState) -> Result<()> {
+    async fn write_locked(
+        &self,
+        written: &mut Written,
+        generation: u64,
+        mut state: SwarmState,
+    ) -> Result<()> {
         if generation <= written.generation {
             return Ok(());
         }
+        let agents = std::mem::take(&mut state.agents);
+        if agents.iter().any(is_cancelled) {
+            state.order = agents.iter().map(|agent| agent.id.clone()).collect();
+        }
+        let (cancelled, live): (Vec<_>, Vec<_>) = agents.into_iter().partition(is_cancelled);
+        state.agents = live;
+        // First, so a crash between the two writes leaves an agent cancelled since in both files
+        // (and `swarm.json`'s older record wins), never in neither. Written once per process
+        // even when empty, so a file a removed run left behind is not read into a new one.
+        if written.cancelled.as_ref() != Some(&cancelled) {
+            written.cancelled = None;
+            let file = CancelledState { agents: cancelled };
+            let json = serde_json::to_vec(&file).map_err(|e| Error::other(e.to_string()))?;
+            self.replace(CANCELLED_FILE, json).await?;
+            self.cancelled_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            written.cancelled = Some(file.agents);
+        }
         let capacity = written.print.map_or(0, |(len, _)| len + len / 16);
         let mut json = Vec::with_capacity(capacity);
-        serde_json::to_writer(&mut json, state).map_err(|e| Error::other(e.to_string()))?;
+        serde_json::to_writer(&mut json, &state).map_err(|e| Error::other(e.to_string()))?;
         let print = {
             use std::hash::Hasher;
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -364,22 +469,28 @@ impl Persister {
         };
         if written.print != Some(print) {
             written.print = None;
-            // Durable: after a power loss, the old state or the new one, never an empty file. A
-            // full disk spends the run's reserve on it.
-            let path = self.dir.join(STATE_FILE);
-            let json = std::sync::Arc::new(json);
-            crate::reserve::save_with(&self.dir, || {
-                crate::files::replace_async(&path, std::sync::Arc::clone(&json), true)
-            })
-            .await
-            .map_err(|e| Error::other(format!("Failed to save swarm state: {e}")))?;
+            self.replace(STATE_FILE, json).await?;
         }
-        *written = Written {
-            generation,
-            print: Some(print),
-        };
+        written.generation = generation;
+        written.print = Some(print);
         Ok(())
     }
+
+    /// Replace `name` in the run directory with `json`. Durable: after a power loss, the old
+    /// state or the new one, never an empty file. A full disk spends the run's reserve on it.
+    async fn replace(&self, name: &str, json: Vec<u8>) -> Result<()> {
+        let path = self.dir.join(name);
+        let json = std::sync::Arc::new(json);
+        crate::reserve::save_with(&self.dir, || {
+            crate::files::replace_async(&path, std::sync::Arc::clone(&json), true)
+        })
+        .await
+        .map_err(|e| Error::other(format!("Failed to save swarm state: {e}")))
+    }
+}
+
+fn is_cancelled(agent: &AgentState) -> bool {
+    agent.status == "cancelled"
 }
 
 #[cfg(test)]
@@ -515,5 +626,190 @@ mod tests {
         std::fs::write(dir.path().join(STATE_FILE), pretty).unwrap();
         let loaded = load(dir.path()).await.unwrap().unwrap();
         assert_eq!((loaded.next_id, loaded.agents[0].id.as_str()), (7, "a1"));
+    }
+
+    /// A state of agents `(id, status)` in that (spawn) order.
+    fn agents_state(dir: &Path, agents: &[(&str, &str)]) -> SwarmState {
+        let agents: Vec<_> = agents
+            .iter()
+            .map(|(id, status)| {
+                serde_json::json!({"id": id, "parent": "user", "cwd": dir, "task": "t",
+                                   "status": status, "mailbox": [], "input_tokens": 10})
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "run_id": "r", "cwd": dir, "next_id": 9, "agents": agents,
+        }))
+        .unwrap()
+    }
+
+    fn ids(state: &SwarmState) -> Vec<(&str, &str)> {
+        state
+            .agents
+            .iter()
+            .map(|a| (a.id.as_str(), a.status.as_str()))
+            .collect()
+    }
+
+    fn file(dir: &Path, name: &str) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.join(name)).unwrap()).unwrap()
+    }
+
+    // Spawn order that is not id order (a concurrent spawn can insert a later id first).
+    const MIXED: [(&str, &str); 5] = [
+        ("a1", "idle"),
+        ("a3", "cancelled"),
+        ("a2", "running"),
+        ("a5", "cancelled"),
+        ("a4", "idle"),
+    ];
+
+    #[tokio::test]
+    async fn cancelled_agents_are_kept_apart_and_load_back_in_spawn_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = agents_state(dir.path(), &MIXED);
+        Persister::new(dir.path()).write(1, &state).await.unwrap();
+        let hot = file(dir.path(), STATE_FILE);
+        let live: Vec<_> = hot["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].clone())
+            .collect();
+        assert_eq!(live, ["a1", "a2", "a4"]);
+        assert_eq!(hot["order"], serde_json::json!(["a1", "a3", "a2", "a5", "a4"]));
+        assert_eq!(
+            file(dir.path(), CANCELLED_FILE)["agents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let loaded = load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(ids(&loaded), MIXED);
+        assert_eq!((loaded.next_id, loaded.order.len()), (9, 0));
+        // Readers of the whole run (`--cost`, `--run NAME`) see the cancelled agents' spend.
+        assert_eq!(loaded.agents.iter().map(|a| a.input_tokens).sum::<u64>(), 50);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_cancelled_set_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let persister = Persister::new(dir.path());
+        let mut state = agents_state(dir.path(), &MIXED);
+        persister.write(1, &state).await.unwrap();
+        state.agents[0].input_tokens = 99;
+        persister.write(2, &state).await.unwrap();
+        assert_eq!(persister.cancelled_writes(), 1, "only swarm.json changed");
+        assert_eq!(
+            load(dir.path()).await.unwrap().unwrap().agents[0].input_tokens,
+            99
+        );
+
+        state.agents[2].status = "cancelled".into();
+        persister.write(3, &state).await.unwrap();
+        state.agents[3].conversation_removed = Some(5);
+        persister.write(4, &state).await.unwrap();
+        assert_eq!(
+            persister.cancelled_writes(),
+            3,
+            "a cancel and a cancelled record's change"
+        );
+        let loaded = load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                loaded.agents[2].status.as_str(),
+                loaded.agents[3].conversation_removed
+            ),
+            ("cancelled", Some(5))
+        );
+
+        // A new process writes it once, empty or not: a stale one is never read into a new run.
+        let fresh = tempfile::tempdir().unwrap();
+        std::fs::copy(dir.path().join(CANCELLED_FILE), fresh.path().join(CANCELLED_FILE)).unwrap();
+        let state = agents_state(fresh.path(), &[("a1", "idle")]);
+        Persister::new(fresh.path()).write(1, &state).await.unwrap();
+        assert_eq!(ids(&load(fresh.path()).await.unwrap().unwrap()), [("a1", "idle")]);
+    }
+
+    #[tokio::test]
+    async fn an_old_state_with_every_agent_loads_and_is_split_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = agents_state(dir.path(), &MIXED);
+        std::fs::write(dir.path().join(STATE_FILE), serde_json::to_vec(&state).unwrap()).unwrap();
+        let loaded = load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(ids(&loaded), MIXED);
+        Persister::new(dir.path()).write(1, &loaded).await.unwrap();
+        assert_eq!(
+            file(dir.path(), STATE_FILE)["agents"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(ids(&load(dir.path()).await.unwrap().unwrap()), MIXED);
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_the_two_writes_loses_and_duplicates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let persister = Persister::new(dir.path());
+        let before = agents_state(dir.path(), &MIXED);
+        persister.write(1, &before).await.unwrap();
+        let old_hot = std::fs::read(dir.path().join(STATE_FILE)).unwrap();
+        // a2 is cancelled, and a6 spawned and cancelled, within one save that dies after
+        // cancelled.json: swarm.json is the one before.
+        let mut after = before.clone();
+        after.agents[2].status = "cancelled".into();
+        after.agents[2].input_tokens = 77;
+        after
+            .agents
+            .extend(agents_state(dir.path(), &[("a6", "cancelled")]).agents);
+        after.next_id = 7;
+        persister.write(2, &after).await.unwrap();
+        std::fs::write(dir.path().join(STATE_FILE), old_hot).unwrap();
+
+        let loaded = load(dir.path()).await.unwrap().unwrap();
+        // a2 is as swarm.json last had it; a6 is kept, and its id is not handed out again.
+        assert_eq!(ids(&loaded), [MIXED.as_slice(), &[("a6", "cancelled")]].concat());
+        assert_eq!((loaded.agents[2].input_tokens, loaded.next_id), (10, 9));
+        let mut state = before.clone();
+        state.next_id = 2;
+        std::fs::write(dir.path().join(STATE_FILE), serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(load(dir.path()).await.unwrap().unwrap().next_id, 7);
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_binary_dropping_cancelled_agents_loses_none() {
+        let dir = tempfile::tempdir().unwrap();
+        Persister::new(dir.path())
+            .write(1, &agents_state(dir.path(), &MIXED))
+            .await
+            .unwrap();
+        // An older binary loads only swarm.json's live agents, spawns a6 and saves them all.
+        let older = agents_state(
+            dir.path(),
+            &[("a1", "idle"), ("a2", "running"), ("a4", "idle"), ("a6", "idle")],
+        );
+        std::fs::write(dir.path().join(STATE_FILE), serde_json::to_vec(&older).unwrap()).unwrap();
+        let loaded = load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(
+            ids(&loaded),
+            [
+                ("a1", "idle"),
+                ("a2", "running"),
+                ("a3", "cancelled"),
+                ("a4", "idle"),
+                ("a5", "cancelled"),
+                ("a6", "idle")
+            ]
+        );
+        // A self-test copy of just swarm.json and sessions/ loads its live agents.
+        std::fs::remove_file(dir.path().join(CANCELLED_FILE)).unwrap();
+        Persister::new(dir.path())
+            .write(1, &agents_state(dir.path(), &MIXED))
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.path().join(CANCELLED_FILE)).unwrap();
+        let live = load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(ids(&live), [("a1", "idle"), ("a2", "running"), ("a4", "idle")]);
     }
 }

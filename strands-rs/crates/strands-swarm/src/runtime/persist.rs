@@ -260,6 +260,7 @@ impl Swarm {
             cwd: self.inner.config.cwd.clone(),
             next_id: self.inner.next_id.load(Ordering::SeqCst),
             agents,
+            order: Vec::new(),
             budget_tokens: *self.inner.budget.lock(),
             budget_flag: self.inner.config.budget_tokens,
             task_flag: self.inner.config.task_flag.clone(),
@@ -529,6 +530,20 @@ fn resumed_budget(flag: Option<u64>, state: &SwarmState) -> Option<u64> {
     }
 }
 
+/// When to compact the ledger of an agent cancelled at `cancelled_at` (0: unknown) as of `now`:
+/// the cancel for the first hour, then an hour after it, when no call it made is recent any more.
+/// So its record changes once, not each time one of its calls ages out, and
+/// [`crate::state::CANCELLED_FILE`] is not rewritten for it on every save.
+fn compaction_time(cancelled_at: i64, now: i64) -> i64 {
+    match cancelled_at {
+        0 => now,
+        at => match now < at + crate::cost::RECENT_HIT_SECS {
+            true => at,
+            false => at + crate::cost::RECENT_HIT_SECS,
+        },
+    }
+}
+
 /// The persistable view of one agent. Each lock is read on its own, as in `Node::info`.
 pub(super) fn node_state(node: &Node) -> AgentState {
     let usage = *node.usage.lock();
@@ -537,7 +552,10 @@ pub(super) fn node_state(node: &Node) -> AgentState {
     let mailbox = node.mailbox.lock().iter().map(mail_state).collect();
     let cancelled = status == "cancelled";
     let ledger = match cancelled {
-        true => node.ledger.lock().compacted(chrono::Utc::now().timestamp()),
+        true => node.ledger.lock().compacted(compaction_time(
+            node.cancelled_at.load(Ordering::Relaxed),
+            chrono::Utc::now().timestamp(),
+        )),
         false => node.ledger.lock().clone(),
     };
     let task_archived = cancelled && node.task_archived.load(Ordering::SeqCst);
@@ -634,4 +652,19 @@ pub(super) fn history_event(id: &str, messages: &[Message]) -> Option<SwarmEvent
         messages: messages[omitted..].to_vec(),
         omitted,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compaction_time;
+
+    #[test]
+    fn a_cancelled_ledger_is_compacted_at_two_times_only() {
+        let at = 1_000_000;
+        assert_eq!(compaction_time(at, at + 5), at);
+        assert_eq!(compaction_time(at, at + 3599), at);
+        assert_eq!(compaction_time(at, at + 3600), at + 3600);
+        assert_eq!(compaction_time(at, at + 99_999), at + 3600);
+        assert_eq!(compaction_time(0, at), at, "cancel time unknown");
+    }
 }

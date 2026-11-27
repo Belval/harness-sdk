@@ -82,8 +82,15 @@ async fn spawned_task(events: &mut UnboundedReceiver<SwarmEvent>, wanted: &str) 
     .expect("Spawned")
 }
 
+/// The saved run state as one file: `swarm.json` with the agents of `cancelled.json` added.
 fn saved(dir: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(dir.join("swarm.json")).unwrap()).unwrap()
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.join(name)).unwrap()).unwrap()
+    };
+    let mut file = read(state::STATE_FILE);
+    let cancelled = read(state::CANCELLED_FILE)["agents"].as_array().unwrap().clone();
+    file["agents"].as_array_mut().unwrap().extend(cancelled);
+    file
 }
 
 fn agent<'a>(file: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
