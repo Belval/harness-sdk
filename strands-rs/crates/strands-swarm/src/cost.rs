@@ -230,8 +230,26 @@ pub enum SidePurpose {
     Other,
 }
 
+tokio::task_local! {
+    /// The purpose of the side calls made within [`fork`].
+    static FORK: SidePurpose;
+}
+
+/// Run `call`, whose side calls fork the agent's own request (its system prompt, tools and
+/// history, to read its prompt cache), as calls for `purpose`: the system prompt they send is the
+/// agent's, so [`SidePurpose::of`] cannot tell them apart.
+pub async fn fork<F: std::future::Future>(purpose: SidePurpose, call: F) -> F::Output {
+    FORK.scope(purpose, call).await
+}
+
+/// The purpose of a side call made within [`fork`], `None` outside one.
+pub fn forked() -> Option<SidePurpose> {
+    FORK.try_with(|purpose| *purpose).ok()
+}
+
 impl SidePurpose {
-    /// Told apart by the system prompt each one sends.
+    /// Told apart by the system prompt each one sends; a call within [`fork`] sends the agent's
+    /// own and is named by [`forked`] instead.
     pub fn of(system_prompt: Option<&str>) -> Self {
         use strands_agents::context_manager::strategies::SUMMARIZATION_SYSTEM_PROMPT;
         use strands_agents::plugins::vended::goal::JUDGE_SYSTEM_PROMPT;
@@ -1053,6 +1071,14 @@ mod tests {
         );
         assert_eq!(SidePurpose::of(Some("You are a poet.")), SidePurpose::Other);
         assert_eq!(SidePurpose::of(None), SidePurpose::Other);
+    }
+
+    #[tokio::test]
+    async fn a_fork_names_its_purpose_only_within_it() {
+        assert_eq!(forked(), None);
+        let inside = fork(SidePurpose::Summarizer, async { forked() }).await;
+        assert_eq!(inside, Some(SidePurpose::Summarizer));
+        assert_eq!(forked(), None);
     }
 
     #[test]

@@ -695,12 +695,19 @@ impl Model for SideModel {
             // Side calls (the goal judge) belong to the turn: an interrupt stops them too.
             let cancel = node.turn_token();
             let prompt = options.system_prompt.as_ref().map(|prompt| prompt.text());
-            let purpose = crate::cost::SidePurpose::of(prompt.as_deref());
+            // A fork of the agent's request reads its cache; any other summary or verdict is
+            // asked for once, of a prompt never sent again: a cache write there costs 25% more
+            // than plain input and is never read.
+            let (purpose, no_cache) = match crate::cost::forked() {
+                Some(purpose) => (purpose, false),
+                None => {
+                    let purpose = crate::cost::SidePurpose::of(prompt.as_deref());
+                    (purpose, purpose != crate::cost::SidePurpose::Other)
+                }
+            };
             self.swarm.hold_for_reload(&node.id, &cancel).await?;
             let _permit = self.swarm.admit_model_call(&node.id, &cancel).await?;
-            // A summary or a verdict is asked for once, of a prompt never sent again: a cache
-            // write there costs 25% more than plain input and is never read.
-            let once = StreamOptions { no_cache: purpose != crate::cost::SidePurpose::Other, ..options.clone() };
+            let once = StreamOptions { no_cache, ..options.clone() };
             let mut events = model.stream(messages, &once);
             loop {
                 let next = tokio::select! {

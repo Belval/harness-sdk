@@ -16,11 +16,11 @@ use strands_agents::context_manager::strategies::{
 };
 use strands_agents::context_manager::{ContextState, ContextStrategy, AUTO_SUMMARIZE_UTILIZATION};
 use strands_agents::models::{
-    estimate_tokens_heuristic, AggregatedItem, CountTokensOptions, StreamOptions,
+    estimate_tokens_heuristic, AgentMetadata, AggregatedItem, CountTokensOptions, StreamOptions,
     DEFAULT_CONTEXT_WINDOW_LIMIT,
 };
 use strands_agents::types::{ContentBlock, Message, Role, SystemPrompt};
-use strands_agents::{Error, Model, Result};
+use strands_agents::{Agent, Error, Model, Result};
 
 /// The input size (tokens) at which older turns are summarized: the context manager's own 85%
 /// mark of `window`, or `compact_at` when given and smaller, and never so high that the input
@@ -83,12 +83,153 @@ const SUMMARY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(
 /// plus the promises still open: a summary that keeps the facts but drops "the clip by 11 AM"
 /// leaves the agent nothing to keep it.
 fn summary_prompt() -> String {
+    format!("{SUMMARIZATION_SYSTEM_PROMPT}\n\n{COMMITMENTS}")
+}
+
+/// What a summary ends with, beyond the SDK's prompt.
+const COMMITMENTS: &str = "End with a list of every commitment still open: what was promised, to \
+     whom, and by when (the time as written), and whether anything (a schedule, job, child or todo) \
+     will bring it back.";
+
+/// What the SDK's summarizer prompt asks a summary to keep, without its role and its `<content>`
+/// framing: the asks of a [`Fork`]'s instruction.
+fn summary_asks() -> &'static str {
+    let asks = SUMMARIZATION_SYSTEM_PROMPT;
+    let asks = asks
+        .strip_prefix("You are a summarization assistant. ")
+        .unwrap_or(asks);
+    asks.split("\nOutput only").next().unwrap_or(asks).trim_end()
+}
+
+/// The request a summary sends when it forks the agent's own: the agent's system prompt, tools
+/// and session, so the history it shares with the agent's last call is a prompt-cache read
+/// (0.1x input) instead of fresh input. The cache point goes where the agent's calls put it, at
+/// the end of the history: the instruction appended after it is the one trailing block.
+struct Fork {
+    options: StreamOptions,
+}
+
+impl Fork {
+    /// `agent`'s request, when its side calls run on its own model (an `--side-model` that differs
+    /// shares no cache with it) and its tools can be listed as its calls list them.
+    fn of(agent: &Agent) -> Option<Self> {
+        let own = agent.model().model_id()?;
+        if agent.aux_model().model_id()? != own {
+            return None;
+        }
+        let mut tool_specs: Vec<_> = agent.tools().iter().map(|t| t.spec().clone()).collect();
+        if let Some(background) = agent.background_tasks() {
+            tool_specs = background.rewrite_tool_specs(tool_specs).ok()?;
+        }
+        Some(Self {
+            options: StreamOptions {
+                system_prompt: agent.system_prompt(),
+                tool_specs,
+                dynamic_trailing_blocks: Some(1),
+                agent_metadata: agent.session_manager().map(|manager| AgentMetadata {
+                    session_id: Some(manager.session_id().to_owned()),
+                }),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// The summary of `messages[1..cut]`, asked of `model` after the whole of `messages` as the
+    /// agent sends them, when the request fits `model`'s window: `tokens` is the projected input
+    /// of the history, `scale` real tokens per estimated one. `None` (the caller then takes the
+    /// sliced path) when it does not fit, or the reply has a tool call or no text, or the request
+    /// failed for good; a cancel and a transient error that outlasts the retries are errors.
+    async fn summarize(
+        &self,
+        model: &Arc<dyn Model>,
+        messages: &[Message],
+        cut: usize,
+        earlier: bool,
+        tokens: u64,
+        scale: f64,
+    ) -> Result<Option<String>> {
+        let Some(last) = messages.last().filter(|m| m.role == Role::User) else {
+            return Ok(None);
+        };
+        let instruction = ContentBlock::Text(fork_instruction(messages, cut, earlier));
+        let added = (heuristic_blocks(std::slice::from_ref(&instruction)) as f64 * scale) as u64;
+        let room = window_of(model.as_ref()).saturating_sub(model.max_output_tokens().unwrap_or(0));
+        if tokens + added > room {
+            return Ok(None);
+        }
+        let mut request = messages.to_vec();
+        let mut content = last.content.clone();
+        content.push(instruction);
+        *request.last_mut().expect("a last message") = Message::new(Role::User, content);
+        let call = with_retries(|| fork_once(model, &request, &self.options));
+        match crate::cost::fork(crate::cost::SidePurpose::Summarizer, call).await {
+            Ok(Some(summary)) => Ok(Some(summary)),
+            Ok(None) => {
+                tracing::warn!("the forked summary had a tool call or no text, summarizing in slices");
+                Ok(None)
+            }
+            Err(error) if matches!(error, Error::Cancelled) || crate::retry::is_transient(&error) => {
+                Err(error)
+            }
+            Err(error) => {
+                tracing::warn!("error=<{error}> | the forked summary failed, summarizing in slices");
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// The instruction a [`Fork`] appends to the last of `messages`: summarize messages 2 to `cut`
+/// (counting from 1), folding in the summary of still older turns the first carries if `earlier`.
+fn fork_instruction(messages: &[Message], cut: usize, earlier: bool) -> String {
+    let total = messages.len();
+    let ends = opening(&messages[cut - 1]);
+    let earlier = match earlier {
+        true => {
+            " Message 1 also carries a summary of still older turns after the task: fold it into \
+             yours, which replaces it."
+        }
+        false => "",
+    };
     format!(
-        "{SUMMARIZATION_SYSTEM_PROMPT}\n\nEnd with a list of every commitment still open: what was \
-         promised, to whom, and by when (the time as written), and whether anything (a schedule, job, \
-         child or todo) will bring it back."
+        "[Context summary, asked by the harness, not by the user]\nYour context is nearly full, so \
+         older turns of this conversation are about to be replaced by a summary that you write now. \
+         Summarize messages 2 to {cut} of its {total} messages: everything after the first message \
+         (the task, which is kept verbatim: leave it out) up to and including message {cut}, which \
+         starts with {ends}.{earlier} Messages {} to {total} stay as they are: leave them out too.\
+         \n\n{asks}\n\n{COMMITMENTS}\n\nReply with the summary as plain text only: call no tools, \
+         add no preamble, and do not go on with the task.",
+        cut + 1,
+        asks = summary_asks(),
     )
 }
+
+/// How `message` starts, quoted, for an instruction to point at it.
+fn opening(message: &Message) -> String {
+    let flat = flatten_messages_to_content(std::slice::from_ref(message));
+    let words: Vec<&str> = flat
+        .iter()
+        .skip(1)
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .flat_map(str::split_whitespace)
+        .collect();
+    let mut start: String = words.join(" ").chars().take(OPENING_CHARS).collect();
+    if start.chars().count() == OPENING_CHARS {
+        start.push('…');
+    }
+    match message.content.first() {
+        Some(ContentBlock::ToolResult(result)) => {
+            format!("the result of tool call `{}` (\"{start}\")", result.tool_use_id)
+        }
+        _ => format!("\"{start}\""),
+    }
+}
+
+/// Characters of a message's start that [`opening`] quotes.
+const OPENING_CHARS: usize = 80;
 
 /// Why automatic compaction is holding off: the input it last failed at, and the calls left.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -264,11 +405,15 @@ impl CompactAt {
             return Ok(false);
         }
         let model = ctx.agent.aux_model();
+        // Only the first pass forks: after it the history no longer matches the cached one, and
+        // a request over the window (an overflow) is sliced.
+        let fork = (!ctx.overflow).then(|| Fork::of(ctx.agent)).flatten();
         let mut tokens = before;
         let mut passes = 0;
         let mut failure = None;
         while passes < MAX_PASSES && (passes == 0 || tokens >= point) {
-            match summarize_down_to(ctx.messages, tokens, target, &model).await {
+            let fork = fork.as_ref().filter(|_| passes == 0);
+            match summarize_down_to(ctx.messages, tokens, target, &model, fork).await {
                 Ok(Some(after)) => tokens = after,
                 Ok(None) => break,
                 // A shutdown or reload cut the summary short: not a failure, nothing to back off.
@@ -312,12 +457,14 @@ fn input_tokens(ctx: &ContextState<'_>, window: u64) -> u64 {
 /// One pass: summarize the leading messages (after the first) that bring `tokens` (the projected
 /// input, system prompt and tools included) down to `target`, keeping at least the latest
 /// [`SUMMARY_KEEPS`]. Returns the estimated input afterwards, `None` when nothing could be
-/// summarized, or the summarizer's error; either way the context is then left as it was.
+/// summarized, or the summarizer's error; either way the context is then left as it was. With a
+/// `fork`, the summary is first asked of the agent's own request ([`Fork`]).
 async fn summarize_down_to(
     messages: &mut Vec<Message>,
     tokens: u64,
     target: u64,
     model: &Arc<dyn Model>,
+    fork: Option<&Fork>,
 ) -> Result<Option<u64>> {
     let Some(first) = messages.first().filter(|m| m.role == Role::User) else {
         return Ok(None);
@@ -354,18 +501,28 @@ async fn summarize_down_to(
     let Some((cut, removed)) = cut else {
         return Ok(None);
     };
-    let summary = summarize_in_slices(
-        model,
-        earlier,
-        flatten_messages_to_content(&messages[1..cut]),
-        scale,
-    )
-    .await
-    .inspect_err(|error| {
-        if !matches!(error, Error::Cancelled) {
-            tracing::warn!("error=<{error}> | summarizing older turns failed");
+    let forked = match fork {
+        Some(fork) => {
+            fork.summarize(model, messages, cut, !earlier.is_empty(), tokens, scale)
+                .await?
         }
-    })?;
+        None => None,
+    };
+    let summary = match forked {
+        Some(summary) => summary,
+        None => summarize_in_slices(
+            model,
+            earlier,
+            flatten_messages_to_content(&messages[1..cut]),
+            scale,
+        )
+        .await
+        .inspect_err(|error| {
+            if !matches!(error, Error::Cancelled) {
+                tracing::warn!("error=<{error}> | summarizing older turns failed");
+            }
+        })?,
+    };
     let text = format_summarized(
         &format!("{} messages", cut - 1),
         removed.round() as u64,
@@ -480,9 +637,14 @@ async fn summarize(model: &Arc<dyn Model>, content: Vec<ContentBlock>) -> Result
     blocks.extend(content);
     blocks.push(ContentBlock::text("</content>"));
     let messages = [Message::new(Role::User, blocks)];
+    with_retries(|| summarize_once(model, &messages)).await
+}
+
+/// `call` until it succeeds or fails for good, [`SUMMARY_ATTEMPTS`] times at most.
+async fn with_retries<T, F: std::future::Future<Output = Result<T>>>(call: impl Fn() -> F) -> Result<T> {
     let mut attempt = 1;
     loop {
-        match summarize_once(model, &messages).await {
+        match call().await {
             Err(error) if attempt < SUMMARY_ATTEMPTS && crate::retry::is_transient(&error) => {
                 let delay = SUMMARY_RETRY_DELAY * 2u32.pow(attempt - 1);
                 tracing::warn!("attempt=<{attempt}>, delay=<{delay:?}>, error=<{error}> | summarizer call failed, retrying");
@@ -492,6 +654,25 @@ async fn summarize(model: &Arc<dyn Model>, content: Vec<ContentBlock>) -> Result
             result => return result,
         }
     }
+}
+
+/// One forked summary ([`Fork`]): its text, `None` when the reply calls a tool or has no text.
+async fn fork_once(
+    model: &Arc<dyn Model>,
+    messages: &[Message],
+    options: &StreamOptions,
+) -> Result<Option<String>> {
+    let mut stream = model.stream_aggregated(messages, options);
+    let mut reply = None;
+    while let Some(item) = stream.next().await {
+        if let AggregatedItem::Result(result) = item? {
+            reply = Some(result.message);
+        }
+    }
+    Ok(reply
+        .filter(|message| message.tool_uses().next().is_none())
+        .map(|message| message.text().trim().to_owned())
+        .filter(|text| !text.is_empty()))
 }
 
 async fn summarize_once(model: &Arc<dyn Model>, messages: &[Message]) -> Result<String> {
@@ -589,13 +770,40 @@ mod tests {
             .unwrap()
     }
 
+    /// An agent whose summaries take the sliced path: its side calls run on the same mock under
+    /// another model id, which shares no cache with the agent's (see [`forking`]).
     fn agent(summaries: &[&str]) -> (Agent, Arc<MockMessageModel>) {
+        let (_, model) = forking(summaries);
+        let side = Renamed(Arc::clone(&model));
+        let agent = Agent::builder()
+            .model(model.clone())
+            .aux_model(side)
+            .build()
+            .unwrap();
+        (agent, model)
+    }
+
+    /// An agent whose side calls run on its own model, so summaries fork its request.
+    fn forking(summaries: &[&str]) -> (Agent, Arc<MockMessageModel>) {
         let responses = summaries
             .iter()
             .map(|text| MockResponse::message(Message::assistant(*text)))
             .collect();
         let model = MockMessageModel::shared(responses);
         (Agent::builder().model(model.clone()).build().unwrap(), model)
+    }
+
+    /// A mock under another model id.
+    struct Renamed(Arc<MockMessageModel>);
+
+    impl Model for Renamed {
+        fn model_id(&self) -> Option<String> {
+            Some("side-model".into())
+        }
+
+        fn stream<'a>(&'a self, messages: &'a [Message], options: &'a StreamOptions) -> ModelEventStream<'a> {
+            self.0.stream(messages, options)
+        }
     }
 
     fn assert_well_formed(messages: &[Message]) {
@@ -742,6 +950,101 @@ mod tests {
             panic!("{reported:?}");
         };
         assert_eq!(before, projected);
+    }
+
+    #[tokio::test]
+    async fn a_summary_on_the_agents_own_model_forks_its_request() {
+        let model =
+            MockMessageModel::shared(vec![MockResponse::message(Message::assistant("SUMMARY forked"))]);
+        let shell = strands_agents::tools::FunctionTool::builder("shell")
+            .description("run")
+            .handler(|_, _| async { Ok("ok") });
+        let agent = Agent::builder()
+            .model(model.clone())
+            .system_prompt("SYSTEM")
+            .tools([Arc::new(shell) as strands_agents::tools::ToolRef])
+            .build()
+            .unwrap();
+        let (manager, _) = manager(Some(10_000), None);
+        let mut messages = tool_loop(45);
+        let original = messages.clone();
+        let tokens = heuristic(&messages);
+        pass(&manager, &agent, &mut messages, tokens, false).await;
+
+        let calls = model.calls();
+        assert_eq!(calls.len(), 1);
+        let (input, options) = &calls[0];
+        assert_eq!(options.system_prompt, Some(SystemPrompt::Text("SYSTEM".into())));
+        assert_eq!(
+            options
+                .tool_specs
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["shell"]
+        );
+        assert!(options.tool_choice.is_none() && !options.no_cache);
+        assert_eq!(
+            options.dynamic_trailing_blocks,
+            Some(1),
+            "the cache point ends the history"
+        );
+        let (last, history) = input.split_last().unwrap();
+        assert_eq!(history, &original[..original.len() - 1]);
+        let (instruction, own) = last.content.split_last().unwrap();
+        assert_eq!(own, &original.last().unwrap().content[..]);
+        let ContentBlock::Text(instruction) = instruction else {
+            panic!("{instruction:?}");
+        };
+        let cut = original.len() - messages.len() + 1;
+        assert!(
+            instruction.contains(&format!("Summarize messages 2 to {cut} of its 91 messages"))
+                && instruction.contains("every commitment still open")
+                && instruction.contains("call no tools"),
+            "{instruction}"
+        );
+        assert!(messages[0].text().contains("SUMMARY forked"));
+        assert_well_formed(&messages);
+    }
+
+    #[test]
+    fn only_a_side_model_with_the_agents_id_forks() {
+        assert!(Fork::of(&forking(&[]).0).is_some());
+        assert!(Fork::of(&agent(&[]).0).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_overflow_or_a_history_over_the_window_is_summarized_in_slices() {
+        for (tokens, overflow) in [(None, true), (Some(250_000), false)] {
+            let (agent, model) = forking(&["SUMMARY sliced"; 8]);
+            let (manager, _) = manager(Some(10_000), None);
+            let mut messages = tool_loop(45);
+            let tokens = tokens.unwrap_or(heuristic(&messages));
+            assert!(pass(&manager, &agent, &mut messages, tokens, overflow).await);
+            for (input, options) in model.calls() {
+                assert_eq!(input.len(), 1, "one flattened message");
+                assert_eq!(options.system_prompt, Some(SystemPrompt::Text(summary_prompt())));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fork_that_calls_a_tool_or_says_nothing_falls_back_to_slices() {
+        let call = ToolUseBlock::new("shell", "x", serde_json::json!({}));
+        let tool = MockResponse::message(Message::new(Role::Assistant, vec![ContentBlock::ToolUse(call)]));
+        let empty = MockResponse::message(Message::assistant(" "));
+        for reply in [tool, empty] {
+            let sliced = MockResponse::message(Message::assistant("SUMMARY sliced"));
+            let model = MockMessageModel::shared(vec![reply, sliced]);
+            let agent = Agent::builder().model(model.clone()).build().unwrap();
+            let (manager, _) = manager(Some(10_000), None);
+            let mut messages = tool_loop(45);
+            let tokens = heuristic(&messages);
+            assert!(pass(&manager, &agent, &mut messages, tokens, false).await);
+            assert_eq!(model.call_count(), 2);
+            assert_eq!(model.calls()[1].0.len(), 1, "the sliced path");
+            assert!(messages[0].text().contains("SUMMARY sliced"));
+        }
     }
 
     #[tokio::test]

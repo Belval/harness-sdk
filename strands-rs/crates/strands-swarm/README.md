@@ -129,7 +129,8 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   and the latest ~40k characters of the conversation.
 - **Side calls.** The judge and context summarization run on the agent's model or `--side-model ID`.
   They count toward the agent's tokens and the budget, and queue like its own calls. They skip
-  the prompt cache: their prompts are never sent twice, so a cache write would cost 25% extra.
+  the prompt cache (their prompts are never sent twice, so a cache write would cost 25% extra),
+  except a summary that forks the agent's own request (below), which reads it.
 - **Context.**
   - An agent's older turns are summarized once a call's input reaches the compaction point:
     85% of the model's window (850k tokens for a 1M window), or `--compact-at TOKENS` if that
@@ -149,7 +150,18 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     messages. If the first pass leaves the input above the point, a second pass runs. The log
     notes `context compacted: older turns summarized, 305.0k → 98.1k tokens`. The summarizer's
     prompt is the SDK's plus one ask: end with every commitment still open (what, to whom, by
-    when, and whether a schedule, job, child or todo will bring it back). It
+    when, and whether a schedule, job, child or todo will bring it back).
+  - When the side model is the agent's own (no `--side-model`, or the same model id), the first
+    pass *forks* the agent's request: the agent's system prompt, tools and whole history exactly
+    as its calls send them, with the cache point at the end of the history, plus one instruction
+    after it: summarize messages 2 to N (the last one quoted by how it starts), leave out the
+    task and the messages kept, with the same asks as the summarizer's prompt, text only and no
+    tool calls. The history it shares with the agent's last call is then a cache read (0.1x
+    input) instead of fresh input. Nothing else of the request changes (no `tool_choice`, which
+    would invalidate Anthropic's message cache). An overflow, a request that would not fit the
+    window, a reply that calls a tool or has no text, or a call that fails for good takes the
+    sliced path below; the summary replaces the same messages either way.
+  - Otherwise the summarizer
     gets the turns in slices of at most half its own window (one call at 850k of a 1M window;
     a 200k-window `--side-model` gets 100k slices), each with the summary so far; a slice it
     still rejects as too long is halved and sent again, and a call that fails transiently
@@ -464,8 +476,9 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     calls and since the run started (which keeps every early miss). Below the table, side calls
     get their own rows by purpose: the goal `judge`,
     the context `summarizer` and `other` calls on the auxiliary model (told apart by the system
-    prompt they send, so a custom judge or summarizer prompt counts as `other`). They are already
-    part of each agent's totals.
+    prompt they send, so a custom judge or summarizer prompt counts as `other`; a summary that
+    forks the agent's request sends the agent's prompt and is marked `summarizer` by the call
+    itself, with its cache reads). They are already part of each agent's totals.
   - The TUI header shows `est. $12.30`.
   - `list_agents` gives models the same numbers: `est. $4.10 / 12.3M tokens`, a subtree total
     (`with 3 descendants $9.80 / 30.1M`) and a swarm total. A coordinator can spot an expensive

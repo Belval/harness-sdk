@@ -5327,6 +5327,70 @@ async fn context_summarization_runs_on_the_side_model_and_counts_toward_the_agen
     assert_eq!(purposes, vec![json!("summarizer"); summaries as usize]);
 }
 
+/// A summary on the agent's own model forks its request: the agent's system prompt and tools,
+/// caching on, and it still counts as `summarizer`, its cache reads included.
+#[tokio::test]
+async fn a_summary_on_the_agents_own_model_forks_its_request_and_counts_as_summarizer() {
+    use strands_agents::context_manager::{ContextManagerConfig, ContextManagerOption, StashOption};
+    use strands_swarm::compaction::CompactAt;
+    use strands_swarm::dashboard::ContextControl;
+    let dir = tempfile::tempdir().unwrap();
+    let model = MockMessageModel::shared(vec![
+        tool_call("list_agents", "t1", json!({})),
+        tool_call("list_agents", "t2", json!({})),
+        tool_call("context", "t3", json!({"summarize": true})),
+        MockResponse::with_usage(Message::assistant("they listed agents"), usage(5, 200, 3)),
+        say("done"),
+    ]);
+    let shared = Arc::clone(&model);
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let model = Windowed(Arc::clone(&shared), 1_000_000);
+        let control = ContextControl::new(None);
+        let manager = ContextManagerOption::Config(ContextManagerConfig {
+            strategies: Some(vec![Arc::new(
+                CompactAt::new(None).on_request(Arc::clone(&control)),
+            )]),
+            stash: StashOption::Disabled,
+        });
+        let mut tools = spec.tools;
+        tools.push(control.tool());
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .system_prompt(spec.instructions)
+                .tools(tools)
+                .context_manager(manager)
+                .no_sandbox()
+                .build()
+        })
+    });
+    let (swarm, mut events) = Swarm::new(SwarmConfig::new(factory, dir.path()));
+    let id = spawn_root(&swarm, "go").await;
+    usage_until_reply(&mut events, &id).await;
+
+    let calls = model.calls();
+    assert_eq!(calls.len(), 5);
+    let (agent, fork) = (&calls[2], &calls[3]);
+    assert_eq!(fork.1.system_prompt, agent.1.system_prompt);
+    assert_eq!(fork.1.tool_specs, agent.1.tool_specs);
+    assert!(!fork.1.no_cache, "a fork reads the agent's cache");
+    assert_eq!(fork.0.len(), agent.0.len() + 2, "the whole history");
+    assert!(fork
+        .0
+        .last()
+        .unwrap()
+        .text()
+        .contains("Summarize messages 2 to 3"));
+    let side = swarm.cost().side_calls();
+    assert_eq!(side.keys().collect::<Vec<_>>(), ["summarizer"]);
+    assert_eq!(
+        (side["summarizer"].0.calls, side["summarizer"].0.cache_read),
+        (1, 200)
+    );
+    swarm.shutdown().await;
+}
+
 fn every(minutes: u64, to: &str, message: &str) -> strands_swarm::ScheduleRequest {
     strands_swarm::ScheduleRequest {
         to: to.into(),
