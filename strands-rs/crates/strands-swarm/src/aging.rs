@@ -49,7 +49,7 @@ fn old_end(messages: &[Message], turn_start: impl Fn(&Message) -> bool) -> usize
 }
 
 /// `text` cut to about `chars` characters, on a line or word end when one is near.
-fn head(text: &str, chars: usize) -> &str {
+pub(crate) fn head(text: &str, chars: usize) -> &str {
     let end = text.char_indices().nth(chars).map_or(text.len(), |(at, _)| at);
     let cut = &text[..end];
     let near = |at: &usize| *at >= end * 2 / 3;

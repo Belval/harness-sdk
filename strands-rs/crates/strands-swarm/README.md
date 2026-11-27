@@ -193,6 +193,14 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     tool results, and it compacted every 1.5 h. Replayed on that history, aging keeps 3.3k
     instead of 5.5k characters per turn (-39%; about 180k to 110k tokens of growth an hour) and
     compacts every ~450 turns instead of ~270.
+  - **Old call inputs.** Once six newer assistant messages with tool calls exist, each string in
+    a call's input over 1,000 characters (a heredoc script, a `write`'s content, a long
+    `send_message`) keeps its first ~400 and `… [N chars of this old call's input trimmed; it ran
+    as sent] [ref: <id>-input_<i>]`; `retrieve_context` returns the whole string. The input stays
+    an object with the same keys and its other values. No tool is exempt: what a call did is in
+    its result, on disk, delivered or with the child. Why: on 113 live agents, call inputs were
+    23% of the conversation bytes (`shell`'s most) and nothing trimmed them; a prune now removes
+    a further ~9% of the history (5% at results' 2,000 and 800, as most long inputs are 1-2k).
   - All of these edit history, and the prompt cache only matches an unchanged prefix, so they run only when
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
     the `context` tool), after the system prompt or tools changed (a `cd`, a `find_tools` enable;

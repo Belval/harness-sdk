@@ -411,7 +411,10 @@ impl ContextStrategy for CachePrune {
         // After `before`, so an image going counts as an edit to the prefix like a trimmed result.
         let trimmed = drop_old_images(ctx.messages) | trimmed;
         let trimmed = match ctx.stash.clone() {
-            Some(stash) => crate::aging::age(ctx.messages, starts_turn, &stash).await | trimmed,
+            Some(stash) => {
+                let aged = crate::aging::age(ctx.messages, starts_turn, &stash).await;
+                crate::call_inputs::trim_old(ctx.messages, &stash).await | aged | trimmed
+            }
             None => trimmed,
         };
         // A summary (compaction, or the overflow it answers) rewrites everything before the tail;
@@ -477,7 +480,8 @@ fn hash(message: &Message) -> u64 {
 }
 
 /// How much of the history (JSON characters) pruning would remove now, and its whole length;
-/// with a stash, old mail and replies ([`crate::aging`]) count too.
+/// with a stash, old mail and replies ([`crate::aging`]) and old call inputs
+/// ([`crate::call_inputs`]) count too.
 fn removable_chars(messages: &[Message], stash: bool) -> (usize, usize) {
     let total: usize = messages.iter().map(json_len).sum();
     if total == 0 {
@@ -503,7 +507,7 @@ fn removable_chars(messages: &[Message], stash: bool) -> (usize, usize) {
         .map(|(.., stub, size)| size.saturating_sub(stub.len()))
         .sum();
     let aged = match stash {
-        true => crate::aging::removable(messages, starts_turn),
+        true => crate::aging::removable(messages, starts_turn) + crate::call_inputs::removable(messages),
         false => 0,
     };
     ((reasoning + results + images + aged).min(total), total)
@@ -1077,6 +1081,39 @@ mod tests {
             .count();
         assert_eq!(aged, 2 * (keep + 3), "every old turn's report and reply aged");
         assert!(share(&messages, true) < 0.01);
+    }
+
+    #[tokio::test]
+    async fn old_call_inputs_count_as_removable_and_go_in_the_same_prune() {
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+        let script = "echo hello\n".repeat(1_000);
+        let mut messages = vec![Message::user("task")];
+        for i in 0..KEEP_RECENT_RESULTS + 4 {
+            let id = format!("t{i}");
+            let call = ToolUseBlock::new("shell", &id, json!({ "command": script }));
+            messages.push(assistant(vec![ContentBlock::ToolUse(call)]));
+            messages.push(tool_result(&id));
+        }
+        assert_eq!(
+            removable_chars(&messages, false).0,
+            0,
+            "without a stash none goes"
+        );
+        assert!(share(&messages, true) > 0.3, "{}", share(&messages, true));
+        agent.state().set(LAST_CALL_KEY, minutes_ago(6));
+        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
+        let trimmed = messages
+            .iter()
+            .flat_map(|m| m.tool_uses())
+            .filter(|u| {
+                u.input["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("it ran as sent] [ref: ")
+            })
+            .count();
+        assert_eq!(trimmed, 4, "the calls before the latest six");
+        assert_eq!(share(&messages, true), 0.0);
     }
 
     #[tokio::test]
