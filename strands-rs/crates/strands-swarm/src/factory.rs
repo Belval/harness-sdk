@@ -1269,7 +1269,9 @@ mod tests {
         // Raised from 16,600 for `run_background`'s `quiet` (~10 tokens a call): one live
         // coordinator spent 110 turns (~$0.25 each) answering `[silent]` to landing jobs that
         // succeeded.
-        const BUDGET_BYTES: usize = 16_650;
+        // Raised from 16,650 for `send_message`'s `cc` (~12 tokens a call): the same
+        // coordinator spent 95 more answering `[silent]` to mail it was only cc'd on.
+        const BUDGET_BYTES: usize = 16_700;
         const TOOL_BUDGET_BYTES: usize = 1_100;
         // 20 skill lines of at most ~110 bytes plus the heading.
         const SKILLS_BUDGET_BYTES: usize = 2_500;

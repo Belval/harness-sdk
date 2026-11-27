@@ -116,6 +116,9 @@ struct SendInput {
     /// false: no idle recipient wakes for it (FYIs).
     #[serde(default = "yes")]
     wake: bool,
+    /// Also to these, without waking them.
+    #[serde(default)]
+    cc: String,
     /// Set its token budget (parent only).
     #[serde(default)]
     budget_tokens: Option<u64>,
@@ -547,15 +550,22 @@ async fn spawn_tool(swarm: Swarm, me: String, input: SpawnInput, _ctx: ToolConte
 
 async fn send_tool(swarm: Swarm, me: String, input: SendInput, _ctx: ToolContext) -> Result<String> {
     // Every name resolves before anything is sent, so a typo can be fixed and the call repeated.
-    let mut to = Vec::new();
-    for who in input.to.split(',').map(str::trim).filter(|who| !who.is_empty()) {
-        let id = resolve(&swarm, &me, who)?;
-        if !to.contains(&id) {
-            to.push(id);
+    // A name in both `to` and `cc` is a `to`: woken.
+    let mut to: Vec<(String, bool)> = Vec::new();
+    let names = |list: &str| -> Vec<String> {
+        let names = list.split(',').map(str::trim).filter(|who| !who.is_empty());
+        names.map(str::to_owned).collect()
+    };
+    for (list, wake) in [(&input.to, input.wake), (&input.cc, false)] {
+        for who in names(list) {
+            let id = resolve(&swarm, &me, &who)?;
+            if !to.iter().any(|(known, _)| *known == id) {
+                to.push((id, wake));
+            }
         }
     }
     let (mut sent, mut failed, mut budgets) = (Vec::new(), Vec::new(), Vec::new());
-    for id in &to {
+    for (id, wake) in &to {
         let message = input.message.clone();
         let raised = input.budget_tokens.map_or(Ok(None), |tokens| {
             swarm
@@ -564,7 +574,7 @@ async fn send_tool(swarm: Swarm, me: String, input: SendInput, _ctx: ToolContext
         });
         let posted = raised.and_then(|note| {
             budgets.extend(note);
-            match input.wake {
+            match wake {
                 true => swarm.send(&me, id, message),
                 false => swarm.send_fyi(&me, id, message),
             }

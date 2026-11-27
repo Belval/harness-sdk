@@ -633,6 +633,41 @@ async fn a_wait_does_not_end_on_fyi_mail_but_returns_it_with_the_next_message() 
     assert!(fyi < reply, "{after_wait}");
 }
 
+/// `cc` delivers the same message without waking: an FYI to each, unless also in `to`.
+#[tokio::test]
+async fn a_cc_gets_the_message_without_being_woken() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![
+            (
+                "a1",
+                vec![
+                    tool_call("spawn_agent", "t1", json!({"task": "sub", "name": "w"})),
+                    tool_call("spawn_agent", "t2", json!({"task": "sub", "name": "c"})),
+                    tool_call("wait", "w1", json!({"from": ["w", "c"], "all": true})),
+                    tool_call(
+                        "send_message",
+                        "s1",
+                        json!({"to": "w", "cc": "c, w", "message": "ship it"}),
+                    ),
+                    say("sent"),
+                ],
+            ),
+            ("a2", vec![say("ready"), say("shipped")]),
+            ("a3", vec![say("ready")]),
+        ],
+        dir.path(),
+    );
+    spawn_root(&swarm, "go").await;
+    let [woken, cc] = mails_to(&mut events, [("a2", "message"), ("a3", "fyi")]).await;
+    assert_eq!((woken.as_str(), cc.as_str()), ("ship it", "ship it"));
+    let sent = sent_text(&scripts.lock()["a1"].clone(), 4);
+    assert!(sent.contains("Sent to w (a2), c (a3)."), "{sent}");
+    assert_eq!(reply_to(&mut events, "a1").await, "shipped");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(scripts.lock()["a3"].calls().len(), 1, "the cc stays idle");
+}
+
 #[tokio::test]
 async fn cancelling_an_agent_cancels_its_descendants() {
     let dir = tempfile::tempdir().unwrap();
