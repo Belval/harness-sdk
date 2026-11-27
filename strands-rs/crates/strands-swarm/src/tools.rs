@@ -629,7 +629,7 @@ async fn wait_tool(swarm: Swarm, me: String, input: WaitInput, ctx: ToolContext)
         // lists it with the others instead of the conversation reading as if it had returned.
         Ok(WaitOutcome::Cancelled) => return Err(strands_agents::Error::Cancelled),
         Ok(WaitOutcome::Unreachable(notice)) => notice,
-        Err(_) => timeout_summary(&swarm, &from, seconds),
+        Err(_) => timeout_summary(&swarm, &me, &from, seconds),
     };
     Ok(text)
 }
@@ -948,15 +948,35 @@ fn describe(swarm: &Swarm, info: &AgentInfo) -> String {
 }
 
 /// Without `from`, only live agents are listed (cancelled ones are counted), as in `list_agents`.
-fn timeout_summary(swarm: &Swarm, from: &[String], seconds: u64) -> String {
-    let (shown, hidden): (Vec<_>, Vec<_>) = swarm
-        .agents()
+fn timeout_summary(swarm: &Swarm, me: &str, from: &[String], seconds: u64) -> String {
+    let agents = swarm.agents();
+    // Without `from`, the agents `me` started (and theirs): the rest of a large swarm is noise
+    // to it on every timeout, and `list_agents` shows them.
+    let mut mine = vec![me.to_owned()];
+    for info in &agents {
+        if mine.contains(&info.parent) {
+            mine.push(info.id.clone());
+        }
+    }
+    let (relevant, others): (Vec<_>, Vec<_>) = agents.into_iter().partition(|info| match from {
+        [] => info.id != me && mine.contains(&info.id),
+        _ => from.contains(&info.id),
+    });
+    let (shown, hidden): (Vec<_>, Vec<_>) = relevant
         .into_iter()
-        .filter(|info| from.is_empty() || from.contains(&info.id))
         .partition(|info| !from.is_empty() || info.status.is_live());
     let mut lines: Vec<String> = shown.iter().map(|info| describe(swarm, info)).collect();
     if !hidden.is_empty() {
         lines.push(format!("({} cancelled agents not shown)", hidden.len()));
+    }
+    let elsewhere = others
+        .iter()
+        .filter(|info| from.is_empty() && info.id != me && info.status.is_live())
+        .count();
+    if elsewhere > 0 {
+        lines.push(format!(
+            "({elsewhere} other live agents in the swarm: list_agents shows them)"
+        ));
     }
     format!(
         "No messages within {seconds}s. Current status:\n{}",
