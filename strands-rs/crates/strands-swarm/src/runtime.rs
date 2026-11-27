@@ -1230,8 +1230,8 @@ impl Swarm {
     }
 
     /// Add `text` to the user's memory as a bullet dated today. Every agent sees it from its next
-    /// turn on. Returns the line written.
-    pub async fn remember(&self, text: &str) -> Result<String> {
+    /// turn on, unless an entry already says it. Returns the line written or found.
+    pub async fn remember(&self, text: &str) -> Result<crate::memory::Remembered> {
         self.require_memory()?
             .remember(text, &crate::journal::today())
             .await

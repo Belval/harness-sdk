@@ -428,8 +428,7 @@ const REMEMBER_DESCRIPTION: &str = concat!(
 const FORGET_DESCRIPTION: &str = "Remove every memory-file line containing `text` (case-insensitive).";
 
 async fn remember_tool(swarm: Swarm, _me: String, input: RememberInput, _ctx: ToolContext) -> Result<String> {
-    let line = swarm.remember(&input.text).await?;
-    Ok(format!("Remembered: {line}"))
+    Ok(swarm.remember(&input.text).await?.to_string())
 }
 
 async fn forget_tool(swarm: Swarm, _me: String, input: ForgetInput, _ctx: ToolContext) -> Result<String> {

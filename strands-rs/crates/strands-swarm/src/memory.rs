@@ -55,8 +55,9 @@ impl Memory {
         }
     }
 
-    /// Append `text` as a bullet dated `date` (`YYYY-MM-DD`). Returns the line written.
-    pub async fn remember(&self, text: &str, date: &str) -> Result<String> {
+    /// Append `text` as a bullet dated `date` (`YYYY-MM-DD`), unless an entry already says the
+    /// same (ignoring date stamps, case and spacing).
+    pub async fn remember(&self, text: &str, date: &str) -> Result<Remembered> {
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         if text.is_empty() {
             return Err(Error::other("Nothing to remember: the text is empty."));
@@ -64,13 +65,20 @@ impl Memory {
         let line = format!("- {date}: {text}");
         let _guard = self.write.lock().await;
         let mut contents = self.read().await?;
+        let wanted = entry_text(&line);
+        if let Some(found) = contents
+            .lines()
+            .find(|old| !wanted.is_empty() && entry_text(old) == wanted)
+        {
+            return Ok(Remembered::Already(found.trim().to_owned()));
+        }
         if !contents.is_empty() && !contents.ends_with('\n') {
             contents.push('\n');
         }
         contents.push_str(&line);
         contents.push('\n');
         self.replace(&contents).await?;
-        Ok(line)
+        Ok(Remembered::Added(line))
     }
 
     /// Remove every line containing `text` (case-insensitive). Returns the removed lines; an error
@@ -119,6 +127,49 @@ impl Memory {
             self.path.display()
         ))
     }
+}
+
+/// What [`Memory::remember`] did: the line it added, or the entry that already said it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remembered {
+    /// The line appended.
+    Added(String),
+    /// The existing line that already says it; nothing was written.
+    Already(String),
+}
+
+impl std::fmt::Display for Remembered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Added(line) => write!(f, "Remembered: {line}"),
+            Self::Already(line) => write!(f, "Already remembered: {line}"),
+        }
+    }
+}
+
+/// What a memory line says: without its bullet and leading `YYYY-MM-DD:` stamps (an agent
+/// sometimes dates its text itself, giving two), lower-cased, spacing collapsed.
+fn entry_text(line: &str) -> String {
+    let mut rest = line.trim_start();
+    rest = rest.strip_prefix("- ").unwrap_or(rest);
+    loop {
+        let trimmed = rest.trim_start();
+        let stamp = trimmed.get(..11).filter(|head| {
+            head.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 => b == b'-',
+                10 => b == b':',
+                _ => b.is_ascii_digit(),
+            })
+        });
+        match stamp {
+            Some(_) => rest = &trimmed[11..],
+            None => break,
+        }
+    }
+    rest.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// The prompt section for memory `text` read from `path`: the newest [`MAX_PROMPT_CHARS`] at
@@ -208,7 +259,7 @@ mod tests {
         assert!(memory.section().await.is_none());
 
         let line = memory.remember("  use\nbun ", "2026-01-02").await.unwrap();
-        assert_eq!(line, "- 2026-01-02: use bun");
+        assert_eq!(line, Remembered::Added("- 2026-01-02: use bun".into()));
         memory.remember("Prefer tabs", "2026-01-03").await.unwrap();
         assert_eq!(
             memory.read().await.unwrap(),
@@ -220,6 +271,48 @@ mod tests {
         assert_eq!(memory.read().await.unwrap(), "- 2026-01-02: use bun\n");
         assert!(memory.forget("nothing like it").await.is_err());
         assert!(memory.remember(" ", "2026-01-04").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_entry_already_remembered_is_not_added_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Memory::new(dir.path().join("memory.md"));
+        // As the live file has them: one stamp, or the agent's own stamp after the swarm's.
+        let file = "- 2026-11-19: 2026-11-19: Use PT times.\n- 2026-11-20: Keep plans in docs.\n";
+        tokio::fs::write(memory.path(), file).await.unwrap();
+        for text in [
+            "Use PT  times.",
+            "2026-11-21: use pt times.",
+            "keep plans in docs.",
+        ] {
+            let done = memory.remember(text, "2026-11-22").await.unwrap();
+            assert!(matches!(done, Remembered::Already(_)), "{text}: {done}");
+        }
+        let done = memory
+            .remember("2026-11-21: Use PT times.", "2026-11-22")
+            .await
+            .unwrap();
+        assert_eq!(
+            done.to_string(),
+            "Already remembered: - 2026-11-19: 2026-11-19: Use PT times."
+        );
+        assert_eq!(memory.read().await.unwrap(), file, "nothing written");
+        // Only the same text is a duplicate: one that says more is added.
+        let done = memory
+            .remember("Use PT times in Slack.", "2026-11-22")
+            .await
+            .unwrap();
+        assert_eq!(
+            done.to_string(),
+            "Remembered: - 2026-11-22: Use PT times in Slack."
+        );
+        assert_eq!(memory.read().await.unwrap().lines().count(), 3);
+        // A text that is only a date stamp matches no blank line.
+        tokio::fs::write(memory.path(), "\n- 2026-11-20: x\n")
+            .await
+            .unwrap();
+        let done = memory.remember("2026-11-21:", "2026-11-22").await.unwrap();
+        assert!(matches!(done, Remembered::Added(_)));
     }
 
     #[tokio::test]

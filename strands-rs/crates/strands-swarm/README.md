@@ -862,7 +862,8 @@ messages you.
     start.
   - Agents use `remember`/`forget`; you use `/remember <text>`, `/forget <text>` and `/remember`
     (which shows where the file is).
-  - Writes are serialized and atomic.
+  - Writes are serialized and atomic. A text some entry already says (ignoring date stamps,
+    case and spacing) is not added again: `remember` answers `Already remembered: <entry>`.
 - **MCP.**
   - `--mcp-config` accepts any `mcp.json` (or `~/.claude.json`). Servers are shared by all agents
     and start lazily.

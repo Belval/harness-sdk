@@ -499,10 +499,7 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             }
         })
         .map_err(strands_agents::Error::other),
-        (Command::Remember(Some(text)), _) => swarm
-            .remember(&text)
-            .await
-            .map(|line| format!("remembered {line}")),
+        (Command::Remember(Some(text)), _) => swarm.remember(&text).await.map(|done| done.to_string()),
         (Command::Remember(None), _) => Ok(memory_notice(swarm).await),
         (Command::Forget(text), _) => swarm
             .forget(&text)
