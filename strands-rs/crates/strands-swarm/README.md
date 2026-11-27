@@ -400,7 +400,8 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   the cache, the agent's last request is re-sent every 4.5 minutes and dropped at the first
   token: the provider reads (0.1×) and so refreshes the cached prefix that would otherwise expire
   and be rewritten (1.25×) on the next call. It stops at that call, an interrupt or cancel, or
-  after 12 refreshes (under an hour); refreshes pass the model-call gate, count as a full cache
+  after 13 refreshes (58.5 minutes, so the cache lasts past a `wait` at its 60-minute maximum);
+  refreshes pass the model-call gate, count as a full cache
   read toward the agent's tokens, and are logged as `keep_warm` in `events.jsonl`. On by default
   with the 5-minute cache; `--no-keep-warm` turns it off. The interval follows the model's cache
   lifetime (`cost::cache_lifetime`, next to the prices): 4.5 minutes for the 5-minute cache,

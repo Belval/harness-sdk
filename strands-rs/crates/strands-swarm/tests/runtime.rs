@@ -6504,6 +6504,16 @@ async fn a_cache_that_outlives_the_wait_is_not_refreshed() {
     assert_eq!(refreshes_during_a_tool_wait("openai.gpt-6-astra", long).await, 2);
 }
 
+/// A `wait` at its 60-minute maximum (here 3.6 s): the 13th refresh, at 58.5 minutes, keeps the
+/// cache until the call after it, which 12 (to 59 minutes) did not.
+#[tokio::test(start_paused = true)]
+async fn a_wait_at_its_maximum_stays_warm_until_it_returns() {
+    let hour = Duration::from_millis(3600);
+    assert_eq!(refreshes_during_a_tool_wait("claude-sonnet-4-5", hour).await, 13);
+    let last = strands_swarm::runtime::KEEP_WARM_EVERY * 13 + strands_swarm::cost::CACHE_LIFETIME;
+    assert!(last > Duration::from_secs(3600));
+}
+
 /// Answers every call with a cached reply, counting calls.
 struct IdleModel {
     id: &'static str,

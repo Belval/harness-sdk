@@ -17,9 +17,11 @@ use super::*;
 
 /// Refresh interval for the 5-minute cache ([`cost::CACHE_LIFETIME`]), with margin for the call's own latency.
 pub const KEEP_WARM_EVERY: Duration = Duration::from_secs(270);
-/// Refreshes per pause, then the cache is left to expire: 12 × 4.5 min is under an hour (at 0.1x
-/// each, the 12 cost about what one rewrite does).
-pub const KEEP_WARM_MAX: usize = 12;
+/// Refreshes per pause, then the cache is left to expire. The 13th, at 58.5 minutes, keeps it
+/// until 63.5: past a `wait` at its 60-minute maximum, the commonest long pause. With 12 the
+/// cache expired at 59 minutes and the call after such a wait rewrote it, 254 times in 19.5
+/// hours of one swarm (~$430 of writes, against ~$70 for the extra refreshes).
+pub const KEEP_WARM_MAX: usize = 13;
 
 /// A model request as sent, to send again.
 struct Request {
