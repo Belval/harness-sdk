@@ -11,6 +11,10 @@
 //! the same keys, other values untouched. No tool is exempt: the head says what the call did and
 //! the stash holds the rest. Like trimmed results and [`crate::aging`], this runs only when
 //! [`crate::pruning::CachePrune`] prunes, and only with a stash.
+//!
+//! An old `todo_write` that a later one replaced goes whole, short items included: each call
+//! re-sends the full list, and the current one is in the agent's reminders on every call. On a
+//! live coordinator's history, 42 such lists were 10% of the bytes, none over the string limit.
 
 use strands_agents::context_manager::stash::Stash;
 use strands_agents::types::{ContentBlock, JsonValue, Message, Role};
@@ -26,6 +30,8 @@ pub const KEEP_RECENT_CALLS: usize = 6;
 pub const TRIM_ABOVE_CHARS: usize = 1_000;
 /// What a trimmed string keeps of its head, in characters.
 pub const HEAD_CHARS: usize = 400;
+/// The tool whose every call replaces the list the previous call set.
+const TODO_WRITE: &str = "todo_write";
 
 /// One call input to replace: where it is, its trimmed form, and the strings it cut, in the
 /// order of their stash indices.
@@ -71,6 +77,11 @@ fn cuts(messages: &[Message]) -> Vec<Cut> {
         .map(|(i, _)| i)
         .collect();
     let old = calls.len().saturating_sub(KEEP_RECENT_CALLS);
+    let last_list = (messages.iter().enumerate())
+        .flat_map(|(m, message)| message.tool_uses().map(move |call| (m, call)))
+        .filter(|(_, call)| call.name == TODO_WRITE)
+        .map(|(_, call)| call.tool_use_id.clone())
+        .last();
     let mut cuts = Vec::new();
     for &m in &calls[..old] {
         for (b, block) in messages[m].content.iter().enumerate() {
@@ -80,7 +91,16 @@ fn cuts(messages: &[Message]) -> Vec<Cut> {
             let id = stash_id(&call.tool_use_id);
             let mut input = call.input.clone();
             let mut originals = Vec::new();
-            trim(&mut input, &id, &mut originals);
+            let superseded = call.name == TODO_WRITE
+                && last_list.as_ref().is_some_and(|last| *last != call.tool_use_id)
+                && !is_superseded_stub(&input);
+            let stub = serde_json::json!({ "todos": format!("{SUPERSEDED} [ref: {id}_0]") });
+            if superseded && json_len(&stub) < json_len(&input) {
+                originals.push(serde_json::to_string(&input).unwrap_or_default());
+                input = stub;
+            } else {
+                trim(&mut input, &id, &mut originals);
+            }
             if !originals.is_empty() {
                 cuts.push(Cut {
                     message: m,
@@ -93,6 +113,16 @@ fn cuts(messages: &[Message]) -> Vec<Cut> {
         }
     }
     cuts
+}
+
+/// What stands in for a superseded `todo_write`'s list.
+const SUPERSEDED: &str = "[an earlier todo list, replaced by a later todo_write]";
+
+/// Whether `input` is already a superseded list's stand-in.
+fn is_superseded_stub(input: &JsonValue) -> bool {
+    input["todos"]
+        .as_str()
+        .is_some_and(|todos| todos.starts_with(SUPERSEDED))
 }
 
 fn json_len(value: &JsonValue) -> usize {
@@ -203,7 +233,7 @@ mod tests {
     async fn nested_strings_are_trimmed_and_short_ones_kept() {
         let long = "x".repeat(TRIM_ABOVE_CHARS + 1);
         let original = json!({"to": "a2", "items": [{"text": long, "done": false}], "n": null});
-        let mut messages = history(KEEP_RECENT_CALLS + 1, "todo_write", original);
+        let mut messages = history(KEEP_RECENT_CALLS + 1, "send_message", original);
 
         assert!(trim_old(&mut messages, &stash()).await);
 
@@ -243,5 +273,39 @@ mod tests {
             assert!(!trim_old(&mut messages, &stash()).await);
             assert_eq!(messages, whole);
         }
+    }
+
+    #[tokio::test]
+    async fn an_old_todo_list_a_later_one_replaced_goes_whole() {
+        let item = json!({"content": "Land it", "activeForm": "Landing it", "status": "pending"});
+        let list = json!({"todos": vec![item; 4]});
+        let mut messages = history(KEEP_RECENT_CALLS + 2, "todo_write", list.clone());
+        let stash = stash();
+        assert!(removable(&messages) > 0, "short items count too");
+
+        assert!(trim_old(&mut messages, &stash).await);
+
+        let stub = input(&messages[1])["todos"].as_str().unwrap();
+        assert_eq!(stub, format!("{SUPERSEDED} [ref: t0-input_0]"));
+        let whole = stash.retrieve("t0-input_0").await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(whole.as_str().unwrap()).unwrap(),
+            list
+        );
+        assert_eq!(input(&messages[5]), &list, "the recent ones stay whole");
+        assert_eq!(removable(&messages), 0, "a stand-in is not replaced again");
+        assert!(!trim_old(&mut messages, &stash).await);
+    }
+
+    #[tokio::test]
+    async fn the_latest_todo_list_stays_whole_however_old() {
+        let item = json!({"content": "Land it", "activeForm": "Landing it", "status": "pending"});
+        let list = json!({"todos": vec![item; 4]});
+        let mut messages = history(1, "todo_write", list.clone());
+        let rest = history(KEEP_RECENT_CALLS + 1, "shell", json!({"command": "ls"}));
+        messages.extend(rest.into_iter().skip(1));
+
+        assert!(!trim_old(&mut messages, &stash()).await);
+        assert_eq!(input(&messages[1]), &list);
     }
 }
