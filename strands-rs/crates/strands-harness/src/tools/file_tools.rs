@@ -33,7 +33,7 @@ const READ_DESCRIPTION: &str = concat!(
 );
 
 const WRITE_DESCRIPTION: &str =
-    "Write a file, creating it or overwriting it. Use `edit` for surgical changes to a large file.";
+    "Write a file, creating it (and missing parent directories) or overwriting it. Use `edit` for surgical changes to a large file.";
 
 const EDIT_DESCRIPTION: &str = "Replace an exact string in a file. `old_str` must appear exactly once.";
 
@@ -297,6 +297,13 @@ pub fn write() -> FunctionTool {
         .typed_handler(|input: WriteInput, _ctx| async move {
             validate_path(&input.path)?;
             let _lock = lock_file(&input.path).await;
+            // Agents write new files into directories that do not exist yet (a report under a
+            // fresh `docs/x/`): 29 of their `write` errors in two days were just that.
+            if let Some(parent) = std::path::Path::new(&input.path).parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| err(e.to_string()))?;
+            }
             tokio::fs::write(&input.path, &input.content)
                 .await
                 .map_err(|e| err(e.to_string()))?;
@@ -476,6 +483,15 @@ mod tests {
         .await;
         assert_eq!(text_of(&result), format!("Wrote 3 lines to {}.", path.display()));
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "a\nb\nc");
+    }
+
+    #[tokio::test]
+    async fn write_creates_missing_parent_directories() {
+        let dir = tmp();
+        let path = dir.path().join("docs/new/out.txt");
+        let result = invoke(&write(), serde_json::json!({ "path": path, "content": "x" })).await;
+        assert_eq!(text_of(&result), format!("Wrote 1 lines to {}.", path.display()));
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "x");
     }
 
     #[tokio::test]
