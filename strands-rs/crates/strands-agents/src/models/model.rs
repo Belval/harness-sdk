@@ -279,6 +279,14 @@ impl Aggregator {
                 Err(e) => {
                     tracing::error!(error = %e, "unable to parse tool input JSON");
                     self.parse_error = Some(e);
+                    // A call cut off by `max_tokens` stays in the partial message with an empty
+                    // input, so the event loop can answer it; any other parse error fails the call.
+                    let input = serde_json::json!({});
+                    self.blocks.push(ContentBlock::ToolUse(ToolUseBlock::new(
+                        self.tool_name.clone(),
+                        self.tool_use_id.clone(),
+                        input,
+                    )));
                     None
                 }
             };
@@ -354,6 +362,12 @@ impl Aggregator {
                 return Some(block);
             }
             ModelStreamEvent::MessageStop { stop_reason, .. } => {
+                // A tool call the stream never closed (cut off) still belongs to the message.
+                if !self.tool_use_id.is_empty() {
+                    if let Some(block) = self.finish_block() {
+                        self.blocks.push(block);
+                    }
+                }
                 if let Some(role) = self.role {
                     let content = self
                         .blocks
@@ -666,6 +680,44 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Model { message, .. }) if message == "unable to parse tool input JSON")
         );
+    }
+
+    #[test]
+    fn max_tokens_keeps_a_cut_tool_call_in_the_partial_message() {
+        let start = |id: &str| E::ContentBlockStart {
+            start: Some(ContentBlockStart::ToolUse {
+                name: "shell".into(),
+                tool_use_id: id.into(),
+                reasoning_signature: None,
+            }),
+        };
+        let input = |s: &str| E::ContentBlockDelta {
+            delta: ContentBlockDelta::ToolUseInput { input: s.into() },
+        };
+        // One call closed with invalid JSON, one never closed at all.
+        let events = vec![
+            E::MessageStart {
+                role: Role::Assistant,
+            },
+            start("t1"),
+            input("{\"command\": \"cat <<EOF"),
+            E::ContentBlockStop {},
+            start("t2"),
+            input("{\"command\": \"ec"),
+            E::MessageStop {
+                stop_reason: StopReason::MaxTokens,
+                additional_model_response_fields: None,
+            },
+        ];
+        let (_, result) = run(events);
+        let Err(Error::MaxTokens { partial_message, .. }) = result else {
+            panic!("unexpected: {result:?}");
+        };
+        let ids: Vec<_> = partial_message
+            .tool_uses()
+            .map(|t| (t.tool_use_id.as_str(), t.input.clone()))
+            .collect();
+        assert_eq!(ids, vec![("t1", json!({})), ("t2", json!({}))]);
     }
 
     #[test]

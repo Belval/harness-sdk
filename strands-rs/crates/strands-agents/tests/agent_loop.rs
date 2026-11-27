@@ -809,6 +809,112 @@ async fn projects_input_tokens_for_the_model_call() {
     assert!(projected[0].is_some_and(|tokens| tokens > 0));
 }
 
+/// Every `toolUse` in `messages` is answered by a `toolResult` in the next message.
+fn assert_every_call_answered(messages: &[Message]) {
+    for (i, message) in messages.iter().enumerate() {
+        for call in message.tool_uses() {
+            let answered = messages.get(i + 1).is_some_and(|next| {
+                next.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult(r) if r.tool_use_id == call.tool_use_id))
+            });
+            assert!(answered, "call {} unanswered in {messages:?}", call.tool_use_id);
+        }
+    }
+}
+
+fn counting_echo() -> (ToolRef, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&runs);
+    let tool: ToolRef = Arc::new(function_tool("echo").description("Echoes its input").handler(
+        move |input, _ctx| {
+            seen.lock().unwrap().push(input.clone());
+            async move { Ok(json!({ "echoed": input })) }
+        },
+    ));
+    (tool, runs)
+}
+
+fn first_result_text(message: &Message) -> (ToolResultStatus, String) {
+    match &message.content[0] {
+        ContentBlock::ToolResult(result) => (result.status, format!("{:?}", result.content)),
+        other => panic!("expected a tool result, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_tool_call_cut_by_max_tokens_is_answered_not_run_and_retried() {
+    let model = MockMessageModel::shared(vec![
+        MockResponse::with_stop_reason(
+            tool_use_message("echo", "t1", json!({"v": "cut"})),
+            StopReason::MaxTokens,
+        ),
+        MockResponse::message(tool_use_message("echo", "t2", json!({"v": "whole"}))),
+        MockResponse::message(Message::assistant("done")),
+    ]);
+    let (tool, runs) = counting_echo();
+    let agent = Agent::builder().model(model.clone()).tool(tool).build().unwrap();
+
+    let result = agent.invoke("go").await.unwrap();
+
+    assert_eq!(result.to_string(), "done");
+    assert_eq!(*runs.lock().unwrap(), vec![json!({"v": "whole"})]);
+    let messages = agent.messages();
+    assert_eq!(messages.len(), 6);
+    let (status, text) = first_result_text(&messages[2]);
+    assert_eq!(status, ToolResultStatus::Error);
+    assert!(text.contains("output-token limit"), "{text}");
+    assert_every_call_answered(&messages);
+}
+
+#[tokio::test]
+async fn replies_cut_inside_tool_calls_give_up_after_three_retries() {
+    let model = MockMessageModel::shared(vec![MockResponse::with_stop_reason(
+        tool_use_message("echo", "t1", json!({})),
+        StopReason::MaxTokens,
+    )]);
+    let (tool, runs) = counting_echo();
+    let agent = Agent::builder().model(model.clone()).tool(tool).build().unwrap();
+
+    let error = agent.invoke("go").await.unwrap_err();
+
+    assert!(
+        matches!(error, strands_agents::Error::MaxTokens { .. }),
+        "{error:?}"
+    );
+    assert_eq!(model.call_count(), 4);
+    assert!(runs.lock().unwrap().is_empty());
+    let messages = agent.messages();
+    assert_eq!(messages.last().unwrap().role, Role::Assistant);
+    assert!(messages.last().unwrap().text().starts_with("Stopped: 4 replies"));
+    assert_every_call_answered(&messages);
+}
+
+#[tokio::test]
+async fn tool_calls_in_an_end_turn_reply_are_answered_not_run() {
+    // Bedrock streams cut-off calls closed into valid JSON with `end_turn`: running one could
+    // save half a file, so the model is told and calls again.
+    let model = MockMessageModel::shared(vec![
+        MockResponse::with_stop_reason(
+            tool_use_message("echo", "t1", json!({"v": "ec"})),
+            StopReason::EndTurn,
+        ),
+        MockResponse::message(Message::assistant("done")),
+    ]);
+    let (tool, runs) = counting_echo();
+    let agent = Agent::builder().model(model.clone()).tool(tool).build().unwrap();
+
+    let result = agent.invoke("go").await.unwrap();
+
+    assert_eq!(result.to_string(), "done");
+    assert!(runs.lock().unwrap().is_empty());
+    let messages = agent.messages();
+    let (status, text) = first_result_text(&messages[2]);
+    assert_eq!(status, ToolResultStatus::Error);
+    assert!(text.contains("endTurn"), "{text}");
+    assert_every_call_answered(&messages);
+}
+
 #[tokio::test]
 async fn max_tokens_from_the_model_surfaces_as_an_error() {
     let model = MockMessageModel::shared(vec![MockResponse::with_stop_reason(

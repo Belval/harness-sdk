@@ -61,6 +61,39 @@ pub const STRUCTURED_OUTPUT_FORCED_FAILURE_MESSAGE: &str =
 
 const NO_STRUCTURED_OUTPUT_MESSAGE: &str = "The agent stopped without producing structured output.";
 
+/// Consecutive replies with tool calls but no `toolUse` stop (cut off by `max_tokens`, or ended
+/// early) that the loop answers with error results and retries before it gives up.
+const MAX_UNRUN_TOOL_REPLIES: u32 = 3;
+
+/// The user message answering every tool call of a reply that did not stop for `toolUse`: such a
+/// call was cut off or never meant to run, so none is run (a cut `write` would save half a file).
+/// `None` when the reply holds no tool call.
+fn unrun_calls_message(message: &Message, stop_reason: &StopReason) -> Option<Message> {
+    let text = match stop_reason {
+        StopReason::MaxTokens => "Not run: your reply hit the output-token limit (max_tokens) before this \
+             tool call was complete. Retry with smaller calls (e.g. write a long file in parts)."
+            .to_owned(),
+        other => format!(
+            "Not run: your reply ended (stop reason `{other}`) instead of stopping for this tool call, \
+             so its input may be cut off. Check it and call again, in smaller parts if it was long."
+        ),
+    };
+    let answers: Vec<ContentBlock> = tool_use_blocks(message)
+        .iter()
+        .map(|tool_use| ContentBlock::ToolResult(ToolResultBlock::error(&tool_use.tool_use_id, &text)))
+        .collect();
+    (!answers.is_empty()).then(|| Message::new(Role::User, answers))
+}
+
+/// The assistant message closing a turn that gave up after [`MAX_UNRUN_TOOL_REPLIES`] retries.
+fn gave_up_message(stop_reason: &StopReason) -> Message {
+    Message::assistant(format!(
+        "Stopped: {} replies in a row ended (stop reason `{stop_reason}`) inside tool calls, \
+         which were not run.",
+        MAX_UNRUN_TOOL_REPLIES + 1
+    ))
+}
+
 /// Per-invocation caps (§9.4 step 9). A `None` field is uncapped; comparison is "at most".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -695,6 +728,7 @@ async fn run_cycles_inner(
     let mut usage = Usage::default();
     let mut turns = 0u64;
     let mut forced_choice: Option<ToolChoice> = None;
+    let mut unrun_replies = 0u32;
 
     loop {
         if cancel.is_cancelled() {
@@ -805,6 +839,30 @@ async fn run_cycles_inner(
                 if matches!(error, Error::Cancelled) {
                     return cancelled_result(agent, tx, state).await;
                 }
+                // A reply cut off inside tool calls: answer them and let the model retry.
+                if let Error::MaxTokens { partial_message, .. } = &error {
+                    if let Some(answers) = unrun_calls_message(partial_message, &StopReason::MaxTokens) {
+                        if let Some(cycle_usage) =
+                            partial_message.metadata.as_ref().and_then(|m| m.usage.as_ref())
+                        {
+                            usage.input_tokens += cycle_usage.input_tokens;
+                            usage.output_tokens += cycle_usage.output_tokens;
+                            usage.total_tokens += cycle_usage.total_tokens;
+                        }
+                        append_message(agent, tx, state, (**partial_message).clone()).await?;
+                        append_message(agent, tx, state, answers).await?;
+                        if unrun_replies < MAX_UNRUN_TOOL_REPLIES {
+                            unrun_replies += 1;
+                            tracing::warn!(
+                                attempt = unrun_replies,
+                                "max_tokens cut the reply inside a tool call | answering it and retrying"
+                            );
+                            continue;
+                        }
+                        let last = gave_up_message(&StopReason::MaxTokens);
+                        append_message(agent, tx, state, last).await?;
+                    }
+                }
                 return Err(error);
             }
         };
@@ -827,6 +885,32 @@ async fn run_cycles_inner(
                 continue;
             }
             append_message(agent, tx, state, model_result.message.clone()).await?;
+            // Tool calls without a `toolUse` stop are never run, but always answered, so the
+            // history does not end in calls without results; the model retries a few times.
+            if let Some(answers) = unrun_calls_message(&model_result.message, &model_result.stop_reason) {
+                append_message(agent, tx, state, answers).await?;
+                if unrun_replies < MAX_UNRUN_TOOL_REPLIES {
+                    unrun_replies += 1;
+                    tracing::warn!(
+                        stop_reason = %model_result.stop_reason,
+                        attempt = unrun_replies,
+                        "reply holds tool calls but did not stop for tool use | answering them and retrying"
+                    );
+                    continue;
+                }
+                let last = gave_up_message(&model_result.stop_reason);
+                append_message(agent, tx, state, last.clone()).await?;
+                return Ok(AgentResult {
+                    stop_reason: model_result.stop_reason,
+                    last_message: last,
+                    invocation_state: state.clone(),
+                    structured_output: None,
+                    metrics: agent.meter().metrics(),
+                    traces: agent.tracer().local_traces(),
+                    interrupts: Vec::new(),
+                    checkpoint: None,
+                });
+            }
             return Ok(AgentResult {
                 stop_reason: model_result.stop_reason,
                 last_message: model_result.message,
@@ -840,6 +924,7 @@ async fn run_cycles_inner(
         }
 
         let assistant_message = model_result.message;
+        unrun_replies = 0;
 
         if cancel.is_cancelled() {
             let cancelled = Message::new(
