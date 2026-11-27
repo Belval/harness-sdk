@@ -1,7 +1,7 @@
 //! The actor loop that drives one agent turn by turn, and forwarding of its stream events.
 
 use super::*;
-use strands_agents::hooks::BeforeToolCallEvent;
+use strands_agents::hooks::{AfterToolsEvent, BeforeToolCallEvent, EndTurn};
 use strands_agents::tools::FunctionTool;
 
 impl Swarm {
@@ -116,6 +116,7 @@ impl Swarm {
         };
         self.install_mail_hook(&agent, &node.id);
         self.install_cd_hook(&agent, &node);
+        install_end_turn_hook(&agent, &node);
         self.install_poll_hint(&agent, &node.id);
         self.install_claims_hook(&agent, &node.id);
         self.install_model_gate(&agent, &node);
@@ -529,6 +530,16 @@ impl Swarm {
             });
     }
 
+    /// End `id`'s turn after the tool batch in progress, with `reply` as its final reply
+    /// ([`install_end_turn_hook`]). `false` when it is not a live agent.
+    pub(crate) fn end_turn_after_batch(&self, id: &str, reply: String) -> bool {
+        let Some(node) = self.node(id) else {
+            return false;
+        };
+        *node.end_turn.lock() = Some(reply);
+        true
+    }
+
     /// Move `node` to `dir`: its commands, the system prompt's working directory, the saved
     /// state and the UI.
     fn move_to(&self, node: &Node, agent: &Agent, dir: PathBuf) {
@@ -779,6 +790,21 @@ fn scalar_list(value: &serde_json::Value) -> String {
         Some(items.join(", "))
     };
     scalar(value).or_else(list).unwrap_or_else(|| value.to_string())
+}
+
+/// A batch of tool calls with an `end_turn` among them ends the turn with its reply, instead of
+/// a model call that would only say it ([`crate::tools`]). Every batch takes the request, so one
+/// a cancelled batch left cannot end a later one.
+fn install_end_turn_hook(agent: &Agent, node: &Arc<Node>) {
+    let node = Arc::downgrade(node);
+    agent
+        .hooks()
+        .add_sync_callback(move |event: &mut AfterToolsEvent| {
+            if let Some(reply) = node.upgrade().and_then(|node| node.end_turn.lock().take()) {
+                event.end_turn = EndTurn::Text(reply);
+            }
+            Ok(())
+        });
 }
 
 #[cfg(test)]

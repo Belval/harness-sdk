@@ -1271,7 +1271,10 @@ mod tests {
         // succeeded.
         // Raised from 16,650 for `send_message`'s `cc` (~12 tokens a call): the same
         // coordinator spent 95 more answering `[silent]` to mail it was only cc'd on.
-        const BUDGET_BYTES: usize = 16_700;
+        // Raised from 16,700 for `end_turn` (~80 tokens a call, ~$0.60 per 15k calls): over
+        // 11 hours of a live run, 810 turns ended on a model call that only said `[silent]` or a
+        // line after a send_message or run_background, ~$250 of re-read context.
+        const BUDGET_BYTES: usize = 17_050;
         const TOOL_BUDGET_BYTES: usize = 1_100;
         // 20 skill lines of at most ~110 bytes plus the heading.
         const SKILLS_BUDGET_BYTES: usize = 2_500;

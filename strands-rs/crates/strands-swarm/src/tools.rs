@@ -217,6 +217,18 @@ struct RunBackgroundInput {
     quiet: bool,
 }
 
+const END_TURN_DESCRIPTION: &str = concat!(
+    "End your turn once the other calls in this message finish, with no further model call: call ",
+    "it alongside your last send_message, run_background or todo_write."
+);
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct EndTurnInput {
+    /// Your final reply (default `[silent]`).
+    #[serde(default)]
+    reply: Option<String>,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct JobsInput {
     /// Id of a job to kill (with everything it started); omit to list jobs.
@@ -294,6 +306,15 @@ async fn run_background_tool(
         job.meta.cwd.display(),
         swarm.job_log(&job.meta.id).display()
     ))
+}
+
+async fn end_turn_tool(swarm: Swarm, me: String, input: EndTurnInput, _ctx: ToolContext) -> Result<String> {
+    let reply = input.reply.filter(|reply| !reply.trim().is_empty());
+    let reply = reply.unwrap_or_else(|| crate::runtime::SILENT_REPLY.to_owned());
+    match swarm.end_turn_after_batch(&me, reply) {
+        true => Ok("The turn ends when this message's calls finish.".to_owned()),
+        false => Err(strands_agents::Error::other(format!("{me} is not a live agent"))),
+    }
 }
 
 async fn jobs_tool(swarm: Swarm, me: String, input: JobsInput, _ctx: ToolContext) -> Result<String> {
@@ -477,6 +498,7 @@ pub fn swarm_tools(swarm: Swarm, id: &str) -> Vec<ToolRef> {
             run_background_tool,
         ),
         swarm_tool(s, id, "jobs", JOBS_DESCRIPTION, jobs_tool),
+        swarm_tool(s, id, "end_turn", END_TURN_DESCRIPTION, end_turn_tool),
     ];
     if swarm.can_reload() {
         tools.push(swarm_tool(s, id, "reload_swarm", RELOAD_DESCRIPTION, reload_tool));

@@ -2134,6 +2134,49 @@ fn crash_copy(state_dir: &Path, to: &Path) {
     assert!(copied.success());
 }
 
+/// `end_turn` beside another call ends the turn once the batch finishes, with its reply and no
+/// model call; the next turn starts as usual.
+#[tokio::test]
+async fn end_turn_ends_the_turn_after_its_batch_without_another_model_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let batch = |reply: serde_json::Value| {
+        MockResponse::message(Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::ToolUse(ToolUseBlock::new("list_agents", "t1", json!({}))),
+                ContentBlock::ToolUse(ToolUseBlock::new("end_turn", "t2", reply)),
+            ],
+        ))
+    };
+    let (swarm, mut events, scripts) = swarm_with(
+        vec![(
+            "a1",
+            vec![batch(json!({"reply": "listed"})), batch(json!({})), say("third")],
+        )],
+        dir.path(),
+    );
+    let id = spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "listed");
+    let model = scripts.lock()["a1"].clone();
+    assert_eq!(model.calls().len(), 1);
+
+    swarm.send(USER, &id, "again").unwrap();
+    // The user asked, so even a `[silent]` reply reaches them.
+    assert_eq!(reply_to(&mut events, USER).await, "[silent]");
+    swarm.send(USER, &id, "once more").unwrap();
+    assert_eq!(reply_to(&mut events, USER).await, "third");
+    let sent = sent_text(&model, 2);
+    assert!(
+        sent.contains("[silent]"),
+        "the silent reply stays in history: {sent}"
+    );
+    assert_eq!(
+        model.calls().len(),
+        3,
+        "no model call between batches and replies"
+    );
+}
+
 #[tokio::test]
 async fn a_hard_crash_mid_batch_keeps_its_calls_and_the_results_that_came_in() {
     let dir = tempfile::tempdir().unwrap();

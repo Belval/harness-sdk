@@ -831,6 +831,8 @@ struct Node {
     waits: Mutex<usize>,
     /// The tool batch in progress, also kept on disk ([`resume::OpenBatch`]).
     batch: Mutex<Option<resume::OpenBatch>>,
+    /// The final reply an `end_turn` call in the batch in progress ends the turn with.
+    end_turn: Mutex<Option<String>>,
 }
 
 /// Cumulative `(input, output)` tokens.
