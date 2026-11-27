@@ -1110,7 +1110,13 @@ mod tests {
         let result = calls[1].0.last().unwrap().tool_results().next().unwrap();
         match &result.content[..] {
             [ToolResultContent::Text(text)] => {
-                assert_eq!(text, "say \"hi\"\n[stderr]\nwarn\n[timed out after 0.3s]")
+                assert_eq!(
+                    *text,
+                    format!(
+                        "say \"hi\"\n[stderr]\nwarn\n[timed out after 0.3s]{}",
+                        crate::shell_text::TIMEOUT_HINT
+                    )
+                )
             }
             other => panic!("{other:?}"),
         }

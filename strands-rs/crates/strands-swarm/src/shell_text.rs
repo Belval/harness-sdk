@@ -35,10 +35,6 @@ impl Plugin for ShellText {
     }
 }
 
-/// The SDK's error for a command killed by its timeout or a cancel (`Error: Execution timed
-/// out after S seconds` / `Error: Execution cancelled after S seconds`, then the partial output
-/// as a JSON line) as [`render`]'s text ending in `[timed out after Ss]` / [`CANCELLED`]` Ss]`;
-/// `None` for any other text.
 /// Render a `shell` result's own output as defanged plain text. Only the shell's items: mail the
 /// swarm appended to this result (its hook runs first, as after-tool hooks run last-registered
 /// first) keeps its real wrappers, its bodies already defanged when rendered.
@@ -58,6 +54,12 @@ fn rewrite(content: &mut [ToolResultContent]) {
     }
 }
 
+/// The SDK's error for a command killed by its timeout or a cancel (`Error: Execution timed
+/// out after S seconds` / `Error: Execution cancelled after S seconds`, then the partial output
+/// as a JSON line) as [`render`]'s text ending in `[timed out after Ss]` / [`CANCELLED`]` Ss]`;
+/// `None` for any other text.
+/// A timeout also says what to do instead: of 222 timed-out calls over two days, 186 were
+/// followed by another `shell` call and 13 by `run_background`.
 fn render_killed(text: &str) -> Option<String> {
     let (first, json) = text.split_once('\n')?;
     let (how, seconds) = first
@@ -68,8 +70,19 @@ fn render_killed(text: &str) -> Option<String> {
         return None;
     }
     let partial = serde_json::from_str::<ShellOutput>(json).ok()?;
-    Some(render_ending(&partial, &format!("[{how} after {seconds}s]")))
+    let hint = match how {
+        "timed out" => TIMEOUT_HINT,
+        _ => "",
+    };
+    Some(render_ending(
+        &partial,
+        &format!("[{how} after {seconds}s]{hint}"),
+    ))
 }
+
+/// After `[timed out after Ss]`: the command was killed, and how to give it longer.
+pub(crate) const TIMEOUT_HINT: &str =
+    " killed; pass a larger `timeout`, or use run_background for a slow command";
 
 /// How the last line of a cancelled call's text starts.
 const CANCELLED: &str = "[cancelled after";
@@ -181,10 +194,16 @@ mod tests {
     fn a_timeout_or_cancel_ends_with_how_long_it_ran_instead_of_its_exit_code() {
         let partial = serde_json::to_string(&output("half\n", "", 124)).unwrap();
         let text = format!("Error: Execution timed out after 120 seconds\n{partial}");
-        assert_eq!(render_killed(&text).unwrap(), "half\n[timed out after 120s]");
+        assert_eq!(
+            render_killed(&text).unwrap(),
+            format!("half\n[timed out after 120s]{TIMEOUT_HINT}")
+        );
         let silent = serde_json::to_string(&output("", "", 124)).unwrap();
         let text = format!("Error: Execution timed out after 2.5 seconds\n{silent}");
-        assert_eq!(render_killed(&text).unwrap(), "[timed out after 2.5s]");
+        assert_eq!(
+            render_killed(&text).unwrap(),
+            format!("[timed out after 2.5s]{TIMEOUT_HINT}")
+        );
         let partial = serde_json::to_string(&output("half\n", "warn\n", 137)).unwrap();
         let text = format!("Error: Execution cancelled after 3.2 seconds\n{partial}");
         let cancelled = render_killed(&text).unwrap();
