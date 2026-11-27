@@ -63,7 +63,7 @@ fn slow_failing_validator(ctx: &ValidationContext) -> BoxFuture<'_, Result<Valid
     let first_attempt = ctx.agent.messages().len() <= 2;
     Box::pin(async move {
         if first_attempt {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
         }
         Ok(ValidationOutcome::failed("try again"))
     })
@@ -201,7 +201,9 @@ async fn a_validator_error_becomes_failing_feedback() {
 async fn an_async_validator_stops_the_run_on_the_wall_clock_budget() {
     let model = replies(&["bad", "still bad"]);
     // Attempt 1 alone overruns the budget, so attempt 2 is invoked but never validated.
-    let goal = GoalLoop::validator(slow_failing_validator).with_timeout(Duration::from_millis(10));
+    // The budget leaves the first model call ample time on a loaded host (at 10 ms it ran out
+    // before attempt 1 was validated), and the validator's sleep is well past it.
+    let goal = GoalLoop::validator(slow_failing_validator).with_timeout(Duration::from_millis(200));
     let agent = Agent::builder()
         .model(model.clone())
         .plugin(goal.clone())
