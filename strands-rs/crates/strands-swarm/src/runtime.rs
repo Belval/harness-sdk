@@ -71,7 +71,9 @@ pub use disk::{
 pub use host::{default_max_load, default_min_free_mem, host_stats, HostProbe, HostStats, HOST_POLL};
 use persist::history_event;
 pub(crate) use persist::RESTORED_ERROR;
-pub use warm::{KEEP_WARM_EVERY, KEEP_WARM_IDLE, KEEP_WARM_MAX};
+pub use warm::{
+    CACHE_LIFETIME_1H, KEEP_WARM_EVERY, KEEP_WARM_IDLE, KEEP_WARM_IDLE_1H, KEEP_WARM_MAX, KEEP_WARM_MAX_1H,
+};
 
 /// Judge rejections in a row after which a goal agent's turn ends anyway, so a goal that cannot
 /// be met does not burn turns forever; its parent hears the last attempt and can step in.
@@ -335,6 +337,9 @@ pub struct SwarmConfig {
     /// Keep the prompt cache warm while a turn waits on a tool call ([`KEEP_WARM_EVERY`] for the
     /// 5-minute cache); `None` is off.
     pub keep_warm: Option<Duration>,
+    /// The agents' prompt cache lives an hour (`--cache-ttl 1h`) where the provider takes the
+    /// TTL: keep-warm refreshes 12 times as far apart, and far fewer of them.
+    pub cache_1h: bool,
     /// How long a running background job's log may stay unchanged before its owner gets an FYI
     /// note that it may be hung.
     pub job_quiet: Duration,
@@ -404,6 +409,7 @@ impl SwarmConfig {
             prices: Arc::default(),
             default_model: None,
             keep_warm: None,
+            cache_1h: false,
             job_quiet: Duration::from_secs(30 * 60),
             max_load: 0.0,
             min_free_mem: 0,

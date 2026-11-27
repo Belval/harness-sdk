@@ -39,12 +39,14 @@ struct Cli {
     effort: Effort,
     /// Prompt-cache TTL on Bedrock/Anthropic: `5m` (the provider default) or `1h`. One-hour
     /// entries survive long waits and reloads but cost 2x input to write instead of 1.25x, so
-    /// they pay off only when an agent often idles 5-60 minutes between calls.
+    /// they pay off when an agent often idles 5-60 minutes between calls (measured on a live
+    /// run: ~20% cheaper than 5m with keep-warm). Keep-warm then refreshes every 54 minutes.
     #[arg(long, value_parser = ["5m", "1h"])]
     cache_ttl: Option<String>,
     /// Do not keep the 5-minute prompt cache warm while an agent waits on a tool call (by
     /// default its last request is re-sent every 4.5 minutes, up to 12 times, and dropped at the
-    /// first token: a cache read at 0.1x input instead of a rewrite at 1.25x). Off with `1h`.
+    /// first token: a cache read at 0.1x input instead of a rewrite at 1.25x; with `1h` every 54
+    /// minutes, twice).
     #[arg(long)]
     no_keep_warm: bool,
     /// Working directory of the root agent.
@@ -458,8 +460,8 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
     config.min_free_mem = cli
         .min_free_mem
         .unwrap_or_else(strands_swarm::runtime::default_min_free_mem);
-    config.keep_warm = (!cli.no_keep_warm && cli.cache_ttl.as_deref() != Some("1h"))
-        .then_some(strands_swarm::runtime::KEEP_WARM_EVERY);
+    config.keep_warm = (!cli.no_keep_warm).then_some(strands_swarm::runtime::KEEP_WARM_EVERY);
+    config.cache_1h = cli.cache_ttl.as_deref() == Some("1h");
     config.status_base = cli.status_base;
     config.allow_land = cli.allow_land;
     config.gates = cli.gates;

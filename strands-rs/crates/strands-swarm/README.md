@@ -395,7 +395,7 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   instead of rewriting it. Every write then costs 2× input instead of 1.25×, so it pays off only
   when calls often follow a 5–60 minute pause: per call, 0.75× the new tokens it writes against
   1.15× the prefix for each pause it bridges. Unavoidable misses (a new agent, a binary that
-  changed the tools or prompt) cost the 2× rate too. Off by default.
+  changed the tools or prompt) cost the 2× rate too. Off by default. Replayed over a 21-hour live run (Opus 5.5, 5-minute cache with keep-warm: $15.1k a day of cache and input cost), the hour cuts it to about $11.7k (−22%): the 5–60 minute gaps that missed become reads, and keep-warm falls from $2.5k to about $0.1k. It also leaves keep-warm at 2 refreshes of 54 minutes (3 for an idle agent) instead of 13 of 4.5 (4). Writing only an end-of-turn cache point at the hour would save under 6% more (and Anthropic wants longer TTLs before shorter ones in a request, which a growing history breaks), so the TTL is one value for the run.
 - **Keep-warm.** While a turn waits on a tool call (a `wait`, a slow build) after a call that hit
   the cache, the agent's last request is re-sent every 4.5 minutes and dropped at the first
   token: the provider reads (0.1×) and so refreshes the cached prefix that would otherwise expire
@@ -403,7 +403,7 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   after 13 refreshes (58.5 minutes, so the cache lasts past a `wait` at its 60-minute maximum);
   refreshes pass the model-call gate, count as a full cache
   read toward the agent's tokens, and are logged as `keep_warm` in `events.jsonl`. On by default
-  with the 5-minute cache; `--no-keep-warm` turns it off. The interval follows the model's cache
+  with either TTL; `--no-keep-warm` turns it off. With `--cache-ttl 1h` the interval is 54 minutes with at most 2 refreshes (3 when idle). The interval follows the model's cache
   lifetime (`cost::cache_lifetime`, next to the prices): 4.5 minutes for the 5-minute cache,
   27 for OpenAI's GPT-5.6 and later, which keep it at least 30 minutes (earlier GPT versions
   and gpt-oss state no lifetime and keep the 5-minute assumption), so a tool call under half an

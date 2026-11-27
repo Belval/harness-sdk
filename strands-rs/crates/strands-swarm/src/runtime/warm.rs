@@ -28,6 +28,16 @@ pub const KEEP_WARM_MAX: usize = 13;
 /// still idle at the k-th refresh the share woken before the next one was 29, 21, 13 and 11% for
 /// k = 1..4 and under 8% after, against the 0.1 / 1.15 ≈ 8.7% at which a refresh pays.
 pub const KEEP_WARM_IDLE: usize = 4;
+/// [`KEEP_WARM_MAX`] for the one-hour cache (`--cache-ttl 1h`), whose refreshes are 12 times as
+/// far apart: two, at 54 and 108 minutes, keep a cache warm until 168, past a `wait` at its
+/// 60-minute maximum with the first alone.
+pub const KEEP_WARM_MAX_1H: usize = 2;
+/// [`KEEP_WARM_IDLE`] for the one-hour cache. Measured on a live run, of the agents still idle
+/// at the k-th refresh about half were woken before the next (an hour later), well above the
+/// 0.1 / 1.9 ≈ 5% at which a refresh pays against a 2x rewrite.
+pub const KEEP_WARM_IDLE_1H: usize = 3;
+/// How long the one-hour cache lives without a hit.
+pub const CACHE_LIFETIME_1H: Duration = Duration::from_secs(60 * 60);
 
 /// A model request as sent, to send again.
 struct Request {
@@ -169,6 +179,7 @@ impl Swarm {
                     };
                     let stop = context.agent.cancel_token().child_token();
                     let every = swarm.refresh_every(every, request.model.model_id());
+                    let (max, idle_max) = swarm.refresh_limits(request.model.model_id());
                     let result: StreamAggregatedResult = next.run(context, &events).await?;
                     let cached = result.usage.as_ref().map_or(0, |usage| {
                         usage.cache_read_input_tokens.unwrap_or(0)
@@ -176,11 +187,11 @@ impl Swarm {
                     });
                     let node = node.upgrade().filter(|_| cached > 0);
                     let plan = node.and_then(|node| match result.stop_reason {
-                        StopReason::ToolUse => Some((node, KEEP_WARM_MAX, false, false)),
+                        StopReason::ToolUse => Some((node, max, false, false)),
                         StopReason::EndTurn => {
                             match swarm.refreshes_until_fire(&node, request.model.model_id(), every) {
                                 Some(n) => Some((node, n, true, true)),
-                                None => Some((node, KEEP_WARM_IDLE, true, false)),
+                                None => Some((node, idle_max, true, false)),
                             }
                         }
                         _ => None,
@@ -218,8 +229,25 @@ impl Swarm {
     /// The refresh interval for `model`: `every` is for the default 5-minute cache, and a cache
     /// that lives n times as long is refreshed n times as far apart.
     fn refresh_every(&self, every: Duration, model: Option<String>) -> Duration {
-        let lifetime = crate::cost::cache_lifetime(&self.model_name(model));
+        let lifetime = self.cache_lifetime(model);
         every.mul_f64(lifetime.as_secs_f64() / crate::cost::CACHE_LIFETIME.as_secs_f64())
+    }
+
+    /// How long `model`'s prompt cache lives: the hour of `--cache-ttl 1h` where the model's own
+    /// is the default 5 minutes (OpenAI's longer implicit cache ignores the TTL).
+    fn cache_lifetime(&self, model: Option<String>) -> Duration {
+        match crate::cost::cache_lifetime(&self.model_name(model)) {
+            crate::cost::CACHE_LIFETIME if self.inner.config.cache_1h => CACHE_LIFETIME_1H,
+            lifetime => lifetime,
+        }
+    }
+
+    /// Refreshes of a turn waiting on a tool call, and of an idle agent, for `model`.
+    fn refresh_limits(&self, model: Option<String>) -> (usize, usize) {
+        match self.cache_lifetime(model) == CACHE_LIFETIME_1H {
+            true => (KEEP_WARM_MAX_1H, KEEP_WARM_IDLE_1H),
+            false => (KEEP_WARM_MAX, KEEP_WARM_IDLE),
+        }
     }
 
     /// How many refreshes, `every` apart, keep `node`'s cache warm until its next schedule fires;

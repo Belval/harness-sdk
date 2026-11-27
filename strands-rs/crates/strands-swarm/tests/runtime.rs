@@ -6464,6 +6464,16 @@ async fn refreshes_stop_when_the_history_they_repeat_was_edited() {
 /// Refreshes sent while a turn waits `wait` on a tool, by an agent on `model_id`, with the
 /// default interval for the 5-minute cache (4.5 minutes) scaled to 270 ms: a minute is 1 ms.
 async fn refreshes_during_a_tool_wait(model_id: &'static str, wait: Duration) -> usize {
+    refreshes_during_a_tool_wait_with_ttl(model_id, wait, false).await
+}
+
+/// [`refreshes_during_a_tool_wait`] with the one-hour cache (`--cache-ttl 1h`) when `cache_1h`:
+/// refreshes 54 minutes (3.24 s) apart.
+async fn refreshes_during_a_tool_wait_with_ttl(
+    model_id: &'static str,
+    wait: Duration,
+    cache_1h: bool,
+) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(CachingModel::named(model_id));
     let shared = model.clone();
@@ -6488,6 +6498,7 @@ async fn refreshes_during_a_tool_wait(model_id: &'static str, wait: Duration) ->
     });
     let mut config = SwarmConfig::new(factory, dir.path());
     config.keep_warm = Some(strands_swarm::runtime::KEEP_WARM_EVERY / 1000);
+    config.cache_1h = cache_1h;
     let (swarm, mut events) = Swarm::new(config);
     spawn_root(&swarm, "go").await;
     assert_eq!(reply_to(&mut events, USER).await, "done");
@@ -6522,6 +6533,24 @@ async fn a_wait_at_its_maximum_stays_warm_until_it_returns() {
     assert!(last > Duration::from_secs(3600));
 }
 
+/// With `--cache-ttl 1h` a wait is refreshed 54 minutes apart (a minute is 1 ms): not at all in
+/// 50 minutes, once in a 60-minute `wait` at its maximum (which five-minute refreshes covered
+/// with 13), twice in 110 minutes; OpenAI's 30-minute cache ignores the TTL.
+#[tokio::test(start_paused = true)]
+async fn the_one_hour_cache_is_refreshed_every_54_minutes() {
+    let ms = Duration::from_millis;
+    let one_hour = |wait| refreshes_during_a_tool_wait_with_ttl("claude-sonnet-4-5", wait, true);
+    assert_eq!(one_hour(ms(3000)).await, 0);
+    assert_eq!(one_hour(ms(3600)).await, 1);
+    assert_eq!(one_hour(ms(6_600)).await, 2);
+    assert_eq!(strands_swarm::runtime::KEEP_WARM_MAX_1H, 2);
+    assert_eq!(
+        refreshes_during_a_tool_wait_with_ttl("openai.gpt-6-astra", ms(4200), true).await,
+        2,
+        "refreshed as before, every 27 minutes"
+    );
+}
+
 /// Answers every call with a cached reply, counting calls.
 struct IdleModel {
     id: &'static str,
@@ -6552,6 +6581,12 @@ impl Model for IdleModel {
 /// keep-warm refresh every 10 s: its first turn, the fire's turn, and what keeps its cache warm
 /// after the fire's turn (the first turn's own idle refreshes are not counted).
 async fn calls_while_idle_before_a_fire(model_id: &'static str, minutes: u64) -> usize {
+    calls_while_idle_with_ttl(model_id, minutes, false).await
+}
+
+/// [`calls_while_idle_before_a_fire`] with the one-hour cache when `cache_1h` (refreshes 120 s
+/// apart for the 10 s of the five-minute one).
+async fn calls_while_idle_with_ttl(model_id: &'static str, minutes: u64, cache_1h: bool) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(IdleModel {
         id: model_id,
@@ -6571,6 +6606,7 @@ async fn calls_while_idle_before_a_fire(model_id: &'static str, minutes: u64) ->
     });
     let mut config = SwarmConfig::new(factory, dir.path());
     config.keep_warm = Some(Duration::from_secs(10));
+    config.cache_1h = cache_1h;
     let (swarm, mut events) = Swarm::new(config);
     let root = spawn_root(&swarm, "go").await;
     reply_to(&mut events, USER).await;
@@ -6598,6 +6634,16 @@ async fn an_idle_agent_is_kept_warm_until_a_schedule_fires_only_when_that_is_che
     let idle = strands_swarm::runtime::KEEP_WARM_IDLE;
     assert_eq!(calls_while_idle_before_a_fire("idle", 1).await, 2 + 5);
     assert_eq!(calls_while_idle_before_a_fire("idle", 60).await, 2 + idle);
+}
+
+/// With the one-hour cache an idle agent gets [`KEEP_WARM_IDLE_1H`] refreshes (an hour apart
+/// where it matters), a poller due in a few minutes none beyond the idle ones, as 30 minutes
+/// would cost the same 3 refreshes.
+#[tokio::test(start_paused = true)]
+async fn an_idle_agent_on_the_one_hour_cache_gets_its_own_few_refreshes() {
+    let idle = strands_swarm::runtime::KEEP_WARM_IDLE_1H;
+    assert_eq!(calls_while_idle_with_ttl("idle", 60, true).await, 2 + idle);
+    assert_eq!(calls_while_idle_with_ttl("idle", 1, true).await, 2);
 }
 
 /// The break-even follows the model's cache lifetime: with refreshes 6x as far apart (60 s for
