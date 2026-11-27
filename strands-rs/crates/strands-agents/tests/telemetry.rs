@@ -1,5 +1,7 @@
 //! Span hierarchy, `gen_ai.*` attributes and metrics through the public API
 //! (`telemetry/tracer.test.node.ts`, `telemetry/meter.test.ts`).
+// Spans are only emitted with the `telemetry` feature.
+#![cfg(feature = "telemetry")]
 
 use std::sync::Arc;
 

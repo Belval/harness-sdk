@@ -1,4 +1,7 @@
 //! OTel spans for the agent loop (`strands-ts/src/telemetry/tracer.ts`).
+// Without the `telemetry` feature a raw span is `()`, so the code shared by both builds clones
+// and passes a unit value.
+#![cfg_attr(not(feature = "telemetry"), allow(clippy::clone_on_copy, clippy::unit_arg))]
 
 use parking_lot::Mutex;
 use std::sync::Arc;
