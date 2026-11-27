@@ -66,7 +66,7 @@ impl Swarm {
         owner: &str,
         command: &str,
         name: Option<String>,
-        restart: bool,
+        mode: jobs::Mode,
     ) -> Result<Job> {
         let node = self.known(owner)?;
         self.wait_for_host(owner, false, &node.turn_token()).await?;
@@ -74,14 +74,14 @@ impl Swarm {
         let job = match self.job_over_cap(owner).await {
             Some(_) => {
                 let cwd = node.workdir.get();
-                self.inner.jobs.queue(owner, name, command, &cwd, restart).await?
+                self.inner.jobs.queue(owner, name, command, &cwd, mode).await?
             }
             None => {
                 let env = self.with_build_jobs(node.env.clone());
                 let cwd = node.workdir.get();
                 self.inner
                     .jobs
-                    .start(owner, name, command, &cwd, &env, restart)
+                    .start(owner, name, command, &cwd, &env, mode)
                     .await?
             }
         };
@@ -202,7 +202,12 @@ impl Swarm {
         // Posted and saved before it is marked: a crash in between repeats the report rather than
         // lose it. An owner that is gone (cancelled) cannot be told; the job counts as reported.
         self.inner.reports_posted.lock().insert(id.clone());
-        let _ = self.post(JOBS_SENDER, &job.meta.owner, "job", text);
+        // A quiet job that succeeded is an FYI: the owner reads it at its next turn.
+        let kind = match job.meta.quiet && job.state == jobs::JobState::Exited(0) {
+            true => FYI,
+            false => "job",
+        };
+        let _ = self.post(JOBS_SENDER, &job.meta.owner, kind, text);
         self.journal_event("job_end", serde_json::json!({ "id": id, "status": job.status() }));
         // `post` saves the mailbox in the background; marked first, a crash before that save
         // would lose the report.
@@ -463,6 +468,7 @@ mod tests {
                 pid: 0,
                 started: n,
                 restart: false,
+                quiet: false,
                 restarts: 0,
                 quick: 0,
             };

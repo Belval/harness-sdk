@@ -39,6 +39,23 @@ pub const LOG_KEEP: u64 = 1024 * 1024;
 /// Reported jobs kept on disk; older ones' files are deleted.
 pub const KEEP_JOBS: usize = 200;
 
+/// How a job runs and reports: [`JobMeta::restart`] and [`JobMeta::quiet`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Mode {
+    /// [`JobMeta::restart`].
+    pub restart: bool,
+    /// [`JobMeta::quiet`].
+    pub quiet: bool,
+}
+
+impl Mode {
+    /// Rerun until killed.
+    pub const RESTART: Mode = Mode {
+        restart: true,
+        quiet: false,
+    };
+}
+
 /// What `<id>.json` holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobMeta {
@@ -60,6 +77,9 @@ pub struct JobMeta {
     /// Run it again each time it ends, under this id, until it is killed (the watcher pattern).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub restart: bool,
+    /// A run that exits 0 reports without waking the owner (an FYI); any other end still wakes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
     /// How many times it has been started again.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub restarts: u32,
@@ -229,9 +249,9 @@ impl Jobs {
         command: &str,
         cwd: &Path,
         env: &BTreeMap<String, String>,
-        restart: bool,
+        mode: Mode,
     ) -> Result<Job> {
-        self.create(owner, name, command, cwd, restart, Some(env)).await
+        self.create(owner, name, command, cwd, mode, Some(env)).await
     }
 
     /// Describe a job that is not started yet ([`JobState::Queued`]); [`Self::launch`] starts it.
@@ -241,9 +261,9 @@ impl Jobs {
         name: Option<String>,
         command: &str,
         cwd: &Path,
-        restart: bool,
+        mode: Mode,
     ) -> Result<Job> {
-        self.create(owner, name, command, cwd, restart, None).await
+        self.create(owner, name, command, cwd, mode, None).await
     }
 
     /// A new job, started with `env`, or only described when there is none.
@@ -253,7 +273,7 @@ impl Jobs {
         name: Option<String>,
         command: &str,
         cwd: &Path,
-        restart: bool,
+        mode: Mode,
         env: Option<&BTreeMap<String, String>>,
     ) -> Result<Job> {
         let _guard = self.start.lock().await;
@@ -271,7 +291,8 @@ impl Jobs {
             cwd: cwd.to_path_buf(),
             pid,
             started: now(),
-            restart,
+            restart: mode.restart,
+            quiet: mode.quiet,
             restarts: 0,
             quick: 0,
         };
@@ -688,7 +709,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let jobs = Jobs::new(dir.path().join("jobs"));
         let command = r"printf '\033[1m\033[32mok\033[0m\n 10%%\r 90%%\r100%%\r\nend\n'";
-        jobs.start("a1", None, command, dir.path(), &BTreeMap::new(), false)
+        jobs.start("a1", None, command, dir.path(), &BTreeMap::new(), Mode::default())
             .await
             .unwrap();
         until_ended(&jobs, "j1").await;
@@ -708,7 +729,7 @@ mod tests {
                 "pwd; echo $JOB_TEST_VAR; seq 1 100; exit 3",
                 dir.path(),
                 &env,
-                false,
+                Mode::default(),
             )
             .await
             .unwrap();
@@ -731,7 +752,7 @@ mod tests {
         assert!(jobs.unreported(true).await.is_empty());
 
         let next = jobs
-            .start("a2", None, "true", dir.path(), &BTreeMap::new(), false)
+            .start("a2", None, "true", dir.path(), &BTreeMap::new(), Mode::default())
             .await;
         assert_eq!(next.unwrap().meta.id, "j2", "ids continue after those on disk");
     }
@@ -752,7 +773,7 @@ mod tests {
         assert!(jobs.list().await.is_empty(), "nothing half-written is listed");
 
         let job = jobs
-            .start("a1", None, "true", dir.path(), &BTreeMap::new(), false)
+            .start("a1", None, "true", dir.path(), &BTreeMap::new(), Mode::default())
             .await
             .unwrap();
         assert_eq!(job.meta.id, "j3", "no new job writes into a dead one's files");
@@ -778,9 +799,16 @@ mod tests {
             "(until [ -e go ] || [ ! -e \"$PWD\" ]; do sleep 0.01; done; touch {}) & wait",
             marker.display()
         );
-        jobs.start("a1", None, &command, dir.path(), &BTreeMap::new(), false)
-            .await
-            .unwrap();
+        jobs.start(
+            "a1",
+            None,
+            &command,
+            dir.path(),
+            &BTreeMap::new(),
+            Mode::default(),
+        )
+        .await
+        .unwrap();
         let killed = jobs.kill("j1").await.unwrap();
         assert_eq!(killed.state, JobState::Killed);
         assert!(killed.reported, "the killer already knows");
@@ -800,7 +828,7 @@ mod tests {
             echo \"$group $session\"
             if (: > /dev/tty) 2>/dev/null; then echo tty; else echo no tty; fi";
         let job = jobs
-            .start("a1", None, command, dir.path(), &BTreeMap::new(), false)
+            .start("a1", None, command, dir.path(), &BTreeMap::new(), Mode::default())
             .await
             .unwrap();
         until_ended(&jobs, "j1").await;
@@ -822,6 +850,7 @@ mod tests {
             pid: u32::MAX / 2,
             started: now(),
             restart: false,
+            quiet: false,
             restarts: 0,
             quick: 0,
         };
@@ -850,6 +879,7 @@ mod tests {
                 pid: u32::MAX / 2,
                 started: now(),
                 restart: false,
+                quiet: false,
                 restarts: 0,
                 quick: 0,
             };
@@ -879,7 +909,7 @@ mod tests {
         let none = BTreeMap::new();
         for _ in 0..3 {
             let job = jobs
-                .start("a1", None, "true", dir.path(), &none, false)
+                .start("a1", None, "true", dir.path(), &none, Mode::default())
                 .await
                 .unwrap();
             until_ended(&jobs, &job.meta.id).await;
@@ -889,7 +919,7 @@ mod tests {
         // line.
         let command = "head -c 3000 /dev/zero | tr '\\0' x; echo; touch written; \
                        until [ -e go ] || [ ! -e \"$PWD\" ]; do sleep 0.01; done; echo last";
-        jobs.start("a1", None, command, dir.path(), &none, false)
+        jobs.start("a1", None, command, dir.path(), &none, Mode::default())
             .await
             .unwrap();
         let written = dir.path().join("written");
@@ -918,7 +948,7 @@ mod tests {
         );
         assert_eq!(jobs.tail("j4", 1).await, "last");
         let next = jobs
-            .start("a1", None, "true", dir.path(), &none, false)
+            .start("a1", None, "true", dir.path(), &none, Mode::default())
             .await
             .unwrap();
         assert_eq!(next.meta.id, "j5");
@@ -937,7 +967,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let jobs = Jobs::new(dir.path().join("jobs"));
         let none = BTreeMap::new();
-        jobs.start("a1", None, "echo run; exit 4", dir.path(), &none, true)
+        jobs.start("a1", None, "echo run; exit 4", dir.path(), &none, Mode::RESTART)
             .await
             .unwrap();
         until_ended(&jobs, "j1").await;
@@ -971,10 +1001,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let jobs = Jobs::new(dir.path().join("jobs"));
         let none = BTreeMap::new();
-        jobs.start("a1", None, "true", dir.path(), &none, true)
+        jobs.start("a1", None, "true", dir.path(), &none, Mode::RESTART)
             .await
             .unwrap();
-        jobs.start("a1", None, "true", dir.path(), &none, false)
+        jobs.start("a1", None, "true", dir.path(), &none, Mode::default())
             .await
             .unwrap();
         let (first, second) = (until_ended(&jobs, "j1").await, until_ended(&jobs, "j2").await);
@@ -1001,7 +1031,7 @@ mod tests {
         let jobs = Jobs::new(dir.path().join("jobs"));
         let none = BTreeMap::new();
         for _ in 0..2 {
-            jobs.start("a1", None, "exit 3", dir.path(), &none, false)
+            jobs.start("a1", None, "exit 3", dir.path(), &none, Mode::default())
                 .await
                 .unwrap();
         }
@@ -1036,7 +1066,7 @@ mod tests {
         let none = BTreeMap::new();
         let go = dir.path().join("go");
         let command = format!("if [ -e {} ]; then sleep 30; else exit 4; fi", go.display());
-        jobs.start("a1", None, &command, dir.path(), &none, true)
+        jobs.start("a1", None, &command, dir.path(), &none, Mode::RESTART)
             .await
             .unwrap();
         until_ended(&jobs, "j1").await;
@@ -1057,7 +1087,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let jobs = Jobs::new(dir.path().join("jobs"));
         let none = BTreeMap::new();
-        jobs.start("a1", None, "true", dir.path(), &none, true)
+        jobs.start("a1", None, "true", dir.path(), &none, Mode::RESTART)
             .await
             .unwrap();
         until_ended(&jobs, "j1").await;

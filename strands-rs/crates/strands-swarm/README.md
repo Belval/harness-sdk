@@ -12,7 +12,7 @@ agent with the swarm tools below, and decides for itself whether and how to spli
 | `cancel_agent` | Stop an agent and everything it spawned, background jobs included; reports which worktrees and merged branches were removed and what was kept. |
 | `reload_swarm` | With `--run`: restart the whole swarm into a newly built binary; every agent resumes. |
 | `schedule` | Post a message to a mailbox (default: your own) later and/or repeatedly (`every: "30m"`, at least a minute); list or cancel schedules. |
-| `run_background` | Run a shell command as a background job; its owner gets the exit code and last 40 output lines when it ends. `restart` runs it again each time it ends. |
+| `run_background` | Run a shell command as a background job; its owner gets the exit code and last 40 output lines when it ends. `restart` runs it again each time it ends; with `quiet`, a run that exits 0 reports as an FYI that does not wake the owner (on a live coordinator, 110 of its turns were woken by a successful landing job only to answer `[silent]`). |
 | `jobs` | List your background jobs and other agents' running ones (status, log path; other agents' ended jobs only counted), or kill one with everything it started. |
 | `context` | The agent's context dashboard: size against the compaction point, the biggest items, the stash; offload results or summarize now. |
 | `land` | With `--allow-land`: rebase a branch onto the root's branch, run the checks, fast-forward. |

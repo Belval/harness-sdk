@@ -1266,7 +1266,10 @@ mod tests {
         // 250-agent run), which tells a ~$70 prefix-changing reload apart before it happens.
         // Raised from 16,500 for `todo_write`'s `due` (~15 tokens a call): a promise with a time
         // comes back when it is due instead of being lost between mail-driven turns.
-        const BUDGET_BYTES: usize = 16_600;
+        // Raised from 16,600 for `run_background`'s `quiet` (~10 tokens a call): one live
+        // coordinator spent 110 turns (~$0.25 each) answering `[silent]` to landing jobs that
+        // succeeded.
+        const BUDGET_BYTES: usize = 16_650;
         const TOOL_BUDGET_BYTES: usize = 1_100;
         // 20 skill lines of at most ~110 bytes plus the heading.
         const SKILLS_BUDGET_BYTES: usize = 2_500;

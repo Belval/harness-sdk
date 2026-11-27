@@ -209,6 +209,9 @@ struct RunBackgroundInput {
     /// Rerun each time it ends, until killed.
     #[serde(default)]
     restart: bool,
+    /// Wake only on failure; an exit 0 waits for your next turn.
+    #[serde(default)]
+    quiet: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -264,7 +267,15 @@ async fn run_background_tool(
     _ctx: ToolContext,
 ) -> Result<String> {
     let job = swarm
-        .start_job(&me, &input.command, input.name, input.restart)
+        .start_job(
+            &me,
+            &input.command,
+            input.name,
+            crate::jobs::Mode {
+                restart: input.restart,
+                quiet: input.quiet,
+            },
+        )
         .await?;
     if job.state == JobState::Queued {
         return Ok(format!(
@@ -1000,6 +1011,7 @@ mod tests {
                 pid: 1,
                 started: 0,
                 restart: false,
+                quiet: false,
                 restarts: 0,
                 quick: 0,
             },

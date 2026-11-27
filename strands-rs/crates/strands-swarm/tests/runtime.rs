@@ -1898,7 +1898,12 @@ async fn shells_and_jobs_get_capped_cargo_build_jobs_unless_the_environment_sets
         inherited.is_none().then_some(&expected)
     );
     swarm
-        .start_job("a1", "echo $CARGO_BUILD_JOBS > jobs.txt", None, false)
+        .start_job(
+            "a1",
+            "echo $CARGO_BUILD_JOBS > jobs.txt",
+            None,
+            Default::default(),
+        )
         .await
         .unwrap();
     mail_to(&mut events, "a1", "job").await;
@@ -1931,7 +1936,12 @@ async fn shells_and_jobs_commit_through_the_commit_rule_hooks() {
     assert_eq!(env[&format!("GIT_CONFIG_KEY_{n}")], "core.hooksPath");
     assert_eq!(env[&format!("GIT_CONFIG_VALUE_{n}")], hooks_dir);
     swarm
-        .start_job("a1", "git config core.hooksPath > hooks.txt", None, false)
+        .start_job(
+            "a1",
+            "git config core.hooksPath > hooks.txt",
+            None,
+            Default::default(),
+        )
         .await
         .unwrap();
     mail_to(&mut events, "a1", "job").await;
@@ -3269,7 +3279,7 @@ async fn an_overloaded_host_holds_new_model_calls_and_jobs_until_it_recovers() {
     swarm.set_max_load(None);
     let start = tokio::spawn({
         let swarm = swarm.clone();
-        async move { swarm.start_job("a2", "true", None, false).await }
+        async move { swarm.start_job("a2", "true", None, Default::default()).await }
     });
     assert_eq!(host_held(&mut events, "a2").await.as_deref(), Some(why));
     assert!(swarm.jobs().await.is_empty(), "no job starts while held");
@@ -4275,7 +4285,7 @@ async fn gc_and_resume_remove_a_killed_land_job_s_scratch_once_no_land_job_runs(
 
     // Another land job is running: it might be using the directory.
     let job = swarm
-        .start_job("a1", "sleep 30 # --land plan", None, false)
+        .start_job("a1", "sleep 30 # --land plan", None, Default::default())
         .await
         .unwrap();
     let collected = swarm.gc().await;
@@ -5831,6 +5841,50 @@ async fn a_background_job_mails_its_exit_code_and_output_tail_to_the_idle_agent_
         assert!(tokio::time::Instant::now() < deadline, "never marked reported");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// A `quiet` job that exits 0 reports as an FYI, read at the agent's next turn; one that fails
+/// still wakes it.
+#[tokio::test]
+async fn a_quiet_job_wakes_its_agent_only_when_it_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![(
+        "a1",
+        vec![
+            tool_call(
+                "run_background",
+                "r1",
+                json!({ "command": "echo landed", "name": "land", "quiet": true }),
+            ),
+            say("started"),
+            tool_call(
+                "run_background",
+                "r2",
+                json!({ "command": "exit 3", "name": "land", "quiet": true }),
+            ),
+            say("again"),
+            say("saw it fail"),
+        ],
+    )]);
+    let (swarm, mut events) = Swarm::new(persistent_swarm(&scripts, dir.path()));
+    let id = spawn_root(&swarm, "land it").await;
+    let [reply, report] = mails_to(&mut events, [(USER, "reply"), ("a1", "fyi")]).await;
+    assert_eq!(reply, "started");
+    assert!(report.contains("Job j1 (land) exited 0 after"), "{report}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let model = scripts.lock()["a1"].clone();
+    assert_eq!(model.calls().len(), 2, "a success does not wake it");
+
+    swarm.send(USER, &id, "land the next one").unwrap();
+    let [again, failed] = mails_to(&mut events, [(USER, "reply"), ("a1", "job")]).await;
+    assert_eq!(again, "again");
+    assert!(failed.contains("exited 3 after"), "{failed}");
+    assert_eq!(reply_to(&mut events, USER).await, "saw it fail");
+    assert!(
+        sent_text(&model, 2).contains("Job j1 (land) exited 0"),
+        "the next turn reads the quiet report"
+    );
+    swarm.shutdown().await;
 }
 
 /// A job that writes its output to its own file reports where it went, not just "(no output)".
@@ -8509,35 +8563,35 @@ async fn a_job_over_the_subtree_cap_queues_and_starts_when_a_slot_frees_while_an
 
     let d = dir.path();
     let first = swarm
-        .start_job("a2", &wait_for(d, "g1"), None, false)
+        .start_job("a2", &wait_for(d, "g1"), None, Default::default())
         .await
         .unwrap();
     swarm
-        .start_job("a1", &wait_for(d, "g2"), None, false)
+        .start_job("a1", &wait_for(d, "g2"), None, Default::default())
         .await
         .unwrap();
     // The root is in the priority lane: its jobs never wait, but they count for the others.
     assert_eq!(
         swarm
-            .start_job("a1", &wait_for(d, "g3"), None, false)
+            .start_job("a1", &wait_for(d, "g3"), None, Default::default())
             .await
             .unwrap()
             .state,
         Running
     );
     let third = swarm
-        .start_job("a2", &wait_for(d, "g4"), None, false)
+        .start_job("a2", &wait_for(d, "g4"), None, Default::default())
         .await
         .unwrap();
     assert_eq!(third.state, Queued);
     let fourth = swarm
-        .start_job("a2", &wait_for(d, "g5"), None, false)
+        .start_job("a2", &wait_for(d, "g5"), None, Default::default())
         .await
         .unwrap();
     assert_eq!(fourth.state, Queued);
     // Another subtree has its own slots.
     let other = swarm
-        .start_job("a4", &wait_for(d, "g6"), None, false)
+        .start_job("a4", &wait_for(d, "g6"), None, Default::default())
         .await
         .unwrap();
     assert_eq!(other.state, Running);
@@ -8592,7 +8646,7 @@ async fn without_a_cap_every_job_starts_and_the_cap_can_be_set_and_lifted_at_run
     let d = dir.path();
     for n in 0..4 {
         let job = swarm
-            .start_job("a2", &wait_for(d, &format!("g{n}")), None, false)
+            .start_job("a2", &wait_for(d, &format!("g{n}")), None, Default::default())
             .await
             .unwrap();
         assert_eq!(job.state, Running, "no cap");
@@ -8606,14 +8660,14 @@ async fn without_a_cap_every_job_starts_and_the_cap_can_be_set_and_lifted_at_run
     assert_eq!(swarm.max_jobs(), 5);
     assert_eq!(
         swarm
-            .start_job("a2", &wait_for(d, "h1"), None, false)
+            .start_job("a2", &wait_for(d, "h1"), None, Default::default())
             .await
             .unwrap()
             .state,
         Running
     );
     let queued = swarm
-        .start_job("a2", &wait_for(d, "h2"), None, false)
+        .start_job("a2", &wait_for(d, "h2"), None, Default::default())
         .await
         .unwrap();
     assert_eq!(queued.state, Queued);
@@ -8656,20 +8710,20 @@ async fn a_job_that_used_little_cpu_over_the_window_stops_counting() {
 
     let d = dir.path();
     let watcher = swarm
-        .start_job("a2", &wait_for(d, "w"), Some("watch".into()), false)
+        .start_job("a2", &wait_for(d, "w"), Some("watch".into()), Default::default())
         .await
         .unwrap();
     light.lock().push(watcher.meta.pid);
     // A full window has not passed: the watcher still takes the slot.
     let build = swarm
-        .start_job("a2", &wait_for(d, "b"), None, false)
+        .start_job("a2", &wait_for(d, "b"), None, Default::default())
         .await
         .unwrap();
     assert_eq!(build.state, Queued);
     // Then it has used almost nothing for the whole window, and the build starts.
     until_jobs(&swarm, false, |jobs| jobs[1].state == Running).await;
     let later = swarm
-        .start_job("a2", &wait_for(d, "c"), None, false)
+        .start_job("a2", &wait_for(d, "c"), None, Default::default())
         .await
         .unwrap();
     assert_eq!(later.state, Queued, "the build is busy and holds the slot");
@@ -8747,11 +8801,11 @@ async fn a_resume_without_the_cap_starts_the_jobs_that_were_queued() {
     spawn_child(&swarm, "a1", "work").await;
     mail_to(&mut events, "a1", "reply").await;
     swarm
-        .start_job("a2", &wait_for(d, "g1"), None, false)
+        .start_job("a2", &wait_for(d, "g1"), None, Default::default())
         .await
         .unwrap();
     let queued = swarm
-        .start_job("a2", &wait_for(d, "g2"), None, false)
+        .start_job("a2", &wait_for(d, "g2"), None, Default::default())
         .await
         .unwrap();
     assert_eq!(queued.state, Queued);
