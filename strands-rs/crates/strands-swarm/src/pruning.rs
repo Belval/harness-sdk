@@ -247,12 +247,26 @@ fn drop_old_images(messages: &mut [Message]) -> bool {
 pub const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// The cache lifetime with `--cache-ttl 1h`.
 pub const CACHE_TTL_1H: Duration = Duration::from_secs(60 * 60);
-/// Prune for its own sake once that would remove this share of the history (in characters).
-/// Each prune rewrites the cached conversation (1.25× instead of 0.1× per token) to save 0.1×
-/// of what it removes on every later call. At 15% small agents with chatty shell output pruned
-/// every 4-6 calls, which came to 15-40% of their cost; a simulation over result sizes and
-/// rates puts the cheapest share at 0.4-0.5.
-pub const PRUNE_SHARE: f64 = 0.4;
+/// What a cached input token costs to read, in input tokens.
+const READ_COST: f64 = 0.1;
+/// What writing a token to the cache costs, in input tokens: 1.25 for a [`CACHE_TTL`] cache, 2
+/// for [`CACHE_TTL_1H`].
+fn write_cost(ttl: Duration) -> f64 {
+    match ttl > CACHE_TTL {
+        true => 2.0,
+        false => 1.25,
+    }
+}
+/// Prune for its own sake once the removable part of the history has cost this many times more
+/// in reads than the prune's cache rewrite would. Each prune rewrites the cached conversation
+/// (the write price instead of the read price per token) to save the read price of what it
+/// removes on every later call; waiting costs the removable part's reads each call. Pruning when
+/// those reads add up to the rewrite is never worse than twice the best time. A replay over the
+/// live run's histories (51.9k calls) put the cheapest patience at 1.5 for both cache
+/// lifetimes, under a fixed 40% share of the history by 2.7% (5-minute cache) and 0.7% (1 hour):
+/// that share pruned every 12 calls where the rewrite took 29 to pay back, and so lost on small
+/// histories where a prune frees little to read.
+pub const PRUNE_PATIENCE: f64 = 1.5;
 /// Agent state key: when the agent last called its model (Unix milliseconds). Kept in the
 /// session, so [`PruneReason::Idle`] holds across a restart.
 pub const LAST_CALL_KEY: &str = "swarm_last_model_call_ms";
@@ -272,7 +286,8 @@ pub enum PruneReason {
     /// The last call was longer ago than the cache lives ([`CACHE_TTL`] by default), so the cache
     /// has expired.
     Idle,
-    /// Pruning would remove at least [`PRUNE_SHARE`] of the history, worth one cache rewrite.
+    /// Reading what pruning would remove has cost [`PRUNE_PATIENCE`] cache rewrites since the
+    /// history was last rewritten.
     Large,
 }
 
@@ -293,6 +308,9 @@ struct Gate {
     sent: Mutex<Option<Vec<u64>>>,
     /// A hash of the system prompt and tool specs the last call sent (this process only).
     prompt: Mutex<Option<u64>>,
+    /// What reading the removable part of the history has cost (in input characters) over the
+    /// calls since the cache last held a rewritten history: [`PruneReason::Large`]'s meter.
+    reads: Mutex<f64>,
 }
 
 impl CachePrune {
@@ -305,6 +323,7 @@ impl CachePrune {
             ttl,
             sent: Mutex::new(None),
             prompt: Mutex::new(None),
+            reads: Mutex::new(0.0),
         };
         Self { gate: Arc::new(gate) }
     }
@@ -336,7 +355,11 @@ impl CachePrune {
         if idle {
             return Some(PruneReason::Idle);
         }
-        (removable_share(ctx.messages, ctx.stash.is_some()) >= PRUNE_SHARE).then_some(PruneReason::Large)
+        let (removable, total) = removable_chars(ctx.messages, ctx.stash.is_some());
+        let mut reads = self.gate.reads.lock();
+        *reads += READ_COST * removable as f64;
+        let rewrite = (write_cost(self.gate.ttl) - READ_COST) * (total - removable) as f64;
+        (removable > 0 && *reads >= PRUNE_PATIENCE * rewrite).then_some(PruneReason::Large)
     }
 
     fn edited(&self, messages: &[Message]) -> bool {
@@ -378,6 +401,8 @@ impl ContextStrategy for CachePrune {
         let Some(reason) = self.reason(ctx) else {
             return Ok(false);
         };
+        // Whatever the reason, the history is sent rewritten (or the cache is cold anyway).
+        *self.gate.reads.lock() = 0.0;
         let before: Vec<u64> = ctx.messages.iter().map(hash_without_reasoning).collect();
         let since_sent =
             (self.gate.sent.lock().as_deref()).and_then(|sent| first_change(sent, ctx.messages, hash));
@@ -451,12 +476,12 @@ fn hash(message: &Message) -> u64 {
     hasher.finish()
 }
 
-/// The share of the history (JSON characters) that pruning would remove now; with a stash, old
-/// mail and replies ([`crate::aging`]) count too.
-fn removable_share(messages: &[Message], stash: bool) -> f64 {
+/// How much of the history (JSON characters) pruning would remove now, and its whole length;
+/// with a stash, old mail and replies ([`crate::aging`]) count too.
+fn removable_chars(messages: &[Message], stash: bool) -> (usize, usize) {
     let total: usize = messages.iter().map(json_len).sum();
     if total == 0 {
-        return 0.0;
+        return (0, 0);
     }
     let kept = kept_reasoning(messages);
     let reasoning: usize = messages
@@ -481,7 +506,7 @@ fn removable_share(messages: &[Message], stash: bool) -> f64 {
         true => crate::aging::removable(messages, starts_turn),
         false => 0,
     };
-    (reasoning + results + images + aged) as f64 / total as f64
+    ((reasoning + results + images + aged).min(total), total)
 }
 
 fn json_len<T: serde::Serialize>(value: &T) -> usize {
@@ -771,7 +796,7 @@ mod tests {
     }
 
     /// A finished turn with old reasoning and one large old `shell` result, then a second turn
-    /// whose recent results are large enough that pruning would save under [`PRUNE_SHARE`].
+    /// whose recent results are large enough that pruning would save under a few per cent of the history.
     fn prunable() -> Vec<Message> {
         let mut messages = vec![Message::user("first task")];
         messages.push(assistant(vec![thinking("old"), tool_call("t0")]));
@@ -780,12 +805,29 @@ mod tests {
         let mut second = history(&[("shell", 6_000); KEEP_RECENT_RESULTS]);
         second[0] = Message::user("second task");
         messages.extend(second);
-        assert!(
-            removable_share(&messages, true) < PRUNE_SHARE,
-            "{}",
-            removable_share(&messages, true)
-        );
+        assert!(share(&messages, true) < 0.4, "{}", share(&messages, true));
         messages
+    }
+
+    /// The part of the history pruning would remove now.
+    fn share(messages: &[Message], stash: bool) -> f64 {
+        let (removable, total) = removable_chars(messages, stash);
+        removable as f64 / total as f64
+    }
+
+    /// Passes (warm calls with nothing new) until the gate prunes, at most `limit`.
+    async fn passes_until_pruned(
+        prune: &CachePrune,
+        agent: &Agent,
+        messages: &mut Vec<Message>,
+        limit: usize,
+    ) -> Option<usize> {
+        for n in 1..=limit {
+            if pass(prune, agent, messages, 0.1).await {
+                return Some(n);
+            }
+        }
+        None
     }
 
     fn pruned(messages: &[Message]) -> bool {
@@ -891,21 +933,91 @@ mod tests {
         assert!(pass(&CachePrune::new(None, CACHE_TTL), &agent, &mut messages, 0.1).await);
     }
 
-    #[tokio::test]
-    async fn prunes_once_it_would_remove_prune_share_of_the_history() {
-        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
-        let mut messages = prunable();
-        assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
-        // Six more large results age the second turn's ones out of the kept window.
+    /// Six more large results age the second turn's ones out of the kept window.
+    fn age_out(messages: &mut Vec<Message>) {
         for i in 10..10 + KEEP_RECENT_RESULTS {
             let id = format!("t{i}");
             messages.push(assistant(vec![tool_call(&id)]));
             messages.push(result(&id, "y".repeat(6_000)));
         }
-        assert!(removable_share(&messages, true) >= PRUNE_SHARE);
-        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
+    }
+
+    #[tokio::test]
+    async fn prunes_once_reading_what_it_would_remove_costs_more_than_a_rewrite() {
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+        let mut messages = prunable();
+        assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
+        age_out(&mut messages);
+        let share = share(&messages, true);
+        assert!(share > 0.3, "{share}");
+        // Reading the removable part costs 0.1 per call and the rewrite of the rest 1.15, to
+        // be matched PRUNE_PATIENCE times over: tens of calls for a share of a third.
+        let calls = passes_until_pruned(&prune, &agent, &mut messages, 100).await;
+        let expected = PRUNE_PATIENCE * 1.15 * (1.0 - share) / (0.1 * share);
+        let calls = calls.expect("pruned in the end") as f64;
+        assert!(
+            (calls - expected).abs() <= 1.0,
+            "{calls} calls, expected {expected}"
+        );
         assert!(pruned(&messages));
-        assert!(removable_share(&messages, true) < 0.01);
+        assert!(removable_chars(&messages, true).0 * 100 < removable_chars(&messages, true).1);
+        assert_eq!(
+            passes_until_pruned(&prune, &agent, &mut messages, 100).await,
+            None,
+            "nothing left to remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_one_hour_cache_waits_longer_for_a_prune_to_pay() {
+        let wait = |ttl| async move {
+            let (prune, agent) = (CachePrune::new(None, ttl), agent());
+            let mut messages = prunable();
+            assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
+            age_out(&mut messages);
+            passes_until_pruned(&prune, &agent, &mut messages, 100)
+                .await
+                .unwrap()
+        };
+        let (short, long) = (wait(CACHE_TTL).await, wait(CACHE_TTL_1H).await);
+        // Writes cost 2 instead of 1.25, so the rewrite is 1.9 instead of 1.15 reads' worth.
+        assert!(
+            long > short && long as f64 / short as f64 > 1.4,
+            "{short} vs {long}"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_rewrite_starts_the_meter_over() {
+        let full = {
+            let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+            let mut messages = prunable();
+            assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
+            age_out(&mut messages);
+            passes_until_pruned(&prune, &agent, &mut messages, 100)
+                .await
+                .unwrap()
+        };
+        assert!(full > 3, "{full}");
+
+        // Nearly paid, then a cold cache prunes for free: what was read so far no longer counts.
+        let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
+        let mut messages = prunable();
+        assert!(!pass(&prune, &agent, &mut messages, 0.1).await);
+        age_out(&mut messages);
+        assert!(passes_until_pruned(&prune, &agent, &mut messages, full - 1)
+            .await
+            .is_none());
+        agent.state().set(LAST_CALL_KEY, minutes_ago(6));
+        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
+        age_out(&mut messages);
+        let again = passes_until_pruned(&prune, &agent, &mut messages, 100)
+            .await
+            .unwrap();
+        assert!(
+            again * 2 >= full,
+            "{again} calls after a rewrite, {full} on a fresh meter"
+        );
     }
 
     /// A coordinator's turns: a child's long report, then a long reply of its own.
@@ -931,38 +1043,40 @@ mod tests {
             !pass(&prune, &agent, &mut messages, 0.1).await,
             "every turn is recent"
         );
-        // Old turns past a few: some to age, but under PRUNE_SHARE of the history.
+        // Old turns past a few: some to age, but not yet worth a rewrite.
         messages.splice(0..0, coordinator(3));
         prune
             .mark()
             .apply(&mut ctx(&mut messages, &agent, 0.1))
             .await
             .unwrap();
-        assert!(removable_share(&messages, true) < PRUNE_SHARE);
+        assert!(share(&messages, true) < 0.4);
         assert!(
             !pass(&prune, &agent, &mut messages, 0.1).await,
             "warm, not worth a rewrite"
         );
         assert_eq!(
-            removable_share(&messages, false),
-            0.0,
+            removable_chars(&messages, false).0,
+            0,
             "without a stash nothing ages"
         );
-        // As many old turns as recent ones: well over PRUNE_SHARE.
+        // As many old turns as recent ones: about half the history.
         messages.splice(0..0, coordinator(keep));
         prune
             .mark()
             .apply(&mut ctx(&mut messages, &agent, 0.1))
             .await
             .unwrap();
-        assert!(removable_share(&messages, true) >= PRUNE_SHARE);
-        assert!(pass(&prune, &agent, &mut messages, 0.1).await);
+        assert!(share(&messages, true) > 0.4);
+        assert!(passes_until_pruned(&prune, &agent, &mut messages, 100)
+            .await
+            .is_some());
         let aged = messages
             .iter()
             .take_while(|m| m.text().contains("[Stashed:"))
             .count();
         assert_eq!(aged, 2 * (keep + 3), "every old turn's report and reply aged");
-        assert!(removable_share(&messages, true) < 0.01);
+        assert!(share(&messages, true) < 0.01);
     }
 
     #[tokio::test]
@@ -1154,7 +1268,7 @@ mod tests {
     #[tokio::test]
     async fn images_stay_on_a_warm_call() {
         let (prune, agent) = (CachePrune::new(None, CACHE_TTL), agent());
-        // A long first message keeps what pruning would save under PRUNE_SHARE of the history.
+        // A long first message keeps what pruning would save a small part of the history.
         let mut messages = image_loop(8);
         messages[0] = Message::user("task ".repeat(20_000));
         let before = messages.clone();

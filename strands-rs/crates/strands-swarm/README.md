@@ -184,8 +184,13 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     the cache is cold anyway: in the pass that summarizes, after the context was edited (e.g. by
     the `context` tool), after the system prompt or tools changed (a `cd`, a `find_tools` enable;
     then all thinking goes, as it is bound to them), on the first call after the cache's lifetime
-    (five idle minutes, an hour with `--cache-ttl 1h`), on overflow, or once they would remove 40%
-    of the history. Every other call re-sends history byte for byte.
+    (five idle minutes, an hour with `--cache-ttl 1h`), on overflow, or once reading what they
+    would remove has cost 1.5 rewrites of the rest of the history (the rewrite is 1.15 reads'
+    worth per token with a 5-minute cache, 1.9 with `--cache-ttl 1h`, so it waits longer: a
+    history that is half removable prunes after ~17 calls, or ~29 with the hour cache). Every
+    other call re-sends history byte for byte. On the 22-hour live run's 51.9k calls a fixed 40%
+    pruned every 12 calls where the rewrite took 29 to pay back; most prunes' edits sit just
+    after the system prompt, so they rewrite almost the whole cache.
   - The `context` tool lets the agent manage its own context. It lists the biggest items with tool
     results numbered (not previews and stubs, which offloading would not shrink). `offload: [n, …]`
     replaces results with a stub whose reference reads them back; a stub names only its own
