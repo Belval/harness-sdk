@@ -289,8 +289,13 @@ impl ChatStream {
                 trace: None,
             });
         }
+        // Some OpenAI-compatible servers finish a complete tool-call reply with `stop`.
+        let stop_reason = match self.stop_reason.clone() {
+            None | Some(StopReason::EndTurn) if !self.tool_calls.is_empty() => StopReason::ToolUse,
+            other => other.unwrap_or(StopReason::EndTurn),
+        };
         out.push(ModelStreamEvent::MessageStop {
-            stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
+            stop_reason,
             additional_model_response_fields: None,
         });
         out

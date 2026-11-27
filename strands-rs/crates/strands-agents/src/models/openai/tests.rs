@@ -433,6 +433,22 @@ async fn chat_stream_maps_text_tool_calls_and_buffered_usage() {
     );
 }
 
+#[tokio::test]
+async fn chat_stream_reports_tool_use_for_tool_calls_finished_with_stop() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let events = collect(&model(OpenAIApi::Chat, body), &[user("hi")]).await;
+    assert!(matches!(
+        events.last().unwrap(),
+        ModelStreamEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn maps_openai_stop_reasons() {
     assert_eq!(chat::map_finish_reason("stop"), StopReason::EndTurn);
