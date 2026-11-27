@@ -461,13 +461,16 @@ async fn run_tool(
     events: &mpsc::Sender<ToolExecutorEvent>,
 ) -> Result<(ToolResultBlock, Option<std::sync::Arc<Error>>)> {
     let Some(tool) = tool else {
-        return Ok((
-            ToolResultBlock::error(
-                &tool_use.tool_use_id,
-                format!("Tool '{}' not found in registry", tool_use.name),
-            ),
-            None,
-        ));
+        // Name the tools there are, so a model that guessed a name (`bash` for `shell`) can
+        // retry with the right one instead of guessing again.
+        let names = input
+            .agent
+            .with_tool_registry(|r| r.list().iter().map(|t| t.name().to_owned()).collect::<Vec<_>>());
+        let mut text = format!("Tool '{}' not found in registry", tool_use.name);
+        if !names.is_empty() {
+            text.push_str(&format!("; available tools: {}", names.join(", ")));
+        }
+        return Ok((ToolResultBlock::error(&tool_use.tool_use_id, text), None));
     };
 
     let (progress_tx, mut progress_rx) = mpsc::channel(16);
@@ -639,6 +642,15 @@ mod tests {
         let (_, results, events) = run(&SequentialToolExecutor, &input).await;
         assert_eq!(results[0].status, ToolResultStatus::Error);
         assert_eq!(text(&results[0]), "Tool 'missing' not found in registry");
+        agent.with_tool_registry(|r| {
+            r.add(echo_tool("shell")).unwrap();
+            r.add(echo_tool("read")).unwrap();
+        });
+        let (_, results, _) = run(&SequentialToolExecutor, &input).await;
+        assert_eq!(
+            text(&results[0]),
+            "Tool 'missing' not found in registry; available tools: shell, read"
+        );
         let after = events
             .iter()
             .find_map(|e| match e {
