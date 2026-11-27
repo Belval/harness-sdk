@@ -61,7 +61,7 @@ pub fn is_transient(error: &Error) -> bool {
 }
 
 /// `error` and every source under it, joined.
-fn chain(error: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {

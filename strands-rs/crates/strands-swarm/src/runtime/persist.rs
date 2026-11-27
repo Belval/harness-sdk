@@ -155,7 +155,10 @@ impl Swarm {
                             swarm.emit(history);
                         }
                     }
-                    Err(error) => tracing::warn!(agent = %id, %error, "saved conversation unreadable"),
+                    Err(error) => {
+                        let error = crate::retry::chain(&error);
+                        tracing::warn!(agent = %id, %error, "saved conversation unreadable")
+                    }
                 }
             }
         }));

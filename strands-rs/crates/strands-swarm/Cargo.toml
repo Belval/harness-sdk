@@ -38,7 +38,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 ratatui-image.workspace = true
 chrono.workspace = true
 image.workspace = true
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "resource"] }
 # glibc malloc keeps every thread arena at its high-water mark; jemalloc returns freed pages.
 tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 

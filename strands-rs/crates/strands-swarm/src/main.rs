@@ -248,6 +248,7 @@ fn parse_inodes(text: &str) -> Result<u64, String> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    strands_swarm::limits::raise_open_files();
     strands_swarm::watchdog::spawn(Duration::from_secs(10), |report| {
         // Under swarmctl stderr goes to the run's stderr.log.
         release_terminal();
