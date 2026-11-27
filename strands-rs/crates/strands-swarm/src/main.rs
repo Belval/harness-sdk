@@ -129,6 +129,11 @@ struct Cli {
     /// whichever is smaller; `0` turns only this check off.
     #[arg(long, value_name = "COUNT", value_parser = parse_inodes)]
     min_free_inodes: Option<u64>,
+    /// Tell the root agents once when a filesystem's free space (or inodes), falling at the linear
+    /// rate of the last 24 hours (after 6 hours of samples), reaches its floor within this many
+    /// days; `0` turns it off.
+    #[arg(long, value_name = "DAYS", default_value_t = 3)]
+    disk_warn_days: u32,
     /// Summarize an agent's older turns once a call's input reaches this many tokens (e.g. `300k`,
     /// `1.5M`), or 85% of the model's window if that is smaller. Without it, 85% of the window
     /// (850k tokens for a 1M window). `spawn_agent`'s `compact_at` overrides it for one agent.
@@ -454,6 +459,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         None => Some(strands_swarm::runtime::default_build_jobs()),
     };
     config.min_free_inodes = cli.min_free_inodes;
+    config.disk_warn_days = cli.disk_warn_days;
     if cli.min_free_disk > 0 {
         config.disk_reserve = strands_swarm::reserve::RESERVE_BYTES;
     }

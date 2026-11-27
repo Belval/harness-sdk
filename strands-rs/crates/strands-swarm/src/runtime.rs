@@ -56,6 +56,7 @@ mod report;
 mod retention;
 mod scheduler;
 mod spend;
+mod trend;
 mod warm;
 
 pub(crate) use actor::summarize_input;
@@ -362,6 +363,10 @@ pub struct SwarmConfig {
     /// bytes: `None` is [`inode_floor`]'s default (5% of its inodes, at most a million), `Some(0)`
     /// turns the check off.
     pub min_free_inodes: Option<u64>,
+    /// [`Swarm::guard_disk`] warns the root agents once when a filesystem's free space (or
+    /// inodes) is falling so fast that its linear trend over the last day reaches the floor within
+    /// this many days; `0` turns it off.
+    pub disk_warn_days: u32,
     /// Between a live agent's turns, once this long has passed since its stash was last pruned
     /// (or the agent started), delete the entries its saved session no longer names
     /// ([`crate::stash_gc::prune_unnamed`]); `None` prunes only on resume.
@@ -417,6 +422,7 @@ impl SwarmConfig {
             build_jobs: Some(default_build_jobs()),
             disk_reserve: 0,
             min_free_inodes: None,
+            disk_warn_days: 3,
             stash_prune_every: Some(STASH_PRUNE_EVERY),
             keep_cancelled: None,
             cancelled_history: true,

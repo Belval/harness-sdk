@@ -3,6 +3,7 @@
 //! Free inodes count like free bytes: a filesystem out of inodes fails every file create with
 //! `ENOSPC` while terabytes are free, and a cargo target dir is tens of thousands of small files.
 
+use super::trend::{Trends, Warning};
 use super::*;
 use crate::text::count;
 
@@ -23,8 +24,10 @@ pub const LOW_DISK_CHECK_EVERY: Duration = Duration::from_secs(5);
 pub const MIN_FREE_INODES: u64 = 1_000_000;
 
 /// What a filesystem has left.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Space {
+    /// Which filesystem: readings with the same `dev` are one (the trend history is per `dev`).
+    pub dev: u64,
     /// Free bytes for an unprivileged writer.
     pub bytes: u64,
     /// `(free, total)` inodes; `None` where the filesystem has no fixed inode count (btrfs, xfs
@@ -35,7 +38,10 @@ pub struct Space {
 impl From<u64> for Space {
     /// `bytes` free, inodes unknown.
     fn from(bytes: u64) -> Self {
-        Space { bytes, inodes: None }
+        Space {
+            bytes,
+            ..Space::default()
+        }
     }
 }
 
@@ -80,6 +86,8 @@ impl Swarm {
             .map(|dir| dir.join(DISK_WARNED_FILE));
         let mut warned = marker.as_ref().is_some_and(|marker| marker.exists());
         let inodes = self.inner.config.min_free_inodes;
+        let mut trends = Trends::new(self.inner.config.disk_warn_days);
+        let started = tokio::time::Instant::now();
         // The last pass over finished agents' target dirs, while space is low.
         let mut reclaimed_at: Option<tokio::time::Instant> = None;
         loop {
@@ -92,6 +100,21 @@ impl Swarm {
                     .unwrap_or_default()
             };
             *self.inner.host.disk_free.lock() = least_free(&readings);
+            let floors = |space: &Space| {
+                let files = match (inodes, space.inodes) {
+                    (Some(0), _) | (_, None) => 0,
+                    (_, Some((_, total))) => inode_floor(inodes, total),
+                };
+                (min_free, files)
+            };
+            let due = trends.observe(started.elapsed(), &readings, floors);
+            *self.inner.host.disk_trend.lock() = readings
+                .iter()
+                .min_by_key(|(_, space)| space.bytes)
+                .and_then(|(_, space)| trends.bytes_estimate(space.dev));
+            if !due.is_empty() {
+                self.warn_trends(due).await;
+            }
             let low = match judge(&readings, min_free, inodes) {
                 Verdict::Recovered => {
                     *self.inner.host.disk_low.lock() = None;
@@ -142,6 +165,19 @@ impl Swarm {
                 () = self.inner.root_cancel.cancelled() => return,
                 () = tokio::time::sleep(pause) => {}
             }
+        }
+    }
+
+    /// Tell the root agents which filesystems will reach their floor soon, with the biggest
+    /// target dirs (the reclaim ranking).
+    async fn warn_trends(&self, due: Vec<Warning>) {
+        for warning in due {
+            let targets = self.target_dirs();
+            let by_files = warning.inodes;
+            let sizes = tokio::task::spawn_blocking(move || biggest(targets, by_files))
+                .await
+                .unwrap_or_default();
+            self.tell_roots(DISK_SENDER, "disk", trend_warning(&warning, &sizes));
         }
     }
 
@@ -491,6 +527,43 @@ fn disk_warning(
     text
 }
 
+/// The FYI that a filesystem fills up: `disk: the filesystem of /x loses ~1.0 TB/day; at this rate
+/// free space reaches the floor in ~9 days (biggest target dirs: 90 GB x (a2), 40 GB y (a3))`.
+fn trend_warning(warning: &Warning, sizes: &[(String, PathBuf, u64, u64)]) -> String {
+    let (what, per_day) = if warning.inodes {
+        (
+            "inodes",
+            format!("{} inodes", count(warning.estimate.per_day.round() as u64)),
+        )
+    } else {
+        ("space", crate::gc::human(warning.estimate.per_day.round() as u64))
+    };
+    let days = warning.estimate.days;
+    let left = if days < 1.0 {
+        format!("~{:.0} hours", days * 24.0)
+    } else {
+        format!("~{days:.0} days")
+    };
+    let size = |(label, _, bytes, files): &(String, PathBuf, u64, u64)| {
+        if warning.inodes {
+            format!("{} files {label}", count(*files))
+        } else {
+            format!("{} {label}", crate::gc::human(*bytes))
+        }
+    };
+    let top: Vec<String> = sizes.iter().take(3).map(size).collect();
+    let biggest = if top.is_empty() {
+        String::new()
+    } else {
+        format!(" (biggest target dirs: {})", top.join(", "))
+    };
+    format!(
+        "disk: the filesystem of {} loses ~{per_day}/day; at this rate free {what} reaches the \
+         floor in {left}{biggest}",
+        warning.path.display()
+    )
+}
+
 /// Free bytes and inodes on the filesystem holding `path` for an unprivileged writer (`statvfs`'s
 /// available blocks and file slots, as `df` shows them).
 #[allow(clippy::useless_conversion)] // Not `u64` on every platform.
@@ -499,7 +572,8 @@ pub fn free_space(path: &Path) -> Option<Space> {
     let bytes = u64::from(stats.blocks_available()).checked_mul(u64::from(stats.fragment_size()))?;
     let total = u64::from(stats.files());
     let inodes = (total > 0).then(|| (u64::from(stats.files_available()), total));
-    Some(Space { bytes, inodes })
+    let dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(path).ok()?);
+    Some(Space { dev, bytes, inodes })
 }
 
 #[cfg(test)]
@@ -507,7 +581,14 @@ mod tests {
     use super::*;
 
     fn reading(path: &str, bytes: u64, inodes: Option<(u64, u64)>) -> (PathBuf, Space) {
-        (PathBuf::from(path), Space { bytes, inodes })
+        (
+            PathBuf::from(path),
+            Space {
+                dev: 0,
+                bytes,
+                inodes,
+            },
+        )
     }
 
     #[test]
@@ -534,6 +615,7 @@ mod tests {
         std::fs::create_dir(&a).unwrap();
         let free = |path: &Path| {
             Some(Space {
+                dev: 0,
                 bytes: if path.ends_with("a") { 5 } else { 9 },
                 inodes: Some((if path.ends_with("a") { 90 } else { 40 }, 1000)),
             })

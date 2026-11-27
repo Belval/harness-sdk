@@ -6738,6 +6738,7 @@ impl DiskProbe {
         Arc::new(move |_: &Path| {
             probe.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(strands_swarm::runtime::Space {
+                dev: 0,
                 bytes: probe.free.load(std::sync::atomic::Ordering::SeqCst),
                 inodes: Some((
                     probe.inodes.load(std::sync::atomic::Ordering::SeqCst),
@@ -6884,6 +6885,59 @@ async fn a_restarted_swarm_does_not_repeat_a_disk_warning() {
     let _third = guard(&swarm);
     probe.settle().await;
     assert_eq!(disk_warnings(&mut events).len(), 1);
+    swarm.shutdown().await;
+}
+
+/// A disk that fills at 1 TB/day (a sample every 10 minutes) warns the root once, after 6 hours,
+/// with the rate and the days left, and `/status` shows the trend; recovered, it warns again.
+#[tokio::test(start_paused = true)]
+async fn a_filling_disk_warns_the_root_once_per_episode_and_shows_in_status() {
+    const TB: u64 = 1 << 40;
+    let dir = tempfile::tempdir().unwrap();
+    let replies = (0..4).map(|_| say("noted")).collect();
+    let (swarm, mut events, _) = swarm_with(vec![("a1", replies)], dir.path());
+    spawn_root(&swarm, "root").await;
+    reply_to(&mut events, USER).await;
+    let probe = DiskProbe::new(3 * TB);
+    let every = Duration::from_secs(600);
+    tokio::spawn(swarm.clone().guard_disk(20 << 30, every, probe.check()));
+    let hours = |from: u64, to: u64, start: u64, per_day: i64| {
+        let probe = probe.clone();
+        async move {
+            for step in from * 6..to * 6 {
+                probe.set((start as i64 - per_day * step as i64 / 144) as u64);
+                tokio::time::sleep(every).await;
+            }
+        }
+    };
+    hours(0, 5, 3 * TB, TB as i64 * 3 / 2).await;
+    assert_eq!(disk_warnings(&mut events), [], "under 6 hours of samples");
+    assert!(!swarm.status().limits.unwrap().describe().contains("/day"));
+    hours(5, 12, 3 * TB, TB as i64 * 3 / 2).await;
+    let warnings = disk_warnings(&mut events);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].0, "a1");
+    assert!(
+        warnings[0].1.starts_with("disk: the filesystem of ")
+            && warnings[0]
+                .1
+                .contains(" loses ~1.5 TB/day; at this rate free space reaches the floor in ~2 days"),
+        "{}",
+        warnings[0].1
+    );
+    let described = swarm.status().limits.unwrap().describe();
+    assert!(described.contains("(\u{2212}1.5 TB/day, ~"), "{described}");
+    hours(12, 20, 3 * TB, TB as i64 * 3 / 2).await;
+    assert_eq!(disk_warnings(&mut events), [], "one warning per episode");
+
+    // Free space comes back and stays level for a day: the estimate is gone, the guard re-armed.
+    for _ in 0..(26 * 6) {
+        probe.set(20 * TB);
+        tokio::time::sleep(every).await;
+    }
+    assert!(!swarm.status().limits.unwrap().describe().contains("/day"));
+    hours(0, 12, 3 * TB, TB as i64 * 3 / 2).await;
+    assert_eq!(disk_warnings(&mut events).len(), 1, "a new episode warns again");
     swarm.shutdown().await;
 }
 
@@ -7173,6 +7227,7 @@ async fn the_task_a_run_was_started_with_is_saved() {
 async fn finished_worktree_agents_are_flagged_and_lose_their_target_dir_when_disk_runs_low() {
     let low_bytes: strands_swarm::runtime::FreeSpace = Arc::new(|_: &Path| {
         Some(strands_swarm::runtime::Space {
+            dev: 0,
             bytes: 5 << 30,
             inodes: Some((50_000_000, 100_000_000)),
         })
@@ -7186,6 +7241,7 @@ async fn finished_worktree_agents_are_flagged_and_lose_their_target_dir_when_dis
 async fn finished_worktree_agents_lose_their_target_dir_when_inodes_run_low() {
     let low_inodes: strands_swarm::runtime::FreeSpace = Arc::new(|_: &Path| {
         Some(strands_swarm::runtime::Space {
+            dev: 0,
             bytes: 500 << 30,
             inodes: Some((40_000, 100_000_000)),
         })

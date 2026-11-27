@@ -51,7 +51,7 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
               [--budget-tokens N] [--compact-at TOKENS]
               [--allow-land] [--land-into GLOB]... [--gate CMD]...
               [--notify] [--status-base BRANCH] [--prices FILE] [--min-free-disk SIZE]
-              [--min-free-inodes COUNT] [--headless]
+              [--min-free-inodes COUNT] [--disk-warn-days N] [--headless]
               [--journal | --gc | --cost] [TASK]
 ```
 
@@ -291,7 +291,7 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     the priority lane, below.
   - A held agent says why, like a queued call: `waiting: host load 180/128 (/max-load to
     change)` in its log line, `/status` and `list_agents`; `/status` starts with
-    `agents 3/100 · calls 8/8 · load 45/128 · disk 120 GB free · 8.2M inodes free` (the least
+    `agents 3/100 · calls 8/8 · load 45/128 · disk 120 GB free (−1.0 GB/day, ~9 days) · 8.2M inodes free` (the least
     free bytes and inodes over the disks the disk guard watches). Holds are logged as `host_held` in `events.jsonl`.
   - The host is read from `/proc` at most once a second. A held caller looks again each second,
     and every fresh reading (and every `/max-load` or `/min-free-mem` change) wakes all held
@@ -840,6 +840,14 @@ messages you.
     (~50k files each) in which the guard can still reclaim before saves fail, while 5% keeps a
     small filesystem from being held on its first build. There is no `/min-free-inodes` TUI
     command: the limit is a startup option.
+  - **Trend.** The guard keeps one sample of each filesystem's free bytes (and inodes) per 10
+    minutes for the last 24 hours, in memory (a restart starts a new window). Once the samples
+    span 6 hours it fits a line to them; if free space is falling and that line reaches the floor
+    in under `--disk-warn-days` (default `3`; `0` turns it off) the root agents get one FYI per
+    episode, from `disk`: `disk: the filesystem of /x loses ~1.0 TB/day; at this rate free space
+    reaches the floor in ~2 days (biggest target dirs: 90 GB a2, ...)`. The estimate has to come
+    back above twice the threshold (or stop falling) to arm it again. Bytes and inodes warn
+    separately. `/status` shows it beside the free space once known.
   - Meanwhile agents' worktree spawns and land jobs wait, shown like a load hold: `waiting: disk
     space low: 3.0 GB free on the filesystem of /x (below 20 GB; cancel finished worktree agents
     to free some)`. They go on once space has recovered to 10% above the threshold. Spawns

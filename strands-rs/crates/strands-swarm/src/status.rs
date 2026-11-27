@@ -249,11 +249,14 @@ pub struct Limits {
     /// The least free bytes and free inodes on the disks the swarm writes to, as the disk guard
     /// last read them; `None` without a guard.
     pub disk: Option<(u64, Option<u64>)>,
+    /// Bytes the least-free disk loses per day by the guard's linear fit over the last day, and
+    /// the days until its floor at that rate; `None` until it has 6 hours of samples falling.
+    pub disk_trend: Option<(u64, f64)>,
 }
 
 impl Limits {
-    /// `3 of 100 agent slots in use · calls 8/8 · load 45/128 · disk 120 GB free · 8.2M inodes
-    /// free`.
+    /// `3 of 100 agent slots in use · calls 8/8 · load 45/128 · disk 120 GB free (−1.0 GB/day, ~9 days) ·
+    /// 8.2M inodes free`.
     pub fn describe(&self) -> String {
         let (calls, limit) = self.calls;
         let limit = if limit == 0 {
@@ -269,7 +272,16 @@ impl Limits {
             let inodes = inodes.map_or(String::new(), |free| {
                 format!(" · {} inodes free", crate::text::count(free))
             });
-            format!(" · disk {} free{inodes}", crate::gc::human(bytes))
+            let trend = self.disk_trend.map_or(String::new(), |(per_day, days)| {
+                let rounded = days.round().max(1.0) as u64;
+                let days = match rounded {
+                    _ if days > 365.0 => String::new(),
+                    1 => ", ~1 day".to_owned(),
+                    d => format!(", ~{d} days"),
+                };
+                format!(" (\u{2212}{}/day{days})", crate::gc::human(per_day))
+            });
+            format!(" · disk {} free{trend}{inodes}", crate::gc::human(bytes))
         });
         format!("{} · calls {calls}/{limit}{load}{disk}", self.agents)
     }
@@ -684,6 +696,32 @@ async fn git(dir: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_disk_trend_shows_beside_the_free_space() {
+        let limits = |disk_trend| Limits {
+            agents: AgentSlots {
+                in_use: 3,
+                limit: 100,
+                waiting: 0,
+            },
+            calls: (8, 8),
+            load: None,
+            disk: Some((9_400 << 30, Some(8_200_000))),
+            disk_trend,
+        };
+        let tb = 1u64 << 40;
+        let text = |trend| limits(trend).describe();
+        assert!(
+            text(Some((tb, 9.2)))
+                .ends_with("disk 9.2 TB free (\u{2212}1.0 TB/day, ~9 days) · 8.2M inodes free"),
+            "{}",
+            text(Some((tb, 9.2)))
+        );
+        assert!(text(Some((tb, 0.4))).contains("(\u{2212}1.0 TB/day, ~1 day)"));
+        assert!(text(Some((1 << 20, 4000.0))).contains("(\u{2212}1.0 MB/day)"));
+        assert!(text(None).ends_with("disk 9.2 TB free · 8.2M inodes free"));
+    }
 
     fn todo(content: &str, status: TodoStatus) -> TodoItem {
         TodoItem {

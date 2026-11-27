@@ -68,6 +68,12 @@ impl Swarm {
                     .filter(|max| *max > 0.0)
                     .and_then(|max| Some((self.host()?.load, max))),
                 disk: *self.inner.host.disk_free.lock(),
+                disk_trend: self
+                    .inner
+                    .host
+                    .disk_trend
+                    .lock()
+                    .map(|e| (e.per_day.round() as u64, e.days)),
             }),
             base: cache.base,
             agents,

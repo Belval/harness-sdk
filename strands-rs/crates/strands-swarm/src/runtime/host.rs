@@ -66,6 +66,8 @@ pub(super) struct HostGate {
     pub(super) disk_low: Mutex<Option<String>>,
     /// The least free bytes and inodes over the disks the guard watches, as it last read them.
     pub(super) disk_free: Mutex<Option<(u64, Option<u64>)>>,
+    /// The fitted decline of the free bytes of the filesystem `disk_free` reads, once known.
+    pub(super) disk_trend: Mutex<Option<super::trend::Estimate>>,
 }
 
 /// Clears an agent's hold when its wait ends, however it ends.
