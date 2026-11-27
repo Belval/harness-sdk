@@ -316,6 +316,22 @@ pub fn write() -> FunctionTool {
         })
 }
 
+/// The lines where `needle`'s matches in `content` start, as `read` numbers them: the first
+/// [`MATCH_LINES_SHOWN`], then how many more.
+fn match_lines(content: &str, needle: &str) -> String {
+    let starts: Vec<usize> = content.match_indices(needle).map(|(at, _)| at).collect();
+    let mut shown: Vec<String> = (starts.iter().take(MATCH_LINES_SHOWN))
+        .map(|&at| (content[..at].matches('\n').count() + 1).to_string())
+        .collect();
+    if starts.len() > MATCH_LINES_SHOWN {
+        shown.push(format!("{} more", starts.len() - MATCH_LINES_SHOWN));
+    }
+    shown.join(", ")
+}
+
+/// Lines listed for an ambiguous `old_str`, at most.
+const MATCH_LINES_SHOWN: usize = 10;
+
 /// The `edit` tool: exact-string replacement that must match exactly once.
 pub fn edit() -> FunctionTool {
     FunctionTool::builder("edit")
@@ -345,8 +361,9 @@ pub fn edit() -> FunctionTool {
             }
             if occurrences > 1 {
                 return Err(err(format!(
-                    "old_str appears {occurrences} times in {}; make it unique.",
-                    input.path
+                    "old_str appears {occurrences} times in {} (at lines {}); make it unique.",
+                    input.path,
+                    match_lines(&content, &input.old_str)
                 )));
             }
 
@@ -566,7 +583,7 @@ mod tests {
     async fn edit_fails_when_old_str_is_ambiguous() {
         let dir = tmp();
         let path = dir.path().join("a.txt");
-        tokio::fs::write(&path, "x x x").await.unwrap();
+        tokio::fs::write(&path, "x\nx x").await.unwrap();
         let result = invoke(
             &edit(),
             serde_json::json!({ "path": path, "old_str": "x", "new_str": "y" }),
@@ -574,9 +591,16 @@ mod tests {
         .await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(text_of(&result).contains(&format!(
-            "old_str appears 3 times in {}; make it unique.",
+            "old_str appears 3 times in {} (at lines 1, 2, 2); make it unique.",
             path.display()
         )));
+    }
+
+    #[test]
+    fn match_lines_lists_the_first_ten_then_a_count() {
+        assert_eq!(match_lines("a\nb a\n\na", "a"), "1, 2, 4");
+        let many = "x\n".repeat(12);
+        assert_eq!(match_lines(&many, "x"), "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2 more");
     }
 
     #[test]
