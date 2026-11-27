@@ -266,6 +266,14 @@ async fn run_background_tool(
     let job = swarm
         .start_job(&me, &input.command, input.name, input.restart)
         .await?;
+    if job.state == JobState::Queued {
+        return Ok(format!(
+            "Job {} {}; output: {}. It starts when a slot frees, and you will get a message when it ends.",
+            job.label(),
+            swarm.job_queue_note(&me).await,
+            swarm.job_log(&job.meta.id).display()
+        ));
+    }
     Ok(format!(
         "Started job {} in {}; output: {}. You will get a message when it ends.",
         job.label(),

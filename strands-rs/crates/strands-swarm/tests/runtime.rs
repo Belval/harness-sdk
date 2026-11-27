@@ -8356,3 +8356,335 @@ async fn an_agent_that_committed_its_change_no_longer_claims_it() {
     tokio::time::sleep(strands_swarm::claims::TTL + Duration::from_millis(100)).await;
     assert_eq!(swarm.claims_report().await.get(&id), None);
 }
+
+// --- `--max-jobs`: a cap on the background jobs one root subtree runs at once.
+
+/// A job that ends when `<dir>/<name>` exists, using no CPU meanwhile.
+fn wait_for(dir: &Path, name: &str) -> String {
+    format!("until [ -e {0}/{name} ]; do sleep 0.05; done", dir.display())
+}
+
+/// A swarm with the job cap `cap`; the probe reports the CPU of every job session as busy
+/// (100 s more at each reading) except those in `light`, which use none.
+fn capped_swarm(scripts: &Scripts, dir: &Path, cap: usize, light: &Arc<Mutex<Vec<u32>>>) -> SwarmConfig {
+    let mut config = persistent_swarm(scripts, dir);
+    config.max_jobs = cap;
+    config.job_light_window = Duration::from_millis(900);
+    let light = light.clone();
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    config.job_cpu_probe = Arc::new(move |sessions| {
+        let busy = reads.fetch_add(100, std::sync::atomic::Ordering::SeqCst) as f64;
+        let light = light.lock();
+        sessions
+            .iter()
+            .map(|pid| (*pid, if light.contains(pid) { 0.0 } else { busy }))
+            .collect()
+    });
+    config
+}
+
+fn say_n(n: usize) -> Vec<MockResponse> {
+    (0..n).map(|_| say("ok")).collect()
+}
+
+/// Two roots, `a1` with the child `a2` and `a3` with the child `a4`; returns once all are idle.
+async fn two_subtrees(swarm: &Swarm, events: &mut UnboundedReceiver<SwarmEvent>) {
+    spawn_root(swarm, "lead").await;
+    assert_eq!(reply_to(events, USER).await, "ok");
+    spawn_child(swarm, "a1", "work").await;
+    mail_to(events, "a1", "reply").await;
+    spawn_root(swarm, "other").await;
+    assert_eq!(reply_to(events, USER).await, "ok");
+    spawn_child(swarm, "a3", "work").await;
+    mail_to(events, "a3", "reply").await;
+}
+
+fn states(jobs: &[strands_swarm::jobs::Job]) -> Vec<(String, strands_swarm::jobs::JobState)> {
+    jobs.iter()
+        .map(|job| (job.meta.id.clone(), job.state.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_job_over_the_subtree_cap_queues_and_starts_when_a_slot_frees_while_another_subtree_is_unaffected()
+{
+    use strands_swarm::jobs::JobState::{Exited, Queued, Running};
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![
+        ("a1", say_n(6)),
+        ("a2", say_n(2)),
+        ("a3", say_n(6)),
+        ("a4", say_n(2)),
+    ]);
+    let (swarm, mut events) = Swarm::new(capped_swarm(&scripts, dir.path(), 2, &Arc::default()));
+    two_subtrees(&swarm, &mut events).await;
+
+    let d = dir.path();
+    let first = swarm
+        .start_job("a2", &wait_for(d, "g1"), None, false)
+        .await
+        .unwrap();
+    swarm
+        .start_job("a1", &wait_for(d, "g2"), None, false)
+        .await
+        .unwrap();
+    // The root is in the priority lane: its jobs never wait, but they count for the others.
+    assert_eq!(
+        swarm
+            .start_job("a1", &wait_for(d, "g3"), None, false)
+            .await
+            .unwrap()
+            .state,
+        Running
+    );
+    let third = swarm
+        .start_job("a2", &wait_for(d, "g4"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(third.state, Queued);
+    let fourth = swarm
+        .start_job("a2", &wait_for(d, "g5"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(fourth.state, Queued);
+    // Another subtree has its own slots.
+    let other = swarm
+        .start_job("a4", &wait_for(d, "g6"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(other.state, Running);
+    let note = swarm.job_queue_note("a2").await;
+    assert_eq!(note, "queued: subtree has 3 jobs running (--max-jobs)");
+
+    let jobs = swarm.jobs().await;
+    assert_eq!(
+        jobs[3].state,
+        Queued,
+        "jobs lists queued jobs: {:?}",
+        states(&jobs)
+    );
+    assert!(jobs[3].status().contains("queued"), "{}", jobs[3].status());
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(swarm.jobs().await[3].state, Queued, "no slot has freed");
+
+    // Still three running in the subtree after one ends: the oldest queued job waits for two.
+    std::fs::write(d.join("g1"), "").unwrap();
+    until_jobs(&swarm, false, |jobs| jobs[0].state == Exited(0)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let now = states(&swarm.jobs().await);
+    assert_eq!(now[3].1, Queued, "{now:?}");
+    std::fs::write(d.join("g2"), "").unwrap();
+    until_jobs(&swarm, false, |jobs| jobs[3].state == Running).await;
+    let now = states(&swarm.jobs().await);
+    assert_eq!(now[4].1, Queued, "oldest first, one slot: {now:?}");
+    assert_eq!(first.meta.id, "j1");
+
+    for name in ["g3", "g4", "g5", "g6"] {
+        std::fs::write(d.join(name), "").unwrap();
+    }
+    until_jobs(&swarm, false, |jobs| {
+        jobs.iter().all(|job| job.state != Running && job.state != Queued)
+    })
+    .await;
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn without_a_cap_every_job_starts_and_the_cap_can_be_set_and_lifted_at_runtime() {
+    use strands_swarm::jobs::JobState::{Queued, Running};
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![
+        ("a1", say_n(6)),
+        ("a2", say_n(2)),
+        ("a3", say_n(6)),
+        ("a4", say_n(2)),
+    ]);
+    let (swarm, mut events) = Swarm::new(capped_swarm(&scripts, dir.path(), 0, &Arc::default()));
+    two_subtrees(&swarm, &mut events).await;
+    let d = dir.path();
+    for n in 0..4 {
+        let job = swarm
+            .start_job("a2", &wait_for(d, &format!("g{n}")), None, false)
+            .await
+            .unwrap();
+        assert_eq!(job.state, Running, "no cap");
+    }
+    assert!(
+        swarm.status().limits.unwrap().jobs.is_none(),
+        "no cap, no jobs line"
+    );
+
+    swarm.set_max_jobs(Some(5));
+    assert_eq!(swarm.max_jobs(), 5);
+    assert_eq!(
+        swarm
+            .start_job("a2", &wait_for(d, "h1"), None, false)
+            .await
+            .unwrap()
+            .state,
+        Running
+    );
+    let queued = swarm
+        .start_job("a2", &wait_for(d, "h2"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(queued.state, Queued);
+    eventually("/status shows the jobs", || {
+        swarm.status().limits.unwrap().jobs == Some((5, 1, 5))
+    })
+    .await;
+    let lines = swarm.status().lines(&|_| None);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "jobs: 5 running, 1 queued (max 5 per subtree)"),
+        "{lines:?}"
+    );
+    let saved = strands_swarm::state::load(&d.join("run")).await.unwrap().unwrap();
+    assert_eq!(saved.max_jobs, Some(5));
+
+    // Lifting the cap starts what waits.
+    swarm.set_max_jobs(Some(0));
+    until_jobs(&swarm, false, |jobs| jobs.iter().all(|job| job.state == Running)).await;
+    swarm.set_max_jobs(None);
+    assert_eq!(swarm.max_jobs(), 0);
+    for job in swarm.jobs().await {
+        swarm.kill_job(&job.meta.id).await.unwrap();
+    }
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_that_used_little_cpu_over_the_window_stops_counting() {
+    use strands_swarm::jobs::JobState::{Queued, Running};
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_of(vec![("a1", say_n(4)), ("a2", say_n(2))]);
+    let light: Arc<Mutex<Vec<u32>>> = Arc::default();
+    let (swarm, mut events) = Swarm::new(capped_swarm(&scripts, dir.path(), 1, &light));
+    spawn_root(&swarm, "lead").await;
+    assert_eq!(reply_to(&mut events, USER).await, "ok");
+    spawn_child(&swarm, "a1", "work").await;
+    mail_to(&mut events, "a1", "reply").await;
+
+    let d = dir.path();
+    let watcher = swarm
+        .start_job("a2", &wait_for(d, "w"), Some("watch".into()), false)
+        .await
+        .unwrap();
+    light.lock().push(watcher.meta.pid);
+    // A full window has not passed: the watcher still takes the slot.
+    let build = swarm
+        .start_job("a2", &wait_for(d, "b"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(build.state, Queued);
+    // Then it has used almost nothing for the whole window, and the build starts.
+    until_jobs(&swarm, false, |jobs| jobs[1].state == Running).await;
+    let later = swarm
+        .start_job("a2", &wait_for(d, "c"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(later.state, Queued, "the build is busy and holds the slot");
+    for name in ["w", "b", "c"] {
+        std::fs::write(d.join(name), "").unwrap();
+    }
+    until_jobs(&swarm, false, |jobs| {
+        jobs.iter().all(|job| job.state != Running && job.state != Queued)
+    })
+    .await;
+    swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn run_background_tells_the_caller_its_job_is_queued_and_a_resume_keeps_it_queued_until_a_slot_frees() {
+    use strands_swarm::jobs::JobState::{Queued, Running};
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let call =
+        |id: &str, name: &str| tool_call("run_background", id, json!({ "command": wait_for(d, name) }));
+    let scripts = scripts_of(vec![
+        ("a1", say_n(4)),
+        ("a2", vec![call("r1", "g1"), call("r2", "g2"), say("started")]),
+    ]);
+    let light = Arc::default();
+    let config = capped_swarm(&scripts, d, 1, &light);
+    let (swarm, mut events) = Swarm::new(config.clone());
+    spawn_root(&swarm, "lead").await;
+    assert_eq!(reply_to(&mut events, USER).await, "ok");
+    spawn_child(&swarm, "a1", "work").await;
+    mail_to(&mut events, "a1", "reply").await;
+    let model = scripts.lock()["a2"].clone();
+    let result = |call: usize| format!("{:?}", model.calls()[call].0.last().unwrap());
+    assert!(result(1).contains("Started job j1"), "{}", result(1));
+    assert!(
+        result(2).contains("j2") && result(2).contains("queued: subtree has 1 jobs running (--max-jobs)"),
+        "{}",
+        result(2)
+    );
+    assert_eq!(states(&swarm.jobs().await)[1].1, Queued);
+    swarm.shutdown().await;
+
+    // The restart leaves the first running and the second queued, and starts it on a free slot.
+    let saved = strands_swarm::state::load(&d.join("run")).await.unwrap().unwrap();
+    assert_eq!(saved.max_jobs, None);
+    scripts
+        .lock()
+        .insert("a1".into(), MockMessageModel::shared(say_n(4)));
+    scripts
+        .lock()
+        .insert("a2".into(), MockMessageModel::shared(say_n(4)));
+    let (resumed, _events) = Swarm::resume(config.clone(), saved.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        states(&resumed.jobs().await)[1].1,
+        Queued,
+        "resume keeps it queued"
+    );
+    std::fs::write(d.join("g1"), "").unwrap();
+    until_jobs(&resumed, false, |jobs| jobs[1].state == Running).await;
+    resumed.shutdown().await;
+    std::fs::write(d.join("g2"), "").unwrap();
+}
+
+#[tokio::test]
+async fn a_resume_without_the_cap_starts_the_jobs_that_were_queued() {
+    use strands_swarm::jobs::JobState::{Queued, Running};
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let scripts = scripts_of(vec![("a1", say_n(4)), ("a2", say_n(2))]);
+    let config = capped_swarm(&scripts, d, 1, &Arc::default());
+    let (swarm, mut events) = Swarm::new(config.clone());
+    spawn_root(&swarm, "lead").await;
+    assert_eq!(reply_to(&mut events, USER).await, "ok");
+    spawn_child(&swarm, "a1", "work").await;
+    mail_to(&mut events, "a1", "reply").await;
+    swarm
+        .start_job("a2", &wait_for(d, "g1"), None, false)
+        .await
+        .unwrap();
+    let queued = swarm
+        .start_job("a2", &wait_for(d, "g2"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(queued.state, Queued);
+    swarm.shutdown().await;
+
+    let saved = strands_swarm::state::load(&d.join("run")).await.unwrap().unwrap();
+    scripts
+        .lock()
+        .insert("a1".into(), MockMessageModel::shared(say_n(4)));
+    scripts
+        .lock()
+        .insert("a2".into(), MockMessageModel::shared(say_n(4)));
+    let mut config = config;
+    config.max_jobs = 0;
+    let (resumed, _events) = Swarm::resume(config, saved).await.unwrap();
+    until_jobs(&resumed, false, |jobs| {
+        jobs.iter().all(|job| job.state == Running)
+    })
+    .await;
+    for job in resumed.jobs().await {
+        resumed.kill_job(&job.meta.id).await.unwrap();
+    }
+    resumed.shutdown().await;
+}

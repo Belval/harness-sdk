@@ -74,6 +74,7 @@ impl Swarm {
                     .disk_trend
                     .lock()
                     .map(|e| (e.per_day.round() as u64, e.days)),
+                jobs: self.job_totals(),
             }),
             base: cache.base,
             agents,

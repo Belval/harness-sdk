@@ -57,7 +57,8 @@ impl Swarm {
     /// Start `command` as a background job of agent `owner`: in its working directory and
     /// environment, detached from this process so a restart does not stop it. When it ends, the
     /// owner gets a `job` message with its exit code and the tail of its output. Waits first
-    /// while the host is overloaded ([`Swarm::host_busy`]). With `restart`, each time it ends the
+    /// while the host is overloaded ([`Swarm::host_busy`]). Over the subtree's cap
+    /// ([`Swarm::max_jobs`]) the job is returned [`jobs::JobState::Queued`] and starts later. With `restart`, each time it ends the
     /// harness also starts it again (same id, fresh log, after a back-off when it keeps exiting
     /// at once) until it is killed: see [`Swarm::restart_job`].
     pub async fn start_job(
@@ -69,18 +70,21 @@ impl Swarm {
     ) -> Result<Job> {
         let node = self.known(owner)?;
         self.wait_for_host(owner, false, &node.turn_token()).await?;
-        let job = self
-            .inner
-            .jobs
-            .start(
-                owner,
-                name,
-                command,
-                &node.workdir.get(),
-                &self.with_build_jobs(node.env.clone()),
-                restart,
-            )
-            .await?;
+        let _gate = self.job_gate().await;
+        let job = match self.job_over_cap(owner).await {
+            Some(_) => {
+                let cwd = node.workdir.get();
+                self.inner.jobs.queue(owner, name, command, &cwd, restart).await?
+            }
+            None => {
+                let env = self.with_build_jobs(node.env.clone());
+                let cwd = node.workdir.get();
+                self.inner
+                    .jobs
+                    .start(owner, name, command, &cwd, &env, restart)
+                    .await?
+            }
+        };
         self.journal_event(
             "job",
             serde_json::json!({ "id": job.meta.id, "agent": owner, "command": command }),
@@ -135,6 +139,7 @@ impl Swarm {
                     swarm.report_job(&job).await;
                 }
                 swarm.note_stalled_jobs().await;
+                swarm.tick_job_cap(ticks == 0).await;
                 if check_alive {
                     let jobs = &swarm.inner.jobs;
                     jobs.tidy(jobs::LOG_MAX, jobs::LOG_KEEP, jobs::KEEP_JOBS).await;

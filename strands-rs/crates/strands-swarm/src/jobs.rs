@@ -93,6 +93,8 @@ pub fn restart_delay(quick: u32) -> std::time::Duration {
 pub enum JobState {
     /// Still running.
     Running,
+    /// Described but not started: waiting for a slot under `--max-jobs` (`pid` is 0).
+    Queued,
     /// Exited with this code.
     Exited(i32),
     /// Killed through [`Jobs::kill`].
@@ -122,7 +124,7 @@ impl Job {
 
     /// Running, or waiting to be started again.
     pub fn live(&self) -> bool {
-        self.state == JobState::Running || self.restarting()
+        matches!(self.state, JobState::Running | JobState::Queued) || self.restarting()
     }
 
     /// Quick exits in a row once this run is over: the count the next restart is delayed by.
@@ -146,6 +148,7 @@ impl Job {
         let time = duration(self.seconds);
         let status = match self.state {
             JobState::Running => format!("running {time}"),
+            JobState::Queued => format!("queued {time}: waiting for a slot (--max-jobs)"),
             JobState::Exited(code) => format!("exited {code} after {time}"),
             JobState::Killed => format!("killed after {time}"),
             JobState::Lost => "ended without an exit code".to_owned(),
@@ -228,16 +231,45 @@ impl Jobs {
         env: &BTreeMap<String, String>,
         restart: bool,
     ) -> Result<Job> {
+        self.create(owner, name, command, cwd, restart, Some(env)).await
+    }
+
+    /// Describe a job that is not started yet ([`JobState::Queued`]); [`Self::launch`] starts it.
+    pub async fn queue(
+        &self,
+        owner: &str,
+        name: Option<String>,
+        command: &str,
+        cwd: &Path,
+        restart: bool,
+    ) -> Result<Job> {
+        self.create(owner, name, command, cwd, restart, None).await
+    }
+
+    /// A new job, started with `env`, or only described when there is none.
+    async fn create(
+        &self,
+        owner: &str,
+        name: Option<String>,
+        command: &str,
+        cwd: &Path,
+        restart: bool,
+        env: Option<&BTreeMap<String, String>>,
+    ) -> Result<Job> {
         let _guard = self.start.lock().await;
         tokio::fs::create_dir_all(&self.dir).await?;
         let id = self.next_id().await?;
+        let pid = match env {
+            Some(env) => self.spawn(&id, command, cwd, env)?,
+            None => 0,
+        };
         let meta = JobMeta {
             id: id.clone(),
             owner: owner.to_owned(),
             name: name.filter(|n| !n.trim().is_empty()),
             command: command.to_owned(),
             cwd: cwd.to_path_buf(),
-            pid: self.spawn(&id, command, cwd, env)?,
+            pid,
             started: now(),
             restart,
             restarts: 0,
@@ -246,10 +278,27 @@ impl Jobs {
         self.describe(&meta).await?;
         Ok(Job {
             meta,
-            state: JobState::Running,
+            state: match env {
+                Some(_) => JobState::Running,
+                None => JobState::Queued,
+            },
             reported: false,
             seconds: 0,
         })
+    }
+
+    /// Start queued job `id` now, with `env`; `None` when it is not queued any more (killed).
+    pub async fn launch(&self, id: &str, env: &BTreeMap<String, String>) -> Result<Option<Job>> {
+        let _guard = self.start.lock().await;
+        let job = self.get(id).await?;
+        if job.state != JobState::Queued {
+            return Ok(None);
+        }
+        let mut meta = job.meta;
+        meta.pid = self.spawn(id, &meta.command, &meta.cwd, env)?;
+        meta.started = now();
+        self.describe(&meta).await?;
+        Ok(Some(self.read(meta).await))
     }
 
     /// Spawn the wrapper for job `id`; its process id.
@@ -378,16 +427,18 @@ impl Jobs {
 
     async fn read(&self, meta: JobMeta) -> Job {
         let exit = self.file(&meta.id, "exit");
+        let queued = meta.pid == 0;
         let state = match tokio::fs::read_to_string(&exit).await {
             Ok(text) => match text.trim() {
                 "killed" => JobState::Killed,
                 "lost" => JobState::Lost,
                 code => code.parse().map_or(JobState::Lost, JobState::Exited),
             },
+            Err(_) if queued => JobState::Queued,
             Err(_) => JobState::Running,
         };
         let end = match state {
-            JobState::Running => now(),
+            JobState::Running | JobState::Queued => now(),
             _ => modified(&exit).await.unwrap_or_else(now),
         };
         let reported = tokio::fs::try_exists(self.file(&meta.id, "reported"))
@@ -455,7 +506,7 @@ impl Jobs {
             let Ok(job) = self.get(&id).await else {
                 continue;
             };
-            if job.reported {
+            if job.reported || job.state == JobState::Queued {
                 continue;
             }
             if job.state != JobState::Running {
@@ -510,8 +561,8 @@ impl Jobs {
         // Not while it is being started again.
         let _guard = self.start.lock().await;
         let job = self.get(id).await?;
-        if job.restarting() {
-            // Waiting to start again: never will.
+        if job.restarting() || job.state == JobState::Queued {
+            // Waiting to start (again): never will.
             self.mark_reported(id).await?;
             tokio::fs::write(self.file(id, "exit"), "killed").await?;
             return self.get(id).await;

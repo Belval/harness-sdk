@@ -19,6 +19,7 @@ impl Swarm {
         *swarm.inner.mail_settle.lock() = state.mail_settle;
         *swarm.inner.host.max_load.lock() = state.max_load;
         *swarm.inner.host.min_free_mem.lock() = state.min_free_mem;
+        *swarm.inner.jobcap.max_jobs.lock() = state.max_jobs;
         *swarm.inner.priority.lock() = state.priority.clone();
         let budget = resumed_budget(swarm.inner.config.budget_tokens, &state);
         *swarm.inner.budget.lock() = budget;
@@ -267,6 +268,7 @@ impl Swarm {
             mail_settle: *self.inner.mail_settle.lock(),
             max_load: *self.inner.host.max_load.lock(),
             min_free_mem: *self.inner.host.min_free_mem.lock(),
+            max_jobs: *self.inner.jobcap.max_jobs.lock(),
             priority: self.inner.priority.lock().clone(),
             commit: self.inner.config.commit.clone(),
             schedules: self.inner.schedules.lock().clone(),

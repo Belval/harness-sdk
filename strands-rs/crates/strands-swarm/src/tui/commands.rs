@@ -44,6 +44,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         help: "show or change how many model calls may run at once (0: no limit)",
     },
     SlashCommand {
+        name: "/max-jobs",
+        args: "[N|off|default]",
+        help: "show or change how many background jobs one root's subtree may run at once",
+    },
+    SlashCommand {
         name: "/max-load",
         args: "[N|off|default]",
         help: "show or change the host load above which new model calls and jobs wait",
@@ -147,6 +152,8 @@ pub enum Command {
     MaxCalls(Option<String>),
     /// `/mail-settle [SECS|default]`: show or change the mail settle window (`0`: none).
     MailSettle(Option<String>),
+    /// `/max-jobs [N|off|default]`: show or change the per-subtree job cap.
+    MaxJobs(Option<String>),
     /// `/max-load [N|off|default]`: show or change the host load limit.
     MaxLoad(Option<String>),
     /// `/min-free-mem [SIZE|off|default]`: show or change the free-memory floor.
@@ -214,10 +221,11 @@ pub fn parse_command(line: &str, has_agents: bool) -> Option<Command> {
         });
     }
     // The limits: alone they show the limit, with an argument they set it.
-    let limits: [(&str, LimitCommand); 7] = [
+    let limits: [(&str, LimitCommand); 8] = [
         ("/max-agents", Command::MaxAgents),
         ("/max-calls", Command::MaxCalls),
         ("/mail-settle", Command::MailSettle),
+        ("/max-jobs", Command::MaxJobs),
         ("/max-load", Command::MaxLoad),
         ("/min-free-mem", Command::MinFreeMem),
         ("/priority", Command::Priority),
@@ -337,6 +345,10 @@ mod tests {
             })
         );
         assert_eq!(parse_command("/max-load", true), Some(Command::MaxLoad(None)));
+        assert_eq!(
+            parse_command("/max-jobs off", true),
+            Some(Command::MaxJobs(Some("off".into())))
+        );
         assert_eq!(
             parse_command("/min-free-mem", true),
             Some(Command::MinFreeMem(None))

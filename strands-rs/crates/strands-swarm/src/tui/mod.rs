@@ -463,6 +463,11 @@ async fn submit(swarm: &Swarm, app: &mut App, command: Command) {
             swarm.set_mail_settle(secs);
             mail_settle_notice(swarm)
         }),
+        (Command::MaxJobs(None), _) => Ok(max_jobs_notice(swarm)),
+        (Command::MaxJobs(Some(arg)), _) => limit_arg(&arg, Some(0), number).map(|limit| {
+            swarm.set_max_jobs(limit);
+            max_jobs_notice(swarm)
+        }),
         (Command::MaxLoad(None), _) => Ok(max_load_notice(swarm)),
         (Command::MaxLoad(Some(arg)), _) => limit_arg(&arg, Some(0.0), |n| {
             let load = n.parse().ok().filter(|load: &f64| *load >= 0.0);
@@ -600,6 +605,13 @@ fn mail_settle_notice(swarm: &Swarm) -> String {
     match swarm.mail_settle().as_secs() {
         0 => "agents start a turn at once on agent mail".to_owned(),
         secs => format!("agents with working children wait up to {secs}s for more mail before a turn"),
+    }
+}
+
+fn max_jobs_notice(swarm: &Swarm) -> String {
+    match swarm.max_jobs() {
+        0 => "background jobs unlimited per subtree".to_owned(),
+        limit => format!("a root's subtree runs up to {limit} busy background jobs at once; more queue"),
     }
 }
 

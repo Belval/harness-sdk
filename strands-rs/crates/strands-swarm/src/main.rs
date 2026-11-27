@@ -63,6 +63,11 @@ struct Cli {
     /// never waits. 0 starts the turn at once.
     #[arg(long, value_name = "SECS", default_value_t = 20)]
     mail_settle: u64,
+    /// Background jobs one root agent's subtree may run at once; more wait for a slot, oldest
+    /// first (`0`: no cap; TUI `/max-jobs`). Jobs that stay under 5% of a core for a minute and
+    /// the priority lane's do not count.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max_jobs: usize,
     /// New model calls, background jobs and agents' spawns wait while the host's 1-minute load
     /// average is above this (default: twice the CPUs; `0` turns it off; TUI `/max-load`).
     #[arg(long, value_name = "LOAD")]
@@ -458,6 +463,7 @@ async fn run(cli: Cli) -> Result<Exit, Box<dyn std::error::Error>> {
         Some(jobs) => Some(jobs),
         None => Some(strands_swarm::runtime::default_build_jobs()),
     };
+    config.max_jobs = cli.max_jobs;
     config.min_free_inodes = cli.min_free_inodes;
     config.disk_warn_days = cli.disk_warn_days;
     if cli.min_free_disk > 0 {

@@ -81,6 +81,9 @@ pub struct SwarmState {
     /// Host load limit set at runtime (`0`: none), overriding `--max-load`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_load: Option<f64>,
+    /// Per-subtree job cap set at runtime (`0`: none), overriding `--max-jobs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_jobs: Option<usize>,
     /// Free-memory floor set at runtime (`0`: none), overriding `--min-free-mem`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_free_mem: Option<u64>,

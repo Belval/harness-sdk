@@ -47,6 +47,7 @@ mod disk;
 mod dormant;
 mod due;
 mod host;
+mod jobcap;
 mod landing;
 mod mailbox;
 mod persist;
@@ -70,6 +71,7 @@ pub use disk::{
     LOW_DISK_CHECK_EVERY, MIN_FREE_INODES,
 };
 pub use host::{default_max_load, default_min_free_mem, host_stats, HostProbe, HostStats, HOST_POLL};
+pub use jobcap::{proc_job_cpu, JobCpuProbe, JOB_LIGHT_WINDOW};
 use persist::history_event;
 pub(crate) use persist::RESTORED_ERROR;
 pub use warm::{
@@ -352,6 +354,13 @@ pub struct SwarmConfig {
     pub min_free_mem: u64,
     /// Reads the host's load and memory for those holds ([`host_stats`]).
     pub host_probe: HostProbe,
+    /// Background jobs one root subtree may run at once; more wait for a slot
+    /// ([`Swarm::max_jobs`]). `0` (the default) is no cap.
+    pub max_jobs: usize,
+    /// A job that used at most 5% of a core over this long does not count against the cap.
+    pub job_light_window: Duration,
+    /// Reads the CPU time of the jobs' sessions for that ([`proc_job_cpu`]).
+    pub job_cpu_probe: JobCpuProbe,
     /// `CARGO_BUILD_JOBS` for agents' shell commands and background jobs (land checks included),
     /// unless this process's environment sets it; `None` sets none. Without it every cargo build
     /// starts a compiler per CPU, and a few dozen agents building at once swamp the host.
@@ -419,6 +428,9 @@ impl SwarmConfig {
             max_load: 0.0,
             min_free_mem: 0,
             host_probe: Arc::new(host_stats),
+            max_jobs: 0,
+            job_light_window: JOB_LIGHT_WINDOW,
+            job_cpu_probe: Arc::new(proc_job_cpu),
             build_jobs: Some(default_build_jobs()),
             disk_reserve: 0,
             min_free_inodes: None,
@@ -950,6 +962,8 @@ struct Inner {
     reports_posted: Mutex<std::collections::BTreeSet<String>>,
     /// Holds new work while the host is overloaded ([`Swarm::wait_for_host`]).
     host: host::HostGate,
+    /// The cap on a subtree's jobs ([`Swarm::max_jobs`]).
+    jobcap: jobcap::JobGate,
     /// The priority lane set at runtime with [`Swarm::set_priority`]; overrides the config.
     priority: Mutex<Option<Vec<String>>>,
 }
@@ -1003,6 +1017,7 @@ impl Swarm {
             watching_dormant: AtomicBool::new(false),
             reports_posted: Mutex::default(),
             host: host::HostGate::default(),
+            jobcap: jobcap::JobGate::default(),
             priority: Mutex::new(None),
             config,
         };

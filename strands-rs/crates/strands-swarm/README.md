@@ -47,6 +47,7 @@ strands-swarm [--run NAME] [--cwd DIR] [--goal GOAL] [--model ID] [--side-model 
               [--mcp-eager] [--list-tools]
               [--skills-dir DIR]... [--no-default-skills] [--list-skills]
               [--max-agents N] [--max-concurrent-calls N] [--max-load N] [--min-free-mem SIZE]
+              [--max-jobs N]
               [--priority AGENT]... [--build-jobs N]
               [--budget-tokens N] [--compact-at TOKENS]
               [--allow-land] [--land-into GLOB]... [--gate CMD]...
@@ -299,6 +300,32 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
   - `/max-load N` changes the limit for the running swarm, `/max-load off` lifts it and
     `/max-load default` returns to the flag; `/min-free-mem SIZE|off|default` does the same for
     memory. Both are kept in `swarm.json` across restarts, ahead of the flags, like `/max-calls`.
+- **Jobs per subtree.** The host hold stalls every agent's model calls, the unrelated ones too.
+  `--max-jobs N` (default `0`: no cap) bounds the one source of load instead: the busy
+  `run_background` jobs that agents of one root's subtree (the top-level agent and everything
+  below it) run at once.
+  - A start over the cap does not wait: `run_background` returns at once with the job id and
+    "queued: subtree has N jobs running (--max-jobs)". The job is described on disk, not started
+    (`jobs` shows it as `queued`), and the job watcher starts queued jobs, oldest first, within a
+    poll of a slot freeing. A job queues behind older queued jobs of its subtree even when a slot
+    is free. A queued job can be killed like any job; cancelling its owner kills it.
+  - **What counts.** A job counts while it runs, unless it is light. A restart job waiting out
+    its back-off is not running. The rule is CPU, not a flag on `run_background` (which would grow
+    every agent's tool schema and rely on the model judging its own command): a job that has run
+    a whole minute (`SwarmConfig::job_light_window`) and used at most 5% of one core over it does
+    not count, measured from `/proc/<pid>/stat` (user, system and reaped children's time) of
+    every process in the job's session, sampled by the watcher every 5 s. So a `sleep 600; curl …`
+    poller, or a build blocked on a lock, frees its slot; a compile or a test run holds it. A
+    new job counts for its first minute whatever it is. If it turns busy again it counts again.
+    Restarts of a restart job are not held by the cap, only counted while they run.
+  - Priority-lane agents' jobs (the roots among them) never queue, as with host holds, but count
+    toward their subtree's cap for the others.
+  - `/max-jobs N` changes the cap for the running swarm (`off` lifts it, `default` returns to the
+    flag; queued jobs start as it allows); kept in `swarm.json` across restarts, ahead of the
+    flag. `/status` adds `jobs: 12 running, 3 queued (max 8 per subtree)` while there is a cap.
+  - Queued jobs are on disk, so they stay queued across a restart (the first watcher pass after
+    resume starts what the cap, now or lifted, allows) and a job whose owner is gone is killed
+    rather than started.
 - **Priority lane.** Root agents, and the agents named with `--priority AGENT` (repeatable; an id
   or name, as `send_message` takes it, so a name can be given before that agent is spawned), never
   wait on the host or the caps; for an agent that relays the user's messages, a hold makes the
@@ -579,7 +606,7 @@ time, whatever tool an agent commits or lands with.
 | `/cancel` | Stop the selected agent and its subtree for good. |
 | `/status` | Each live agent's state, activity, todos, unmerged commits and merge outlook, jobs and schedules, without a model call. |
 | `/cost` | Estimated spend (see [Cost](#cost)); its intro and footnote wrap, its table is clipped on narrow terminals. |
-| `/budget`, `/mail-settle`, `/max-agents`, `/max-calls`, `/max-load`, `/min-free-mem`, `/priority` | See [Limits](#limits). |
+| `/budget`, `/mail-settle`, `/max-agents`, `/max-calls`, `/max-jobs`, `/max-load`, `/min-free-mem`, `/priority` | See [Limits](#limits). |
 | `/remember`, `/forget` | Edit the memory file (see [Persistence](#persistence)). |
 | `/schedules` | All schedules. |
 | `/gc` | Retry reclaiming the disk of cancelled worktree agents. |

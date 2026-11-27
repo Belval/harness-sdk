@@ -138,7 +138,7 @@ impl Swarm {
     }
 
     /// The top-level agent above `node` (the one the user started).
-    fn root_of(&self, node: &Arc<Node>) -> Arc<Node> {
+    pub(super) fn root_of(&self, node: &Arc<Node>) -> Arc<Node> {
         let mut current = node.clone();
         while let Some(parent) = self.node(&current.parent) {
             current = parent;

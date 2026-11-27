@@ -891,6 +891,7 @@ mod tests {
             mail_settle: None,
             max_load: None,
             min_free_mem: None,
+            max_jobs: None,
             priority: None,
             commit: None,
             schedules: Vec::new(),

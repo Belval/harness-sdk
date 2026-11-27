@@ -252,6 +252,9 @@ pub struct Limits {
     /// Bytes the least-free disk loses per day by the guard's linear fit over the last day, and
     /// the days until its floor at that rate; `None` until it has 6 hours of samples falling.
     pub disk_trend: Option<(u64, f64)>,
+    /// Background jobs running and queued, and the per-subtree cap (`/max-jobs`); `None` without
+    /// a cap.
+    pub jobs: Option<(usize, usize, usize)>,
 }
 
 impl Limits {
@@ -285,6 +288,14 @@ impl Limits {
         });
         format!("{} · calls {calls}/{limit}{load}{disk}", self.agents)
     }
+
+    /// `jobs: 12 running, 3 queued (max 8 per subtree)`.
+    pub fn describe_jobs(&self) -> Option<String> {
+        let (running, queued, cap) = self.jobs?;
+        Some(format!(
+            "jobs: {running} running, {queued} queued (max {cap} per subtree)"
+        ))
+    }
 }
 
 /// What [`crate::Swarm::status`] returns.
@@ -309,6 +320,7 @@ impl StatusReport {
         let base = self.base.as_deref().unwrap_or("the base");
         let mut lines = vec![head];
         lines.extend(self.limits.map(|limits| limits.describe()));
+        lines.extend(self.limits.and_then(|limits| limits.describe_jobs()));
         for agent in &self.agents {
             let mut head = format!("{} · {}", agent.label, agent.status);
             if agent.priority {
@@ -709,7 +721,12 @@ mod tests {
             load: None,
             disk: Some((9_400 << 30, Some(8_200_000))),
             disk_trend,
+            jobs: Some((12, 3, 8)),
         };
+        assert_eq!(
+            limits(None).describe_jobs().as_deref(),
+            Some("jobs: 12 running, 3 queued (max 8 per subtree)")
+        );
         let tb = 1u64 << 40;
         let text = |trend| limits(trend).describe();
         assert!(
