@@ -4,7 +4,8 @@
 //! A model whose cache lives longer ([`cost::cache_lifetime`]: OpenAI's GPT-6 on Bedrock, 30
 //! minutes) is refreshed proportionally less often.
 //! An idle agent whose next schedule fires soon is kept warm the same way until it fires, when
-//! that costs less than the rewrite ([`Swarm::refreshes_until_fire`]).
+//! that costs less than the rewrite ([`Swarm::refreshes_until_fire`]); any other idle agent for
+//! [`KEEP_WARM_IDLE`] refreshes, in case a message wakes it.
 
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
@@ -22,6 +23,11 @@ pub const KEEP_WARM_EVERY: Duration = Duration::from_secs(270);
 /// cache expired at 59 minutes and the call after such a wait rewrote it, 254 times in 19.5
 /// hours of one swarm (~$430 of writes, against ~$70 for the extra refreshes).
 pub const KEEP_WARM_MAX: usize = 13;
+/// Refreshes after a turn ends, when no schedule keeps the agent warm: an idle agent is usually
+/// woken by a message (a child's reply) within minutes. Measured over 3,800 idle gaps, of those
+/// still idle at the k-th refresh the share woken before the next one was 29, 21, 13 and 11% for
+/// k = 1..4 and under 8% after, against the 0.1 / 1.15 ≈ 8.7% at which a refresh pays.
+pub const KEEP_WARM_IDLE: usize = 4;
 
 /// A model request as sent, to send again.
 struct Request {
@@ -117,6 +123,8 @@ fn digest(before: &[Message], role: &Role, content: &[ContentBlock]) -> u64 {
 struct Plan {
     every: Duration,
     refreshes: usize,
+    /// The turn ended: runs on past it, stopping if the agent is cancelled.
+    idle: bool,
     /// Until a schedule fires: stops if none is left.
     scheduled: bool,
 }
@@ -168,16 +176,19 @@ impl Swarm {
                     });
                     let node = node.upgrade().filter(|_| cached > 0);
                     let plan = node.and_then(|node| match result.stop_reason {
-                        StopReason::ToolUse => Some((node, KEEP_WARM_MAX, false)),
-                        StopReason::EndTurn => swarm
-                            .refreshes_until_fire(&node, request.model.model_id(), every)
-                            .map(|n| (node, n, true)),
+                        StopReason::ToolUse => Some((node, KEEP_WARM_MAX, false, false)),
+                        StopReason::EndTurn => {
+                            match swarm.refreshes_until_fire(&node, request.model.model_id(), every) {
+                                Some(n) => Some((node, n, true, true)),
+                                None => Some((node, KEEP_WARM_IDLE, true, false)),
+                            }
+                        }
                         _ => None,
                     });
-                    if let Some((node, refreshes, scheduled)) = plan {
+                    if let Some((node, refreshes, idle, scheduled)) = plan {
                         // The invocation's token ends with the turn; an idle agent's refreshes
                         // run on until its next call, the swarm's shutdown or its last schedule.
-                        let stop = match scheduled {
+                        let stop = match idle {
                             true => swarm.inner.root_cancel.child_token(),
                             false => stop,
                         };
@@ -186,6 +197,7 @@ impl Swarm {
                         let plan = Plan {
                             every,
                             refreshes,
+                            idle,
                             scheduled,
                         };
                         tokio::spawn(swarm.keep_warm(node, request, usage, plan, stop));
@@ -259,6 +271,7 @@ impl Swarm {
         let Plan {
             every,
             refreshes,
+            idle,
             scheduled,
         } = plan;
         // The whole request was cached by the call it repeats: a refresh reads all of it.
@@ -274,7 +287,7 @@ impl Swarm {
                 _ = stop.cancelled() => return,
                 _ = tokio::time::sleep(every) => {}
             }
-            if scheduled && (self.next_fire(&node.id).is_none() || !node.status.lock().is_live()) {
+            if (scheduled && self.next_fire(&node.id).is_none()) || (idle && !node.status.lock().is_live()) {
                 return;
             }
             let Ok(_permit) = self.admit_model_call(&node.id, &stop).await else {

@@ -6372,9 +6372,17 @@ async fn a_turn_waiting_on_a_tool_keeps_its_prompt_cache_warm_until_the_next_cal
     assert_eq!(
         model.repeats.load(Ordering::SeqCst),
         refreshes,
-        "the turn is over: no more refreshes"
+        "the turn is over: no more refreshes of its tool call"
     );
-    assert_eq!(model.calls.load(Ordering::SeqCst), 2 + refreshes);
+    // The idle agent's cache is kept warm a while for a message that may wake it.
+    let idle = strands_swarm::runtime::KEEP_WARM_IDLE;
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2 + refreshes + idle);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        2 + refreshes + idle,
+        "then left to expire"
+    );
     swarm.shutdown().await;
 }
 
@@ -6541,7 +6549,8 @@ impl Model for IdleModel {
 }
 
 /// Model calls an agent makes while idle between two fires of a schedule `minutes` apart, with a
-/// keep-warm refresh every 10 s: its first turn, the fire's turn, and what keeps its cache warm.
+/// keep-warm refresh every 10 s: its first turn, the fire's turn, and what keeps its cache warm
+/// after the fire's turn (the first turn's own idle refreshes are not counted).
 async fn calls_while_idle_before_a_fire(model_id: &'static str, minutes: u64) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(IdleModel {
@@ -6565,41 +6574,88 @@ async fn calls_while_idle_before_a_fire(model_id: &'static str, minutes: u64) ->
     let (swarm, mut events) = Swarm::new(config);
     let root = spawn_root(&swarm, "go").await;
     reply_to(&mut events, USER).await;
-    swarm.schedule(USER, every(minutes, &root, "tick")).unwrap();
-    // The fire's turn ends with the next fire `minutes` away.
-    tokio::time::sleep(Duration::from_secs(minutes * 60 + 1)).await;
     let calls = |model: &IdleModel| model.calls.load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(
-        calls(&model),
-        2,
-        "the first turn ended before the schedule existed"
-    );
+    swarm.schedule(USER, every(minutes, &root, "tick")).unwrap();
+    // The fire's turn (its reply to the user) ends with the next fire `minutes` away.
+    while let Some(event) = events.recv().await {
+        if matches!(&event, SwarmEvent::Mail { to, mail } if to == USER && mail.kind == "reply") {
+            break;
+        }
+    }
+    let fired = calls(&model);
     tokio::time::sleep(Duration::from_secs(minutes * 60 - 6)).await;
-    let calls = calls(&model);
+    let calls = calls(&model) - fired + 2;
     swarm.shutdown().await;
     calls
 }
 
 /// A refresh costs 0.1 of the cached prefix and a rewrite 1.25 instead of 0.1 for a read, so up
 /// to 11 refreshes pay for themselves: a poller due in a minute is kept warm until its fire (five
-/// refreshes 10 s apart), one due in an hour (with 10 s refreshes: 360) is left to expire.
+/// refreshes 10 s apart); one due in an hour (with 10 s refreshes: 360) only for the
+/// [`KEEP_WARM_IDLE`] refreshes any idle agent gets, then left to expire.
 #[tokio::test(start_paused = true)]
 async fn an_idle_agent_is_kept_warm_until_a_schedule_fires_only_when_that_is_cheaper() {
+    let idle = strands_swarm::runtime::KEEP_WARM_IDLE;
     assert_eq!(calls_while_idle_before_a_fire("idle", 1).await, 2 + 5);
-    assert_eq!(calls_while_idle_before_a_fire("idle", 60).await, 2);
+    assert_eq!(calls_while_idle_before_a_fire("idle", 60).await, 2 + idle);
 }
 
 /// The break-even follows the model's cache lifetime: with refreshes 6x as far apart (60 s for
-/// 10 s), a 5-minute poller on GPT-6 is kept warm (four refreshes) where the same poller on the
-/// 5-minute cache is not (29 would cost more than the rewrite), and a one-minute one needs none.
+/// 10 s), a 5-minute poller on GPT-6 is kept warm until its fire (four refreshes) where the same
+/// poller on the 5-minute cache gets only the idle ones (29 would cost more than the rewrite),
+/// and a one-minute one needs none.
 #[tokio::test(start_paused = true)]
 async fn a_longer_lived_cache_is_kept_warm_for_longer_gaps() {
-    assert_eq!(calls_while_idle_before_a_fire("idle", 5).await, 2);
+    let idle = strands_swarm::runtime::KEEP_WARM_IDLE;
+    assert_eq!(calls_while_idle_before_a_fire("idle", 5).await, 2 + idle);
     assert_eq!(
         calls_while_idle_before_a_fire("openai.gpt-6-astra", 5).await,
         2 + 4
     );
     assert_eq!(calls_while_idle_before_a_fire("openai.gpt-6-astra", 1).await, 2);
+}
+
+/// An idle agent with no schedule is kept warm for [`KEEP_WARM_IDLE`] refreshes, in case a
+/// message wakes it, then left to expire; a cancelled one is not refreshed at all.
+#[tokio::test(start_paused = true)]
+async fn an_idle_agent_is_kept_warm_a_few_refreshes_for_a_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(IdleModel {
+        id: "idle",
+        calls: Default::default(),
+    });
+    let shared = model.clone();
+    let factory: AgentFactory = Arc::new(move |spec: AgentSpec| {
+        let model = shared.clone();
+        Box::pin(async move {
+            Agent::builder()
+                .id(spec.id)
+                .model(model)
+                .tools(spec.tools)
+                .no_sandbox()
+                .build()
+        })
+    });
+    let mut config = SwarmConfig::new(factory, dir.path());
+    config.keep_warm = Some(Duration::from_secs(10));
+    let (swarm, mut events) = Swarm::new(config);
+    let root = spawn_root(&swarm, "go").await;
+    reply_to(&mut events, USER).await;
+    let calls = |model: &IdleModel| model.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let first = calls(&model);
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    assert_eq!(calls(&model), first + 2, "a refresh every 10 s while idle");
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    let idle = strands_swarm::runtime::KEEP_WARM_IDLE;
+    assert_eq!(calls(&model), first + idle, "then left to expire");
+    // A message wakes it: its turn ends idle again and starts a fresh round, which a cancel ends.
+    swarm.send(USER, &root, "again").unwrap();
+    reply_to(&mut events, USER).await;
+    let woken = calls(&model);
+    swarm.cancel(&root).unwrap();
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(calls(&model), woken, "a cancelled agent is not refreshed");
+    swarm.shutdown().await;
 }
 
 /// A free-space reading for the disk guard that counts its reads, so a test waits for the guard

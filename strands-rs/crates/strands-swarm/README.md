@@ -414,6 +414,10 @@ STRANDS_SWARM_AWS_PROFILE=swarm STRANDS_SWARM_AWS_CONFIG_FILE=~/.config/strands-
     The limit is priced per model (`--prices` cache read and write); a poller further out is
     left to expire, where `--cache-ttl 1h` is the cheaper answer. The limit counts refreshes at
     the model's interval, so on a 30-minute cache it reaches about six times as far.
+  - Any other idle agent is kept warm for 4 refreshes (about 23 minutes) after its turn ends,
+    in case a message (a child's reply) wakes it: of measured idle gaps still open at the k-th
+    refresh, 29, 21, 13 and 11% ended before the next for k = 1..4, above the 0.1 / 1.15 ≈ 8.7%
+    at which a refresh pays, and under 8% after.
 - **OpenAI models on Bedrock** (GPT-6.x Astra) cache prompt prefixes on their own, without cache
   points; `--cache-ttl` does not apply, and their cache lifetime and write prices are above. Bedrock
   routes their requests by a hash of the prompt prefix and spills a prefix sent more than ~15
