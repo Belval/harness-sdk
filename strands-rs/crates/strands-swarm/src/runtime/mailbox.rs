@@ -261,6 +261,29 @@ impl Swarm {
         }
     }
 
+    /// Why mail to cancelled `node` was refused, and who may take it instead: the newest live
+    /// agent of the same name up to a `-N` suffix (a respawn: names stay unique, so the second
+    /// `pyo3` is `pyo3-2`), else its parent while that is live.
+    fn cancelled_note(&self, node: &Node) -> String {
+        let live = |other: &Node| other.status.lock().is_live();
+        let nodes = self.nodes();
+        let stem = |name: &str| -> String {
+            match name.rsplit_once('-') {
+                Some((stem, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => stem.to_owned(),
+                _ => name.to_owned(),
+            }
+        };
+        let own = stem(&node.name);
+        let successor = (nodes.iter().rev()).find(|other| stem(&other.name) == own && live(other));
+        let parent = (nodes.iter()).find(|other| other.id == node.parent && live(other));
+        let hint = match (successor, parent) {
+            (Some(other), _) => format!(" A live agent has its name: {}.", other.label()),
+            (None, Some(parent)) => format!(" Its parent {} is live.", parent.label()),
+            (None, None) => String::new(),
+        };
+        format!("Agent {} is cancelled.{hint}", node.label())
+    }
+
     pub(super) fn post(&self, from: &str, to: &str, kind: &'static str, text: String) -> Result<()> {
         self.post_mail(from, to, kind, text, Vec::new())
     }
@@ -292,7 +315,7 @@ impl Swarm {
         }
         let node = self.known(to)?;
         if !node.status.lock().is_live() {
-            return Err(Error::other(format!("Agent {to} is cancelled.")));
+            return Err(Error::other(self.cancelled_note(&node)));
         }
         self.journal_mail(&mail, to);
         // Emitted under the mailbox lock, so it always precedes the `MailRead` of its drain.

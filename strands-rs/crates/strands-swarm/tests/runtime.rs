@@ -634,6 +634,44 @@ async fn a_wait_does_not_end_on_fyi_mail_but_returns_it_with_the_next_message() 
 }
 
 /// `cc` delivers the same message without waking: an FYI to each, unless also in `to`.
+/// Mail to a cancelled agent is refused with who may take it: a live agent of its name, else
+/// its live parent.
+#[tokio::test]
+async fn mail_to_a_cancelled_agent_names_its_successor_or_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swarm, mut events, _scripts) = swarm_with(
+        vec![
+            ("a1", vec![say("root")]),
+            ("a2", vec![say("old")]),
+            ("a3", vec![say("new")]),
+        ],
+        dir.path(),
+    );
+    let root = spawn_root(&swarm, "go").await;
+    assert_eq!(reply_to(&mut events, USER).await, "root");
+    let named = |name: &str| SpawnRequest {
+        task: "work".into(),
+        name: Some(name.into()),
+        ..Default::default()
+    };
+    let old = swarm.spawn(&root, named("pyo3")).await.unwrap();
+    assert_eq!(reply_to(&mut events, &root).await, "old");
+    swarm.cancel(&old).unwrap();
+    let error = swarm.send(USER, &old, "hi").unwrap_err().to_string();
+    assert!(
+        error.contains("Agent pyo3 (a2) is cancelled. Its parent"),
+        "{error}"
+    );
+
+    let new = swarm.spawn(&root, named("pyo3")).await.unwrap();
+    assert_eq!(reply_to(&mut events, &root).await, "new");
+    let error = swarm.send(USER, &old, "hi").unwrap_err().to_string();
+    assert!(
+        error.contains(&format!("A live agent has its name: pyo3-2 ({new}).")),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn a_cc_gets_the_message_without_being_woken() {
     let dir = tempfile::tempdir().unwrap();
